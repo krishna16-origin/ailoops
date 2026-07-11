@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 # LangChain & LangGraph
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langchain.output_parsers import PydanticOutputParser
+from langchain_core.output_parsers import PydanticOutputParser
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langchain_nvidia_ai_endpoints import ChatNVIDIA

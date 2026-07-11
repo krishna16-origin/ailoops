@@ -2,7 +2,7 @@ fastapi
 uvicorn
 pydantic
 langchain
-langchain-core
+langchain-core>=1.0
 langchain-nvidia-ai-endpoints
 langgraph
 python-dotenv
