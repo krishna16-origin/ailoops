@@ -3,6 +3,7 @@
 # ==================================================
 import os
 import json
+import re
 import asyncio
 from typing import TypedDict, List, Dict, Any, Optional, Annotated
 
@@ -124,7 +125,16 @@ def get_llm(model_type: str, temperature: float = 0.7) -> ChatNVIDIA:
     elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
         
-    return ChatNVIDIA(model=model_name, temperature=temperature)
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=4096)
+
+def strip_thinking(text: str) -> str:
+    """Removes <think>...</think> reasoning blocks some models emit before the real answer."""
+    if not text:
+        return text
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
+    return text.strip()
+
 
 async def execute_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic_model, state: dict, retries: int = 3):
     """Executes an LLM call and ensures structured Pydantic output."""
@@ -307,7 +317,7 @@ Do not wrap the JSON in markdown blocks like ```json if it breaks standard parsi
     for attempt in range(retries):
         try:
             res = await chain.ainvoke({"format_instructions": format_instructions, **state})
-            content = res.content.strip()
+            content = strip_thinking(res.content).strip()
             # Clean up potential markdown artifacts
             if content.startswith("```json"):
                 content = content[7:]
@@ -318,7 +328,7 @@ Do not wrap the JSON in markdown blocks like ```json if it breaks standard parsi
             
             return parser.parse(content.strip())
         except Exception as e:
-            print(f"Structured Parsing Retry {attempt + 1}/{retries} failed: {e}")
+            print(f"Structured Parsing Retry {attempt + 1}/{retries} failed: {e} | Raw content: {res.content[:300] if 'res' in dir() else 'N/A'}")
             await asyncio.sleep(0.5)
             
     return None
