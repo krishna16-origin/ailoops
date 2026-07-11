@@ -576,29 +576,12 @@ async def _handle_chat(request: ChatRequest):
     # 2. Append the new human message
     session["messages"].append(HumanMessage(content=request.message))
 
-    # 3. Fast path: skip the full plan/execute/reflect/evaluate loop for simple messages
-    if is_simple_message(request.message):
-        final_response = await answer_directly(
-            request.message, session["messages"], request.model_type, request.temperature
-        )
-        final_state = {"completion_score": 100, "iteration": 1}
-    else:
-        # Setup LangGraph state
-        initial_state = {
-            "messages": session["messages"],
-            "model_type": request.model_type,
-            "temperature": request.temperature,
-            "max_iterations": request.max_iterations,
-            "iteration": 0,
-            "completion_score": 0,
-            "response": "",
-            "plan": [],
-            "completed_steps": []
-        }
-
-        # Execute the invisible reasoning loop
-        final_state = await app_graph.ainvoke(initial_state)
-        final_response = final_state.get("response", "Error: No response was generated.")
+ # Always get a real LLM answer directly — no structured JSON pipeline
+    final_response = await answer_directly(
+        request.message, session["messages"], request.model_type, request.temperature
+    )
+    final_state = {"completion_score": 100, "iteration": 1}
+   
     # 5. Append AI final answer to memory
     session["messages"].append(AIMessage(content=final_response))
 
