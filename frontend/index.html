@@ -4,6 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Maximus</title>
+    
+    <!-- KaTeX CSS for Math Rendering -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
+    
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
 
@@ -385,6 +389,7 @@
         .user .message-bubble {
             background-color: var(--bg-input);
             border-radius: 24px 24px 6px 24px;
+            white-space: pre-wrap; /* Keeps user newlines intact */
         }
 
         .assistant .message-bubble {
@@ -411,6 +416,78 @@
             padding: 4px;
             border-radius: 50%;
             border: 1px solid var(--border-color);
+        }
+
+        /* Markdown Styles */
+        .message-text {
+            word-break: break-word;
+        }
+        .message-text p { margin-bottom: 12px; }
+        .message-text p:last-child { margin-bottom: 0; }
+        .message-text h1, .message-text h2, .message-text h3, .message-text h4 {
+            margin: 20px 0 10px 0;
+            font-weight: 600;
+            color: #fff;
+        }
+        .message-text h1 { font-size: 1.5em; }
+        .message-text h2 { font-size: 1.3em; }
+        .message-text h3 { font-size: 1.1em; }
+        
+        .message-text ul, .message-text ol {
+            margin: 12px 0;
+            padding-left: 24px;
+        }
+        .message-text li {
+            margin-bottom: 6px;
+        }
+        
+        .message-text table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 16px 0;
+            background-color: rgba(0,0,0,0.15);
+            border-radius: 8px;
+            overflow: hidden;
+            display: block; /* For horizontal scroll if too wide */
+            overflow-x: auto;
+        }
+        .message-text th, .message-text td {
+            border: 1px solid var(--border-color);
+            padding: 10px 14px;
+            text-align: left;
+        }
+        .message-text th {
+            background-color: rgba(255,255,255,0.05);
+            font-weight: 600;
+        }
+        
+        .message-text pre {
+            background-color: #111;
+            padding: 16px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 16px 0;
+            border: 1px solid var(--border-color);
+        }
+        .message-text code {
+            font-family: 'Courier New', Courier, monospace;
+            background-color: rgba(255, 255, 255, 0.1);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 0.9em;
+        }
+        .message-text pre code {
+            background-color: transparent;
+            padding: 0;
+            font-size: 0.9em;
+            border: none;
+        }
+        
+        .message-text blockquote {
+            border-left: 4px solid var(--accent);
+            padding-left: 12px;
+            color: var(--text-secondary);
+            margin: 12px 0;
         }
 
         /* Goal Progress Indicator */
@@ -644,7 +721,15 @@
         </div>
     </div>
 
+    <!-- Markdown & Math Parsers -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked-katex-extension/lib/index.umd.js"></script>
+
     <script>
+        // Configure Marked to seamlessly parse KaTeX math formulas
+        marked.use(markedKatex({ throwOnError: false }));
+
         const API_URL = 'https://ailoops.onrender.com/chat';
         let currentSessionId = generateUUID();
         let isWaitingForResponse = false;
@@ -728,7 +813,7 @@
                 
                 const contentDiv = document.createElement('div');
                 contentDiv.className = 'message-text';
-                contentDiv.innerHTML = text; // Initial text (can be empty)
+                contentDiv.innerHTML = text ? marked.parse(text) : ''; // Render initial text as markdown
 
                 // Goal looping indicator with Swirl Spin for the thought process
                 const statusDiv = document.createElement('div');
@@ -810,19 +895,15 @@
                 }
             }, 2500);
             
+            // Accumulate response to correctly parse markdown formats and tables
+            let assistantFullText = '';
+
             // Add typing cursor for streaming
             if (useStream) {
                 textContainer.innerHTML = '<span class="typing-cursor"></span>';
             }
 
             try {
-                // To test the UI without backend uncomment below block and comment fetch block
-                /*
-                await new Promise(r => setTimeout(r, 2000));
-                statusIndicator.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg> <span>Objective executed</span>';
-                textContainer.innerHTML = "This is a simulated response since the backend is not connected. The UI is working perfectly!";
-                */
-
                 const response = await fetch(API_URL, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -834,7 +915,6 @@
                 if (useStream) {
                     const reader = response.body.getReader();
                     const decoder = new TextDecoder();
-                    textContainer.innerHTML = ''; // clear cursor
                     let buffer = '';
 
                     while (true) {
@@ -855,7 +935,9 @@
                             try {
                                 const parsed = JSON.parse(jsonStr);
                                 if (parsed.assistant_message) {
-                                    textContainer.innerHTML += parsed.assistant_message.replace(/\n/g, '<br>');
+                                    assistantFullText += parsed.assistant_message;
+                                    // Parse accumulated markdown + Math live as it streams
+                                    textContainer.innerHTML = marked.parse(assistantFullText) + '<span class="typing-cursor"></span>';
                                     scrollToBottom();
                                 }
                             } catch (e) {
@@ -863,9 +945,14 @@
                             }
                         }
                     }
+                    
+                    // Final markdown parse (without cursor)
+                    textContainer.innerHTML = marked.parse(assistantFullText);
+
                 } else {
                     const data = await response.json();
-                    textContainer.innerHTML = data.response.replace(/\n/g, '<br>');
+                    assistantFullText = data.response;
+                    textContainer.innerHTML = marked.parse(assistantFullText);
                 }
 
                 // Goal Complete state update
