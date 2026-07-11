@@ -426,7 +426,7 @@ def decision_edge(state: AgentState) -> str:
     """Decides whether to end the reasoning loop or continue planning/executing."""
     if state.get("completion_score", 0) >= 100:
         return END
-    if state.get("iteration", 0) >= 5:
+    if state.get("iteration", 0) >= state.get("max_iterations", 2):
         return END
     return "planner"
 
@@ -480,7 +480,7 @@ class ChatRequest(BaseModel):
     model_type: str = "Balanced"
     stream: bool = False
     temperature: float = 0.7
-    max_iterations: int = 5
+    max_iterations: int = 2
 
 class ClearSessionRequest(BaseModel):
     session_id: str
@@ -517,6 +517,16 @@ def is_simple_message(message: str) -> bool:
         return True
     greetings = ("hi", "hello", "hey", "yo", "sup", "thanks", "thank you", "ok", "okay", "bye")
     return any(text == g or text.startswith(g + " ") or text.startswith(g + ",") for g in greetings)
+
+def graph_timeout_seconds(model_type: str, max_iterations: int) -> float:
+    """
+    Sizes the overall graph timeout to the worst-case number of sequential LLM calls
+    (1 understand_goal call + up to max_iterations * 4 planner/executor/reflector/evaluator calls),
+    with extra headroom per call for the slower 'reasoning' model.
+    """
+    per_call_seconds = 18.0 if model_type.strip().lower() == "reasoning" else 8.0
+    worst_case_calls = 1 + (max_iterations * 4)
+    return min(worst_case_calls * per_call_seconds, 120.0)  # hard ceiling so a request can never hang indefinitely
 
 async def answer_directly(message: str, history: List[BaseMessage], model_type: str, temperature: float) -> str:
     """Always returns a real answer — falls back to the fast model if the primary one times out."""
@@ -576,35 +586,47 @@ async def _handle_chat(request: ChatRequest):
     # 2. Append the new human message
     session["messages"].append(HumanMessage(content=request.message))
 
-    # 3. Setup Initial State for the LangGraph Workflow
-    initial_state = {
-        "messages": session["messages"],
-        "model_type": request.model_type,
-        "temperature": request.temperature,
-        "max_iterations": request.max_iterations,
-        "iteration": 0,
-        "completion_score": 0,
-        "completed_steps": [],
-        "plan": []
-    }
+    # 3. Small talk / short messages skip the plan-execute-reflect loop entirely — no reason to
+    #    pay for 5+ sequential LLM calls (or wait on a timeout) to answer "hi" or "thanks".
+    if is_simple_message(request.message):
+        final_response = await answer_directly(
+            request.message, session["messages"], request.model_type, request.temperature
+        )
+        final_state = {"completion_score": 100, "iteration": 1}
+    else:
+        # 4. Setup Initial State for the LangGraph Workflow
+        initial_state = {
+            "messages": session["messages"],
+            "model_type": request.model_type,
+            "temperature": request.temperature,
+            "max_iterations": request.max_iterations,
+            "iteration": 0,
+            "completion_score": 0,
+            "completed_steps": [],
+            "plan": []
+        }
 
-    # 4. Run the workflow with a strict 20-second timeout to prevent overthinking
-    try:
-        # Executes the full Goal->Plan->Execute->Reflect loop
-        final_state = await asyncio.wait_for(app_graph.ainvoke(initial_state), timeout=20.0)
-        final_response = final_state.get("response", "Task completed but no response was formulated.")
-    except asyncio.TimeoutError:
-        print(f"[{session_id}] Workflow timed out after 20 seconds. Falling back to direct answer.")
-        final_response = await answer_directly(
-            request.message, session["messages"], request.model_type, request.temperature
-        )
-        final_state = {"completion_score": 100, "iteration": 1}
-    except Exception as e:
-        print(f"[{session_id}] Workflow failed: {e}. Falling back to direct answer.")
-        final_response = await answer_directly(
-            request.message, session["messages"], request.model_type, request.temperature
-        )
-        final_state = {"completion_score": 100, "iteration": 1}
+        # 5. Size the timeout to the worst-case number of sequential LLM calls this request
+        #    could trigger, instead of a flat 20s that's fine for small tasks but too short
+        #    for anything that needs multiple plan/execute/reflect iterations.
+        timeout = graph_timeout_seconds(request.model_type, request.max_iterations)
+
+        try:
+            # Executes the full Goal->Plan->Execute->Reflect loop
+            final_state = await asyncio.wait_for(app_graph.ainvoke(initial_state), timeout=timeout)
+            final_response = final_state.get("response", "Task completed but no response was formulated.")
+        except asyncio.TimeoutError:
+            print(f"[{session_id}] Workflow timed out after {timeout:.0f}s. Falling back to direct answer.")
+            final_response = await answer_directly(
+                request.message, session["messages"], request.model_type, request.temperature
+            )
+            final_state = {"completion_score": 100, "iteration": 1}
+        except Exception as e:
+            print(f"[{session_id}] Workflow failed: {e}. Falling back to direct answer.")
+            final_response = await answer_directly(
+                request.message, session["messages"], request.model_type, request.temperature
+            )
+            final_state = {"completion_score": 100, "iteration": 1}
 
     # 5. Append AI final answer to memory
     session["messages"].append(AIMessage(content=final_response))
