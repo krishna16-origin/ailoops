@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
 # LangChain & LangGraph
@@ -451,6 +452,7 @@ app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="front
 
 # Root route serves the frontend
 @app.get("/")
+@app.head("/")
 async def serve_frontend():
     return FileResponse("frontend/index.html")
 
