@@ -253,7 +253,7 @@
             transform: scale(1);
         }
 
-        .model-selector select, .settings-group input {
+        .settings-group input {
             background-color: var(--bg-main);
             color: var(--text-primary);
             border: 1px solid transparent;
@@ -266,8 +266,26 @@
             transition: background 0.2s, border 0.2s;
         }
         
-        .model-selector select:hover, .settings-group input:hover {
+        .settings-group input:hover {
             background-color: var(--bg-hover);
+        }
+
+        .sidebar-setting-item select {
+            background-color: var(--bg-main);
+            color: var(--text-primary);
+            border: 1px solid transparent;
+            padding: 4px 8px;
+            border-radius: 6px;
+            outline: none;
+            font-size: 13px;
+            cursor: pointer;
+            transition: background 0.2s, border-color 0.2s;
+        }
+
+        .sidebar-setting-item select:hover,
+        .sidebar-setting-item select:focus {
+            background-color: var(--bg-hover);
+            border-color: rgba(255, 255, 255, 0.2);
         }
 
         .settings-group {
@@ -651,12 +669,20 @@
         <!-- Sidebar Settings -->
         <div class="sidebar-settings">
             <div class="sidebar-setting-item">
+                <label title="Model">Model</label>
+                <select id="modelType">
+                    <option value="fast">Horus</option>
+                    <option value="balanced" selected>Osiris</option>
+                    <option value="reasoning">Amun-Ra</option>
+                </select>
+            </div>
+            <div class="sidebar-setting-item">
                 <label title="Model Temperature">Temperature</label>
                 <input type="number" id="tempSetting" value="0.7" step="0.1" min="0" max="1">
             </div>
             <div class="sidebar-setting-item">
                 <label title="Maximum Goal Iterations">Max Iterations</label>
-                <input type="number" id="iterSetting" value="5" min="1" max="10">
+                <input type="number" id="iterSetting" value="2" min="1" max="10">
             </div>
             <div class="sidebar-setting-item">
                 <label title="Stream Response Tokens">Stream Response</label>
@@ -676,13 +702,6 @@
                         <line x1="9" y1="3" x2="9" y2="21"></line>
                     </svg>
                 </button>
-                <div class="model-selector">
-                    <select id="modelType">
-                        <option value="fast">Horus</option>
-                        <option value="balanced" selected>Osiris</option>
-                        <option value="reasoning">Amun-Ra</option>
-                    </select>
-                </div>
             </div>
         </div>
 
@@ -872,29 +891,20 @@
             const textContainer = assistantBubble.querySelector('.message-text');
             const statusIndicator = assistantBubble.querySelector('.goal-status');
             const goalText = statusIndicator.querySelector('.goal-text');
-            
-            // Cycle through thought steps to simulate the Goal-Oriented loop
-            const thoughtSteps = [
-                "Understanding user intent...",
-                "Analyzing conversation context...",
-                "Formulating execution plan...",
-                "Executing strategic sub-tasks...",
-                "Evaluating output quality...",
-                "Refining generated response..."
-            ];
-            let stepIndex = 0;
-            const stepInterval = setInterval(() => {
-                if (goalText) {
-                    stepIndex = (stepIndex + 1) % thoughtSteps.length;
-                    goalText.style.opacity = 0;
-                    setTimeout(() => {
-                        goalText.textContent = thoughtSteps[stepIndex];
-                        goalText.style.opacity = 1;
-                        goalText.style.transition = "opacity 0.3s";
-                    }, 300);
-                }
-            }, 2500);
-            
+
+            // Updates the status line with whatever step the backend just reported it's actually
+            // running (understand_goal, planner, executor, reflector, evaluator...) — this is real
+            // progress from the LangGraph workflow, not a simulated/canned cycle.
+            function setGoalStatus(label) {
+                if (!goalText) return;
+                goalText.style.opacity = 0;
+                setTimeout(() => {
+                    goalText.textContent = label;
+                    goalText.style.opacity = 1;
+                    goalText.style.transition = "opacity 0.3s";
+                }, 150);
+            }
+
             // Accumulate response to correctly parse markdown formats and tables
             let assistantFullText = '';
 
@@ -934,7 +944,10 @@
                             const jsonStr = line.slice(5).trim();
                             try {
                                 const parsed = JSON.parse(jsonStr);
-                                if (parsed.assistant_message) {
+                                if (parsed.type === 'status') {
+                                    // Real backend progress — which LangGraph node just ran
+                                    setGoalStatus(parsed.label);
+                                } else if (parsed.assistant_message) {
                                     assistantFullText += parsed.assistant_message;
                                     // Parse accumulated markdown + Math live as it streams
                                     textContainer.innerHTML = marked.parse(assistantFullText) + '<span class="typing-cursor"></span>';
@@ -956,14 +969,12 @@
                 }
 
                 // Goal Complete state update
-                clearInterval(stepInterval);
                 statusIndicator.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg> <span style="color:var(--text-secondary)">Objective executed successfully</span>`;
                 statusIndicator.style.background = "transparent";
                 statusIndicator.style.border = "none";
                 statusIndicator.style.padding = "0";
 
             } catch (error) {
-                clearInterval(stepInterval);
                 console.error('Error:', error);
                 statusIndicator.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg> <span style="color:#ef4444">Connection Failed</span>`;
                 textContainer.innerHTML = `<span style="color: var(--text-secondary)">Make sure your Python FastAPI backend is running on http://localhost:8000</span>`;
