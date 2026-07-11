@@ -125,7 +125,7 @@ def get_llm(model_type: str, temperature: float = 0.7) -> ChatNVIDIA:
     elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
         
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=4096, timeout=120)
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=4096, timeout=15)
 
 def strip_thinking(text: str) -> str:
     """Removes <think>...</think> reasoning blocks some models emit before the real answer."""
