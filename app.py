@@ -10,7 +10,8 @@ from dotenv import load_dotenv
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 # LangChain & LangGraph
@@ -445,6 +446,14 @@ app_graph = workflow.compile()
 
 app = FastAPI(title="Goal-Oriented AI Assistant")
 
+# Serve the frontend static files
+app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
+
+# Root route serves the frontend
+@app.get("/")
+async def serve_frontend():
+    return FileResponse("frontend/index.html")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -463,10 +472,6 @@ class ChatRequest(BaseModel):
 
 class ClearSessionRequest(BaseModel):
     session_id: str
-
-@app.get("/")
-async def root():
-    return {"message": "Goal-Oriented AI Assistant Backend is Running"}
 
 @app.get("/health")
 async def health():
@@ -546,4 +551,4 @@ async def chat(request: ChatRequest):
         }
 
 if __name__ == "__main__":
-    uvicorn.run("backend:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
