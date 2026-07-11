@@ -125,7 +125,7 @@ def get_llm(model_type: str, temperature: float = 0.7) -> ChatNVIDIA:
     elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
         
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=4096)
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=4096, timeout=120)
 
 def strip_thinking(text: str) -> str:
     """Removes <think>...</think> reasoning blocks some models emit before the real answer."""
@@ -519,16 +519,49 @@ def is_simple_message(message: str) -> bool:
     return any(text == g or text.startswith(g + " ") or text.startswith(g + ",") for g in greetings)
 
 async def answer_directly(message: str, history: List[BaseMessage], model_type: str, temperature: float) -> str:
-    """Single fast LLM call, no LangGraph loop, for simple/short messages."""
-    llm = get_llm(model_type, temperature)
+    """Always returns a real answer — falls back to the fast model if the primary one times out."""
     messages = [SystemMessage(content="You are GoalAI, a helpful, friendly assistant. Respond naturally and concisely.")]
     messages.extend(history[-6:])
     messages.append(HumanMessage(content=message))
-    res = await llm.ainvoke(messages)
-    return strip_thinking(res.content).strip()
+
+    # Try the requested model first
+    try:
+        llm = get_llm(model_type, temperature)
+        res = await llm.ainvoke(messages)
+        answer = strip_thinking(res.content).strip()
+        if answer:
+            return answer
+    except Exception as e:
+        print(f"Primary model failed: {e}")
+
+    # Fallback: always try the fast model before giving up
+    try:
+        fallback_llm = get_llm("fast", temperature)
+        res = await fallback_llm.ainvoke(messages)
+        answer = strip_thinking(res.content).strip()
+        if answer:
+            return answer
+    except Exception as e:
+        print(f"Fallback model also failed: {e}")
+
+    # Absolute last resort — user still gets a real response, never a crash
+    return "I'm having trouble reaching the model right now. Please try again in a moment."
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
+    try:
+        return await _handle_chat(request)
+    except Exception as e:
+        print(f"Chat handler failed entirely: {e}")
+        return {
+            "response": "Something went wrong on my end — please try again.",
+            "session_id": request.session_id,
+            "goal_progress": 0,
+            "completed": False,
+            "iterations": 0
+        }
+
+async def _handle_chat(request: ChatRequest):
     session_id = request.session_id
     
     if session_id not in sessions:
