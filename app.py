@@ -125,7 +125,7 @@ def get_llm(model_type: str, temperature: float = 0.7) -> ChatNVIDIA:
     elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
         
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=4096, timeout=15)
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=8192, timeout=60)
 
 def strip_thinking(text: str) -> str:
     """Removes <think>...</think> reasoning blocks some models emit before the real answer."""
@@ -136,7 +136,7 @@ def strip_thinking(text: str) -> str:
     return text.strip()
 
 
-async def execute_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic_model, state: dict, retries: int = 3):
+async def execute_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic_model, state: dict, retries: int = 2):
     """Executes an LLM call and ensures structured Pydantic output."""
     parser = PydanticOutputParser(pydantic_object=pydantic_model)
     format_instructions = parser.get_format_instructions()
@@ -497,11 +497,11 @@ async def clear_session(request: ClearSessionRequest):
 
 # Human-readable labels for each real LangGraph node, shown to the user as that node actually runs.
 NODE_LABELS = {
-    "understand_goal": "Understanding your goal...",
-    "planner": "Planning next steps...",
-    "executor": "Working on it...",
-    "reflector": "Reviewing the draft...",
-    "evaluator": "Checking if that's enough...",
+    "understand_goal": "Igniting...",
+    "planner": "Engineering...",
+    "executor": "Synthesizing...",
+    "reflector": "Simmering...",
+    "evaluator": "Coockin...",
 }
 
 async def run_graph_streaming(initial_state: dict, timeout: float):
@@ -608,9 +608,12 @@ def graph_timeout_seconds(model_type: str, max_iterations: int) -> float:
     (1 understand_goal call + up to max_iterations * 4 planner/executor/reflector/evaluator calls),
     with extra headroom per call for the slower 'reasoning' model.
     """
-    per_call_seconds = 18.0 if model_type.strip().lower() == "reasoning" else 8.0
+    # Each node call can retry up to twice against a 60s per-call LLM timeout (see get_llm),
+    # so the per-call budget here must comfortably exceed 60s or the outer graph deadline
+    # will cut off a call that hadn't even hit its own timeout yet.
+    per_call_seconds = 130.0 if model_type.strip().lower() == "reasoning" else 100.0
     worst_case_calls = 1 + (max_iterations * 4)
-    return min(worst_case_calls * per_call_seconds, 120.0)  # hard ceiling so a request can never hang indefinitely
+    return min(worst_case_calls * per_call_seconds, 240.0)  # hard ceiling so a request can never hang indefinitely
 
 async def answer_directly(message: str, history: List[BaseMessage], model_type: str, temperature: float) -> str:
     """Always returns a real answer — falls back to the fast model if the primary one times out."""
