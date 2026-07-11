@@ -1,0 +1,889 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Goal-Oriented AI</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+
+        :root {
+            --bg-main: #212121;
+            --bg-sidebar: #171717;
+            --bg-input: #2f2f2f;
+            --bg-hover: #2f2f2f;
+            --text-primary: #ececec;
+            --text-secondary: #b4b4b4;
+            --accent: #10a37f;
+            --border-color: rgba(255, 255, 255, 0.1);
+            --transition-bezier: cubic-bezier(0.2, 0.8, 0.2, 1);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Inter', sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-main);
+            color: var(--text-primary);
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Splash Screen */
+        .splash-screen {
+            position: fixed;
+            inset: 0;
+            background-color: var(--bg-main);
+            z-index: 9999;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            transition: opacity 0.8s var(--transition-bezier), visibility 0.8s;
+        }
+
+        .splash-screen.hidden {
+            opacity: 0;
+            visibility: hidden;
+        }
+
+        .splash-logo-container {
+            animation: splashPulse 2s infinite ease-in-out;
+            margin-bottom: 24px;
+        }
+
+        .splash-logo {
+            width: 80px;
+            height: 80px;
+            color: var(--text-primary);
+        }
+
+        @keyframes splashPulse {
+            0% { transform: scale(0.95); opacity: 0.7; }
+            50% { transform: scale(1.05); opacity: 1; }
+            100% { transform: scale(0.95); opacity: 0.7; }
+        }
+
+        .splash-text {
+            font-size: 18px;
+            font-weight: 500;
+            letter-spacing: 3px;
+            color: var(--text-primary);
+            opacity: 0.8;
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: 260px;
+            background-color: var(--bg-sidebar);
+            display: flex;
+            flex-direction: column;
+            padding: 10px;
+            border-right: 1px solid var(--border-color);
+            transition: width 0.3s var(--transition-bezier), padding 0.3s var(--transition-bezier), opacity 0.3s var(--transition-bezier);
+            overflow-x: hidden;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        .sidebar.collapsed {
+            width: 0;
+            padding-left: 0;
+            padding-right: 0;
+            border-right: none;
+            opacity: 0;
+        }
+
+        .sidebar-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            gap: 10px;
+        }
+
+        .icon-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 8px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: background 0.2s, color 0.2s;
+        }
+
+        .icon-btn:hover {
+            background-color: var(--bg-hover);
+            color: var(--text-primary);
+        }
+
+        .new-chat-btn {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 12px;
+            background-color: transparent;
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+
+        .new-chat-btn:hover {
+            background-color: var(--bg-hover);
+        }
+
+        .history-list {
+            flex: 1;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        .history-item {
+            padding: 12px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            color: var(--text-secondary);
+            transition: background 0.2s, color 0.2s;
+        }
+
+        .history-item:hover {
+            background-color: var(--bg-hover);
+            color: var(--text-primary);
+        }
+
+        /* Sidebar Settings */
+        .sidebar-settings {
+            margin-top: auto;
+            padding-top: 16px;
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .sidebar-setting-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            color: var(--text-secondary);
+            font-size: 13px;
+        }
+
+        .sidebar-setting-item input[type="number"] {
+            width: 50px;
+            background-color: var(--bg-main);
+            color: var(--text-primary);
+            border: 1px solid transparent;
+            padding: 4px 8px;
+            border-radius: 6px;
+            outline: none;
+            transition: background 0.2s, border-color 0.2s;
+        }
+        
+        .sidebar-setting-item input[type="number"]:hover,
+        .sidebar-setting-item input[type="number"]:focus {
+            background-color: var(--bg-hover);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        .sidebar-setting-item input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            accent-color: var(--accent);
+            cursor: pointer;
+        }
+
+        /* Main Content */
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+            min-width: 0; /* Prevents flex blowout */
+        }
+
+        /* Header / Controls */
+        .header {
+            height: 60px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 16px;
+            z-index: 10;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .sidebar-toggle-main {
+            display: none;
+            opacity: 0;
+            transform: scale(0.8);
+            transition: opacity 0.3s var(--transition-bezier), transform 0.3s var(--transition-bezier);
+        }
+
+        .sidebar.collapsed ~ .main-content .sidebar-toggle-main {
+            display: flex;
+            opacity: 1;
+            transform: scale(1);
+        }
+
+        .model-selector select, .settings-group input {
+            background-color: var(--bg-main);
+            color: var(--text-primary);
+            border: 1px solid transparent;
+            padding: 8px 12px;
+            border-radius: 8px;
+            outline: none;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s, border 0.2s;
+        }
+        
+        .model-selector select:hover, .settings-group input:hover {
+            background-color: var(--bg-hover);
+        }
+
+        .settings-group {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+
+        .settings-group label {
+            font-size: 13px;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .settings-group input[type="number"] {
+            width: 50px;
+            padding: 4px 8px;
+            background-color: var(--bg-input);
+        }
+
+        /* Chat Area */
+        .chat-container {
+            flex: 1;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            scroll-behavior: smooth;
+        }
+
+        .chat-content {
+            width: 100%;
+            max-width: 800px;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 32px;
+            padding-bottom: 150px; /* Space for input */
+        }
+
+        /* Opening Scene with Staggered Animations */
+        .opening-scene {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            width: 100%;
+        }
+
+        .mono-logo-container {
+            margin-bottom: 24px;
+            opacity: 0;
+            transform: scale(0.8) translateY(20px);
+            animation: popFadeIn 0.8s var(--transition-bezier) forwards;
+        }
+
+        .mono-logo {
+            width: 72px;
+            height: 72px;
+            color: var(--text-primary);
+        }
+
+        .swirl-spin {
+            animation: spin 3s linear infinite;
+        }
+
+        .opening-title {
+            font-size: 28px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            opacity: 0;
+            transform: translateY(15px);
+            animation: slideFadeIn 0.8s var(--transition-bezier) 0.15s forwards;
+        }
+
+        .opening-subtitle {
+            color: var(--text-secondary);
+            font-size: 15px;
+            opacity: 0;
+            transform: translateY(15px);
+            animation: slideFadeIn 0.8s var(--transition-bezier) 0.3s forwards;
+        }
+
+        @keyframes popFadeIn {
+            to { opacity: 1; transform: scale(1) translateY(0); }
+        }
+
+        @keyframes slideFadeIn {
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* Messages */
+        .message-row {
+            display: flex;
+            width: 100%;
+            opacity: 0;
+            transform: translateY(15px);
+            animation: slideFadeIn 0.5s var(--transition-bezier) forwards;
+        }
+
+        .message-row.user {
+            justify-content: flex-end;
+        }
+
+        .message-row.assistant {
+            justify-content: flex-start;
+        }
+
+        .message-bubble {
+            max-width: 85%;
+            padding: 16px 20px;
+            font-size: 15px;
+            line-height: 1.6;
+        }
+
+        .user .message-bubble {
+            background-color: var(--bg-input);
+            border-radius: 24px 24px 6px 24px;
+        }
+
+        .assistant .message-bubble {
+            background-color: transparent;
+            border-radius: 8px;
+            color: var(--text-primary);
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            padding-left: 0;
+        }
+
+        .assistant-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-weight: 600;
+            font-size: 16px;
+        }
+
+        .assistant-logo {
+            width: 24px;
+            height: 24px;
+            padding: 4px;
+            border-radius: 50%;
+            border: 1px solid var(--border-color);
+        }
+
+        /* Goal Progress Indicator */
+        .goal-status {
+            font-size: 12px;
+            color: var(--text-secondary);
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background-color: var(--bg-input);
+            border-radius: 6px;
+            width: fit-content;
+            margin-top: 8px;
+            border: 1px solid var(--border-color);
+        }
+
+        .spinner {
+            width: 14px;
+            height: 14px;
+            border: 2px solid var(--text-secondary);
+            border-top: 2px solid transparent;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        /* Input Area */
+        .input-container {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            width: 100%;
+            padding: 24px;
+            background: linear-gradient(180deg, rgba(33,33,33,0) 0%, var(--bg-main) 40%);
+            display: flex;
+            justify-content: center;
+        }
+
+        .input-box {
+            width: 100%;
+            max-width: 800px;
+            background-color: var(--bg-input);
+            border-radius: 24px;
+            border: 1px solid var(--border-color);
+            display: flex;
+            align-items: flex-end;
+            padding: 12px 16px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+            transition: border-color 0.3s;
+        }
+
+        .input-box:focus-within {
+            border-color: rgba(255, 255, 255, 0.3);
+        }
+
+        .input-box textarea {
+            flex: 1;
+            background: transparent;
+            border: none;
+            color: var(--text-primary);
+            font-size: 16px;
+            resize: none;
+            outline: none;
+            max-height: 200px;
+            padding: 8px 4px;
+            line-height: 1.5;
+        }
+
+        .input-box textarea::placeholder {
+            color: var(--text-secondary);
+        }
+
+        .send-btn {
+            background: var(--text-primary);
+            color: var(--bg-main);
+            border: none;
+            border-radius: 50%;
+            width: 36px;
+            height: 36px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: opacity 0.2s, transform 0.2s var(--transition-bezier);
+            margin-left: 12px;
+            margin-bottom: 4px;
+        }
+
+        .send-btn:hover:not(:disabled) {
+            transform: scale(1.05);
+        }
+
+        .send-btn:active:not(:disabled) {
+            transform: scale(0.95);
+        }
+
+        .send-btn:disabled {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+
+        .send-btn svg {
+            width: 18px;
+            height: 18px;
+        }
+        
+        .typing-cursor {
+            display: inline-block;
+            width: 8px;
+            height: 16px;
+            background-color: var(--text-primary);
+            animation: blink 1s step-end infinite;
+            vertical-align: text-bottom;
+            margin-left: 2px;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
+        }
+
+    </style>
+</head>
+<body>
+
+    <!-- Splash Screen -->
+    <div class="splash-screen" id="splashScreen">
+        <div class="splash-logo-container">
+            <svg class="splash-logo swirl-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 12c-1.657 0-3 1.343-3 3 0 1.657 1.343 3 3 3 3.314 0 6-2.686 6-6 0-3.314-2.686-6-6-6-4.97 0-9 4.03-9 9 0 4.97 4.03 9 9 9"></path>
+            </svg>
+        </div>
+        <div class="splash-text">GOAL-ORIENTED AI</div>
+    </div>
+
+    <!-- Sidebar -->
+    <div class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <button class="icon-btn" onclick="toggleSidebar()" title="Close sidebar">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                    <line x1="9" y1="3" x2="9" y2="21"></line>
+                </svg>
+            </button>
+            <button class="new-chat-btn" onclick="startNewChat()">
+                <span>New session</span>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 5v14M5 12h14"></path>
+                </svg>
+            </button>
+        </div>
+        <div class="history-list" id="historyList">
+            <!-- History appended here -->
+        </div>
+        
+        <!-- Sidebar Settings -->
+        <div class="sidebar-settings">
+            <div class="sidebar-setting-item">
+                <label title="Model Temperature">Temperature</label>
+                <input type="number" id="tempSetting" value="0.7" step="0.1" min="0" max="1">
+            </div>
+            <div class="sidebar-setting-item">
+                <label title="Maximum Goal Iterations">Max Iterations</label>
+                <input type="number" id="iterSetting" value="5" min="1" max="10">
+            </div>
+            <div class="sidebar-setting-item">
+                <label title="Stream Response Tokens">Stream Response</label>
+                <input type="checkbox" id="streamSetting" checked>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-content">
+        <!-- Header -->
+        <div class="header">
+            <div class="header-left">
+                <button class="icon-btn sidebar-toggle-main" onclick="toggleSidebar()" title="Open sidebar">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                        <line x1="9" y1="3" x2="9" y2="21"></line>
+                    </svg>
+                </button>
+                <div class="model-selector">
+                    <select id="modelType">
+                        <option value="fast">Fast (NVIDIA)</option>
+                        <option value="balanced" selected>Balanced (NVIDIA)</option>
+                        <option value="reasoning">Reasoning (NVIDIA)</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <!-- Chat Container -->
+        <div class="chat-container" id="chatContainer">
+            
+            <!-- Opening Scene -->
+            <div class="opening-scene" id="openingScene">
+                <div class="mono-logo-container">
+                    <svg class="mono-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+                        <polyline points="2 12 12 17 22 12"></polyline>
+                        <polyline points="2 17 12 22 22 17"></polyline>
+                    </svg>
+                </div>
+                <h1 class="opening-title">How can I help you achieve your goal?</h1>
+                <p class="opening-subtitle">Goal-Oriented AI powered by NVIDIA & LangGraph</p>
+            </div>
+
+            <!-- Messages Append Here -->
+            <div class="chat-content" id="chatContent" style="display: none;"></div>
+
+        </div>
+
+        <!-- Input Container -->
+        <div class="input-container">
+            <div class="input-box">
+                <textarea id="userInput" rows="1" placeholder="Describe your objective..." oninput="autoResize(this)" onkeydown="handleEnter(event)"></textarea>
+                <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="12" y1="19" x2="12" y2="5"></line>
+                        <polyline points="5 12 12 5 19 12"></polyline>
+                    </svg>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = 'http://localhost:8000/chat';
+        let currentSessionId = generateUUID();
+        let isWaitingForResponse = false;
+
+        const sidebar = document.getElementById('sidebar');
+        const chatContainer = document.getElementById('chatContainer');
+        const chatContent = document.getElementById('chatContent');
+        const openingScene = document.getElementById('openingScene');
+        const userInput = document.getElementById('userInput');
+        const sendBtn = document.getElementById('sendBtn');
+
+        function toggleSidebar() {
+            sidebar.classList.toggle('collapsed');
+        }
+
+        function generateUUID() {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        }
+
+        function autoResize(textarea) {
+            textarea.style.height = 'auto';
+            textarea.style.height = (textarea.scrollHeight) + 'px';
+            if(textarea.value === '') {
+                textarea.style.height = 'auto';
+            }
+        }
+
+        function handleEnter(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        }
+
+        function startNewChat() {
+            currentSessionId = generateUUID();
+            chatContent.innerHTML = '';
+            chatContent.style.display = 'none';
+            openingScene.style.display = 'flex';
+            
+            // Re-trigger animations by cloning and replacing
+            const newOpening = openingScene.cloneNode(true);
+            openingScene.parentNode.replaceChild(newOpening, openingScene);
+            
+            userInput.value = '';
+            autoResize(userInput);
+            userInput.focus();
+            
+            // Add to history sidebar visually
+            const historyList = document.getElementById('historyList');
+            const item = document.createElement('div');
+            item.className = 'history-item';
+            item.textContent = 'New Objective';
+            historyList.prepend(item);
+        }
+
+        function appendMessage(role, text) {
+            document.getElementById('openingScene').style.display = 'none';
+            chatContent.style.display = 'flex';
+
+            const row = document.createElement('div');
+            row.className = `message-row ${role}`;
+            
+            const bubble = document.createElement('div');
+            bubble.className = 'message-bubble';
+
+            if (role === 'assistant') {
+                const header = document.createElement('div');
+                header.className = 'assistant-header';
+                header.innerHTML = `
+                    <svg class="assistant-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+                        <polyline points="2 12 12 17 22 12"></polyline>
+                        <polyline points="2 17 12 22 22 17"></polyline>
+                    </svg>
+                    Goal-Oriented AI
+                `;
+                
+                const contentDiv = document.createElement('div');
+                contentDiv.className = 'message-text';
+                contentDiv.innerHTML = text; // Initial text (can be empty)
+
+                // Goal looping indicator with Swirl Spin for the thought process
+                const statusDiv = document.createElement('div');
+                statusDiv.className = 'goal-status';
+                statusDiv.innerHTML = `
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="swirl-spin">
+                        <path d="M12 12c-1.657 0-3 1.343-3 3 0 1.657 1.343 3 3 3 3.314 0 6-2.686 6-6 0-3.314-2.686-6-6-6-4.97 0-9 4.03-9 9 0 4.97 4.03 9 9 9"></path>
+                    </svg>
+                    <span class="goal-text">Initializing goal parameters...</span>
+                `;
+
+                bubble.appendChild(header);
+                bubble.appendChild(statusDiv);
+                bubble.appendChild(contentDiv);
+            } else {
+                bubble.innerText = text;
+            }
+
+            row.appendChild(bubble);
+            chatContent.appendChild(row);
+            scrollToBottom();
+            
+            return role === 'assistant' ? bubble : null;
+        }
+
+        function scrollToBottom() {
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const text = userInput.value.trim();
+            if (!text || isWaitingForResponse) return;
+
+            // UI Updates
+            appendMessage('user', text);
+            userInput.value = '';
+            autoResize(userInput);
+            sendBtn.disabled = true;
+            isWaitingForResponse = true;
+
+            const modelType = document.getElementById('modelType').value;
+            const temp = parseFloat(document.getElementById('tempSetting').value);
+            const maxIters = parseInt(document.getElementById('iterSetting').value);
+            const useStream = document.getElementById('streamSetting').checked;
+
+            const payload = {
+                message: text,
+                session_id: currentSessionId,
+                model_type: modelType,
+                stream: useStream,
+                temperature: temp,
+                max_iterations: maxIters
+            };
+
+            const assistantBubble = appendMessage('assistant', '');
+            const textContainer = assistantBubble.querySelector('.message-text');
+            const statusIndicator = assistantBubble.querySelector('.goal-status');
+            const goalText = statusIndicator.querySelector('.goal-text');
+            
+            // Cycle through thought steps to simulate the Goal-Oriented loop
+            const thoughtSteps = [
+                "Understanding user intent...",
+                "Analyzing conversation context...",
+                "Formulating execution plan...",
+                "Executing strategic sub-tasks...",
+                "Evaluating output quality...",
+                "Refining generated response..."
+            ];
+            let stepIndex = 0;
+            const stepInterval = setInterval(() => {
+                if (goalText) {
+                    stepIndex = (stepIndex + 1) % thoughtSteps.length;
+                    goalText.style.opacity = 0;
+                    setTimeout(() => {
+                        goalText.textContent = thoughtSteps[stepIndex];
+                        goalText.style.opacity = 1;
+                        goalText.style.transition = "opacity 0.3s";
+                    }, 300);
+                }
+            }, 2500);
+            
+            // Add typing cursor for streaming
+            if (useStream) {
+                textContainer.innerHTML = '<span class="typing-cursor"></span>';
+            }
+
+            try {
+                // To test the UI without backend uncomment below block and comment fetch block
+                /*
+                await new Promise(r => setTimeout(r, 2000));
+                statusIndicator.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg> <span>Objective executed</span>';
+                textContainer.innerHTML = "This is a simulated response since the backend is not connected. The UI is working perfectly!";
+                */
+
+                const response = await fetch(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) throw new Error('Network response was not ok');
+
+                if (useStream) {
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    textContainer.innerHTML = ''; // clear cursor
+                    
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        
+                        const chunk = decoder.decode(value, { stream: true });
+                        textContainer.innerHTML += chunk.replace(/\n/g, '<br>');
+                        scrollToBottom();
+                    }
+                } else {
+                    const data = await response.json();
+                    textContainer.innerHTML = data.response.replace(/\n/g, '<br>');
+                }
+
+                // Goal Complete state update
+                clearInterval(stepInterval);
+                statusIndicator.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg> <span style="color:var(--text-secondary)">Objective executed successfully</span>`;
+                statusIndicator.style.background = "transparent";
+                statusIndicator.style.border = "none";
+                statusIndicator.style.padding = "0";
+
+            } catch (error) {
+                clearInterval(stepInterval);
+                console.error('Error:', error);
+                statusIndicator.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg> <span style="color:#ef4444">Connection Failed</span>`;
+                textContainer.innerHTML = `<span style="color: var(--text-secondary)">Make sure your Python FastAPI backend is running on http://localhost:8000</span>`;
+            } finally {
+                sendBtn.disabled = false;
+                isWaitingForResponse = false;
+                userInput.focus();
+                
+                // Remove cursor if left over
+                const cursor = textContainer.querySelector('.typing-cursor');
+                if(cursor) cursor.remove();
+            }
+        }
+        
+        // Focus input on load
+        window.onload = () => {
+            setTimeout(() => {
+                const splash = document.getElementById('splashScreen');
+                if (splash) {
+                    splash.classList.add('hidden');
+                    // Remove from DOM after fade out to allow clicking underneath
+                    setTimeout(() => splash.style.display = 'none', 800);
+                }
+                document.getElementById('userInput').focus();
+            }, 1600);
+        };
+    </script>
+</body>
+</html>
