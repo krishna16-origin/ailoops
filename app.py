@@ -290,8 +290,9 @@ Then wait for the user's next instruction.
 
 Never continue unnecessary work after the goal has been completed.
 
-Your success is measured by how effectively you help the user achieve their objective while keeping the interaction natural, efficient, and focused."" "
-"Do not wrap the JSON in markdown blocks like ```json if it breaks standard parsing, just return the raw JSON object."
+Your success is measured by how effectively you help the user achieve their objective while keeping the interaction natural, efficient, and focused.
+
+Do not wrap the JSON in markdown blocks like ```json if it breaks standard parsing, just return the raw JSON object."""
     )
     
     prompt = ChatPromptTemplate.from_messages([
