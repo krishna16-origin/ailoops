@@ -576,12 +576,36 @@ async def _handle_chat(request: ChatRequest):
     # 2. Append the new human message
     session["messages"].append(HumanMessage(content=request.message))
 
- # Always get a real LLM answer directly — no structured JSON pipeline
-    final_response = await answer_directly(
-        request.message, session["messages"], request.model_type, request.temperature
-    )
-    final_state = {"completion_score": 100, "iteration": 1}
-   
+    # 3. Setup Initial State for the LangGraph Workflow
+    initial_state = {
+        "messages": session["messages"],
+        "model_type": request.model_type,
+        "temperature": request.temperature,
+        "max_iterations": request.max_iterations,
+        "iteration": 0,
+        "completion_score": 0,
+        "completed_steps": [],
+        "plan": []
+    }
+
+    # 4. Run the workflow with a strict 20-second timeout to prevent overthinking
+    try:
+        # Executes the full Goal->Plan->Execute->Reflect loop
+        final_state = await asyncio.wait_for(app_graph.ainvoke(initial_state), timeout=20.0)
+        final_response = final_state.get("response", "Task completed but no response was formulated.")
+    except asyncio.TimeoutError:
+        print(f"[{session_id}] Workflow timed out after 20 seconds. Falling back to direct answer.")
+        final_response = await answer_directly(
+            request.message, session["messages"], request.model_type, request.temperature
+        )
+        final_state = {"completion_score": 100, "iteration": 1}
+    except Exception as e:
+        print(f"[{session_id}] Workflow failed: {e}. Falling back to direct answer.")
+        final_response = await answer_directly(
+            request.message, session["messages"], request.model_type, request.temperature
+        )
+        final_state = {"completion_score": 100, "iteration": 1}
+
     # 5. Append AI final answer to memory
     session["messages"].append(AIMessage(content=final_response))
 
@@ -601,4 +625,5 @@ async def _handle_chat(request: ChatRequest):
         }
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    # Ensure uvicorn runs the correct file 'main' instead of 'app'
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
