@@ -495,17 +495,101 @@ async def clear_session(request: ClearSessionRequest):
         del sessions[request.session_id]
     return {"status": "success", "message": f"Session {request.session_id} cleared."}
 
-async def generate_stream(response_text: str, state: dict, session_id: str):
-    """Yields chunks of the final response to simulate a ChatGPT-like streaming experience."""
-    # Chunk by words to simulate token streaming
-    chunks = response_text.split(" ")
+# Human-readable labels for each real LangGraph node, shown to the user as that node actually runs.
+NODE_LABELS = {
+    "understand_goal": "Understanding your goal...",
+    "planner": "Planning next steps...",
+    "executor": "Working on it...",
+    "reflector": "Reviewing the draft...",
+    "evaluator": "Checking if that's enough...",
+}
+
+async def run_graph_streaming(initial_state: dict, timeout: float):
+    """
+    Runs the LangGraph workflow node-by-node, yielding (node_name, state_so_far) the moment each
+    node actually finishes — this is real backend progress, not a simulated/canned timer. Enforces
+    the same overall timeout budget as the non-streaming path so a slow run still falls back cleanly.
+    """
+    state_acc = dict(initial_state)
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    agen = app_graph.astream(initial_state, stream_mode="updates")
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            chunk = await asyncio.wait_for(agen.__anext__(), timeout=remaining)
+            node_name, node_output = next(iter(chunk.items()))
+            state_acc.update(node_output)
+            yield node_name, state_acc
+    except StopAsyncIteration:
+        return
+    finally:
+        await agen.aclose()
+
+async def generate_stream(request: "ChatRequest", session: dict, session_id: str):
+    """
+    Streams two kinds of SSE events to the frontend:
+      - {"type": "status", "step": <node name>, "label": <text>}  while the agent is actually working
+      - {"type": "message", "assistant_message": <word chunk>, ...}  once the final answer is ready
+    The status events mirror whichever LangGraph node just finished, so the "thought process" shown
+    in the UI is synced to real backend state instead of a client-side simulated cycle.
+    """
+    if is_simple_message(request.message):
+        yield f"data: {json.dumps({'type': 'status', 'step': 'direct', 'label': 'Answering...'})}\n\n"
+        final_response = await answer_directly(
+            request.message, session["messages"], request.model_type, request.temperature
+        )
+        final_state = {"completion_score": 100, "iteration": 1}
+    else:
+        initial_state = {
+            "messages": session["messages"],
+            "model_type": request.model_type,
+            "temperature": request.temperature,
+            "max_iterations": request.max_iterations,
+            "iteration": 0,
+            "completion_score": 0,
+            "completed_steps": [],
+            "plan": []
+        }
+        timeout = graph_timeout_seconds(request.model_type, request.max_iterations)
+        final_state = initial_state
+
+        try:
+            async for node_name, state_so_far in run_graph_streaming(initial_state, timeout):
+                label = NODE_LABELS.get(node_name, node_name)
+                yield f"data: {json.dumps({'type': 'status', 'step': node_name, 'label': label})}\n\n"
+                final_state = state_so_far
+            final_response = final_state.get("response", "Task completed but no response was formulated.")
+        except asyncio.TimeoutError:
+            print(f"[{session_id}] Streaming workflow timed out after {timeout:.0f}s. Falling back to direct answer.")
+            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': 'Taking a shortcut to get you an answer...'})}\n\n"
+            final_response = await answer_directly(
+                request.message, session["messages"], request.model_type, request.temperature
+            )
+            final_state = {"completion_score": 100, "iteration": 1}
+        except Exception as e:
+            print(f"[{session_id}] Streaming workflow failed: {e}. Falling back to direct answer.")
+            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': 'Taking a shortcut to get you an answer...'})}\n\n"
+            final_response = await answer_directly(
+                request.message, session["messages"], request.model_type, request.temperature
+            )
+            final_state = {"completion_score": 100, "iteration": 1}
+
+    # Now that we actually have the final answer, save it to memory
+    session["messages"].append(AIMessage(content=final_response))
+
+    # Stream the final answer word-by-word (ChatGPT-style typing effect)
+    chunks = final_response.split(" ")
     for i, chunk in enumerate(chunks):
         space = " " if i < len(chunks) - 1 else ""
         data = {
+            "type": "message",
             "assistant_message": chunk + space,
             "conversation_id": session_id,
             "session_id": session_id,
-            "goal_complete": state.get("completion_score", 100) >= 100
+            "goal_complete": final_state.get("completion_score", 100) >= 100
         }
         yield f"data: {json.dumps(data)}\n\n"
         await asyncio.sleep(0.015) # Simulated typing delay
@@ -586,8 +670,16 @@ async def _handle_chat(request: ChatRequest):
     # 2. Append the new human message
     session["messages"].append(HumanMessage(content=request.message))
 
-    # 3. Small talk / short messages skip the plan-execute-reflect loop entirely — no reason to
-    #    pay for 5+ sequential LLM calls (or wait on a timeout) to answer "hi" or "thanks".
+    # 3. Streaming requests get real-time node-by-node progress from the graph itself —
+    #    hand off to the generator now instead of running the graph synchronously first.
+    if request.stream:
+        return StreamingResponse(
+            generate_stream(request, session, session_id),
+            media_type="text/event-stream"
+        )
+
+    # 4. Non-streaming (plain JSON) path. Small talk / short messages skip the plan-execute-reflect
+    #    loop entirely — no reason to pay for 5+ sequential LLM calls to answer "hi" or "thanks".
     if is_simple_message(request.message):
         final_response = await answer_directly(
             request.message, session["messages"], request.model_type, request.temperature
@@ -631,20 +723,14 @@ async def _handle_chat(request: ChatRequest):
     # 5. Append AI final answer to memory
     session["messages"].append(AIMessage(content=final_response))
 
-    # 6. Return response (Streamed or JSON)
-    if request.stream:
-        return StreamingResponse(
-            generate_stream(final_response, final_state, session_id),
-            media_type="text/event-stream"
-        )
-    else:
-        return {
-            "response": final_response,
-            "session_id": session_id,
-            "goal_progress": final_state.get("completion_score", 100),
-            "completed": final_state.get("completion_score", 100) >= 100,
-            "iterations": final_state.get("iteration", 1)
-        }
+    # 6. Return the plain JSON response (streaming requests already returned in step 3)
+    return {
+        "response": final_response,
+        "session_id": session_id,
+        "goal_progress": final_state.get("completion_score", 100),
+        "completed": final_state.get("completion_score", 100) >= 100,
+        "iterations": final_state.get("iteration", 1)
+    }
 
 if __name__ == "__main__":
     # Ensure uvicorn runs the correct file 'main' instead of 'app'
