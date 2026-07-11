@@ -835,14 +835,33 @@
                     const reader = response.body.getReader();
                     const decoder = new TextDecoder();
                     textContainer.innerHTML = ''; // clear cursor
-                    
+                    let buffer = '';
+
                     while (true) {
                         const { value, done } = await reader.read();
                         if (done) break;
-                        
-                        const chunk = decoder.decode(value, { stream: true });
-                        textContainer.innerHTML += chunk.replace(/\n/g, '<br>');
-                        scrollToBottom();
+
+                        buffer += decoder.decode(value, { stream: true });
+
+                        // SSE events are separated by a blank line
+                        const events = buffer.split('\n\n');
+                        buffer = events.pop(); // keep incomplete trailing chunk for next read
+
+                        for (const event of events) {
+                            const line = event.trim();
+                            if (!line.startsWith('data:')) continue;
+
+                            const jsonStr = line.slice(5).trim();
+                            try {
+                                const parsed = JSON.parse(jsonStr);
+                                if (parsed.assistant_message) {
+                                    textContainer.innerHTML += parsed.assistant_message.replace(/\n/g, '<br>');
+                                    scrollToBottom();
+                                }
+                            } catch (e) {
+                                console.error('Failed to parse SSE chunk:', jsonStr, e);
+                            }
+                        }
                     }
                 } else {
                     const data = await response.json();
