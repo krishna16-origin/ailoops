@@ -510,6 +510,23 @@ async def generate_stream(response_text: str, state: dict, session_id: str):
         yield f"data: {json.dumps(data)}\n\n"
         await asyncio.sleep(0.015) # Simulated typing delay
 
+def is_simple_message(message: str) -> bool:
+    """Quick heuristic: short greetings/small talk don't need the full plan/execute/reflect loop."""
+    text = message.strip().lower()
+    if len(text) <= 20:
+        return True
+    greetings = ("hi", "hello", "hey", "yo", "sup", "thanks", "thank you", "ok", "okay", "bye")
+    return any(text == g or text.startswith(g + " ") or text.startswith(g + ",") for g in greetings)
+
+async def answer_directly(message: str, history: List[BaseMessage], model_type: str, temperature: float) -> str:
+    """Single fast LLM call, no LangGraph loop, for simple/short messages."""
+    llm = get_llm(model_type, temperature)
+    messages = [SystemMessage(content="You are GoalAI, a helpful, friendly assistant. Respond naturally and concisely.")]
+    messages.extend(history[-6:])
+    messages.append(HumanMessage(content=message))
+    res = await llm.ainvoke(messages)
+    return strip_thinking(res.content).strip()
+
 @app.post("/chat")
 async def chat(request: ChatRequest):
     session_id = request.session_id
@@ -526,24 +543,29 @@ async def chat(request: ChatRequest):
     # 2. Append the new human message
     session["messages"].append(HumanMessage(content=request.message))
 
-    # 3. Setup LangGraph state
-    initial_state = {
-        "messages": session["messages"],
-        "model_type": request.model_type,
-        "temperature": request.temperature,
-        "max_iterations": request.max_iterations,
-        "iteration": 0,
-        "completion_score": 0,
-        "response": "",
-        "plan": [],
-        "completed_steps": []
-    }
+    # 3. Fast path: skip the full plan/execute/reflect/evaluate loop for simple messages
+    if is_simple_message(request.message):
+        final_response = await answer_directly(
+            request.message, session["messages"], request.model_type, request.temperature
+        )
+        final_state = {"completion_score": 100, "iteration": 1}
+    else:
+        # Setup LangGraph state
+        initial_state = {
+            "messages": session["messages"],
+            "model_type": request.model_type,
+            "temperature": request.temperature,
+            "max_iterations": request.max_iterations,
+            "iteration": 0,
+            "completion_score": 0,
+            "response": "",
+            "plan": [],
+            "completed_steps": []
+        }
 
-    # 4. Execute the invisible reasoning loop
-    final_state = await app_graph.ainvoke(initial_state)
-
-    final_response = final_state.get("response", "Error: No response was generated.")
-
+        # Execute the invisible reasoning loop
+        final_state = await app_graph.ainvoke(initial_state)
+        final_response = final_state.get("response", "Error: No response was generated.")
     # 5. Append AI final answer to memory
     session["messages"].append(AIMessage(content=final_response))
 
