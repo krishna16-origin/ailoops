@@ -7,6 +7,9 @@
     
     <!-- KaTeX CSS for Math Rendering -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
+
+    <!-- highlight.js theme for code block syntax coloring -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
     
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
@@ -479,13 +482,92 @@
             font-weight: 600;
         }
         
+        /* Code block card — header bar (language + copy) above a dark code body,
+           matching the code block style used on claude.ai */
+        .message-text .code-card {
+            margin: 16px 0;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 1px solid var(--border-color);
+        }
+        .message-text .code-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background-color: #2a2a2a;
+            padding: 8px 16px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border-color);
+        }
+        .message-text .code-card-lang {
+            font-family: 'Courier New', Courier, monospace;
+            text-transform: lowercase;
+        }
+        .message-text .artifact-tabs {
+            display: flex;
+            gap: 2px;
+        }
+        .message-text .artifact-tab {
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 12px;
+            padding: 4px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background 0.2s, color 0.2s;
+        }
+        .message-text .artifact-tab:hover {
+            color: var(--text-primary);
+        }
+        .message-text .artifact-tab.active {
+            background-color: var(--bg-input);
+            color: var(--text-primary);
+        }
+        .message-text .artifact-preview {
+            background-color: #ffffff;
+            padding: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: auto;
+        }
+        .message-text .artifact-preview svg {
+            max-width: 100%;
+            height: auto;
+        }
+        .message-text .code-card [hidden] {
+            display: none !important;
+        }
+        .message-text .copy-btn {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: transparent;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 12px;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 6px;
+            transition: background 0.2s, color 0.2s;
+        }
+        .message-text .copy-btn:hover {
+            background-color: var(--bg-hover);
+            color: var(--text-primary);
+        }
+        .message-text .copy-btn svg {
+            width: 14px;
+            height: 14px;
+        }
         .message-text pre {
             background-color: #111;
             padding: 16px;
-            border-radius: 8px;
             overflow-x: auto;
-            margin: 16px 0;
-            border: 1px solid var(--border-color);
+            margin: 0;
+            border: none;
+            border-radius: 0;
         }
         .message-text code {
             font-family: 'Courier New', Courier, monospace;
@@ -744,10 +826,89 @@
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked-katex-extension/lib/index.umd.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.5/purify.min.js"></script>
 
     <script>
         // Configure Marked to seamlessly parse KaTeX math formulas
         marked.use(markedKatex({ throwOnError: false }));
+
+        // Runs highlight.js over any code blocks inside the given element, then wraps
+        // each one in a card with a header bar, matching the code block style used
+        // on claude.ai. `svg` blocks get a Preview/Code toggle and are actually
+        // rendered as a graphic (sanitized with DOMPurify); all other languages
+        // just get a language label + copy button.
+        // Call this right after marked.parse() is injected into the DOM.
+        function highlightCode(el) {
+            el.querySelectorAll('pre code').forEach(codeEl => {
+                hljs.highlightElement(codeEl);
+
+                const pre = codeEl.parentElement;
+                if (pre.parentElement.classList.contains('code-card')) return; // already wrapped
+
+                const langClass = [...codeEl.classList].find(c => c.startsWith('language-'));
+                const lang = langClass ? langClass.replace('language-', '') : 'text';
+                const isSvg = lang === 'svg' || codeEl.textContent.trim().startsWith('<svg');
+
+                const card = document.createElement('div');
+                card.className = 'code-card';
+
+                const header = document.createElement('div');
+                header.className = 'code-card-header';
+
+                const copyBtnHtml = `
+                    <button class="copy-btn" type="button">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                        <span>Copy</span>
+                    </button>
+                `;
+
+                let previewDiv = null;
+
+                if (isSvg) {
+                    header.innerHTML = `
+                        <div class="artifact-tabs">
+                            <button class="artifact-tab active" type="button" data-tab="preview">Preview</button>
+                            <button class="artifact-tab" type="button" data-tab="code">Code</button>
+                        </div>
+                        ${copyBtnHtml}
+                    `;
+
+                    previewDiv = document.createElement('div');
+                    previewDiv.className = 'artifact-preview';
+                    previewDiv.innerHTML = DOMPurify.sanitize(codeEl.textContent, { USE_PROFILES: { svg: true, svgFilters: true } });
+
+                    pre.hidden = true; // code view starts hidden; preview shows first
+
+                    const tabs = header.querySelectorAll('.artifact-tab');
+                    tabs.forEach(tab => {
+                        tab.addEventListener('click', () => {
+                            tabs.forEach(t => t.classList.remove('active'));
+                            tab.classList.add('active');
+                            const showPreview = tab.dataset.tab === 'preview';
+                            previewDiv.hidden = !showPreview;
+                            pre.hidden = showPreview;
+                        });
+                    });
+                } else {
+                    header.innerHTML = `<span class="code-card-lang">${lang}</span>${copyBtnHtml}`;
+                }
+
+                const copyBtn = header.querySelector('.copy-btn');
+                const copyLabel = copyBtn.querySelector('span');
+                copyBtn.addEventListener('click', () => {
+                    navigator.clipboard.writeText(codeEl.textContent);
+                    copyLabel.textContent = 'Copied!';
+                    setTimeout(() => { copyLabel.textContent = 'Copy'; }, 1500);
+                });
+
+                pre.parentNode.insertBefore(card, pre);
+                card.appendChild(header);
+                if (previewDiv) card.appendChild(previewDiv);
+                card.appendChild(pre);
+            });
+        }
+
 
         const API_URL = 'https://ailoops.onrender.com/chat';
         let currentSessionId = generateUUID();
@@ -833,6 +994,7 @@
                 const contentDiv = document.createElement('div');
                 contentDiv.className = 'message-text';
                 contentDiv.innerHTML = text ? marked.parse(text) : ''; // Render initial text as markdown
+                if (text) highlightCode(contentDiv);
 
                 // Goal looping indicator with Swirl Spin for the thought process
                 const statusDiv = document.createElement('div');
@@ -961,11 +1123,13 @@
                     
                     // Final markdown parse (without cursor)
                     textContainer.innerHTML = marked.parse(assistantFullText);
+                    highlightCode(textContainer);
 
                 } else {
                     const data = await response.json();
                     assistantFullText = data.response;
                     textContainer.innerHTML = marked.parse(assistantFullText);
+                    highlightCode(textContainer);
                 }
 
                 // Goal Complete state update
