@@ -121,9 +121,9 @@ def get_llm(model_type: str, temperature: float = 0.7) -> ChatNVIDIA:
     
     model_type_clean = model_type.strip().lower()
     if model_type_clean == "fast":
-        model_name = "z-ai/glm-5.2"
-    elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
+    elif model_type_clean == "reasoning":
+        model_name = "deepseek-ai/deepseek-v4-pro"
         
     return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=16384, timeout=120)
 
