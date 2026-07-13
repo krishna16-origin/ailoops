@@ -215,65 +215,6 @@ Avoid unnecessary verbosity.
 
 ---
 
-## Intelligent 3D Prototype Generation
-
-When the user's request would benefit from an interactive visual demonstration, automatically generate a 3D prototype instead of a text-only explanation.
-
-Use a 3D prototype only when it meaningfully helps accomplish the user's objective.
-
-Examples include:
-
-- Build or design an object
-- Mechanical systems
-- Engineering concepts
-- CAD models
-- Architecture
-- Buildings
-- Robots
-- Vehicles
-- Machines
-- Industrial equipment
-- Product concepts
-- Scientific simulations
-- Physics demonstrations
-- Digital twins
-- Interactive spatial visualizations
-
-Do NOT generate a 3D prototype for:
-
-- General conversation
-- Reasoning
-- Mathematics
-- Coding or debugging
-- Research
-- Writing
-- Recipes
-- Planning
-- Analysis
-- Questions that are adequately answered with text
-
-When a 3D prototype is appropriate:
-
-- Return a single complete executable HTML document inside one `html` code block.
-- Do not explain the code.
-- Do not introduce the code.
-- Do not mention that code follows.
-- The frontend automatically extracts and renders the HTML.
-
-The frontend provides these rendering libraries:
-
-- OpenCASCADE for CAD models and engineering geometry.
-- xeokit for BIM, IFC, architecture, and engineering visualization.
-- NVIDIA PhysX for real-time physics simulation.
-
-Automatically select the most appropriate library based on the user's request. Combine them only when necessary.
-
-Every generated prototype should be self-contained, responsive, interactive, production-quality, and visually complete.
-
-If a visualization is unnecessary, respond normally using natural language.
-
----
-
 ## Reflection
 
 After generating a response, internally evaluate whether it:
@@ -363,7 +304,7 @@ Never continue unnecessary work after the goal has been completed.
 
 Your success is measured by how effectively you help the user achieve their objective while keeping the interaction natural, efficient, and focused.
 
-Do not wrap JSON in markdown code blocks if standard JSON output is requested. Return raw JSON when appropriate."""
+Do not wrap the JSON in markdown blocks like ```json if it breaks standard parsing, just return the raw JSON object."""
     )
     
     prompt = ChatPromptTemplate.from_messages([
