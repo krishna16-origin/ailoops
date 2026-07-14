@@ -2046,6 +2046,12 @@
 
                 `;
 
+                statusDiv.querySelector('.thinking-toggle').addEventListener('click', () => {
+
+                    statusDiv.querySelector('.thinking-content').classList.toggle('expanded');
+
+                });
+
 
 
                 bubble.appendChild(header);
@@ -2138,33 +2144,63 @@
 
             const textContainer = assistantBubble.querySelector('.message-text');
 
-            const statusIndicator = assistantBubble.querySelector('.goal-status');
+            const thinkingBlock = assistantBubble.querySelector('.thinking-block');
 
-            const goalText = statusIndicator.querySelector('.goal-text');
+            const thinkingToggle = thinkingBlock.querySelector('.thinking-toggle');
+
+            const thinkingContent = thinkingBlock.querySelector('.thinking-content');
+
+            const thinkingStartTime = Date.now();
 
 
 
-            // Updates the status line with whatever step the backend just reported it's actually
+            // Appends whatever step the backend just reported it's actually running
 
-            // running (understand_goal, planner, executor, reflector, evaluator...) — this is real
+            // (understand_goal, planner, executor, reflector, evaluator...) as a real line of
 
-            // progress from the LangGraph workflow, not a simulated/canned cycle.
+            // reasoning text — this mirrors real backend progress from the LangGraph workflow,
 
-            function setGoalStatus(label) {
+            // not a simulated/canned cycle.
 
-                if (!goalText) return;
+            function addThought(label, detail) {
 
-                goalText.style.opacity = 0;
+                thinkingToggle.textContent = label || 'Thinking';
 
-                setTimeout(() => {
+                const p = document.createElement('p');
 
-                    goalText.textContent = label;
+                p.textContent = detail || label || '';
 
-                    goalText.style.opacity = 1;
+                thinkingContent.appendChild(p);
 
-                    goalText.style.transition = "opacity 0.3s";
+                scrollToBottom();
 
-                }, 150);
+            }
+
+
+
+            // Once the final answer is ready, collapse the thought process and show how long
+
+            // it took (ChatGPT-style "Thought for Ns"). If no status events ever came in (e.g.
+
+            // streaming was off, or a simple message skipped the reasoning loop with nothing to
+
+            // show), just remove the empty block instead of leaving a dead toggle behind.
+
+            function finishThinking() {
+
+                if (!thinkingContent.childElementCount) {
+
+                    thinkingBlock.remove();
+
+                    return;
+
+                }
+
+                const seconds = Math.max(1, Math.round((Date.now() - thinkingStartTime) / 1000));
+
+                thinkingToggle.textContent = `Thought for ${seconds}s`;
+
+                thinkingContent.classList.remove('expanded');
 
             }
 
@@ -2250,9 +2286,11 @@
 
                                 if (parsed.type === 'status') {
 
-                                    // Real backend progress — which LangGraph node just ran
+                                    // Real backend progress — which LangGraph node just ran,
 
-                                    setGoalStatus(parsed.label);
+                                    // plus the actual reasoning text it produced.
+
+                                    addThought(parsed.label, parsed.detail);
 
                                 } else if (parsed.assistant_message) {
 
@@ -2300,15 +2338,9 @@
 
 
 
-                // Goal Complete state update
+                // Response complete — collapse the thought process and show elapsed time.
 
-                statusIndicator.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg> <span style="color:var(--text-secondary)">Objective executed successfully</span>`;
-
-                statusIndicator.style.background = "transparent";
-
-                statusIndicator.style.border = "none";
-
-                statusIndicator.style.padding = "0";
+                finishThinking();
 
 
 
@@ -2316,7 +2348,7 @@
 
                 console.error('Error:', error);
 
-                statusIndicator.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg> <span style="color:#ef4444">Connection Failed</span>`;
+                thinkingBlock.remove();
 
                 textContainer.innerHTML = `<span style="color: var(--text-secondary)">Make sure your Python FastAPI backend is running on http://localhost:8000</span>`;
 
