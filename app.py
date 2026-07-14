@@ -78,6 +78,7 @@ class AgentState(TypedDict):
     remaining_steps: List[str]
     reflection: str
     completion_score: int
+    executor_reasoning: str
     iteration: int
     max_iterations: int
     response: str
@@ -393,6 +394,7 @@ async def executor_node(state: AgentState) -> dict:
     
     return {
         "response": res.response if res else "I apologize, I encountered an issue formulating my answer.",
+        "executor_reasoning": res.reasoning_summary if res else "",
         "completed_steps": new_completed
     }
 
@@ -497,12 +499,34 @@ async def clear_session(request: ClearSessionRequest):
 
 # Human-readable labels for each real LangGraph node, shown to the user as that node actually runs.
 NODE_LABELS = {
-    "understand_goal": "Igniting...",
-    "planner": "Engineering...",
-    "executor": "Synthesizing...",
-    "reflector": "Simmering...",
-    "evaluator": "Coockin...",
+    "understand_goal": "Understanding the goal",
+    "planner": "Planning the next step",
+    "executor": "Drafting a response",
+    "reflector": "Checking the draft",
+    "evaluator": "Confirming completion",
 }
+
+def node_detail(node_name: str, state: dict) -> str:
+    """
+    Turns whatever a node actually produced into a real sentence of reasoning text,
+    so the thinking UI shows genuine content instead of a decorative status word.
+    """
+    if node_name == "understand_goal":
+        goal = state.get("goal", "")
+        return f"Understanding the goal: {goal}" if goal else "Understanding the goal."
+    if node_name == "planner":
+        step = state.get("current_step", "")
+        return f"Planning the next step: {step}" if step else "Planning the next step."
+    if node_name == "executor":
+        reasoning = state.get("executor_reasoning", "")
+        return reasoning if reasoning else "Drafting a response for the current step."
+    if node_name == "reflector":
+        reflection = state.get("reflection", "")
+        return reflection if reflection else "Checking the draft for quality and accuracy."
+    if node_name == "evaluator":
+        score = state.get("completion_score", None)
+        return f"Completion check: {score}% of the goal is done." if score is not None else "Checking whether the goal is complete."
+    return NODE_LABELS.get(node_name, node_name)
 
 async def run_graph_streaming(initial_state: dict, timeout: float):
     """
@@ -537,7 +561,7 @@ async def generate_stream(request: "ChatRequest", session: dict, session_id: str
     in the UI is synced to real backend state instead of a client-side simulated cycle.
     """
     if is_simple_message(request.message):
-        yield f"data: {json.dumps({'type': 'status', 'step': 'direct', 'label': 'Answering...'})}\n\n"
+        yield f"data: {json.dumps({'type': 'status', 'step': 'direct', 'label': 'Answering', 'detail': 'This is a short message, so answering directly without the full planning loop.'})}\n\n"
         final_response = await answer_directly(
             request.message, session["messages"], request.model_type, request.temperature
         )
@@ -559,19 +583,20 @@ async def generate_stream(request: "ChatRequest", session: dict, session_id: str
         try:
             async for node_name, state_so_far in run_graph_streaming(initial_state, timeout):
                 label = NODE_LABELS.get(node_name, node_name)
-                yield f"data: {json.dumps({'type': 'status', 'step': node_name, 'label': label})}\n\n"
+                detail = node_detail(node_name, state_so_far)
+                yield f"data: {json.dumps({'type': 'status', 'step': node_name, 'label': label, 'detail': detail})}\n\n"
                 final_state = state_so_far
             final_response = final_state.get("response", "Task completed but no response was formulated.")
         except asyncio.TimeoutError:
             print(f"[{session_id}] Streaming workflow timed out after {timeout:.0f}s. Falling back to direct answer.")
-            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': 'Taking a shortcut to get you an answer...'})}\n\n"
+            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': 'Taking a shortcut', 'detail': 'The full reasoning loop was taking too long, so falling back to a direct answer.'})}\n\n"
             final_response = await answer_directly(
                 request.message, session["messages"], request.model_type, request.temperature
             )
             final_state = {"completion_score": 100, "iteration": 1}
         except Exception as e:
             print(f"[{session_id}] Streaming workflow failed: {e}. Falling back to direct answer.")
-            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': 'Taking a shortcut to get you an answer...'})}\n\n"
+            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': 'Taking a shortcut', 'detail': 'Something went wrong in the reasoning loop, so falling back to a direct answer.'})}\n\n"
             final_response = await answer_directly(
                 request.message, session["messages"], request.model_type, request.temperature
             )
