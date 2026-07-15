@@ -242,6 +242,17 @@
     <script>
         marked.use(markedKatex({ throwOnError: false }));
 
+        // marked-katex-extension only recognizes $...$ and $$...$$ delimiters.
+        // A lot of model output uses the LaTeX-style \( ... \) and \[ ... \]
+        // delimiters instead, which silently fail to render without this.
+        // Converting them to $ / $$ before handing text to marked() fixes that.
+        function normalizeMathDelimiters(text) {
+            if (!text) return text;
+            return text
+                .replace(/\\\[([\s\S]*?)\\\]/g, (_, expr) => `$$${expr}$$`)
+                .replace(/\\\(([\s\S]*?)\\\)/g, (_, expr) => `$${expr}$`);
+        }
+
         // Claude-style "thinking" indicator: an 8-petal flower that
         // wobbles/breathes/fades in a staggered ring. Shown wherever the
         // old blinking text cursor used to appear while a response streams.
@@ -440,7 +451,7 @@
 
                 const contentDiv = document.createElement('div');
                 contentDiv.className = 'message-text';
-                contentDiv.innerHTML = text ? marked.parse(text) : '';
+                contentDiv.innerHTML = text ? marked.parse(normalizeMathDelimiters(text)) : '';
                 if (text) highlightCode(contentDiv);
 
                 // Thinking block starts EMPTY and expanded. It is only ever populated
@@ -507,8 +518,9 @@
             const thinkingContent = thinkingBlock.querySelector('.thinking-content');
             const thinkingStartTime = Date.now();
 
-            let thinkingDone = false;   // true once the model has moved on to answering
-            let answerStarted = false;  // true once the first answer token has arrived
+            let thinkingDone = false;      // true once the model has moved on to answering
+            let answerStarted = false;     // true once the first answer token has arrived
+            let thinkingFinalized = false; // true once "Thought for Ns" has been set for good
 
             // Real backend progress event (planner / executor / reflector / evaluator...).
             // Reveals the block on the first thought and keeps it expanded while it grows.
@@ -516,20 +528,33 @@
                 if (thinkingDone) return; // don't resurrect thinking after the answer began
                 thinkingBlock.style.display = 'block';
                 thinkingToggle.textContent = label || 'Thinking';
-                // Shimmer only applies to the fallback labels (Fathoming, Pondering,
-                // Discovering, Triangulating, Sifting) — every other real node label
-                // (Understanding the goal, Planning the next step, etc.) stays plain.
-                thinkingToggle.classList.toggle('shimmer', step === 'fallback');
+                // Shimmer lives on the main toggle only, for as long as it's actively
+                // "Thinking" — never on the individual entries in the expanded log below.
+                thinkingToggle.classList.add('shimmer');
                 const p = document.createElement('p');
                 p.textContent = detail || label || '';
                 thinkingContent.appendChild(p);
                 scrollToBottom();
             }
 
-            // Called the moment the answer actually starts (or at the very end as a
-            // fallback). Collapses "Thinking" into "Thought for Ns", Claude-style.
-            function finishThinking() {
+            // Called the moment the answer actually starts streaming. Switches the main
+            // toggle from a shimmering "Thinking" to a shimmering "Answering" and
+            // collapses the thought log, but doesn't settle the final label yet.
+            function startAnswering() {
                 if (thinkingDone) return;
+                thinkingDone = true;
+                if (!thinkingContent.childElementCount) return; // nothing was ever logged
+                thinkingToggle.textContent = 'Answering';
+                thinkingToggle.classList.add('shimmer');
+                thinkingContent.classList.remove('expanded');
+            }
+
+            // Called once the response is fully done (stream ended, or non-streaming
+            // reply received). Settles the main toggle into "Thought for Ns" and stops
+            // the shimmer for good, Claude-style.
+            function finishThinking() {
+                if (thinkingFinalized) return;
+                thinkingFinalized = true;
                 thinkingDone = true;
                 if (!thinkingContent.childElementCount) {
                     thinkingBlock.remove();
@@ -585,7 +610,7 @@
                                         finishThinking(); // collapse thoughts the instant the answer begins
                                     }
                                     assistantFullText += parsed.assistant_message;
-                                    textContainer.innerHTML = marked.parse(assistantFullText) + THINKING_SVG;
+                                    textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText)) + THINKING_SVG;
                                     scrollToBottom();
                                 }
                             } catch (e) {
@@ -594,13 +619,13 @@
                         }
                     }
 
-                    textContainer.innerHTML = marked.parse(assistantFullText);
+                    textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText));
                     highlightCode(textContainer);
 
                 } else {
                     const data = await response.json();
                     assistantFullText = data.response;
-                    textContainer.innerHTML = marked.parse(assistantFullText);
+                    textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText));
                     highlightCode(textContainer);
                 }
 
