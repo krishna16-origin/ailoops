@@ -4,6 +4,7 @@
 import os
 import json
 import re
+import random
 import asyncio
 from typing import TypedDict, List, Dict, Any, Optional, Annotated
 
@@ -122,9 +123,9 @@ def get_llm(model_type: str, temperature: float = 0.7) -> ChatNVIDIA:
     
     model_type_clean = model_type.strip().lower()
     if model_type_clean == "fast":
-        model_name = "nvidia/nemotron-3-ultra-550b-a55b"
-    elif model_type_clean == "reasoning":
         model_name = "deepseek-ai/deepseek-v4-pro"
+    elif model_type_clean == "reasoning":
+        model_name = "nvidia/nemotron-3-ultra-550b-a55b"
         
     return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=16384, timeout=120)
 
@@ -506,6 +507,10 @@ NODE_LABELS = {
     "evaluator": "Confirming completion",
 }
 
+# Shown instead of "Taking a shortcut" whenever the full reasoning loop
+# times out or errors and the app falls back to a direct answer.
+FALLBACK_LABELS = ["Fathoming", "Pondering", "Discovering", "Triangulating", "Sifting"]
+
 def node_detail(node_name: str, state: dict) -> str:
     """
     Turns whatever a node actually produced into a real sentence of reasoning text,
@@ -589,14 +594,14 @@ async def generate_stream(request: "ChatRequest", session: dict, session_id: str
             final_response = final_state.get("response", "Task completed but no response was formulated.")
         except asyncio.TimeoutError:
             print(f"[{session_id}] Streaming workflow timed out after {timeout:.0f}s. Falling back to direct answer.")
-            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': 'Taking a shortcut', 'detail': 'The full reasoning loop was taking too long, so falling back to a direct answer.'})}\n\n"
+            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'The full reasoning loop was taking too long, so falling back to a direct answer.'})}\n\n"
             final_response = await answer_directly(
                 request.message, session["messages"], request.model_type, request.temperature
             )
             final_state = {"completion_score": 100, "iteration": 1}
         except Exception as e:
             print(f"[{session_id}] Streaming workflow failed: {e}. Falling back to direct answer.")
-            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': 'Taking a shortcut', 'detail': 'Something went wrong in the reasoning loop, so falling back to a direct answer.'})}\n\n"
+            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'Something went wrong in the reasoning loop, so falling back to a direct answer.'})}\n\n"
             final_response = await answer_directly(
                 request.message, session["messages"], request.model_type, request.temperature
             )
