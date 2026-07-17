@@ -1357,6 +1357,58 @@ async def add_missing_js(code: str, goal: str, current_step: str, model_key: str
         return code  # fall back to the unrepaired version rather than losing the answer
 
 # ----------------------------------------------------------------------
+# CODE MODE: Single-file frontend enforcement — runs ONCE per user turn
+#
+# Guards 0/1/2 (bundle non-HTML into HTML, restore dropped style/script, add missing JS)
+# used to run inside code_executor_node itself, i.e. on every internal planner/executor
+# loop iteration. Only the LAST iteration's output actually reaches the user (each
+# iteration overwrites "code"/"language" in state), so re-running these checks on every
+# earlier iteration wasted calls for nothing AND stacked several extra sequential LLM
+# calls inside a single node — which is what pushed some turns past the graph's timeout
+# budget and produced a silent "no code" fallback instead of a slow-but-correct answer.
+# Running it once here, on the final result only, fixes both problems.
+# ----------------------------------------------------------------------
+
+async def enforce_single_file_frontend(
+    code: str, language: str, is_frontend: bool,
+    goal_hint: str, prior_code: str, model_key: str, temperature: float
+) -> tuple[str, str, bool]:
+    if not code or not is_frontend:
+        return code, language, is_frontend
+
+    lang_lower = language.strip().lower()
+
+    # Any non-HTML frontend language (bare CSS/JS, JSX, Vue SFC, etc.) can't be previewed
+    # standalone in an iframe with no build step — bundle it into one real HTML file.
+    if lang_lower in FRONTEND_CODE_LANGUAGES and lang_lower not in ("html", "htm"):
+        code = await bundle_into_html(code, language, goal_hint, prior_code, model_key, temperature)
+        language, lang_lower = "html", "html"
+
+    if lang_lower in ("html", "htm"):
+        # Merge back anything the prior file had that this answer silently dropped.
+        if prior_code:
+            code_lower, prior_lower = code.lower(), prior_code.lower()
+            looks_like_full_page = ("<html" in code_lower) or ("<!doctype" in code_lower)
+            dropped_style = ("<style" in prior_lower) and ("<style" not in code_lower)
+            dropped_script = ("<script" in prior_lower) and ("<script" not in code_lower)
+            if not looks_like_full_page or dropped_style or dropped_script:
+                code = await merge_html_bundle(prior_code, code, model_key, temperature)
+
+        # Add JS once, at the end, if the overall goal clearly needs interactivity and
+        # the final answer still has none.
+        if "<script" not in code.lower() and _needs_js(goal_hint, ""):
+            code = await add_missing_js(code, goal_hint, "", model_key, temperature)
+
+    return code, language, is_frontend
+
+def rebuild_response_with_code(final_response: str, new_code: str, new_language: str) -> str:
+    """After enforce_single_file_frontend changes the code, the fenced code block inside
+    final_response (built earlier, before post-processing) is stale — rebuild it, keeping
+    whatever prose/explanation came before the fence."""
+    explanation_part = final_response.split("```")[0].strip() if "```" in final_response else final_response.strip()
+    return f"{explanation_part}\n\n```{new_language}\n{new_code}\n```".strip()
+
+# ----------------------------------------------------------------------
 # CODE MODE: Structured LLM Execution Helper (mirrors execute_llm_structured,
 # but uses CODE_SYSTEM_PROMPT instead of the GoalAI persona)
 # ----------------------------------------------------------------------
@@ -1509,39 +1561,6 @@ async def code_executor_node(state: CodeAgentState) -> dict:
             code = prior_code
             language = state.get("language", "")
             is_frontend = bool(state.get("is_frontend", False))
-
-    # Guard 0: any frontend answer that ISN'T plain HTML — bare CSS, bare JS, a JSX
-    # component, a Vue SFC, etc. — can't be dropped into an iframe and previewed with no
-    # build step. Bundle/compile it down into one self-contained HTML file first so every
-    # frontend language ends up as something the preview can actually render, and so the
-    # drop-detection guards below always have real HTML to check against.
-    lang_lower = language.strip().lower()
-    if code and is_frontend and lang_lower in FRONTEND_CODE_LANGUAGES and lang_lower not in ("html", "htm"):
-        code = await bundle_into_html(code, language, state.get("goal", ""), prior_code, state["model_key"], state["temperature"])
-        language = "html"
-        lang_lower = "html"
-
-    # Guard 1: a "frontend HTML" answer that dropped something the PRIOR file already had
-    # (e.g. a follow-up that only answered the narrow ask, "add a navbar", and quietly
-    # dropped the <script> block that was there before) gets merged back into the full
-    # file. Checked per-tag (not "style OR script") — otherwise an answer that kept CSS
-    # but silently lost JS looked "bundled enough" and slipped through uncaught.
-    if code and is_frontend and lang_lower in ("html", "htm") and prior_code:
-        code_lower, prior_lower = code.lower(), prior_code.lower()
-        looks_like_full_page = ("<html" in code_lower) or ("<!doctype" in code_lower)
-        dropped_style = ("<style" in prior_lower) and ("<style" not in code_lower)
-        dropped_script = ("<script" in prior_lower) and ("<script" not in code_lower)
-        if not looks_like_full_page or dropped_style or dropped_script:
-            code = await merge_html_bundle(prior_code, code, state["model_key"], state["temperature"])
-
-    # Guard 2: even on a FIRST turn (no prior file to compare against), the model
-    # sometimes ships HTML + CSS but skips the JS a request clearly needs (a todo list,
-    # calculator, form validation, game, etc. that doesn't actually do anything without
-    # it). If the goal/current step matches an interactivity keyword and there's still
-    # no <script> tag at all, do one repair pass that adds the missing behavior.
-    if code and is_frontend and lang_lower in ("html", "htm") and "<script" not in code.lower():
-        if _needs_js(state.get("goal", ""), state.get("current_step", "")):
-            code = await add_missing_js(code, state.get("goal", ""), state.get("current_step", ""), state["model_key"], state["temperature"])
 
     # Only emit a fenced code block when there IS code. An empty ```{lang}\n\n```
     # fence still gets parsed as a real (empty) code block by the frontend's
@@ -1790,6 +1809,17 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
             final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
             final_state = {"completion_score": 100, "iteration": 1}
 
+    # Enforce single-file bundling ONCE here, on the final settled answer — not on every
+    # internal loop iteration (see enforce_single_file_frontend's docstring for why).
+    goal_hint = final_state.get("goal", "") or request.message
+    prior_code_for_guard = session.get("last_code", "")
+    new_code, new_language, new_is_frontend = await enforce_single_file_frontend(
+        code, language, is_frontend, goal_hint, prior_code_for_guard, request.model, request.temperature
+    )
+    if new_code != code:
+        final_response = rebuild_response_with_code(final_response, new_code, new_language)
+        code, language, is_frontend = new_code, new_language, new_is_frontend
+
     # Hard guarantee: no matter what path got here, never let an empty string reach the
     # frontend — that's what silently produced a blank bubble after the thinking animation
     # ended (the animation still resolves to "Thought for Ns" either way, so an empty
@@ -1917,6 +1947,17 @@ async def _handle_code_chat(request: CodeChatRequest):
             result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
             final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
             final_state = {"completion_score": 100, "iteration": 1}
+
+    # Enforce single-file bundling ONCE here, on the final settled answer — not on every
+    # internal loop iteration (see enforce_single_file_frontend's docstring for why).
+    goal_hint = final_state.get("goal", "") or request.message
+    prior_code_for_guard = session.get("last_code", "")
+    new_code, new_language, new_is_frontend = await enforce_single_file_frontend(
+        code, language, is_frontend, goal_hint, prior_code_for_guard, request.model, request.temperature
+    )
+    if new_code != code:
+        final_response = rebuild_response_with_code(final_response, new_code, new_language)
+        code, language, is_frontend = new_code, new_language, new_is_frontend
 
     if not (final_response or "").strip():
         final_response = "I wasn't able to generate a response for that — please try again."
