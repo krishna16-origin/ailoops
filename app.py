@@ -1276,6 +1276,48 @@ async def merge_html_bundle(prior_code: str, new_snippet: str, model_key: str, t
         print(f"[CodeMode] HTML merge pass failed: {e}")
         return new_snippet  # fall back to whatever we had rather than losing the answer
 
+# A deliberately generous keyword list: false positives just cost one extra cheap LLM
+# call (add_missing_js is a no-op-safe repair), false negatives silently ship a dead
+# page, so err toward triggering the check.
+_JS_INTERACTIVITY_KEYWORDS = (
+    "click", "button", "toggle", "interactive", "calculator", "todo", "to-do",
+    "game", "quiz", "form", "validate", "validation", "filter", "search",
+    "drag", "drop", "animate", "animation", "counter", "timer", "slider",
+    "carousel", "modal", "popup", "fetch", "api call", "dynamic", "add task",
+    "delete task", "sort", "score", "submit", "login", "sign up", "chatbot",
+    "calendar", "clock", "stopwatch", "convert", "converter", "generator",
+)
+
+def _needs_js(goal: str, current_step: str) -> bool:
+    """Heuristic: does the goal/current step imply behavior that requires JavaScript?"""
+    text = f"{goal} {current_step}".lower()
+    return any(keyword in text for keyword in _JS_INTERACTIVITY_KEYWORDS)
+
+async def add_missing_js(code: str, goal: str, current_step: str, model_key: str, temperature: float) -> str:
+    """Repair pass for an HTML answer that has no <script> tag at all despite the goal
+    clearly needing interactive behavior (e.g. a todo list that can't add/remove items).
+    Adds the missing JavaScript inline, preserving the existing HTML/CSS untouched."""
+    llm = get_code_llm(model_key, temperature)
+    prompt = (
+        "The HTML file below is missing the JavaScript needed to make it actually work. "
+        f"Goal: {goal}\nCurrent step: {current_step}\n\n"
+        "Add the necessary JavaScript inside a single <script> tag in the same file so the "
+        "page is fully functional — do not just style it, make it actually do what the goal "
+        "describes. Preserve the existing HTML and CSS as-is. Never use <script src=...> "
+        "pointing at a separate file. Return ONLY the raw HTML — no explanation, no markdown "
+        f"code fences.\n\nExisting File:\n{code}"
+    )
+    try:
+        res = await llm.ainvoke([HumanMessage(content=prompt)])
+        repaired = strip_thinking(res.content).strip()
+        fence_match = CODE_FENCE_RE.search(repaired)
+        if fence_match:
+            repaired = fence_match.group(2).strip()
+        return repaired if repaired else code
+    except Exception as e:
+        print(f"[CodeMode] add_missing_js repair pass failed: {e}")
+        return code  # fall back to the unrepaired version rather than losing the answer
+
 # ----------------------------------------------------------------------
 # CODE MODE: Structured LLM Execution Helper (mirrors execute_llm_structured,
 # but uses CODE_SYSTEM_PROMPT instead of the GoalAI persona)
@@ -1404,16 +1446,28 @@ async def code_executor_node(state: CodeAgentState) -> dict:
         # a random glitch every time.
         explanation = f"I hit an issue generating code for this step: {err}" if err else "I hit an issue generating code for this step."
 
-    # Guard: a "frontend HTML" answer that dropped the required single-file bundling
-    # (e.g. a follow-up that only answered the narrow ask, "add a navbar", instead of
-    # re-emitting the full page) gets one cheap merge pass so the Canvas always gets a
-    # complete, runnable file instead of a bare fragment.
+    # Guard 1: a "frontend HTML" answer that dropped something the PRIOR file already had
+    # (e.g. a follow-up that only answered the narrow ask, "add a navbar", and quietly
+    # dropped the <script> block that was there before) gets merged back into the full
+    # file. Checked per-tag (not "style OR script") — otherwise an answer that kept CSS
+    # but silently lost JS looked "bundled enough" and slipped through uncaught.
     prior_code = state.get("code", "")
     if code and is_frontend and language.strip().lower() in ("html", "htm") and prior_code:
-        has_style_or_script = ("<style" in code.lower()) or ("<script" in code.lower())
-        looks_like_full_page = ("<html" in code.lower()) or ("<!doctype" in code.lower())
-        if not (has_style_or_script and looks_like_full_page):
+        code_lower, prior_lower = code.lower(), prior_code.lower()
+        looks_like_full_page = ("<html" in code_lower) or ("<!doctype" in code_lower)
+        dropped_style = ("<style" in prior_lower) and ("<style" not in code_lower)
+        dropped_script = ("<script" in prior_lower) and ("<script" not in code_lower)
+        if not looks_like_full_page or dropped_style or dropped_script:
             code = await merge_html_bundle(prior_code, code, state["model_key"], state["temperature"])
+
+    # Guard 2: even on a FIRST turn (no prior file to compare against), the model
+    # sometimes ships HTML + CSS but skips the JS a request clearly needs (a todo list,
+    # calculator, form validation, game, etc. that doesn't actually do anything without
+    # it). If the goal/current step matches an interactivity keyword and there's still
+    # no <script> tag at all, do one repair pass that adds the missing behavior.
+    if code and is_frontend and language.strip().lower() in ("html", "htm") and "<script" not in code.lower():
+        if _needs_js(state.get("goal", ""), state.get("current_step", "")):
+            code = await add_missing_js(code, state.get("goal", ""), state.get("current_step", ""), state["model_key"], state["temperature"])
 
     # Only emit a fenced code block when there IS code. An empty ```{lang}\n\n```
     # fence still gets parsed as a real (empty) code block by the frontend's
