@@ -885,6 +885,22 @@ def get_code_max_iterations(reasoning_level: str) -> int:
     return CODE_REASONING_ITERATIONS.get((reasoning_level or "").strip().lower(), CODE_REASONING_ITERATIONS["medium"])
 
 # ----------------------------------------------------------------------
+# CODE MODE: "Simple message" check — deliberately NOT the same heuristic as
+# is_simple_message() used by the normal chat section. That one treats ANY
+# message <=20 chars as small talk, which wrongly swallows real coding asks
+# like "fix this bug" or "add a button" (both under 20 chars) — those would
+# skip the whole plan/execute loop (and the seeded prior-code context) and
+# go straight to a single freeform LLM call with no guarantee of returning
+# code at all. Here only genuine greetings/acknowledgements count as simple.
+# ----------------------------------------------------------------------
+
+CODE_MODE_GREETINGS = ("hi", "hello", "hey", "yo", "sup", "thanks", "thank you", "ok", "okay", "bye")
+
+def is_simple_code_message(message: str) -> bool:
+    text = message.strip().lower()
+    return any(text == g or text.startswith(g + " ") or text.startswith(g + ",") for g in CODE_MODE_GREETINGS)
+
+# ----------------------------------------------------------------------
 # CODE MODE: System Prompt — intentionally left empty, to be filled in separately
 # ----------------------------------------------------------------------
 
@@ -1612,10 +1628,25 @@ async def code_evaluator_node(state: CodeAgentState) -> dict:
     }
 
 def code_decision_edge(state: CodeAgentState) -> str:
-    """Decides whether to end the code reasoning loop or continue planning/executing."""
+    """Decides whether to end the code reasoning loop or continue planning/executing.
+
+    Bug fix: this used to end the loop purely on the evaluator's own opinion of
+    "is this done?", with no check that code had actually been produced. If the
+    planner's first step was something non-code-producing (e.g. "clarify
+    requirements") and the evaluator still scored it 100% complete, the loop
+    ended having never generated any code — surfacing as "task completed but
+    no code was formulated" with nothing to show. Now: as long as iterations
+    remain, an empty 'code' field forces at least one more planner/executor
+    pass before the loop is allowed to end.
+    """
+    has_code = bool((state.get("code") or "").strip())
+    out_of_iterations = state.get("iteration", 0) >= state.get("max_iterations", 3)
+
+    if not has_code and not out_of_iterations:
+        return "code_planner"
     if state.get("completion_score", 0) >= 100:
         return END
-    if state.get("iteration", 0) >= state.get("max_iterations", 3):
+    if out_of_iterations:
         return END
     return "code_planner"
 
@@ -1757,7 +1788,7 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
     show_preview fields so the frontend can decide whether to render a live preview."""
     max_iterations = get_code_max_iterations(request.reasoning_level)
 
-    if is_simple_message(request.message):
+    if is_simple_code_message(request.message):
         yield f"data: {json.dumps({'type': 'status', 'step': 'direct', 'label': 'Answering', 'detail': 'Short message — answering directly without the full coding loop.'})}\n\n"
         result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
         final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
@@ -1796,6 +1827,17 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
             code = final_state.get("code", "")
             language = final_state.get("language", "")
             is_frontend = final_state.get("is_frontend", False)
+
+            # Hard safety net: code_decision_edge now avoids ending the loop before code
+            # exists, but if iterations still ran out with none (e.g. reasoning_level
+            # "low" giving very few passes), don't hand back an explanation with nothing
+            # to show — make one guaranteed direct attempt at real code instead.
+            if not code.strip():
+                print(f"[{session_id}] Code graph ended with empty code — falling back to direct generation.")
+                yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'The coding loop finished without code, so falling back to a direct answer.'})}\n\n"
+                fallback = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
+                if fallback["code"].strip():
+                    final_response, code, language, is_frontend = fallback["text"], fallback["code"], fallback["language"], fallback["is_frontend"]
         except asyncio.TimeoutError:
             print(f"[{session_id}] Code Mode streaming timed out after {timeout:.0f}s. Falling back to direct answer.")
             yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'The coding loop was taking too long, so falling back to a direct answer.'})}\n\n"
@@ -1907,7 +1949,7 @@ async def _handle_code_chat(request: CodeChatRequest):
             media_type="text/event-stream"
         )
 
-    if is_simple_message(request.message):
+    if is_simple_code_message(request.message):
         result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
         final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
         final_state = {"completion_score": 100, "iteration": 1}
@@ -1937,6 +1979,16 @@ async def _handle_code_chat(request: CodeChatRequest):
             code = final_state.get("code", "")
             language = final_state.get("language", "")
             is_frontend = final_state.get("is_frontend", False)
+
+            # Hard safety net: code_decision_edge now avoids ending the loop before code
+            # exists, but if iterations still ran out with none (e.g. reasoning_level
+            # "low" giving very few passes), don't hand back an explanation with nothing
+            # to show — make one guaranteed direct attempt at real code instead.
+            if not code.strip():
+                print(f"[{session_id}] Code graph ended with empty code — falling back to direct generation.")
+                fallback = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
+                if fallback["code"].strip():
+                    final_response, code, language, is_frontend = fallback["text"], fallback["code"], fallback["language"], fallback["is_frontend"]
         except asyncio.TimeoutError:
             print(f"[{session_id}] Code Mode workflow timed out after {timeout:.0f}s. Falling back to direct answer.")
             result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
