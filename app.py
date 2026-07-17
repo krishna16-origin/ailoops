@@ -1462,11 +1462,19 @@ async def code_planner_node(state: CodeAgentState) -> dict:
 
 async def code_executor_node(state: CodeAgentState) -> dict:
     llm = get_code_llm(state["model_key"], state["temperature"])
-    prompt = "Execute the 'Current Step' to satisfy the coding 'Goal'. Return complete, runnable code plus its language and a brief explanation.\n\n{context}"
+    prompt = (
+        "Execute the 'Current Step' to satisfy the coding 'Goal'. Return complete, runnable "
+        "code plus its language and a brief explanation. IMPORTANT: the 'code' field must "
+        "never be left empty for a coding task — even if this step is just a review, a small "
+        "tweak, or you believe the goal is already met, return the full current version of the "
+        "code (unchanged if nothing needed to change), not just an explanation with no code."
+        "\n\n{context}"
+    )
 
     res, err = await execute_code_llm_structured(llm, prompt, CodeExecutorOutput, {"context": format_code_context(state)})
 
     new_completed = state.get("completed_steps", []) + [state.get("current_step", "")]
+    prior_code = state.get("code", "")
 
     if res:
         language = res.language
@@ -1477,19 +1485,36 @@ async def code_executor_node(state: CodeAgentState) -> dict:
             print(f"[CodeMode] classify_code_target failed: {e}")
             is_frontend = bool(res.is_frontend)
         explanation = res.explanation
+
+        # Guard -1: the model decided no new code was needed and left 'code' blank.
+        # That should never happen on a genuine coding task when a working prior file
+        # already exists — carry the prior file forward instead of resolving to
+        # "explanation only, no code", which is exactly what showed up as
+        # "task completed, no code was formulated".
+        if not code and prior_code:
+            code = prior_code
+            language = language or state.get("language", "")
+            is_frontend = is_frontend or bool(state.get("is_frontend", False))
+            if not explanation.strip():
+                explanation = "No changes were needed for this step — carrying the existing code forward."
     else:
         language, code, is_frontend = "", "", False
         # Surface the real reason instead of a generic canned message, so a bad
         # API key / rate limit / model error is visible instead of looking like
         # a random glitch every time.
         explanation = f"I hit an issue generating code for this step: {err}" if err else "I hit an issue generating code for this step."
+        # Same carry-forward here: an LLM/parsing failure shouldn't wipe out a
+        # perfectly good previous file either.
+        if prior_code:
+            code = prior_code
+            language = state.get("language", "")
+            is_frontend = bool(state.get("is_frontend", False))
 
     # Guard 0: any frontend answer that ISN'T plain HTML — bare CSS, bare JS, a JSX
     # component, a Vue SFC, etc. — can't be dropped into an iframe and previewed with no
     # build step. Bundle/compile it down into one self-contained HTML file first so every
     # frontend language ends up as something the preview can actually render, and so the
     # drop-detection guards below always have real HTML to check against.
-    prior_code = state.get("code", "")
     lang_lower = language.strip().lower()
     if code and is_frontend and lang_lower in FRONTEND_CODE_LANGUAGES and lang_lower not in ("html", "htm"):
         code = await bundle_into_html(code, language, state.get("goal", ""), prior_code, state["model_key"], state["temperature"])
