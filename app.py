@@ -865,8 +865,8 @@ def get_code_llm(model_key: str, temperature: float = 0.2) -> ChatNVIDIA:
     return ChatNVIDIA(
         model=model_name,
         temperature=temperature,
-        max_tokens=16384,
-        timeout=120,
+        max_tokens=32768,
+        timeout=280,
         model_kwargs={"chat_template_kwargs": thinking_kwargs} if thinking_kwargs else {},
     )
 
