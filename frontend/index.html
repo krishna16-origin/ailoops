@@ -115,6 +115,14 @@
         .message-text .artifact-preview.code-preview-frame { padding:0; display:block; }
         .message-text .code-preview-frame iframe { width:100%; min-height:360px; border:none; display:block; background:#fff; }
         .message-text .code-card [hidden] { display:none !important; }
+        .message-text .artifact-chip { display:flex; align-items:center; gap:12px; margin:14px 0; padding:10px 14px; border:1px solid var(--border-color); border-radius:12px; background-color:#262626; cursor:pointer; transition:background 0.2s ease, border-color 0.2s ease; max-width:320px; }
+        .message-text .artifact-chip:hover { background-color:#2d2d2d; border-color:rgba(255,255,255,0.18); }
+        .message-text .artifact-chip-icon { flex-shrink:0; width:34px; height:34px; border-radius:8px; background-color:rgba(16,163,127,0.15); color:var(--accent); display:flex; align-items:center; justify-content:center; }
+        .message-text .artifact-chip-icon svg { width:18px; height:18px; }
+        .message-text .artifact-chip-info { flex:1; min-width:0; }
+        .message-text .artifact-chip-title { font-size:13.5px; font-weight:500; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .message-text .artifact-chip-meta { font-size:12px; color:var(--text-secondary); margin-top:2px; }
+        .message-text .artifact-chip-btn { flex-shrink:0; background-color:var(--text-primary); color:var(--bg-main); border:none; border-radius:999px; font-size:12.5px; font-weight:600; padding:6px 14px; cursor:pointer; pointer-events:none; }
         .message-text .copy-btn { display:flex; align-items:center; gap:6px; background:transparent; border:none; color:var(--text-secondary); font-size:12px; cursor:pointer; padding:4px 8px; border-radius:6px; transition:background 0.2s, color 0.2s; }
         .message-text .copy-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
         .message-text .copy-btn svg { width:14px; height:14px; }
@@ -661,6 +669,40 @@
             win.document.close();
         });
 
+        // Removes the fenced code block from Code mode's answer text before it's shown
+        // in the chat bubble — the code itself now lives only in the Canvas panel,
+        // the chat bubble just gets the explanation plus a small chip to open it.
+        function stripCodeFence(text) {
+            if (!text) return text;
+            return text.replace(/```[\w+#.-]*\n[\s\S]*?```/, '').trim();
+        }
+
+        // Small "open the artifact" chip, shown in place of the removed code block.
+        // Clicking it (re)opens the Canvas panel — this is the ONLY other way besides
+        // auto-open to bring the panel back after the user has closed it with X.
+        function appendArtifactChip(container, language, code) {
+            if (!code) return;
+            const chip = document.createElement('div');
+            chip.className = 'artifact-chip';
+            const fileName = `code.${fileExtensionFor(language)}`;
+            const timestamp = new Date().toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+            chip.innerHTML = `
+                <div class="artifact-chip-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+                </div>
+                <div class="artifact-chip-info">
+                    <div class="artifact-chip-title">${fileName}</div>
+                    <div class="artifact-chip-meta">${timestamp}</div>
+                </div>
+                <button type="button" class="artifact-chip-btn">Open</button>
+            `;
+            chip.addEventListener('click', () => {
+                if (modes.code.canvas) modes.code.canvas.open = true;
+                renderCodeCanvas();
+            });
+            container.appendChild(chip);
+        }
+
         const API_BASE = 'https://ailoops.onrender.com';
 
         function generateUUID() {
@@ -1068,19 +1110,27 @@
                         }
                     }
 
-                    textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText));
-                    highlightCode(textContainer);
                     if (mode === 'code' && codeResult && codeResult.code) {
+                        textContainer.innerHTML = marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText)));
+                        highlightCode(textContainer);
+                        appendArtifactChip(textContainer, codeResult.language, codeResult.code);
                         updateCodeCanvas(codeResult.language, codeResult.code, codeResult.show_preview);
+                    } else {
+                        textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText));
+                        highlightCode(textContainer);
                     }
 
                 } else {
                     const data = await response.json();
                     assistantFullText = data.response;
-                    textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText));
-                    highlightCode(textContainer);
                     if (mode === 'code' && data.code) {
+                        textContainer.innerHTML = marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText)));
+                        highlightCode(textContainer);
+                        appendArtifactChip(textContainer, data.language, data.code);
                         updateCodeCanvas(data.language, data.code, data.show_preview);
+                    } else {
+                        textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText));
+                        highlightCode(textContainer);
                     }
                 }
 
