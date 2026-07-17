@@ -190,6 +190,31 @@
         .mode-fade-in { animation:modeFadeIn 0.25s ease forwards; }
         @keyframes modeFadeOut { to { opacity:0; transform:translateY(4px); } }
         @keyframes modeFadeIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
+
+        /* ============== CODE CANVAS ==============
+           A dedicated split-panel that appears next to the chat column, only
+           ever used in Code mode. It is a plain flex sibling of .main-content,
+           so it never touches Chat mode's markup, state, or event handlers. */
+        .canvas-panel { flex:1 1 0; min-width:0; display:flex; flex-direction:column; background-color:#181818; border-left:1px solid var(--border-color); animation:canvasSlideIn 0.25s var(--transition-bezier); }
+        .canvas-panel[hidden] { display:none; }
+        @keyframes canvasSlideIn { from { opacity:0; transform:translateX(14px); } to { opacity:1; transform:translateX(0); } }
+        .canvas-header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border-bottom:1px solid var(--border-color); flex-shrink:0; }
+        .canvas-header-left { display:flex; align-items:center; gap:8px; min-width:0; }
+        .canvas-header-left svg { width:16px; height:16px; color:var(--text-secondary); flex-shrink:0; }
+        .canvas-title { font-size:13px; font-weight:500; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .canvas-header-right { display:flex; align-items:center; gap:4px; flex-shrink:0; }
+        .canvas-tabs { display:flex; align-items:center; background-color:var(--bg-input); border-radius:999px; padding:3px; margin-right:6px; }
+        .canvas-tabs button { border:none; background:transparent; color:var(--text-secondary); font-size:12.5px; font-weight:500; padding:6px 14px; border-radius:999px; cursor:pointer; transition:background 0.2s ease, color 0.2s ease; }
+        .canvas-tabs button.active { background-color:var(--text-primary); color:var(--bg-main); }
+        .canvas-icon-btn { background:transparent; border:none; color:var(--text-secondary); cursor:pointer; padding:6px; border-radius:6px; display:flex; align-items:center; justify-content:center; transition:background 0.2s ease, color 0.2s ease; }
+        .canvas-icon-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
+        .canvas-icon-btn svg { width:16px; height:16px; }
+        .canvas-body { flex:1; min-height:0; position:relative; }
+        .canvas-view { width:100%; height:100%; overflow:auto; }
+        .canvas-view[hidden] { display:none; }
+        .canvas-view iframe { width:100%; height:100%; border:none; display:block; background:#fff; }
+        #canvasCodeView pre { margin:0; padding:20px; min-height:100%; background-color:#111; }
+        #canvasCodeView code { font-size:13px; line-height:1.65; font-family:'Courier New', Courier, monospace; }
     </style>
 </head>
 <body>
@@ -318,6 +343,45 @@
                         <polyline points="5 12 12 5 19 12"></polyline>
                     </svg>
                 </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ================= CODE CANVAS =================
+         Split panel that opens next to the chat only while in Code mode,
+         showing the generated file with a Code/Preview toggle — same
+         pattern as Gemini/ChatGPT Canvas. Chat mode never touches this. -->
+    <div class="canvas-panel" id="codeCanvas" hidden>
+        <div class="canvas-header">
+            <div class="canvas-header-left">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+                <span class="canvas-title" id="canvasTitle">Code</span>
+            </div>
+            <div class="canvas-header-right">
+                <div class="canvas-tabs" id="canvasTabs">
+                    <button type="button" data-tab="preview" id="canvasPreviewTabBtn">Preview</button>
+                    <button type="button" data-tab="code">Code</button>
+                </div>
+                <button class="canvas-icon-btn" id="canvasOpenNewTabBtn" title="Open preview in new tab">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+                </button>
+                <button class="canvas-icon-btn" id="canvasDownloadBtn" title="Download">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                </button>
+                <button class="canvas-icon-btn" id="canvasCopyBtn" title="Copy code">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                </button>
+                <button class="canvas-icon-btn" id="canvasCloseBtn" title="Close">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                </button>
+            </div>
+        </div>
+        <div class="canvas-body">
+            <div class="canvas-view" id="canvasPreviewView">
+                <iframe id="canvasPreviewFrame" sandbox="allow-scripts allow-same-origin allow-forms allow-modals"></iframe>
+            </div>
+            <div class="canvas-view" id="canvasCodeView" hidden>
+                <pre><code id="canvasCode"></code></pre>
             </div>
         </div>
     </div>
@@ -499,49 +563,103 @@
             });
         }
 
-        // Called only for Code Mode answers where the backend said show_preview=true.
-        // Converts the plain code-card that already exists for the fenced code block
-        // into a Preview/Code tabbed card — same interaction pattern as the SVG case above.
-        function addPreviewToLastCodeCard(container, language, code) {
-            const cards = container.querySelectorAll('.code-card');
-            if (!cards.length) return;
-            const card = cards[cards.length - 1];
-            if (card.querySelector('.artifact-preview')) return; // already has a preview
+        // ================= CODE CANVAS =================
+        // Everything below only runs when Code mode calls updateCodeCanvas().
+        // Nothing here is invoked from the Chat mode code path.
 
-            const header = card.querySelector('.code-card-header');
-            const pre = card.querySelector('pre');
-            if (!header || !pre) return;
-
-            const copyBtn = header.querySelector('.copy-btn');
-            header.innerHTML = `
-                <div class="artifact-tabs">
-                    <button class="artifact-tab active" type="button" data-tab="preview">Preview</button>
-                    <button class="artifact-tab" type="button" data-tab="code">Code</button>
-                </div>
-            `;
-            if (copyBtn) header.appendChild(copyBtn);
-
-            const previewDiv = document.createElement('div');
-            previewDiv.className = 'artifact-preview code-preview-frame';
-            const iframe = document.createElement('iframe');
-            iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-modals');
-            iframe.srcdoc = buildPreviewDoc(language, code);
-            previewDiv.appendChild(iframe);
-
-            pre.hidden = true;
-            card.insertBefore(previewDiv, pre);
-
-            const tabs = header.querySelectorAll('.artifact-tab');
-            tabs.forEach(tab => {
-                tab.addEventListener('click', () => {
-                    tabs.forEach(t => t.classList.remove('active'));
-                    tab.classList.add('active');
-                    const showPreview = tab.dataset.tab === 'preview';
-                    previewDiv.hidden = !showPreview;
-                    pre.hidden = showPreview;
-                });
-            });
+        function friendlyLangLabel(language) {
+            const lang = (language || '').trim();
+            if (!lang) return 'Code';
+            const known = { html: 'HTML', css: 'CSS', javascript: 'JavaScript', js: 'JavaScript', jsx: 'JSX', tsx: 'TSX', json: 'JSON', python: 'Python', py: 'Python' };
+            return known[lang.toLowerCase()] || (lang.charAt(0).toUpperCase() + lang.slice(1));
         }
+
+        function fileExtensionFor(language) {
+            const map = { html: 'html', css: 'css', javascript: 'js', js: 'js', jsx: 'jsx', tsx: 'tsx', typescript: 'ts', python: 'py', py: 'py', json: 'json' };
+            return map[(language || '').trim().toLowerCase()] || 'txt';
+        }
+
+        // Called from Code mode's sendMessage() the moment a code_result arrives
+        // (streaming) or a non-streaming response with code comes back. Stores the
+        // result on modes.code and renders it only if Code mode is currently visible.
+        function updateCodeCanvas(language, code, showPreview) {
+            if (!code) return;
+            modes.code.canvas = {
+                open: true,
+                language: language || '',
+                code: code,
+                showPreview: !!showPreview,
+                tab: showPreview ? 'preview' : 'code'
+            };
+            if (currentMode === 'code') renderCodeCanvas();
+        }
+
+        function renderCodeCanvas() {
+            const state = modes.code.canvas;
+            if (!state || !state.open) { codeCanvas.hidden = true; return; }
+
+            canvasTitle.textContent = `${friendlyLangLabel(state.language)}${state.showPreview ? ' Preview' : ''}`;
+            canvasCodeEl.textContent = state.code;
+            canvasCodeEl.className = `language-${(state.language || 'plaintext').toLowerCase()}`;
+            canvasCodeEl.removeAttribute('data-highlighted');
+            hljs.highlightElement(canvasCodeEl);
+
+            document.getElementById('canvasPreviewTabBtn').style.display = state.showPreview ? '' : 'none';
+            if (state.showPreview) {
+                canvasPreviewFrame.srcdoc = buildPreviewDoc(state.language, state.code);
+            }
+
+            setCanvasTab(state.showPreview ? state.tab : 'code');
+            codeCanvas.hidden = false;
+        }
+
+        function setCanvasTab(tab) {
+            if (modes.code.canvas) modes.code.canvas.tab = tab;
+            document.querySelectorAll('#canvasTabs button').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === tab));
+            document.getElementById('canvasPreviewView').hidden = tab !== 'preview';
+            document.getElementById('canvasCodeView').hidden = tab !== 'code';
+        }
+
+        document.querySelectorAll('#canvasTabs button').forEach(btn => {
+            btn.addEventListener('click', () => setCanvasTab(btn.dataset.tab));
+        });
+
+        document.getElementById('canvasCloseBtn').addEventListener('click', () => {
+            if (modes.code.canvas) modes.code.canvas.open = false;
+            codeCanvas.hidden = true;
+        });
+
+        document.getElementById('canvasDownloadBtn').addEventListener('click', () => {
+            const state = modes.code.canvas;
+            if (!state || !state.code) return;
+            const blob = new Blob([state.code], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `code.${fileExtensionFor(state.language)}`;
+            a.click();
+            URL.revokeObjectURL(url);
+        });
+
+        document.getElementById('canvasCopyBtn').addEventListener('click', () => {
+            const state = modes.code.canvas;
+            if (!state || !state.code) return;
+            navigator.clipboard.writeText(state.code);
+            const btn = document.getElementById('canvasCopyBtn');
+            const original = btn.title;
+            btn.title = 'Copied!';
+            setTimeout(() => { btn.title = original; }, 1200);
+        });
+
+        document.getElementById('canvasOpenNewTabBtn').addEventListener('click', () => {
+            const state = modes.code.canvas;
+            if (!state || !state.showPreview) return;
+            const win = window.open('', '_blank');
+            if (!win) return;
+            win.document.open();
+            win.document.write(buildPreviewDoc(state.language, state.code));
+            win.document.close();
+        });
 
         const API_BASE = 'https://ailoops.onrender.com';
 
@@ -561,7 +679,12 @@
         };
         const modes = {
             chat: { sessionId: generateUUID(), html: '', hasMessages: false },
-            code: { sessionId: generateUUID(), html: '', hasMessages: false }
+            code: { sessionId: generateUUID(), html: '', hasMessages: false,
+                // Canvas is Code-mode-only state: the last generated file, whether
+                // it's live-previewable, which tab is active, and whether the user
+                // has closed it. Chat mode has no equivalent and never reads this.
+                canvas: { open: false, language: '', code: '', showPreview: false, tab: 'code' }
+            }
         };
         let currentMode = 'chat';
         let isWaitingForResponse = false;
@@ -577,6 +700,10 @@
         const modeToggle = document.getElementById('modeToggle');
         const chatSettings = document.getElementById('chatSettings');
         const codeSettings = document.getElementById('codeSettings');
+        const codeCanvas = document.getElementById('codeCanvas');
+        const canvasTitle = document.getElementById('canvasTitle');
+        const canvasCodeEl = document.getElementById('canvasCode');
+        const canvasPreviewFrame = document.getElementById('canvasPreviewFrame');
 
         function toggleSidebar() { sidebar.classList.toggle('collapsed'); }
 
@@ -619,6 +746,11 @@
             chatSettings.hidden = mode !== 'chat';
             codeSettings.hidden = mode !== 'code';
 
+            // Canvas only ever exists in Code mode: show it if a result is
+            // already sitting there (and the user hasn't closed it), otherwise
+            // make sure it's hidden. Chat mode always takes this "else" branch.
+            if (mode === 'code') { renderCodeCanvas(); } else { codeCanvas.hidden = true; }
+
             const copy = MODE_COPY[mode];
             openingTitle.style.opacity = 0;
             openingSubtitle.style.opacity = 0;
@@ -645,6 +777,11 @@
             modes[currentMode].sessionId = generateUUID();
             modes[currentMode].html = '';
             modes[currentMode].hasMessages = false;
+
+            if (currentMode === 'code') {
+                modes.code.canvas = { open: false, language: '', code: '', showPreview: false, tab: 'code' };
+                codeCanvas.hidden = true;
+            }
 
             chatContent.innerHTML = '';
             refreshOpeningSceneVisibility();
@@ -933,8 +1070,8 @@
 
                     textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText));
                     highlightCode(textContainer);
-                    if (codeResult && codeResult.show_preview) {
-                        addPreviewToLastCodeCard(textContainer, codeResult.language, codeResult.code);
+                    if (mode === 'code' && codeResult && codeResult.code) {
+                        updateCodeCanvas(codeResult.language, codeResult.code, codeResult.show_preview);
                     }
 
                 } else {
@@ -942,8 +1079,8 @@
                     assistantFullText = data.response;
                     textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText));
                     highlightCode(textContainer);
-                    if (mode === 'code' && data.show_preview) {
-                        addPreviewToLastCodeCard(textContainer, data.language, data.code);
+                    if (mode === 'code' && data.code) {
+                        updateCodeCanvas(data.language, data.code, data.show_preview);
                     }
                 }
 
