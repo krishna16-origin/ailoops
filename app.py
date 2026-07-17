@@ -1086,6 +1086,18 @@ code_app_graph = code_workflow.compile()
 # CODE MODE: Direct-answer fallback (used for tiny messages, timeouts, errors)
 # ----------------------------------------------------------------------
 
+CODE_FENCE_RE = re.compile(r"```([\w+#.-]*)\n([\s\S]*?)```")
+
+def extract_code_from_answer(answer: str) -> tuple[str, str]:
+    """Pulls the first fenced code block out of a plain-text LLM answer, if any.
+    Needed because answer_code_directly (used for timeouts/errors/simple messages)
+    only ever produced free-text before — the code was inside that text but never
+    split out into its own field, so the frontend Canvas had nothing to render."""
+    match = CODE_FENCE_RE.search(answer or "")
+    if not match:
+        return "", ""
+    return (match.group(1) or "").strip(), match.group(2).strip()
+
 async def answer_code_directly(message: str, history: List[BaseMessage], model_key: str, temperature: float) -> dict:
     """Always returns a real code answer — falls back to the other Code Mode model if the primary one fails."""
     base_system = CODE_SYSTEM_PROMPT if CODE_SYSTEM_PROMPT.strip() else "You are a coding assistant. Respond with code and a brief explanation."
@@ -1101,7 +1113,9 @@ async def answer_code_directly(message: str, history: List[BaseMessage], model_k
             res = await llm.ainvoke(messages)
             answer = strip_thinking(res.content).strip()
             if answer:
-                return {"text": answer, "code": "", "language": "", "is_frontend": False}
+                language, code = extract_code_from_answer(answer)
+                is_frontend = classify_code_target(language, code) if code else False
+                return {"text": answer, "code": code, "language": language, "is_frontend": is_frontend}
         except Exception as e:
             print(f"[CodeMode] Model '{key}' failed: {e}")
 
