@@ -113,9 +113,17 @@
             0% { background-position: 200% 0; }
             100% { background-position: -200% 0; }
         }
-        .thinking-content { display:none; margin:8px 0 4px; padding-left:12px; border-left:2px solid var(--border-color); font-size:13px; line-height:1.7; color:var(--text-secondary); }
+        .thinking-content { display:none; margin:12px 0 12px 12px; padding-left:24px; border-left:1px solid var(--border-color); font-size:14px; line-height:1.6; color:var(--text-secondary); }
         .thinking-content.expanded { display:block; }
-        .thinking-content p { margin:0 0 8px; }
+        .thought-item { position: relative; margin-bottom: 16px; }
+        .thought-item:last-child { margin-bottom: 0; }
+        .thought-bullet { position: absolute; left: -28.5px; top: 8px; width: 8px; height: 8px; background-color: #555; border-radius: 50%; z-index: 1; }
+        .thought-icon-wrapper { position: absolute; left: -36px; top: 0px; width: 24px; height: 24px; background-color: var(--bg-main); display: flex; align-items: center; justify-content: center; z-index: 2; }
+        .thought-icon-wrapper svg { width: 18px; height: 18px; color: var(--text-secondary); }
+        .thought-content { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
+        .thought-content.expanded { -webkit-line-clamp: unset; }
+        .show-more-btn { background: none; border: none; color: var(--text-primary); cursor: pointer; font-size: 12px; padding: 4px 0; margin-top: 2px; display: none; opacity: 0.7; }
+        .show-more-btn:hover { opacity: 1; text-decoration: underline; }
         .spinner { width:14px; height:14px; border:2px solid var(--text-secondary); border-top:2px solid transparent; border-radius:50%; animation:spin 1s linear infinite; }
         @keyframes spin { 0%{transform:rotate(0deg);} 100%{transform:rotate(360deg);} }
         .input-container { position:absolute; bottom:0; left:0; width:100%; padding:24px; background:linear-gradient(180deg, rgba(33,33,33,0) 0%, var(--bg-main) 40%); display:flex; justify-content:center; }
@@ -522,18 +530,65 @@
             let answerStarted = false;     // true once the first answer token has arrived
             let thinkingFinalized = false; // true once "Thought for Ns" has been set for good
 
+            // Icons mapping for different thought types
+            const thoughtIcons = {
+                'web': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>`,
+                'search': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`,
+                'error': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>`,
+                'success': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`,
+                'default': `<div class="thought-bullet"></div>`
+            };
+
+            function getIconForLabel(label) {
+                const l = label.toLowerCase();
+                if (l.includes('search')) return thoughtIcons['search'];
+                if (l.includes('fetch') || l.includes('web') || l.includes('url')) return thoughtIcons['web'];
+                if (l.includes('fail') || l.includes('error')) return thoughtIcons['error'];
+                if (l.includes('finish') || l.includes('success') || l.includes('complete')) return thoughtIcons['success'];
+                return thoughtIcons['default'];
+            }
+
             // Real backend progress event (planner / executor / reflector / evaluator...).
             // Reveals the block on the first thought and keeps it expanded while it grows.
             function addThought(label, detail, step) {
-                if (thinkingDone) return; // don't resurrect thinking after the answer began
+                if (thinkingDone) return;
                 thinkingBlock.style.display = 'block';
                 thinkingToggle.textContent = label || 'Thinking';
-                // Shimmer lives on the main toggle only, for as long as it's actively
-                // "Thinking" — never on the individual entries in the expanded log below.
                 thinkingToggle.classList.add('shimmer');
-                const p = document.createElement('p');
-                p.textContent = detail || label || '';
-                thinkingContent.appendChild(p);
+
+                const item = document.createElement('div');
+                item.className = 'thought-item';
+
+                const icon = getIconForLabel(label || detail || '');
+                if (icon.includes('svg')) {
+                    item.innerHTML = `<div class="thought-icon-wrapper">${icon}</div>`;
+                } else {
+                    item.innerHTML = icon; // bullet
+                }
+
+                const content = document.createElement('div');
+                content.className = 'thought-content';
+                content.textContent = detail || label || '';
+                item.appendChild(content);
+
+                const showMore = document.createElement('button');
+                showMore.className = 'show-more-btn';
+                showMore.textContent = 'Show more';
+                item.appendChild(showMore);
+
+                thinkingContent.appendChild(item);
+
+                // Check for truncation after rendering
+                setTimeout(() => {
+                    if (content.scrollHeight > content.clientHeight) {
+                        showMore.style.display = 'block';
+                        showMore.onclick = () => {
+                            const isExpanded = content.classList.toggle('expanded');
+                            showMore.textContent = isExpanded ? 'Show less' : 'Show more';
+                        };
+                    }
+                }, 0);
+
                 scrollToBottom();
             }
 
