@@ -765,6 +765,578 @@ async def _handle_chat(request: ChatRequest):
         "iterations": final_state.get("iteration", 1)
     }
 
+# ==================================================================================
+# CODE MODE SECTION  —  fully separate from the normal chat section above.
+#
+# This section only handles "code with reasoning" requests. It has its own
+# models, its own session memory, its own LangGraph workflow, and its own
+# FastAPI endpoint. Nothing here touches or is touched by the normal /chat flow.
+# ==================================================================================
+
+# ----------------------------------------------------------------------
+# CODE MODE: Structured Output Models
+# ----------------------------------------------------------------------
+
+class CodeGoalExtraction(BaseModel):
+    main_goal: str = Field(description="The coding task the user actually wants solved")
+    language_hint: str = Field(description="Programming language / framework implied by the request, if any (empty string if unclear)")
+    constraints: List[str] = Field(description="Technical constraints or requirements to follow")
+    missing_information: List[str] = Field(description="What we need to ask the user, if anything")
+
+class CodePlannerOutput(BaseModel):
+    plan: List[str] = Field(description="Ordered list of technical steps to build the solution")
+    current_step: str = Field(description="The single immediate next step to execute")
+    approach: str = Field(description="Technical approach / design decision for this step")
+
+class CodeExecutorOutput(BaseModel):
+    code: str = Field(description="The generated code for the current step, complete and runnable")
+    language: str = Field(description="Programming language of the code, e.g. python, javascript, html, jsx, css")
+    explanation: str = Field(description="Brief explanation of what the code does")
+    is_frontend: bool = Field(description="True if this code renders a UI in a browser (html/css/js/react/vue/etc), false if it is backend/server/CLI/script code")
+
+class CodeReflectorOutput(BaseModel):
+    quality: str = Field(description="Assessment of the code quality")
+    correctness: str = Field(description="Is the code correct / free of bugs?")
+    bugs_found: str = Field(description="Any bugs, edge cases, or issues found")
+    improvements: str = Field(description="Actionable advice to improve the code")
+
+class CodeEvaluatorOutput(BaseModel):
+    completion_percentage: int = Field(description="0 to 100 representing how complete the coding task is")
+    confidence: float = Field(description="Confidence in this evaluation (0.0 to 1.0)")
+    should_continue: bool = Field(description="Whether more iterations are needed to finish the task")
+
+# ----------------------------------------------------------------------
+# CODE MODE: Graph State
+# ----------------------------------------------------------------------
+
+class CodeAgentState(TypedDict):
+    messages: List[BaseMessage]
+    goal: str
+    constraints: List[str]
+    plan: List[str]
+    current_step: str
+    completed_steps: List[str]
+    reflection: str
+    completion_score: int
+    iteration: int
+    max_iterations: int
+    code: str
+    language: str
+    is_frontend: bool
+    explanation: str
+    response: str
+    model_key: str
+    temperature: float
+
+# ----------------------------------------------------------------------
+# CODE MODE: Session Memory (kept separate from the normal chat sessions)
+# ----------------------------------------------------------------------
+
+code_sessions: Dict[str, Dict[str, Any]] = {}
+
+# ----------------------------------------------------------------------
+# CODE MODE: Model Router — only two models, both selectable by the user
+# ----------------------------------------------------------------------
+
+CODE_MODEL_MAP = {
+    "kimi": "moonshotai/kimi-k2.6",   # high-end reasoning and coding
+    "glm": "z-ai/glm-5.2",            # fast response with code
+}
+
+def get_code_llm(model_key: str, temperature: float = 0.2) -> ChatNVIDIA:
+    """Routes to one of the two Code Mode models. Uses the same NVIDIA_API_KEY as the rest of the app."""
+    key = (model_key or "").strip().lower()
+    model_name = CODE_MODEL_MAP.get(key, CODE_MODEL_MAP["kimi"])  # default to the high-reasoning model
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=16384, timeout=120)
+
+# ----------------------------------------------------------------------
+# CODE MODE: Reasoning Level -> Max Iterations
+# ----------------------------------------------------------------------
+
+CODE_REASONING_ITERATIONS = {
+    "low": 2,
+    "medium": 3,
+    "high": 4,
+    "max": 5,
+}
+
+def get_code_max_iterations(reasoning_level: str) -> int:
+    return CODE_REASONING_ITERATIONS.get((reasoning_level or "").strip().lower(), CODE_REASONING_ITERATIONS["medium"])
+
+# ----------------------------------------------------------------------
+# CODE MODE: System Prompt — intentionally left empty, to be filled in separately
+# ----------------------------------------------------------------------
+
+CODE_SYSTEM_PROMPT = """"""
+
+# ----------------------------------------------------------------------
+# CODE MODE: Frontend vs Backend Detection (drives whether a live preview
+# is shown, the same way Gemini Canvas / Claude Artifacts only preview
+# renderable frontend code and just show a code block for backend code)
+# ----------------------------------------------------------------------
+
+FRONTEND_CODE_LANGUAGES = {
+    "html", "htm", "css", "scss", "sass", "javascript", "js", "jsx",
+    "typescript", "ts", "tsx", "vue", "svelte", "react",
+}
+BACKEND_CODE_LANGUAGES = {
+    "python", "py", "java", "c", "cpp", "c++", "csharp", "c#", "go", "golang",
+    "rust", "ruby", "php", "sql", "bash", "shell", "sh", "kotlin", "swift",
+    "scala", "perl", "r", "dart", "elixir", "haskell", "lua",
+}
+
+_FRONTEND_CODE_SIGNALS = (
+    "<html", "<!doctype html", "<div", "<body", "document.getelementbyid",
+    "usestate(", "import react", "from 'react'", "<template>", "createroot",
+    "addeventlistener", "queryselector", "export default function",
+)
+_BACKEND_CODE_SIGNALS = (
+    "def ", "import flask", "@app.route", "public static void main",
+    "using system;", "func main(", "package main", "import fastapi",
+    "select * from", "#include <", "class ", "require(",
+)
+
+def classify_code_target(language: str, code: str) -> bool:
+    """
+    Returns True if the code should be treated as frontend (preview-able), False if backend.
+    Trusts the explicit language first; falls back to a content heuristic only if the
+    language is missing or ambiguous.
+    """
+    lang = (language or "").strip().lower()
+    if lang in FRONTEND_CODE_LANGUAGES:
+        return True
+    if lang in BACKEND_CODE_LANGUAGES:
+        return False
+
+    code_lower = (code or "").lower()
+    fe_score = sum(1 for s in _FRONTEND_CODE_SIGNALS if s in code_lower)
+    be_score = sum(1 for s in _BACKEND_CODE_SIGNALS if s in code_lower)
+    if fe_score > be_score:
+        return True
+    return False  # default: no preview when unclear (safer than a broken preview)
+
+# ----------------------------------------------------------------------
+# CODE MODE: Structured LLM Execution Helper (mirrors execute_llm_structured,
+# but uses CODE_SYSTEM_PROMPT instead of the GoalAI persona)
+# ----------------------------------------------------------------------
+
+async def execute_code_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic_model, state: dict, retries: int = 2):
+    parser = PydanticOutputParser(pydantic_object=pydantic_model)
+    format_instructions = parser.get_format_instructions()
+
+    system_prompt = (CODE_SYSTEM_PROMPT + "\n\n" if CODE_SYSTEM_PROMPT.strip() else "") + format_instructions
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("user", prompt_str)
+    ])
+
+    chain = prompt | llm
+
+    for attempt in range(retries):
+        try:
+            res = await chain.ainvoke({"format_instructions": format_instructions, **state})
+            content = strip_thinking(res.content).strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+
+            return parser.parse(content.strip())
+        except Exception as e:
+            print(f"[CodeMode] Structured Parsing Retry {attempt + 1}/{retries} failed: {e} | Raw content: {res.content[:300] if 'res' in dir() else 'N/A'}")
+            await asyncio.sleep(0.5)
+
+    return None
+
+def format_code_context(state: CodeAgentState) -> str:
+    msg_str = "\n".join([f"{m.type.capitalize()}: {m.content}" for m in state.get("messages", [])])
+
+    return f"""Conversation History:
+{msg_str}
+
+Current Internal State:
+- Goal: {state.get('goal', 'Not set')}
+- Constraints: {state.get('constraints', [])}
+- Plan: {state.get('plan', [])}
+- Completed Steps: {state.get('completed_steps', [])}
+- Current Step: {state.get('current_step', 'Not set')}
+- Prior Code Draft: {state.get('code', 'None')}
+- Prior Language: {state.get('language', 'None')}
+- Reflection on Draft: {state.get('reflection', 'None')}
+"""
+
+# ----------------------------------------------------------------------
+# CODE MODE: LangGraph Nodes
+# ----------------------------------------------------------------------
+
+async def understand_code_goal_node(state: CodeAgentState) -> dict:
+    llm = get_code_llm(state["model_key"], state["temperature"])
+    prompt = "Analyze this conversation and extract the core coding goal, language hint, constraints, and missing info.\n\n{context}"
+
+    res = await execute_code_llm_structured(llm, prompt, CodeGoalExtraction, {"context": format_code_context(state)})
+
+    return {
+        "goal": res.main_goal if res else "Write the requested code.",
+        "constraints": res.constraints if res else [],
+        "iteration": 0,
+        "completed_steps": [],
+        "plan": state.get("plan", [])
+    }
+
+async def code_planner_node(state: CodeAgentState) -> dict:
+    llm = get_code_llm(state["model_key"], state["temperature"])
+    prompt = "Based on the goal and completed steps, create or update the technical plan. Identify the single immediate next step.\n\n{context}"
+
+    res = await execute_code_llm_structured(llm, prompt, CodePlannerOutput, {"context": format_code_context(state)})
+
+    iteration = state.get("iteration", 0) + 1
+
+    return {
+        "plan": res.plan if res else state.get("plan", []),
+        "current_step": res.current_step if res else "Write the code that satisfies the goal.",
+        "iteration": iteration
+    }
+
+async def code_executor_node(state: CodeAgentState) -> dict:
+    llm = get_code_llm(state["model_key"], state["temperature"])
+    prompt = "Execute the 'Current Step' to satisfy the coding 'Goal'. Return complete, runnable code plus its language and a brief explanation.\n\n{context}"
+
+    res = await execute_code_llm_structured(llm, prompt, CodeExecutorOutput, {"context": format_code_context(state)})
+
+    new_completed = state.get("completed_steps", []) + [state.get("current_step", "")]
+
+    if res:
+        language = res.language
+        code = res.code
+        is_frontend = res.is_frontend if res.is_frontend is not None else classify_code_target(language, code)
+        explanation = res.explanation
+    else:
+        language, code, is_frontend, explanation = "", "", False, "I hit an issue generating code for this step."
+
+    response_text = f"{explanation}\n\n```{language}\n{code}\n```".strip()
+
+    return {
+        "code": code,
+        "language": language,
+        "is_frontend": is_frontend,
+        "explanation": explanation,
+        "response": response_text,
+        "completed_steps": new_completed
+    }
+
+async def code_reflector_node(state: CodeAgentState) -> dict:
+    llm = get_code_llm(state["model_key"], state["temperature"])
+    prompt = "Review the 'Prior Code Draft' against the 'Goal' and 'Constraints'. Check correctness, bugs, and quality.\n\n{context}"
+
+    res = await execute_code_llm_structured(llm, prompt, CodeReflectorOutput, {"context": format_code_context(state)})
+
+    reflection_str = "Looks solid."
+    if res:
+        reflection_str = f"Quality: {res.quality} | Correctness: {res.correctness} | Bugs: {res.bugs_found} | Improvements: {res.improvements}"
+
+    return {
+        "reflection": reflection_str
+    }
+
+async def code_evaluator_node(state: CodeAgentState) -> dict:
+    llm = get_code_llm(state["model_key"], state["temperature"])
+    prompt = "Based on the reflection, evaluate if the coding goal is now fully achieved (0-100 completion).\n\n{context}"
+
+    res = await execute_code_llm_structured(llm, prompt, CodeEvaluatorOutput, {"context": format_code_context(state)})
+
+    score = res.completion_percentage if res else 100
+
+    return {
+        "completion_score": score
+    }
+
+def code_decision_edge(state: CodeAgentState) -> str:
+    """Decides whether to end the code reasoning loop or continue planning/executing."""
+    if state.get("completion_score", 0) >= 100:
+        return END
+    if state.get("iteration", 0) >= state.get("max_iterations", 3):
+        return END
+    return "code_planner"
+
+# ----------------------------------------------------------------------
+# CODE MODE: Workflow Graph (separate compiled graph from the normal app_graph)
+# ----------------------------------------------------------------------
+
+code_workflow = StateGraph(CodeAgentState)
+
+code_workflow.add_node("understand_code_goal", understand_code_goal_node)
+code_workflow.add_node("code_planner", code_planner_node)
+code_workflow.add_node("code_executor", code_executor_node)
+code_workflow.add_node("code_reflector", code_reflector_node)
+code_workflow.add_node("code_evaluator", code_evaluator_node)
+
+code_workflow.set_entry_point("understand_code_goal")
+code_workflow.add_edge("understand_code_goal", "code_planner")
+code_workflow.add_edge("code_planner", "code_executor")
+code_workflow.add_edge("code_executor", "code_reflector")
+code_workflow.add_edge("code_reflector", "code_evaluator")
+code_workflow.add_conditional_edges("code_evaluator", code_decision_edge)
+
+code_app_graph = code_workflow.compile()
+
+# ----------------------------------------------------------------------
+# CODE MODE: Direct-answer fallback (used for tiny messages, timeouts, errors)
+# ----------------------------------------------------------------------
+
+async def answer_code_directly(message: str, history: List[BaseMessage], model_key: str, temperature: float) -> dict:
+    """Always returns a real code answer — falls back to the other Code Mode model if the primary one fails."""
+    base_system = CODE_SYSTEM_PROMPT if CODE_SYSTEM_PROMPT.strip() else "You are a coding assistant. Respond with code and a brief explanation."
+    messages = [SystemMessage(content=base_system)]
+    messages.extend(history[-6:])
+    messages.append(HumanMessage(content=message))
+
+    fallback_key = "glm" if (model_key or "").strip().lower() != "glm" else "kimi"
+
+    for key in (model_key, fallback_key):
+        try:
+            llm = get_code_llm(key, temperature)
+            res = await llm.ainvoke(messages)
+            answer = strip_thinking(res.content).strip()
+            if answer:
+                return {"text": answer, "code": "", "language": "", "is_frontend": False}
+        except Exception as e:
+            print(f"[CodeMode] Model '{key}' failed: {e}")
+
+    return {"text": "I'm having trouble reaching the code model right now. Please try again in a moment.", "code": "", "language": "", "is_frontend": False}
+
+def code_graph_timeout_seconds(model_key: str, max_iterations: int) -> float:
+    """Sizes the overall graph timeout the same way the normal chat section does, but keyed off
+    the two Code Mode models: kimi (high-end reasoning) gets a larger per-call budget than glm (fast)."""
+    per_call_seconds = 140.0 if (model_key or "").strip().lower() == "kimi" else 90.0
+    worst_case_calls = 1 + (max_iterations * 4)
+    return min(worst_case_calls * per_call_seconds, 240.0)
+
+CODE_NODE_LABELS = {
+    "understand_code_goal": "Understanding the coding goal",
+    "code_planner": "Planning the implementation",
+    "code_executor": "Writing the code",
+    "code_reflector": "Reviewing the code",
+    "code_evaluator": "Confirming completion",
+}
+
+def code_node_detail(node_name: str, state: dict) -> str:
+    if node_name == "understand_code_goal":
+        goal = state.get("goal", "")
+        return f"Understanding the goal: {goal}" if goal else "Understanding the coding goal."
+    if node_name == "code_planner":
+        step = state.get("current_step", "")
+        return f"Planning the next step: {step}" if step else "Planning the implementation."
+    if node_name == "code_executor":
+        explanation = state.get("explanation", "")
+        return explanation if explanation else "Writing code for the current step."
+    if node_name == "code_reflector":
+        reflection = state.get("reflection", "")
+        return reflection if reflection else "Reviewing the code for bugs and quality."
+    if node_name == "code_evaluator":
+        score = state.get("completion_score", None)
+        return f"Completion check: {score}% of the task is done." if score is not None else "Checking whether the task is complete."
+    return CODE_NODE_LABELS.get(node_name, node_name)
+
+async def run_code_graph_streaming(initial_state: dict, timeout: float):
+    state_acc = dict(initial_state)
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    agen = code_app_graph.astream(initial_state, stream_mode="updates")
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            chunk = await asyncio.wait_for(agen.__anext__(), timeout=remaining)
+            node_name, node_output = next(iter(chunk.items()))
+            state_acc.update(node_output)
+            yield node_name, state_acc
+    except StopAsyncIteration:
+        return
+    finally:
+        await agen.aclose()
+
+async def generate_code_stream(request: "CodeChatRequest", session: dict, session_id: str):
+    """Streams SSE events for Code Mode: status updates while working, then the final
+    answer word-by-word, followed by one 'code_result' event carrying the code/language/
+    show_preview fields so the frontend can decide whether to render a live preview."""
+    max_iterations = get_code_max_iterations(request.reasoning_level)
+
+    if is_simple_message(request.message):
+        yield f"data: {json.dumps({'type': 'status', 'step': 'direct', 'label': 'Answering', 'detail': 'Short message — answering directly without the full coding loop.'})}\n\n"
+        result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
+        final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
+        final_state = {"completion_score": 100, "iteration": 1}
+    else:
+        initial_state = {
+            "messages": session["messages"],
+            "model_key": request.model,
+            "temperature": request.temperature,
+            "max_iterations": max_iterations,
+            "iteration": 0,
+            "completion_score": 0,
+            "completed_steps": [],
+            "plan": []
+        }
+        timeout = code_graph_timeout_seconds(request.model, max_iterations)
+        final_state = initial_state
+
+        try:
+            async for node_name, state_so_far in run_code_graph_streaming(initial_state, timeout):
+                label = CODE_NODE_LABELS.get(node_name, node_name)
+                detail = code_node_detail(node_name, state_so_far)
+                yield f"data: {json.dumps({'type': 'status', 'step': node_name, 'label': label, 'detail': detail})}\n\n"
+                final_state = state_so_far
+            final_response = final_state.get("response", "Task completed but no code was formulated.")
+            code = final_state.get("code", "")
+            language = final_state.get("language", "")
+            is_frontend = final_state.get("is_frontend", False)
+        except asyncio.TimeoutError:
+            print(f"[{session_id}] Code Mode streaming timed out after {timeout:.0f}s. Falling back to direct answer.")
+            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'The coding loop was taking too long, so falling back to a direct answer.'})}\n\n"
+            result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
+            final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
+            final_state = {"completion_score": 100, "iteration": 1}
+        except Exception as e:
+            print(f"[{session_id}] Code Mode streaming failed: {e}. Falling back to direct answer.")
+            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'Something went wrong in the coding loop, so falling back to a direct answer.'})}\n\n"
+            result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
+            final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
+            final_state = {"completion_score": 100, "iteration": 1}
+
+    session["messages"].append(AIMessage(content=final_response))
+
+    chunks = final_response.split(" ")
+    for i, chunk in enumerate(chunks):
+        space = " " if i < len(chunks) - 1 else ""
+        data = {
+            "type": "message",
+            "assistant_message": chunk + space,
+            "conversation_id": session_id,
+            "session_id": session_id,
+            "goal_complete": final_state.get("completion_score", 100) >= 100
+        }
+        yield f"data: {json.dumps(data)}\n\n"
+        await asyncio.sleep(0.015)
+
+    # One final event carrying the structured code result, so the frontend can render
+    # a live preview (Gemini-Canvas style) only when the code is frontend code.
+    yield f"data: {json.dumps({'type': 'code_result', 'code': code, 'language': language, 'show_preview': bool(is_frontend), 'session_id': session_id})}\n\n"
+
+# ----------------------------------------------------------------------
+# CODE MODE: FastAPI request models
+# ----------------------------------------------------------------------
+
+class CodeChatRequest(BaseModel):
+    message: str
+    session_id: str
+    model: str = "kimi"           # "kimi" -> moonshotai/kimi-k2.6, "glm" -> z-ai/glm-5.2
+    reasoning_level: str = "medium"  # "low" | "medium" | "high" | "max"
+    stream: bool = False
+    temperature: float = 0.2
+
+class ClearCodeSessionRequest(BaseModel):
+    session_id: str
+
+# ----------------------------------------------------------------------
+# CODE MODE: FastAPI endpoint
+# ----------------------------------------------------------------------
+
+@app.post("/code-chat")
+async def code_chat(request: CodeChatRequest):
+    try:
+        return await _handle_code_chat(request)
+    except Exception as e:
+        print(f"Code chat handler failed entirely: {e}")
+        return {
+            "response": "Something went wrong on my end — please try again.",
+            "session_id": request.session_id,
+            "code": "",
+            "language": "",
+            "show_preview": False,
+            "goal_progress": 0,
+            "completed": False,
+            "iterations": 0
+        }
+
+async def _handle_code_chat(request: CodeChatRequest):
+    session_id = request.session_id
+
+    if session_id not in code_sessions:
+        code_sessions[session_id] = {"messages": []}
+
+    session = code_sessions[session_id]
+    max_iterations = get_code_max_iterations(request.reasoning_level)
+    llm = get_code_llm(request.model, request.temperature)
+
+    session["messages"] = await summarize_memory(session["messages"], llm)
+    session["messages"].append(HumanMessage(content=request.message))
+
+    if request.stream:
+        return StreamingResponse(
+            generate_code_stream(request, session, session_id),
+            media_type="text/event-stream"
+        )
+
+    if is_simple_message(request.message):
+        result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
+        final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
+        final_state = {"completion_score": 100, "iteration": 1}
+    else:
+        initial_state = {
+            "messages": session["messages"],
+            "model_key": request.model,
+            "temperature": request.temperature,
+            "max_iterations": max_iterations,
+            "iteration": 0,
+            "completion_score": 0,
+            "completed_steps": [],
+            "plan": []
+        }
+        timeout = code_graph_timeout_seconds(request.model, max_iterations)
+
+        try:
+            final_state = await asyncio.wait_for(code_app_graph.ainvoke(initial_state), timeout=timeout)
+            final_response = final_state.get("response", "Task completed but no code was formulated.")
+            code = final_state.get("code", "")
+            language = final_state.get("language", "")
+            is_frontend = final_state.get("is_frontend", False)
+        except asyncio.TimeoutError:
+            print(f"[{session_id}] Code Mode workflow timed out after {timeout:.0f}s. Falling back to direct answer.")
+            result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
+            final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
+            final_state = {"completion_score": 100, "iteration": 1}
+        except Exception as e:
+            print(f"[{session_id}] Code Mode workflow failed: {e}. Falling back to direct answer.")
+            result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
+            final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
+            final_state = {"completion_score": 100, "iteration": 1}
+
+    session["messages"].append(AIMessage(content=final_response))
+
+    return {
+        "response": final_response,
+        "session_id": session_id,
+        "code": code,
+        "language": language,
+        "show_preview": bool(is_frontend),   # frontend code -> True (render live preview); backend code -> False
+        "model": request.model,
+        "reasoning_level": request.reasoning_level,
+        "max_iterations": max_iterations,
+        "goal_progress": final_state.get("completion_score", 100),
+        "completed": final_state.get("completion_score", 100) >= 100,
+        "iterations": final_state.get("iteration", 1)
+    }
+
+@app.post("/clear-code-session")
+async def clear_code_session(request: ClearCodeSessionRequest):
+    if request.session_id in code_sessions:
+        del code_sessions[request.session_id]
+    return {"status": "success", "message": f"Code session {request.session_id} cleared."}
+
 if __name__ == "__main__":
     # Ensure uvicorn runs the correct file 'main' instead of 'app'
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
