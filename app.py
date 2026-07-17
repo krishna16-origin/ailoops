@@ -853,8 +853,8 @@ CODE_MODEL_MAP = {
 # elaborate system prompt makes the model "think" the same way every attempt.
 # Each model family uses a different toggle key, so this is keyed per model.
 CODE_MODEL_THINKING_KWARG = {
-    "moonshotai/kimi-k2.6": {"thinking": False},
-    "z-ai/glm-5.2": {"enable_thinking": False},
+    "deepseek-ai/deepseek-v4-pro": {"thinking": False},
+    "nvidia/nemotron-3-ultra-550b-a55b": {"enable_thinking": False},
 }
 
 def get_code_llm(model_key: str, temperature: float = 0.2) -> ChatNVIDIA:
