@@ -1241,6 +1241,42 @@ def classify_code_target(language: str, code: str) -> bool:
     return False  # default: no preview when unclear (safer than a broken preview)
 
 # ----------------------------------------------------------------------
+# CODE MODE: Single-file bundling guard
+#
+# The "always one self-contained HTML file" rule (see OUTPUT FORMAT CONSTRAINT
+# above) is enforced only by the prompt, so on a follow-up turn ("add a navbar")
+# the model sometimes answers just the narrow slice it was asked for instead of
+# re-emitting the whole bundled page. When that happens this does one cheap
+# follow-up call to merge the new snippet back into the previous full file, so
+# the frontend Canvas always gets a complete, runnable single file.
+# ----------------------------------------------------------------------
+
+async def merge_html_bundle(prior_code: str, new_snippet: str, model_key: str, temperature: float) -> str:
+    if not prior_code:
+        return new_snippet  # nothing to merge into (first turn) — return as-is
+
+    llm = get_code_llm(model_key, temperature)
+    prompt = (
+        "Merge the 'New Snippet' into the 'Existing File' below. Produce ONE complete, "
+        "self-contained HTML file with ALL CSS inside a single <style> tag and ALL JS inside "
+        "a single <script> tag, both inside that same file. Never use <link rel=\"stylesheet\"> "
+        "or <script src=...> pointing at separate files. Preserve everything from the existing "
+        "file that the new snippet doesn't change. Return ONLY the raw HTML — no explanation, "
+        "no markdown code fences.\n\n"
+        f"Existing File:\n{prior_code}\n\nNew Snippet:\n{new_snippet}"
+    )
+    try:
+        res = await llm.ainvoke([HumanMessage(content=prompt)])
+        merged = strip_thinking(res.content).strip()
+        fence_match = CODE_FENCE_RE.search(merged)  # strip fences if the model added them anyway
+        if fence_match:
+            merged = fence_match.group(2).strip()
+        return merged if merged else new_snippet
+    except Exception as e:
+        print(f"[CodeMode] HTML merge pass failed: {e}")
+        return new_snippet  # fall back to whatever we had rather than losing the answer
+
+# ----------------------------------------------------------------------
 # CODE MODE: Structured LLM Execution Helper (mirrors execute_llm_structured,
 # but uses CODE_SYSTEM_PROMPT instead of the GoalAI persona)
 # ----------------------------------------------------------------------
@@ -1367,6 +1403,17 @@ async def code_executor_node(state: CodeAgentState) -> dict:
         # API key / rate limit / model error is visible instead of looking like
         # a random glitch every time.
         explanation = f"I hit an issue generating code for this step: {err}" if err else "I hit an issue generating code for this step."
+
+    # Guard: a "frontend HTML" answer that dropped the required single-file bundling
+    # (e.g. a follow-up that only answered the narrow ask, "add a navbar", instead of
+    # re-emitting the full page) gets one cheap merge pass so the Canvas always gets a
+    # complete, runnable file instead of a bare fragment.
+    prior_code = state.get("code", "")
+    if code and is_frontend and language.strip().lower() in ("html", "htm") and prior_code:
+        has_style_or_script = ("<style" in code.lower()) or ("<script" in code.lower())
+        looks_like_full_page = ("<html" in code.lower()) or ("<!doctype" in code.lower())
+        if not (has_style_or_script and looks_like_full_page):
+            code = await merge_html_bundle(prior_code, code, state["model_key"], state["temperature"])
 
     # Only emit a fenced code block when there IS code. An empty ```{lang}\n\n```
     # fence still gets parsed as a real (empty) code block by the frontend's
@@ -1577,7 +1624,12 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
             "iteration": 0,
             "completion_score": 0,
             "completed_steps": [],
-            "plan": []
+            "plan": [],
+            # Seed the real previous code/language so follow-up turns amend the actual
+            # prior file instead of relying only on the plain-text chat history — this is
+            # what was causing "task completed, no code" replies on a second ask.
+            "code": session.get("last_code", ""),
+            "language": session.get("last_language", "")
         }
         timeout = code_graph_timeout_seconds(request.model, max_iterations)
         final_state = initial_state
@@ -1616,6 +1668,12 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
     # answer looked exactly like the whole thing just doing nothing).
     if not (final_response or "").strip():
         final_response = "I wasn't able to generate a response for that — please try again."
+
+    # Remember this turn's code so the NEXT turn can seed it back in (only overwrite
+    # when we actually got new code — a turn that produced none shouldn't wipe out a
+    # perfectly good previous file).
+    if code:
+        session["last_code"], session["last_language"] = code, language
 
     session["messages"].append(AIMessage(content=final_response))
 
@@ -1704,7 +1762,12 @@ async def _handle_code_chat(request: CodeChatRequest):
             "iteration": 0,
             "completion_score": 0,
             "completed_steps": [],
-            "plan": []
+            "plan": [],
+            # Seed the real previous code/language so follow-up turns amend the actual
+            # prior file instead of relying only on the plain-text chat history — this is
+            # what was causing "task completed, no code" replies on a second ask.
+            "code": session.get("last_code", ""),
+            "language": session.get("last_language", "")
         }
         timeout = code_graph_timeout_seconds(request.model, max_iterations)
 
@@ -1729,6 +1792,12 @@ async def _handle_code_chat(request: CodeChatRequest):
 
     if not (final_response or "").strip():
         final_response = "I wasn't able to generate a response for that — please try again."
+
+    # Remember this turn's code so the NEXT turn can seed it back in (only overwrite
+    # when we actually got new code — a turn that produced none shouldn't wipe out a
+    # perfectly good previous file).
+    if code:
+        session["last_code"], session["last_language"] = code, language
 
     session["messages"].append(AIMessage(content=final_response))
 
