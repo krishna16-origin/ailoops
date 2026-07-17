@@ -924,10 +924,16 @@ async def execute_code_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic
     parser = PydanticOutputParser(pydantic_object=pydantic_model)
     format_instructions = parser.get_format_instructions()
 
-    system_prompt = (CODE_SYSTEM_PROMPT + "\n\n" if CODE_SYSTEM_PROMPT.strip() else "") + format_instructions
+    base_system = CODE_SYSTEM_PROMPT if CODE_SYSTEM_PROMPT.strip() else "You are a coding assistant that returns structured, well-formatted output."
 
+    # format_instructions is raw JSON-schema text full of literal { } characters.
+    # It must be handed to ChatPromptTemplate as a template VARIABLE (filled in at
+    # .ainvoke time), never concatenated into the template string itself — otherwise
+    # LangChain tries to parse every brace in the schema as a template placeholder
+    # and throws on every single call. This mirrors execute_llm_structured above,
+    # which already does it the safe way.
     prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
+        ("system", base_system + "\n\n{format_instructions}"),
         ("user", prompt_str)
     ])
 
