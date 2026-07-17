@@ -1217,6 +1217,37 @@ Because of this:
   pick the single most important file for this step and say in your
   explanation which other files still need separate follow-up turns —
   do not silently drop files with no mention.
+
+--------------------------------------------------
+UI / VISUAL DESIGN STANDARDS (CRITICAL — APPLIES ANY TIME YOU BUILD, DESIGN,
+OR GENERATE A UI: A WEBSITE, APP, PAGE, DASHBOARD, COMPONENT, OR TOOL)
+--------------------------------------------------
+
+Icons and symbols:
+
+- NEVER use emoji characters anywhere in generated UI — not in buttons,
+  headers, nav items, labels, placeholders, empty states, toasts, or any
+  other on-screen text. This rule has no exceptions.
+- Use real icon assets from established open-source icon sets only —
+  e.g. Lucide, Feather Icons, Heroicons, Font Awesome (Free), Bootstrap
+  Icons, Material Symbols, or Simple Icons for brand/tech logos. Inline
+  the SVG markup directly or load the set from its official CDN.
+- Never fake an icon with an emoji, a random Unicode glyph, or a text
+  abbreviation standing in for one.
+
+Color and theme:
+
+- Match the look of modern, production AI-assistant interfaces (ChatGPT,
+  Claude, Gemini-style): true dark backgrounds in the near-black / dark
+  charcoal range (roughly #0d0d0d–#212121), high-contrast readable text,
+  clearly defined surface/border layers, and one deliberate accent color
+  for interactive elements (links, primary buttons, active states).
+- Support both a dark theme and a light theme; default to dark unless the
+  user says otherwise, and include a working theme toggle when reasonable.
+- NEVER use pastel, washed-out, or "paled" color palettes.
+- Avoid both extremes: don't ship a bare, flat, single-color minimal
+  template, and don't ship a cluttered, noisy layout either. Aim for the
+  same polished, considered density as a real shipped product.
 """
 
 # ----------------------------------------------------------------------
