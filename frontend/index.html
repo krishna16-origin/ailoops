@@ -1,1826 +1,1165 @@
-# ==================================================
-# CONFIGURATION
-# ==================================================
-import os
-import json
-import re
-import random
-import asyncio
-from typing import TypedDict, List, Dict, Any, Optional, Annotated
-
-from dotenv import load_dotenv
-import uvicorn
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.routing import APIRoute
-from pydantic import BaseModel, Field
-
-# LangChain & LangGraph
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
-from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
-
-# Load environment variables
-load_dotenv()
-
-if not os.getenv("NVIDIA_API_KEY"):
-    print("WARNING: NVIDIA_API_KEY not found in environment. The API calls will fail.")
-
-# ==================================================
-# MODELS (Pydantic for Structured Output)
-# ==================================================
-
-class GoalExtraction(BaseModel):
-    main_goal: str = Field(description="The primary objective of the user")
-    hidden_intent: str = Field(description="Any implied or implicit needs")
-    constraints: List[str] = Field(description="Rules or restrictions to follow")
-    requested_output: str = Field(description="The format the user wants the answer in")
-    missing_information: List[str] = Field(description="What we need to ask the user, if anything")
-
-class PlannerOutput(BaseModel):
-    plan: List[str] = Field(description="Ordered list of steps to achieve the goal")
-    current_step: str = Field(description="The single immediate next step to execute")
-    priority: str = Field(description="Priority of the current step (High/Medium/Low)")
-    execution_strategy: str = Field(description="How to approach executing this step")
-
-class ExecutorOutput(BaseModel):
-    response: str = Field(description="The generated draft or answer for the current step")
-    reasoning_summary: str = Field(description="Why this response is correct and helpful")
-    confidence: float = Field(description="Confidence from 0.0 to 1.0")
-
-class ReflectorOutput(BaseModel):
-    quality: str = Field(description="Assessment of the response quality")
-    correctness: str = Field(description="Is the response factually correct?")
-    hallucination_risk: str = Field(description="Is there any fabricated info?")
-    improvements: str = Field(description="Actionable advice to improve the response")
-
-class EvaluatorOutput(BaseModel):
-    completion_percentage: int = Field(description="0 to 100 representing how complete the goal is")
-    confidence: float = Field(description="Confidence in this evaluation (0.0 to 1.0)")
-    should_continue: bool = Field(description="Whether we need more iterations to finish the goal")
-
-# ==================================================
-# LANGGRAPH STATE
-# ==================================================
-
-class AgentState(TypedDict):
-    messages: List[BaseMessage]
-    goal: str
-    hidden_intent: str
-    constraints: List[str]
-    plan: List[str]
-    current_step: str
-    completed_steps: List[str]
-    remaining_steps: List[str]
-    reflection: str
-    completion_score: int
-    executor_reasoning: str
-    iteration: int
-    max_iterations: int
-    response: str
-    conversation_summary: str
-    model_type: str
-    temperature: float
-
-# ==================================================
-# MEMORY (In-Memory Sessions)
-# ==================================================
-
-sessions: Dict[str, Dict[str, Any]] = {}
-
-async def summarize_memory(messages: List[BaseMessage], llm: ChatNVIDIA) -> List[BaseMessage]:
-    """Summarizes older messages if conversation history grows too long."""
-    if len(messages) <= 10:
-        return messages
-    
-    # Keep the last 4 messages, summarize the rest
-    recent_messages = messages[-4:]
-    older_messages = messages[:-4]
-    
-    history_str = "\n".join([f"{m.type}: {m.content}" for m in older_messages])
-    prompt = f"Provide a concise summary of the following conversation history. Retain key facts and user preferences:\n\n{history_str}"
-    
-    try:
-        summary_response = await llm.ainvoke(prompt)
-        summary_msg = SystemMessage(content=f"Previous conversation summary: {summary_response.content}")
-        return [summary_msg] + recent_messages
-    except Exception as e:
-        print(f"Summarization failed: {e}")
-        return messages # Fallback to un-summarized
-
-# ==================================================
-# MODEL ROUTER & HELPER
-# ==================================================
-
-def get_llm(model_type: str, temperature: float = 0.7) -> ChatNVIDIA:
-    """Routes to the correct NVIDIA model based on user selection."""
-    model_name = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" # Balanced default
-    
-    model_type_clean = model_type.strip().lower()
-    if model_type_clean == "fast":
-        model_name = "deepseek-ai/deepseek-v4-pro"
-    elif model_type_clean == "reasoning":
-        model_name = "nvidia/nemotron-3-ultra-550b-a55b"
-        
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=16384, timeout=120)
-
-def strip_thinking(text: str) -> str:
-    """Removes <think>...</think> reasoning blocks some models emit before the real answer."""
-    if not text:
-        return text
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
-    return text.strip()
-
-
-async def execute_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic_model, state: dict, retries: int = 2):
-    """Executes an LLM call and ensures structured Pydantic output."""
-    parser = PydanticOutputParser(pydantic_object=pydantic_model)
-    format_instructions = parser.get_format_instructions()
-    
-    system_prompt = (
-        """You are GoalAI, an intelligent goal-oriented assistant.
-
-Your primary responsibility is not merely answering questions but helping the user successfully achieve their goal.
-
-Always identify the user's objective before responding.
-
-Treat every conversation as part of an ongoing mission.
-
-You should continuously monitor progress toward the user's objective and adapt your strategy whenever new information appears.
-
-## Core Principles
-
-• Always understand the user's real objective before generating an answer.
-
-• Maintain awareness of the overall goal throughout the conversation.
-
-• Break complex goals into manageable subtasks.
-
-• Decide the best next action instead of trying to solve everything at once.
-
-• After every response, internally assess whether the goal has been achieved.
-
-• If the goal is incomplete, continue working toward it in future turns.
-
-• If the user's goal changes, immediately update your understanding and continue from the new objective.
-
-Never lose sight of the user's primary objective.
-
----
-
-## Goal Understanding
-
-For every message determine:
-
-- Primary goal
-- Secondary goals
-- User constraints
-- Missing information
-- Desired final outcome
-
-Ask clarifying questions only when necessary.
-
-Avoid unnecessary questions if enough information already exists.
-
----
-
-## Planning
-
-Create an internal strategy before responding.
-
-The strategy should:
-
-- identify subtasks
-- prioritize them
-- choose the best next action
-- minimize unnecessary work
-
-Plans may change whenever new information appears.
-
----
-
-## Execution
-
-Focus only on the next useful action.
-
-Produce responses that move the user closer to completing the goal.
-
-Avoid irrelevant information.
-
-Avoid unnecessary verbosity.
-
----
-
-## Reflection
-
-After generating a response, internally evaluate whether it:
-
-- answered the user's request
-- respected constraints
-- remained accurate
-- moved the user closer to the goal
-
-If improvements are needed, incorporate them into future responses.
-
----
-
-## Goal Tracking
-
-Maintain awareness of:
-
-Current goal
-
-Completed progress
-
-Remaining work
-
-Current context
-
-Conversation history
-
-Always use previous conversation context whenever it is relevant.
-
----
-
-## Adaptation
-
-If the user provides new information:
-
-Update your understanding.
-
-Revise your strategy.
-
-Continue toward the updated goal.
-
-Never restart unless the user explicitly requests it.
-
----
-
-## Conversation Style
-
-Respond naturally like ChatGPT.
-
-Be clear.
-
-Be concise.
-
-Be helpful.
-
-Avoid robotic language.
-
-Avoid repeatedly mentioning goals or planning.
-
-The user should experience a smooth conversation without seeing your internal planning process.
-
----
-
-## Accuracy
-
-Do not invent facts.
-
-If uncertain, clearly state uncertainty.
-
-If required information is missing, ask for it.
-
-Prefer correctness over confidence.
-
----
-
-## Completion
-
-When the user's goal is fully achieved:
-
-Provide the final result.
-
-Mention any remaining considerations only if they are useful.
-
-Then wait for the user's next instruction.
-
-Never continue unnecessary work after the goal has been completed.
-
-Your success is measured by how effectively you help the user achieve their objective while keeping the interaction natural, efficient, and focused.
-
-Do not wrap the JSON in markdown blocks like ```json if it breaks standard parsing, just return the raw JSON object."""
-    )
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt + "\n\n{format_instructions}"),
-        ("user", prompt_str)
-    ])
-    
-    chain = prompt | llm
-    
-    for attempt in range(retries):
-        try:
-            res = await chain.ainvoke({"format_instructions": format_instructions, **state})
-            content = strip_thinking(res.content).strip()
-            # Clean up potential markdown artifacts
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            
-            return parser.parse(content.strip())
-        except Exception as e:
-            print(f"Structured Parsing Retry {attempt + 1}/{retries} failed: {e} | Raw content: {res.content[:300] if 'res' in dir() else 'N/A'}")
-            await asyncio.sleep(0.5)
-            
-    return None
-
-def format_context(state: AgentState) -> str:
-    """Formats the current graph state into a readable string for the prompt."""
-    msg_str = "\n".join([f"{m.type.capitalize()}: {m.content}" for m in state.get("messages", [])])
-    
-    return f"""Conversation History:
-{msg_str}
-
-Current Internal State:
-- Goal: {state.get('goal', 'Not set')}
-- Constraints: {state.get('constraints', [])}
-- Plan: {state.get('plan', [])}
-- Completed Steps: {state.get('completed_steps', [])}
-- Current Step: {state.get('current_step', 'Not set')}
-- Prior Response Draft: {state.get('response', 'None')}
-- Reflection on Draft: {state.get('reflection', 'None')}
-"""
-
-# ==================================================
-# LANGGRAPH NODES
-# ==================================================
-
-async def understand_goal_node(state: AgentState) -> dict:
-    llm = get_llm(state["model_type"], state["temperature"])
-    prompt = "Analyze this conversation and extract the core goal, intent, constraints, and missing info.\n\n{context}"
-    
-    res = await execute_llm_structured(llm, prompt, GoalExtraction, {"context": format_context(state)})
-    
-    return {
-        "goal": res.main_goal if res else "Provide a helpful response.",
-        "hidden_intent": res.hidden_intent if res else "",
-        "constraints": res.constraints if res else [],
-        "iteration": 0,
-        "completed_steps": [],
-        "plan": state.get("plan", [])
-    }
-
-async def planner_node(state: AgentState) -> dict:
-    llm = get_llm(state["model_type"], state["temperature"])
-    prompt = "Based on the goal and completed steps, create or update the execution plan. Identify the single immediate next step.\n\n{context}"
-    
-    res = await execute_llm_structured(llm, prompt, PlannerOutput, {"context": format_context(state)})
-    
-    iteration = state.get("iteration", 0) + 1
-    
-    return {
-        "plan": res.plan if res else state.get("plan", []),
-        "current_step": res.current_step if res else "Generate a direct response to the user.",
-        "iteration": iteration
-    }
-
-async def executor_node(state: AgentState) -> dict:
-    llm = get_llm(state["model_type"], state["temperature"])
-    prompt = "Execute the 'Current Step' to satisfy the user's 'Goal'. Provide your generated response text and reasoning.\n\n{context}"
-    
-    res = await execute_llm_structured(llm, prompt, ExecutorOutput, {"context": format_context(state)})
-    
-    new_completed = state.get("completed_steps", []) + [state.get("current_step", "")]
-    
-    return {
-        "response": res.response if res else "I apologize, I encountered an issue formulating my answer.",
-        "executor_reasoning": res.reasoning_summary if res else "",
-        "completed_steps": new_completed
-    }
-
-async def reflector_node(state: AgentState) -> dict:
-    llm = get_llm(state["model_type"], state["temperature"])
-    prompt = "Review the 'Prior Response Draft' against the 'Goal' and 'Constraints'. Evaluate quality and hallucination risks.\n\n{context}"
-    
-    res = await execute_llm_structured(llm, prompt, ReflectorOutput, {"context": format_context(state)})
-    
-    reflection_str = "Looks solid."
-    if res:
-        reflection_str = f"Quality: {res.quality} | Correctness: {res.correctness} | Improvements: {res.improvements}"
-        
-    return {
-        "reflection": reflection_str
-    }
-
-async def evaluator_node(state: AgentState) -> dict:
-    llm = get_llm(state["model_type"], state["temperature"])
-    prompt = "Based on the reflection, evaluate if the main goal is now fully achieved (0-100 completion).\n\n{context}"
-    
-    res = await execute_llm_structured(llm, prompt, EvaluatorOutput, {"context": format_context(state)})
-    
-    score = res.completion_percentage if res else 100
-    
-    return {
-        "completion_score": score
-    }
-
-def decision_edge(state: AgentState) -> str:
-    """Decides whether to end the reasoning loop or continue planning/executing."""
-    if state.get("completion_score", 0) >= 100:
-        return END
-    if state.get("iteration", 0) >= state.get("max_iterations", 2):
-        return END
-    return "planner"
-
-# ==================================================
-# LANGGRAPH WORKFLOW SETUP
-# ==================================================
-
-workflow = StateGraph(AgentState)
-
-workflow.add_node("understand_goal", understand_goal_node)
-workflow.add_node("planner", planner_node)
-workflow.add_node("executor", executor_node)
-workflow.add_node("reflector", reflector_node)
-workflow.add_node("evaluator", evaluator_node)
-
-workflow.set_entry_point("understand_goal")
-workflow.add_edge("understand_goal", "planner")
-workflow.add_edge("planner", "executor")
-workflow.add_edge("executor", "reflector")
-workflow.add_edge("reflector", "evaluator")
-workflow.add_conditional_edges("evaluator", decision_edge)
-
-app_graph = workflow.compile()
-
-# ==================================================
-# FASTAPI & API ENDPOINTS
-# ==================================================
-
-app = FastAPI(title="Goal-Oriented AI Assistant")
-
-# Serve the frontend static files
-app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
-
-# Root route serves the frontend
-@app.get("/")
-@app.head("/")
-async def serve_frontend():
-    return FileResponse("frontend/index.html")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class ChatRequest(BaseModel):
-    message: str
-    session_id: str
-    model_type: str = "Balanced"
-    stream: bool = False
-    temperature: float = 0.7
-    max_iterations: int = 2
-
-class ClearSessionRequest(BaseModel):
-    session_id: str
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
-@app.post("/clear-session")
-async def clear_session(request: ClearSessionRequest):
-    if request.session_id in sessions:
-        del sessions[request.session_id]
-    return {"status": "success", "message": f"Session {request.session_id} cleared."}
-
-# Human-readable labels for each real LangGraph node, shown to the user as that node actually runs.
-NODE_LABELS = {
-    "understand_goal": "Understanding the goal",
-    "planner": "Planning the next step",
-    "executor": "Drafting a response",
-    "reflector": "Checking the draft",
-    "evaluator": "Confirming completion",
-}
-
-# Shown instead of "Taking a shortcut" whenever the full reasoning loop
-# times out or errors and the app falls back to a direct answer.
-FALLBACK_LABELS = ["Fathoming", "Pondering", "Discovering", "Triangulating", "Sifting"]
-
-def node_detail(node_name: str, state: dict) -> str:
-    """
-    Turns whatever a node actually produced into a real sentence of reasoning text,
-    so the thinking UI shows genuine content instead of a decorative status word.
-    """
-    if node_name == "understand_goal":
-        goal = state.get("goal", "")
-        return f"Understanding the goal: {goal}" if goal else "Understanding the goal."
-    if node_name == "planner":
-        step = state.get("current_step", "")
-        return f"Planning the next step: {step}" if step else "Planning the next step."
-    if node_name == "executor":
-        reasoning = state.get("executor_reasoning", "")
-        return reasoning if reasoning else "Drafting a response for the current step."
-    if node_name == "reflector":
-        reflection = state.get("reflection", "")
-        return reflection if reflection else "Checking the draft for quality and accuracy."
-    if node_name == "evaluator":
-        score = state.get("completion_score", None)
-        return f"Completion check: {score}% of the goal is done." if score is not None else "Checking whether the goal is complete."
-    return NODE_LABELS.get(node_name, node_name)
-
-async def run_graph_streaming(initial_state: dict, timeout: float):
-    """
-    Runs the LangGraph workflow node-by-node, yielding (node_name, state_so_far) the moment each
-    node actually finishes — this is real backend progress, not a simulated/canned timer. Enforces
-    the same overall timeout budget as the non-streaming path so a slow run still falls back cleanly.
-    """
-    state_acc = dict(initial_state)
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout
-    agen = app_graph.astream(initial_state, stream_mode="updates")
-    try:
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise asyncio.TimeoutError()
-            chunk = await asyncio.wait_for(agen.__anext__(), timeout=remaining)
-            node_name, node_output = next(iter(chunk.items()))
-            state_acc.update(node_output)
-            yield node_name, state_acc
-    except StopAsyncIteration:
-        return
-    finally:
-        await agen.aclose()
-
-async def generate_stream(request: "ChatRequest", session: dict, session_id: str):
-    """
-    Streams two kinds of SSE events to the frontend:
-      - {"type": "status", "step": <node name>, "label": <text>}  while the agent is actually working
-      - {"type": "message", "assistant_message": <word chunk>, ...}  once the final answer is ready
-    The status events mirror whichever LangGraph node just finished, so the "thought process" shown
-    in the UI is synced to real backend state instead of a client-side simulated cycle.
-    """
-    if is_simple_message(request.message):
-        yield f"data: {json.dumps({'type': 'status', 'step': 'direct', 'label': 'Answering', 'detail': 'This is a short message, so answering directly without the full planning loop.'})}\n\n"
-        final_response = await answer_directly(
-            request.message, session["messages"], request.model_type, request.temperature
-        )
-        final_state = {"completion_score": 100, "iteration": 1}
-    else:
-        initial_state = {
-            "messages": session["messages"],
-            "model_type": request.model_type,
-            "temperature": request.temperature,
-            "max_iterations": request.max_iterations,
-            "iteration": 0,
-            "completion_score": 0,
-            "completed_steps": [],
-            "plan": []
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Maximus</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+        :root { --bg-main:#212121; --bg-sidebar:#171717; --bg-input:#2f2f2f; --bg-hover:#2f2f2f; --text-primary:#ececec; --text-secondary:#b4b4b4; --accent:#10a37f; --border-color:rgba(255,255,255,0.1); --transition-bezier:cubic-bezier(0.2,0.8,0.2,1); }
+        * { box-sizing:border-box; margin:0; padding:0; font-family:'Inter',sans-serif; }
+        body { background-color:var(--bg-main); color:var(--text-primary); display:flex; height:100vh; overflow:hidden; }
+
+        /* ============== SPLASH SCREEN ============== */
+        .splash-screen { position:fixed; inset:0; background-color:var(--bg-main); z-index:9999; display:flex; flex-direction:column; align-items:center; justify-content:center; transition:opacity 0.7s var(--transition-bezier), visibility 0.7s; }
+        .splash-screen.hidden { opacity:0; visibility:hidden; }
+        .splash-logo-container { width:84px; height:84px; margin-bottom:28px; opacity:0; transform:scale(0.6); animation:splashEnter 0.7s cubic-bezier(0.34,1.56,0.64,1) 0.1s forwards; }
+        .splash-logo { width:100%; height:100%; color:var(--text-primary); }
+        .splash-logo path { stroke-dasharray:60; stroke-dashoffset:60; animation:splashDraw 1s ease-out 0.2s forwards, splashBreathe 2.2s ease-in-out 1.3s infinite; }
+        @keyframes splashEnter { to { opacity:1; transform:scale(1); } }
+        @keyframes splashDraw { to { stroke-dashoffset:0; } }
+        @keyframes splashBreathe { 0%,100% { transform:scale(1); opacity:1; } 50% { transform:scale(1.06); opacity:0.75; } }
+        .splash-text { font-size:16px; font-weight:500; letter-spacing:4px; color:var(--text-secondary); text-transform:uppercase; opacity:0; transform:translateY(8px); animation:splashTextIn 0.6s var(--transition-bezier) 0.55s forwards; }
+        @keyframes splashTextIn { to { opacity:0.9; transform:translateY(0); } }
+        .splash-dots { display:flex; gap:6px; margin-top:18px; opacity:0; animation:splashTextIn 0.5s var(--transition-bezier) 0.8s forwards; }
+        .splash-dots span { width:5px; height:5px; border-radius:50%; background-color:var(--text-secondary); animation:splashDotPulse 1.2s ease-in-out infinite; }
+        .splash-dots span:nth-child(2) { animation-delay:0.15s; }
+        .splash-dots span:nth-child(3) { animation-delay:0.3s; }
+        @keyframes splashDotPulse { 0%,80%,100% { opacity:0.25; transform:scale(0.85); } 40% { opacity:1; transform:scale(1.15); } }
+
+        /* ============== SIDEBAR ============== */
+        .sidebar { width:260px; background-color:var(--bg-sidebar); display:flex; flex-direction:column; padding:10px; border-right:1px solid var(--border-color); transition:width 0.3s var(--transition-bezier), padding 0.3s var(--transition-bezier), opacity 0.3s var(--transition-bezier); overflow-x:hidden; white-space:nowrap; flex-shrink:0; }
+        .sidebar.collapsed { width:0; padding-left:0; padding-right:0; border-right:none; opacity:0; }
+        .sidebar-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; gap:10px; }
+        .icon-btn { background:transparent; border:none; color:var(--text-secondary); cursor:pointer; padding:8px; border-radius:6px; display:flex; align-items:center; justify-content:center; transition:background 0.2s ease, color 0.2s ease, transform 0.15s ease; }
+        .icon-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
+        .icon-btn:active { transform:scale(0.92); }
+        .new-chat-btn { flex:1; display:flex; align-items:center; justify-content:space-between; padding:10px 12px; background-color:transparent; color:var(--text-primary); border:1px solid var(--border-color); border-radius:8px; cursor:pointer; font-size:14px; font-weight:500; transition:background 0.2s ease, transform 0.15s ease; }
+        .new-chat-btn:hover { background-color:var(--bg-hover); }
+        .new-chat-btn:active { transform:scale(0.98); }
+        .history-list { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:5px; }
+        .history-item { padding:12px; border-radius:8px; cursor:pointer; font-size:14px; overflow:hidden; text-overflow:ellipsis; color:var(--text-secondary); transition:background 0.2s, color 0.2s; }
+        .history-item:hover { background-color:var(--bg-hover); color:var(--text-primary); }
+        .sidebar-settings { margin-top:auto; padding-top:16px; border-top:1px solid var(--border-color); display:flex; flex-direction:column; gap:12px; }
+        .settings-panel { display:flex; flex-direction:column; gap:12px; animation:fadeInSettings 0.25s ease; }
+        @keyframes fadeInSettings { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
+        .settings-panel[hidden] { display:none; }
+        .sidebar-setting-item { display:flex; justify-content:space-between; align-items:center; color:var(--text-secondary); font-size:13px; gap:10px; }
+        .sidebar-setting-item input[type="number"] { width:50px; background-color:var(--bg-main); color:var(--text-primary); border:1px solid transparent; padding:4px 8px; border-radius:6px; outline:none; transition:background 0.2s, border-color 0.2s; }
+        .sidebar-setting-item input[type="number"]:hover, .sidebar-setting-item input[type="number"]:focus { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); }
+        .sidebar-setting-item input[type="checkbox"] { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; }
+        .sidebar-setting-item select { background-color:var(--bg-main); color:var(--text-primary); border:1px solid transparent; padding:4px 8px; border-radius:6px; outline:none; font-size:13px; cursor:pointer; transition:background 0.2s, border-color 0.2s; max-width:150px; }
+        .sidebar-setting-item select:hover, .sidebar-setting-item select:focus { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); }
+
+        /* ============== HEADER + MODE TOGGLE ============== */
+        .main-content { flex:1; display:flex; flex-direction:column; position:relative; min-width:0; }
+        .header { height:60px; display:flex; align-items:center; justify-content:space-between; padding:0 16px; z-index:10; }
+        .header-left { display:flex; align-items:center; gap:12px; }
+        .sidebar-toggle-main { display:none; opacity:0; transform:scale(0.8); transition:opacity 0.3s var(--transition-bezier), transform 0.3s var(--transition-bezier); }
+        .sidebar.collapsed ~ .main-content .sidebar-toggle-main { display:flex; opacity:1; transform:scale(1); }
+
+        .mode-toggle { display:flex; align-items:center; background-color:var(--bg-input); border-radius:999px; padding:3px; position:relative; }
+        .mode-toggle button { position:relative; z-index:1; border:none; background:transparent; color:var(--text-secondary); font-size:13px; font-weight:500; padding:7px 16px; border-radius:999px; cursor:pointer; transition:color 0.25s ease; display:flex; align-items:center; gap:6px; }
+        .mode-toggle button svg { width:14px; height:14px; }
+        .mode-toggle button.active { color:var(--bg-main); }
+        .mode-toggle-pill { position:absolute; top:3px; left:3px; height:calc(100% - 6px); width:calc(50% - 3px); background-color:var(--text-primary); border-radius:999px; transition:transform 0.3s var(--transition-bezier); z-index:0; }
+        .mode-toggle.code-active .mode-toggle-pill { transform:translateX(100%); }
+
+        /* ============== CHAT AREA (simplified) ============== */
+        .chat-container { flex:1; overflow-y:auto; display:flex; flex-direction:column; align-items:center; scroll-behavior:smooth; }
+        .chat-content { width:100%; max-width:760px; padding:20px; display:flex; flex-direction:column; gap:26px; padding-bottom:150px; }
+        .opening-scene { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; width:100%; text-align:center; padding:0 20px; }
+        .mono-logo-container { margin-bottom:20px; opacity:0; transform:scale(0.85) translateY(15px); animation:popFadeIn 0.6s var(--transition-bezier) forwards; }
+        .mono-logo { width:56px; height:56px; color:var(--text-primary); }
+        .swirl-spin { animation:spin 3s linear infinite; }
+        .opening-title { font-size:24px; font-weight:600; margin-bottom:10px; opacity:0; transform:translateY(12px); animation:slideFadeIn 0.6s var(--transition-bezier) 0.1s forwards; transition:opacity 0.2s ease; }
+        .opening-subtitle { color:var(--text-secondary); font-size:14px; opacity:0; transform:translateY(12px); animation:slideFadeIn 0.6s var(--transition-bezier) 0.2s forwards; transition:opacity 0.2s ease; }
+        @keyframes popFadeIn { to { opacity:1; transform:scale(1) translateY(0); } }
+        @keyframes slideFadeIn { to { opacity:1; transform:translateY(0); } }
+
+        .message-row { display:flex; width:100%; opacity:0; transform:translateY(10px); animation:slideFadeIn 0.4s var(--transition-bezier) forwards; }
+        .message-row.user { justify-content:flex-end; }
+        .message-row.assistant { justify-content:flex-start; }
+        .message-bubble { max-width:88%; padding:14px 18px; font-size:15px; line-height:1.6; }
+        .user .message-bubble { background-color:var(--bg-input); border-radius:20px 20px 6px 20px; white-space:pre-wrap; }
+
+        /* Simplified assistant message: no repeated title per bubble, just a small quiet avatar */
+        .assistant .message-bubble { background-color:transparent; border-radius:8px; color:var(--text-primary); display:flex; gap:12px; padding-left:0; align-items:flex-start; }
+        .assistant-avatar { flex-shrink:0; width:26px; height:26px; padding:5px; border-radius:50%; border:1px solid var(--border-color); color:var(--text-secondary); margin-top:2px; }
+        .assistant-body { flex:1; min-width:0; display:flex; flex-direction:column; gap:10px; }
+
+        .message-text { word-break:break-word; }
+        .message-text p { margin-bottom:12px; }
+        .message-text p:last-child { margin-bottom:0; }
+        .message-text h1, .message-text h2, .message-text h3, .message-text h4 { margin:18px 0 8px 0; font-weight:600; color:#fff; }
+        .message-text h1 { font-size:1.4em; }
+        .message-text h2 { font-size:1.25em; }
+        .message-text h3 { font-size:1.1em; }
+        .message-text ul, .message-text ol { margin:10px 0; padding-left:22px; }
+        .message-text li { margin-bottom:6px; }
+        .message-text table { width:100%; border-collapse:collapse; margin:14px 0; background-color:rgba(0,0,0,0.15); border-radius:8px; overflow:hidden; display:block; overflow-x:auto; }
+        .message-text th, .message-text td { border:1px solid var(--border-color); padding:9px 13px; text-align:left; }
+        .message-text th { background-color:rgba(255,255,255,0.05); font-weight:600; }
+
+        .message-text .code-card { margin:14px 0; border-radius:10px; overflow:hidden; border:1px solid var(--border-color); }
+        .message-text .code-card-header { display:flex; justify-content:space-between; align-items:center; background-color:#2a2a2a; padding:8px 16px; font-size:12px; color:var(--text-secondary); border-bottom:1px solid var(--border-color); }
+        .message-text .code-card-lang { font-family:'Courier New', Courier, monospace; text-transform:lowercase; }
+        .message-text .artifact-tabs { display:flex; gap:2px; }
+        .message-text .artifact-tab { background:transparent; border:none; color:var(--text-secondary); font-size:12px; padding:4px 10px; border-radius:6px; cursor:pointer; transition:background 0.2s, color 0.2s; }
+        .message-text .artifact-tab:hover { color:var(--text-primary); }
+        .message-text .artifact-tab.active { background-color:var(--bg-input); color:var(--text-primary); }
+        .message-text .artifact-preview { background-color:#ffffff; padding:24px; display:flex; align-items:center; justify-content:center; overflow:auto; }
+        .message-text .artifact-preview svg { max-width:100%; height:auto; }
+        .message-text .artifact-preview.code-preview-frame { padding:0; display:block; }
+        .message-text .code-preview-frame iframe { width:100%; min-height:360px; border:none; display:block; background:#fff; }
+        .message-text .code-card [hidden] { display:none !important; }
+        .message-text .artifact-chip { display:flex; align-items:center; gap:12px; margin:14px 0; padding:10px 14px; border:1px solid var(--border-color); border-radius:12px; background-color:#262626; cursor:pointer; transition:background 0.2s ease, border-color 0.2s ease; max-width:320px; }
+        .message-text .artifact-chip:hover { background-color:#2d2d2d; border-color:rgba(255,255,255,0.18); }
+        .message-text .artifact-chip-icon { flex-shrink:0; width:34px; height:34px; border-radius:8px; background-color:rgba(16,163,127,0.15); color:var(--accent); display:flex; align-items:center; justify-content:center; }
+        .message-text .artifact-chip-icon svg { width:18px; height:18px; }
+        .message-text .artifact-chip-info { flex:1; min-width:0; }
+        .message-text .artifact-chip-title { font-size:13.5px; font-weight:500; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .message-text .artifact-chip-meta { font-size:12px; color:var(--text-secondary); margin-top:2px; }
+        .message-text .artifact-chip-btn { flex-shrink:0; background-color:var(--text-primary); color:var(--bg-main); border:none; border-radius:999px; font-size:12.5px; font-weight:600; padding:6px 14px; cursor:pointer; pointer-events:none; }
+        .message-text .copy-btn { display:flex; align-items:center; gap:6px; background:transparent; border:none; color:var(--text-secondary); font-size:12px; cursor:pointer; padding:4px 8px; border-radius:6px; transition:background 0.2s, color 0.2s; }
+        .message-text .copy-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
+        .message-text .copy-btn svg { width:14px; height:14px; }
+        .message-text pre { background-color:#111; padding:16px; overflow-x:auto; margin:0; border:none; border-radius:0; }
+        .message-text code { font-family:'Courier New', Courier, monospace; background-color:rgba(255,255,255,0.1); padding:2px 6px; border-radius:4px; font-size:0.9em; }
+        .message-text pre code { background-color:transparent; padding:0; font-size:0.9em; border:none; }
+        .message-text blockquote { border-left:4px solid var(--accent); padding-left:12px; color:var(--text-secondary); margin:12px 0; }
+
+        .thinking-block { margin-top:2px; }
+        .thinking-toggle { background:none; border:none; padding:0; font-size:13px; font-family:inherit; color:var(--text-secondary); cursor:pointer; }
+        .thinking-toggle:hover { color:var(--text-primary); text-decoration:underline; }
+        .thinking-toggle.shimmer {
+            background-image: linear-gradient(
+                90deg,
+                var(--text-secondary) 0%,
+                var(--text-secondary) 35%,
+                var(--text-primary) 50%,
+                var(--text-secondary) 65%,
+                var(--text-secondary) 100%
+            );
+            background-size: 200% 100%;
+            background-clip: text;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            animation: thinkingShimmer 1.6s linear infinite;
         }
-        timeout = graph_timeout_seconds(request.model_type, request.max_iterations)
-        final_state = initial_state
-
-        try:
-            async for node_name, state_so_far in run_graph_streaming(initial_state, timeout):
-                label = NODE_LABELS.get(node_name, node_name)
-                detail = node_detail(node_name, state_so_far)
-                yield f"data: {json.dumps({'type': 'status', 'step': node_name, 'label': label, 'detail': detail})}\n\n"
-                final_state = state_so_far
-            final_response = final_state.get("response", "Task completed but no response was formulated.")
-        except asyncio.TimeoutError:
-            print(f"[{session_id}] Streaming workflow timed out after {timeout:.0f}s. Falling back to direct answer.")
-            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'The full reasoning loop was taking too long, so falling back to a direct answer.'})}\n\n"
-            final_response = await answer_directly(
-                request.message, session["messages"], request.model_type, request.temperature
-            )
-            final_state = {"completion_score": 100, "iteration": 1}
-        except Exception as e:
-            print(f"[{session_id}] Streaming workflow failed: {e}. Falling back to direct answer.")
-            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'Something went wrong in the reasoning loop, so falling back to a direct answer.'})}\n\n"
-            final_response = await answer_directly(
-                request.message, session["messages"], request.model_type, request.temperature
-            )
-            final_state = {"completion_score": 100, "iteration": 1}
-
-    # Now that we actually have the final answer, save it to memory
-    session["messages"].append(AIMessage(content=final_response))
-
-    # Stream the final answer word-by-word (ChatGPT-style typing effect)
-    chunks = final_response.split(" ")
-    for i, chunk in enumerate(chunks):
-        space = " " if i < len(chunks) - 1 else ""
-        data = {
-            "type": "message",
-            "assistant_message": chunk + space,
-            "conversation_id": session_id,
-            "session_id": session_id,
-            "goal_complete": final_state.get("completion_score", 100) >= 100
+        @keyframes thinkingShimmer {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
         }
-        yield f"data: {json.dumps(data)}\n\n"
-        await asyncio.sleep(0.015) # Simulated typing delay
+        .thinking-content { display:none; margin:10px 0 10px 12px; padding-left:22px; border-left:1px solid var(--border-color); font-size:14px; line-height:1.6; color:var(--text-secondary); }
+        .thinking-content.expanded { display:block; }
+        .thought-item { position: relative; margin-bottom: 14px; }
+        .thought-item:last-child { margin-bottom: 0; }
+        .thought-bullet { position: absolute; left: -26.5px; top: 8px; width: 8px; height: 8px; background-color: #555; border-radius: 50%; z-index: 1; }
+        .thought-icon-wrapper { position: absolute; left: -34px; top: 0px; width: 24px; height: 24px; background-color: var(--bg-main); display: flex; align-items: center; justify-content: center; z-index: 2; }
+        .thought-icon-wrapper svg { width: 20px; height: 20px; color: var(--text-secondary); }
+        .thought-content { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
+        .thought-content.expanded { -webkit-line-clamp: unset; }
+        .show-more-btn { background: none; border: none; color: var(--text-primary); cursor: pointer; font-size: 12px; padding: 4px 0; margin-top: 2px; display: none; opacity: 0.7; }
+        .show-more-btn:hover { opacity: 1; text-decoration: underline; }
+        .spinner { width:14px; height:14px; border:2px solid var(--text-secondary); border-top:2px solid transparent; border-radius:50%; animation:spin 1s linear infinite; }
+        @keyframes spin { 0%{transform:rotate(0deg);} 100%{transform:rotate(360deg);} }
 
-def is_simple_message(message: str) -> bool:
-    """Quick heuristic: short greetings/small talk don't need the full plan/execute/reflect loop."""
-    text = message.strip().lower()
-    if len(text) <= 20:
-        return True
-    greetings = ("hi", "hello", "hey", "yo", "sup", "thanks", "thank you", "ok", "okay", "bye")
-    return any(text == g or text.startswith(g + " ") or text.startswith(g + ",") for g in greetings)
+        /* ============== INPUT ============== */
+        .input-container { position:absolute; bottom:0; left:0; width:100%; padding:22px; background:linear-gradient(180deg, rgba(33,33,33,0) 0%, var(--bg-main) 40%); display:flex; justify-content:center; }
+        .input-box { width:100%; max-width:760px; background-color:var(--bg-input); border-radius:22px; border:1px solid var(--border-color); display:flex; align-items:flex-end; padding:11px 15px; box-shadow:0 4px 20px rgba(0,0,0,0.15); transition:border-color 0.25s ease, box-shadow 0.25s ease; }
+        .input-box:focus-within { border-color:rgba(255,255,255,0.3); box-shadow:0 4px 24px rgba(0,0,0,0.22); }
+        .input-box textarea { flex:1; background:transparent; border:none; color:var(--text-primary); font-size:15.5px; resize:none; outline:none; max-height:200px; padding:8px 4px; line-height:1.5; }
+        .input-box textarea::placeholder { color:var(--text-secondary); }
+        .send-btn { background:var(--text-primary); color:var(--bg-main); border:none; border-radius:50%; width:34px; height:34px; display:flex; align-items:center; justify-content:center; cursor:pointer; transition:opacity 0.2s, transform 0.2s var(--transition-bezier); margin-left:10px; margin-bottom:3px; }
+        .send-btn:hover:not(:disabled) { transform:scale(1.06); }
+        .send-btn:active:not(:disabled) { transform:scale(0.94); }
+        .send-btn:disabled { opacity:0.3; cursor:not-allowed; }
+        .send-btn svg { width:17px; height:17px; }
 
-def graph_timeout_seconds(model_type: str, max_iterations: int) -> float:
-    """
-    Sizes the overall graph timeout to the worst-case number of sequential LLM calls
-    (1 understand_goal call + up to max_iterations * 4 planner/executor/reflector/evaluator calls),
-    with extra headroom per call for the slower 'reasoning' model.
-    """
-    # Each node call can retry up to twice against a 60s per-call LLM timeout (see get_llm),
-    # so the per-call budget here must comfortably exceed 60s or the outer graph deadline
-    # will cut off a call that hadn't even hit its own timeout yet.
-    per_call_seconds = 130.0 if model_type.strip().lower() == "reasoning" else 100.0
-    worst_case_calls = 1 + (max_iterations * 4)
-    return min(worst_case_calls * per_call_seconds, 240.0)  # hard ceiling so a request can never hang indefinitely
+        .thinking-indicator { display:inline-block; width:26px; height:26px; vertical-align:middle; margin-left:4px; overflow:visible; }
+        .thinking-indicator svg { width:100%; height:100%; overflow:visible; }
+        .thinking-indicator .petal-group { transform-origin:100px 100px; animation:thinkingMove 2s cubic-bezier(0.45,0,0.55,1) infinite; }
+        .thinking-indicator .petal-group:nth-child(1) { animation-delay:0.00s; }
+        .thinking-indicator .petal-group:nth-child(2) { animation-delay:0.10s; }
+        .thinking-indicator .petal-group:nth-child(3) { animation-delay:0.20s; }
+        .thinking-indicator .petal-group:nth-child(4) { animation-delay:0.30s; }
+        .thinking-indicator .petal-group:nth-child(5) { animation-delay:0.40s; }
+        .thinking-indicator .petal-group:nth-child(6) { animation-delay:0.50s; }
+        .thinking-indicator .petal-group:nth-child(7) { animation-delay:0.60s; }
+        .thinking-indicator .petal-group:nth-child(8) { animation-delay:0.70s; }
+        .thinking-indicator .petal { fill:var(--bg-main); stroke:var(--text-primary); stroke-width:6; stroke-linejoin:round; stroke-linecap:round; }
+        @keyframes thinkingMove { 0% { opacity:1; transform:scale(1) rotate(0deg); } 50% { opacity:0.3; transform:scale(0.85) rotate(8deg); } 100% { opacity:1; transform:scale(1) rotate(0deg); } }
 
-async def answer_directly(message: str, history: List[BaseMessage], model_type: str, temperature: float) -> str:
-    """Always returns a real answer — falls back to the fast model if the primary one times out."""
-    messages = [SystemMessage(content="You are GoalAI, a helpful, friendly assistant. Respond naturally and concisely.")]
-    messages.extend(history[-6:])
-    messages.append(HumanMessage(content=message))
+        /* Smooth cross-fade when swapping between Chat / Code content */
+        .mode-fade-out { animation:modeFadeOut 0.15s ease forwards; }
+        .mode-fade-in { animation:modeFadeIn 0.25s ease forwards; }
+        @keyframes modeFadeOut { to { opacity:0; transform:translateY(4px); } }
+        @keyframes modeFadeIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
 
-    # Try the requested model first
-    try:
-        llm = get_llm(model_type, temperature)
-        res = await llm.ainvoke(messages)
-        answer = strip_thinking(res.content).strip()
-        if answer:
-            return answer
-    except Exception as e:
-        print(f"Primary model failed: {e}")
+        /* ============== CODE CANVAS ==============
+           A dedicated split-panel that appears next to the chat column, only
+           ever used in Code mode. It is a plain flex sibling of .main-content,
+           so it never touches Chat mode's markup, state, or event handlers. */
+        .canvas-panel { flex:1 1 0; min-width:0; display:flex; flex-direction:column; background-color:#181818; border-left:1px solid var(--border-color); animation:canvasSlideIn 0.25s var(--transition-bezier); }
+        .canvas-panel[hidden] { display:none; }
+        @keyframes canvasSlideIn { from { opacity:0; transform:translateX(14px); } to { opacity:1; transform:translateX(0); } }
+        .canvas-header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border-bottom:1px solid var(--border-color); flex-shrink:0; }
+        .canvas-header-left { display:flex; align-items:center; gap:8px; min-width:0; }
+        .canvas-header-left svg { width:16px; height:16px; color:var(--text-secondary); flex-shrink:0; }
+        .canvas-title { font-size:13px; font-weight:500; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .canvas-header-right { display:flex; align-items:center; gap:4px; flex-shrink:0; }
+        .canvas-tabs { display:flex; align-items:center; background-color:var(--bg-input); border-radius:999px; padding:3px; margin-right:6px; }
+        .canvas-tabs button { border:none; background:transparent; color:var(--text-secondary); font-size:12.5px; font-weight:500; padding:6px 14px; border-radius:999px; cursor:pointer; transition:background 0.2s ease, color 0.2s ease; }
+        .canvas-tabs button.active { background-color:var(--text-primary); color:var(--bg-main); }
+        .canvas-icon-btn { background:transparent; border:none; color:var(--text-secondary); cursor:pointer; padding:6px; border-radius:6px; display:flex; align-items:center; justify-content:center; transition:background 0.2s ease, color 0.2s ease; }
+        .canvas-icon-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
+        .canvas-icon-btn svg { width:16px; height:16px; }
+        .canvas-body { flex:1; min-height:0; position:relative; }
+        .canvas-view { width:100%; height:100%; overflow:auto; }
+        .canvas-view[hidden] { display:none; }
+        .canvas-view iframe { width:100%; height:100%; border:none; display:block; background:#fff; }
+        #canvasCodeView pre { margin:0; padding:20px; min-height:100%; background-color:#111; }
+        #canvasCodeView code { font-size:13px; line-height:1.65; font-family:'Courier New', Courier, monospace; }
+    </style>
+</head>
+<body>
+    <div class="splash-screen" id="splashScreen">
+        <div class="splash-logo-container">
+            <svg class="splash-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 12c-1.657 0-3 1.343-3 3 0 1.657 1.343 3 3 3 3.314 0 6-2.686 6-6 0-3.314-2.686-6-6-6-4.97 0-9 4.03-9 9 0 4.97 4.03 9 9 9"></path>
+            </svg>
+        </div>
+        <div class="splash-text">Maximus</div>
+        <div class="splash-dots"><span></span><span></span><span></span></div>
+    </div>
 
-    # Fallback: always try the fast model before giving up
-    try:
-        fallback_llm = get_llm("fast", temperature)
-        res = await fallback_llm.ainvoke(messages)
-        answer = strip_thinking(res.content).strip()
-        if answer:
-            return answer
-    except Exception as e:
-        print(f"Fallback model also failed: {e}")
+    <div class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <button class="icon-btn" onclick="toggleSidebar()" title="Close sidebar">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                    <line x1="9" y1="3" x2="9" y2="21"></line>
+                </svg>
+            </button>
+            <button class="new-chat-btn" onclick="startNewChat()">
+                <span>New session</span>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 5v14M5 12h14"></path>
+                </svg>
+            </button>
+        </div>
+        <div class="history-list" id="historyList"></div>
+        <div class="sidebar-settings">
+            <!-- Chat mode settings -->
+            <div class="settings-panel" id="chatSettings">
+                <div class="sidebar-setting-item">
+                    <label title="Model">Model</label>
+                    <select id="modelType">
+                        <option value="fast">Horus</option>
+                        <option value="balanced" selected>Osiris</option>
+                        <option value="reasoning">Amun-Ra</option>
+                    </select>
+                </div>
+                <div class="sidebar-setting-item">
+                    <label title="Model Temperature">Temperature</label>
+                    <input type="number" id="tempSetting" value="0.7" step="0.1" min="0" max="1">
+                </div>
+                <div class="sidebar-setting-item">
+                    <label title="Maximum Goal Iterations">Max Iterations</label>
+                    <input type="number" id="iterSetting" value="2" min="1" max="10">
+                </div>
+                <div class="sidebar-setting-item">
+                    <label title="Stream Response Tokens">Stream Response</label>
+                    <input type="checkbox" id="streamSetting" checked>
+                </div>
+            </div>
 
-    # Absolute last resort — user still gets a real response, never a crash
-    return "I'm having trouble reaching the model right now. Please try again in a moment."
+            <!-- Code mode settings (no temperature) -->
+            <div class="settings-panel" id="codeSettings" hidden>
+                <div class="sidebar-setting-item">
+                    <label title="Model">Model</label>
+                    <select id="codeModel">
+                        <option value="kimi" selected>Kimi K2.6</option>
+                        <option value="glm">GLM 5.2</option>
+                    </select>
+                </div>
+                <div class="sidebar-setting-item">
+                    <label title="Reasoning Depth">Reasoning</label>
+                    <select id="codeReasoningLevel">
+                        <option value="low">Low</option>
+                        <option value="medium" selected>Medium</option>
+                        <option value="high">High</option>
+                        <option value="max">Max</option>
+                    </select>
+                </div>
+                <div class="sidebar-setting-item">
+                    <label title="Stream Response Tokens">Stream Response</label>
+                    <input type="checkbox" id="codeStreamSetting" checked>
+                </div>
+            </div>
+        </div>
+    </div>
 
-@app.post("/chat")
-async def chat(request: ChatRequest):
-    try:
-        return await _handle_chat(request)
-    except Exception as e:
-        print(f"Chat handler failed entirely: {e}")
-        return {
-            "response": "Something went wrong on my end — please try again.",
-            "session_id": request.session_id,
-            "goal_progress": 0,
-            "completed": False,
-            "iterations": 0
+    <div class="main-content">
+        <div class="header">
+            <div class="header-left">
+                <button class="icon-btn sidebar-toggle-main" onclick="toggleSidebar()" title="Open sidebar">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                        <line x1="9" y1="3" x2="9" y2="21"></line>
+                    </svg>
+                </button>
+            </div>
+            <div class="mode-toggle" id="modeToggle">
+                <div class="mode-toggle-pill"></div>
+                <button type="button" class="active" data-mode="chat" onclick="switchMode('chat')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
+                    Chat
+                </button>
+                <button type="button" data-mode="code" onclick="switchMode('code')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+                    Code
+                </button>
+            </div>
+            <div style="width:36px"></div>
+        </div>
+
+        <div class="chat-container" id="chatContainer">
+            <div class="opening-scene" id="openingScene">
+                <div class="mono-logo-container">
+                    <svg class="mono-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+                        <polyline points="2 12 12 17 22 12"></polyline>
+                        <polyline points="2 17 12 22 22 17"></polyline>
+                    </svg>
+                </div>
+                <h1 class="opening-title" id="openingTitle">How can I help you achieve your goal?</h1>
+                <p class="opening-subtitle" id="openingSubtitle">Execution destroys all excuses</p>
+            </div>
+            <div class="chat-content" id="chatContent" style="display: none;"></div>
+        </div>
+
+        <div class="input-container">
+            <div class="input-box">
+                <textarea id="userInput" rows="1" placeholder="Describe your objective..." oninput="autoResize(this)" onkeydown="handleEnter(event)"></textarea>
+                <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="12" y1="19" x2="12" y2="5"></line>
+                        <polyline points="5 12 12 5 19 12"></polyline>
+                    </svg>
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ================= CODE CANVAS =================
+         Split panel that opens next to the chat only while in Code mode,
+         showing the generated file with a Code/Preview toggle — same
+         pattern as Gemini/ChatGPT Canvas. Chat mode never touches this. -->
+    <div class="canvas-panel" id="codeCanvas" hidden>
+        <div class="canvas-header">
+            <div class="canvas-header-left">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+                <span class="canvas-title" id="canvasTitle">Code</span>
+            </div>
+            <div class="canvas-header-right">
+                <div class="canvas-tabs" id="canvasTabs">
+                    <button type="button" data-tab="preview" id="canvasPreviewTabBtn">Preview</button>
+                    <button type="button" data-tab="code">Code</button>
+                </div>
+                <button class="canvas-icon-btn" id="canvasOpenNewTabBtn" title="Open preview in new tab">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+                </button>
+                <button class="canvas-icon-btn" id="canvasDownloadBtn" title="Download">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                </button>
+                <button class="canvas-icon-btn" id="canvasCopyBtn" title="Copy code">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                </button>
+                <button class="canvas-icon-btn" id="canvasCloseBtn" title="Close">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                </button>
+            </div>
+        </div>
+        <div class="canvas-body">
+            <div class="canvas-view" id="canvasPreviewView">
+                <iframe id="canvasPreviewFrame" sandbox="allow-scripts allow-same-origin allow-forms allow-modals"></iframe>
+            </div>
+            <div class="canvas-view" id="canvasCodeView" hidden>
+                <pre><code id="canvasCode"></code></pre>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked-katex-extension/lib/index.umd.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.5/purify.min.js"></script>
+
+    <script>
+        marked.use(markedKatex({ throwOnError: false }));
+
+        // marked-katex-extension only recognizes $...$ and $$...$$ delimiters.
+        // A lot of model output uses the LaTeX-style \( ... \) and \[ ... \]
+        // delimiters instead, which silently fail to render without this.
+        // Converting them to $ / $$ before handing text to marked() fixes that.
+        function normalizeMathDelimiters(text) {
+            if (!text) return text;
+            return text
+                .replace(/\\\[([\s\S]*?)\\\]/g, (_, expr) => `$$${expr}$$`)
+                .replace(/\\\(([\s\S]*?)\\\)/g, (_, expr) => `$${expr}$`);
         }
 
-async def _handle_chat(request: ChatRequest):
-    session_id = request.session_id
-    
-    if session_id not in sessions:
-        sessions[session_id] = {"messages": []}
-        
-    session = sessions[session_id]
-    llm = get_llm(request.model_type, request.temperature)
+        // Claude-style "thinking" indicator: an 8-petal flower that
+        // wobbles/breathes/fades in a staggered ring. Shown wherever the
+        // old blinking text cursor used to appear while a response streams.
+        // Used identically by both Chat mode and Code mode.
+        const THINKING_SVG = `<span class="thinking-indicator"><svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+      <g class="flower">
+        <g class="petal-group">
+          <path class="petal" transform="rotate(0 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+        <g class="petal-group">
+          <path class="petal" transform="rotate(45 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+        <g class="petal-group">
+          <path class="petal" transform="rotate(90 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+        <g class="petal-group">
+          <path class="petal" transform="rotate(135 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+        <g class="petal-group">
+          <path class="petal" transform="rotate(180 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+        <g class="petal-group">
+          <path class="petal" transform="rotate(225 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+        <g class="petal-group">
+          <path class="petal" transform="rotate(270 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+        <g class="petal-group">
+          <path class="petal" transform="rotate(315 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+      </g>
+    </svg></span>`;
 
-    # 1. Manage memory size
-    session["messages"] = await summarize_memory(session["messages"], llm)
+        // Maps a language to whatever markup is needed to actually see something
+        // rendered in a sandboxed iframe. Used only for Code Mode "show_preview" results.
+        function buildPreviewDoc(language, code) {
+            const lang = (language || '').trim().toLowerCase();
+            const safeCode = code || '';
 
-    # 2. Append the new human message
-    session["messages"].append(HumanMessage(content=request.message))
-
-    # 3. Streaming requests get real-time node-by-node progress from the graph itself —
-    #    hand off to the generator now instead of running the graph synchronously first.
-    if request.stream:
-        return StreamingResponse(
-            generate_stream(request, session, session_id),
-            media_type="text/event-stream"
-        )
-
-    # 4. Non-streaming (plain JSON) path. Small talk / short messages skip the plan-execute-reflect
-    #    loop entirely — no reason to pay for 5+ sequential LLM calls to answer "hi" or "thanks".
-    if is_simple_message(request.message):
-        final_response = await answer_directly(
-            request.message, session["messages"], request.model_type, request.temperature
-        )
-        final_state = {"completion_score": 100, "iteration": 1}
-    else:
-        # 4. Setup Initial State for the LangGraph Workflow
-        initial_state = {
-            "messages": session["messages"],
-            "model_type": request.model_type,
-            "temperature": request.temperature,
-            "max_iterations": request.max_iterations,
-            "iteration": 0,
-            "completion_score": 0,
-            "completed_steps": [],
-            "plan": []
+            if (lang.includes('html')) {
+                return safeCode;
+            }
+            if (lang.includes('css')) {
+                return `<!DOCTYPE html><html><head><style>${safeCode}</style></head><body style="font-family:sans-serif;padding:20px;"><h1>Heading</h1><p>Sample paragraph text to preview your CSS against.</p><button>Sample Button</button></body></html>`;
+            }
+            if (lang.includes('jsx') || lang.includes('tsx') || lang.includes('react')) {
+                return `<!DOCTYPE html><html><head>
+                    <script src="https://unpkg.com/react@18/umd/react.development.js"><\/script>
+                    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"><\/script>
+                    <script src="https://unpkg.com/@babel/standalone/babel.min.js"><\/script>
+                </head><body><div id="root"></div>
+                <script type="text/babel">
+                    ${safeCode}
+                    try {
+                        const rootEl = document.getElementById('root');
+                        const Comp = typeof App !== 'undefined' ? App : (typeof default1 !== 'undefined' ? default1 : null);
+                        if (Comp) { ReactDOM.createRoot(rootEl).render(React.createElement(Comp)); }
+                    } catch (e) { document.getElementById('root').innerText = 'Preview error: ' + e.message; }
+                <\/script></body></html>`;
+            }
+            // Plain JS or anything else frontend-ish: run inside a minimal page.
+            return `<!DOCTYPE html><html><body>
+                <script>${safeCode}<\/script>
+            </body></html>`;
         }
 
-        # 5. Size the timeout to the worst-case number of sequential LLM calls this request
-        #    could trigger, instead of a flat 20s that's fine for small tasks but too short
-        #    for anything that needs multiple plan/execute/reflect iterations.
-        timeout = graph_timeout_seconds(request.model_type, request.max_iterations)
-
-        try:
-            # Executes the full Goal->Plan->Execute->Reflect loop
-            final_state = await asyncio.wait_for(app_graph.ainvoke(initial_state), timeout=timeout)
-            final_response = final_state.get("response", "Task completed but no response was formulated.")
-        except asyncio.TimeoutError:
-            print(f"[{session_id}] Workflow timed out after {timeout:.0f}s. Falling back to direct answer.")
-            final_response = await answer_directly(
-                request.message, session["messages"], request.model_type, request.temperature
-            )
-            final_state = {"completion_score": 100, "iteration": 1}
-        except Exception as e:
-            print(f"[{session_id}] Workflow failed: {e}. Falling back to direct answer.")
-            final_response = await answer_directly(
-                request.message, session["messages"], request.model_type, request.temperature
-            )
-            final_state = {"completion_score": 100, "iteration": 1}
-
-    # 5. Append AI final answer to memory
-    session["messages"].append(AIMessage(content=final_response))
-
-    # 6. Return the plain JSON response (streaming requests already returned in step 3)
-    return {
-        "response": final_response,
-        "session_id": session_id,
-        "goal_progress": final_state.get("completion_score", 100),
-        "completed": final_state.get("completion_score", 100) >= 100,
-        "iterations": final_state.get("iteration", 1)
-    }
-
-# ==================================================================================
-# CODE MODE SECTION  —  fully separate from the normal chat section above.
-#
-# This section only handles "code with reasoning" requests. It has its own
-# models, its own session memory, its own LangGraph workflow, and its own
-# FastAPI endpoint. Nothing here touches or is touched by the normal /chat flow.
-# ==================================================================================
-
-# ----------------------------------------------------------------------
-# CODE MODE: Structured Output Models
-# ----------------------------------------------------------------------
-
-class CodeGoalExtraction(BaseModel):
-    main_goal: str = Field(description="The coding task the user actually wants solved")
-    language_hint: str = Field(description="Programming language / framework implied by the request, if any (empty string if unclear)")
-    constraints: List[str] = Field(description="Technical constraints or requirements to follow")
-    missing_information: List[str] = Field(description="What we need to ask the user, if anything")
-
-class CodePlannerOutput(BaseModel):
-    plan: List[str] = Field(description="Ordered list of technical steps to build the solution")
-    current_step: str = Field(description="The single immediate next step to execute")
-    approach: str = Field(description="Technical approach / design decision for this step")
-
-class CodeExecutorOutput(BaseModel):
-    code: str = Field(description="The generated code for the current step, complete and runnable")
-    language: str = Field(description="Programming language of the code, e.g. python, javascript, html, jsx, css")
-    explanation: str = Field(description="Brief explanation of what the code does")
-    is_frontend: bool = Field(description="True if this code renders a UI in a browser (html/css/js/react/vue/etc), false if it is backend/server/CLI/script code")
-
-class CodeReflectorOutput(BaseModel):
-    quality: str = Field(description="Assessment of the code quality")
-    correctness: str = Field(description="Is the code correct / free of bugs?")
-    bugs_found: str = Field(description="Any bugs, edge cases, or issues found")
-    improvements: str = Field(description="Actionable advice to improve the code")
-
-class CodeEvaluatorOutput(BaseModel):
-    completion_percentage: int = Field(description="0 to 100 representing how complete the coding task is")
-    confidence: float = Field(description="Confidence in this evaluation (0.0 to 1.0)")
-    should_continue: bool = Field(description="Whether more iterations are needed to finish the task")
-
-# ----------------------------------------------------------------------
-# CODE MODE: Graph State
-# ----------------------------------------------------------------------
-
-class CodeAgentState(TypedDict):
-    messages: List[BaseMessage]
-    goal: str
-    constraints: List[str]
-    plan: List[str]
-    current_step: str
-    completed_steps: List[str]
-    reflection: str
-    completion_score: int
-    iteration: int
-    max_iterations: int
-    code: str
-    language: str
-    is_frontend: bool
-    explanation: str
-    response: str
-    model_key: str
-    temperature: float
-
-# ----------------------------------------------------------------------
-# CODE MODE: Session Memory (kept separate from the normal chat sessions)
-# ----------------------------------------------------------------------
-
-code_sessions: Dict[str, Dict[str, Any]] = {}
-
-# ----------------------------------------------------------------------
-# CODE MODE: Model Router — only two models, both selectable by the user
-# ----------------------------------------------------------------------
-
-CODE_MODEL_MAP = {
-    "kimi": "nvidia/nemotron-3-ultra-550b-a55b",   # high-end reasoning and coding
-    "glm": "deepseek-ai/deepseek-v4-pro",          # fast response with code
-}
-
-# Both models ship with "Thinking" mode ON by default on NVIDIA NIM. That's the
-# actual reason Code Mode was returning no real answers: for structured JSON
-# calls (goal extraction, planning, execution, reflection, evaluation), when the
-# model's reasoning trace doesn't finish closing before max_tokens is hit, the
-# API hands back an empty/null final `content` — the whole token budget went to
-# reasoning_content instead of the answer. That's a documented NIM behavior for
-# both models (chat_template_kwargs), not something retries fix, since the same
-# elaborate system prompt makes the model "think" the same way every attempt.
-# Different model families use different toggle keys ("thinking" vs "enable_thinking").
-# Sending both every time — instead of keying off a hardcoded model-name list —
-# means this keeps working no matter which models CODE_MODEL_MAP points to;
-# unrecognized keys are harmlessly ignored by the chat template.
-CODE_THINKING_OFF_KWARGS = {"thinking": False, "enable_thinking": False}
-
-def get_code_llm(model_key: str, temperature: float = 0.2) -> ChatNVIDIA:
-    """Routes to one of the two Code Mode models. Uses the same NVIDIA_API_KEY as the rest of the app."""
-    key = (model_key or "").strip().lower()
-    model_name = CODE_MODEL_MAP.get(key, CODE_MODEL_MAP["kimi"])  # default to the high-reasoning model
-    thinking_kwargs = CODE_THINKING_OFF_KWARGS
-    return ChatNVIDIA(
-        model=model_name,
-        temperature=temperature,
-        max_tokens=16384,
-        timeout=120,
-        model_kwargs={"chat_template_kwargs": thinking_kwargs} if thinking_kwargs else {},
-    )
-
-# ----------------------------------------------------------------------
-# CODE MODE: Reasoning Level -> Max Iterations
-# ----------------------------------------------------------------------
-
-CODE_REASONING_ITERATIONS = {
-    "low": 2,
-    "medium": 3,
-    "high": 4,
-    "max": 5,
-}
-
-def get_code_max_iterations(reasoning_level: str) -> int:
-    return CODE_REASONING_ITERATIONS.get((reasoning_level or "").strip().lower(), CODE_REASONING_ITERATIONS["medium"])
-
-# ----------------------------------------------------------------------
-# CODE MODE: System Prompt — intentionally left empty, to be filled in separately
-# ----------------------------------------------------------------------
-
-CODE_SYSTEM_PROMPT = """You are an elite software engineering AI whose only responsibility is solving software engineering tasks.
-
-Your domain is strictly limited to:
-- Programming
-- Software architecture
-- Algorithms and data structures
-- Debugging
-- Refactoring
-- Code review
-- API design
-- Databases
-- DevOps
-- Testing
-- Performance optimization
-- Security
-- Documentation
-- System design
-
-Never switch into a general assistant role.
-
-If a request is unrelated to software engineering, politely refuse and explain that you are a dedicated coding agent.
-
---------------------------------------------------
-PRIMARY OBJECTIVE
---------------------------------------------------
-
-Produce correct, maintainable, production-quality software.
-
-Optimize for:
-
-- correctness
-- robustness
-- readability
-- maintainability
-- scalability
-- security
-- performance
-
-Never optimize for short answers over correct answers.
-
-Quality is always more important than speed.
-
---------------------------------------------------
-THINKING PRINCIPLES
---------------------------------------------------
-
-Before producing code:
-
-1. Understand the entire problem.
-2. Infer missing technical details when reasonable.
-3. Identify constraints.
-4. Identify edge cases.
-5. Design before coding.
-6. Prefer simple solutions over clever ones.
-7. Avoid unnecessary abstractions.
-8. Produce deterministic solutions.
-
-Never randomly guess APIs.
-
-If uncertain, clearly state assumptions.
-
---------------------------------------------------
-ENGINEERING STANDARDS
---------------------------------------------------
-
-Write code as if it will be maintained for years.
-
-Code should be:
-
-- modular
-- readable
-- testable
-- reusable
-- documented
-- typed whenever possible
-
-Avoid:
-
-- duplicated logic
-- magic numbers
-- deeply nested code
-- hidden side effects
-- global mutable state
-
-Prefer:
-
-- pure functions
-- composition
-- dependency injection
-- descriptive naming
-- explicit behavior
-
---------------------------------------------------
-CODE QUALITY
---------------------------------------------------
-
-Every implementation should aim for:
-
-Correctness first.
-
-Then:
-
-- simplicity
-- readability
-- maintainability
-- efficiency
-
-Never intentionally introduce:
-
-- dead code
-- unreachable branches
-- duplicated logic
-- unnecessary complexity
-
---------------------------------------------------
-BUG PREVENTION
---------------------------------------------------
-
-Actively search for:
-
-- null references
-- race conditions
-- resource leaks
-- off-by-one errors
-- integer overflow
-- invalid assumptions
-- concurrency issues
-- API misuse
-- security vulnerabilities
-
-Prevent them before they happen.
-
---------------------------------------------------
-SECURITY
---------------------------------------------------
-
-Always consider:
-
-- input validation
-- output escaping
-- authentication
-- authorization
-- injection attacks
-- secrets management
-- secure defaults
-- least privilege
-
-Never generate insecure production code when a secure alternative exists.
-
---------------------------------------------------
-PERFORMANCE
---------------------------------------------------
-
-When writing algorithms:
-
-Consider:
-
-Time complexity
-
-Space complexity
-
-Scalability
-
-Avoid premature optimization unless required.
-
---------------------------------------------------
-TESTING
---------------------------------------------------
-
-Every implementation should be easy to test.
-
-When appropriate, suggest:
-
-- unit tests
-- integration tests
-- edge cases
-- failure cases
-
---------------------------------------------------
-ERROR HANDLING
---------------------------------------------------
-
-Handle failures explicitly.
-
-Prefer meaningful errors over silent failures.
-
-Never swallow exceptions without reason.
-
---------------------------------------------------
-COMMUNICATION
---------------------------------------------------
-
-Be concise but technically complete.
-
-Avoid unnecessary filler.
-
-Explain only when useful.
-
-Focus on engineering.
-
---------------------------------------------------
-WHEN MODIFYING EXISTING CODE
---------------------------------------------------
-
-Preserve:
-
-- public APIs
-- behavior
-- compatibility
-
-unless the task explicitly requests breaking changes.
-
-Minimize unnecessary modifications.
-
---------------------------------------------------
-WHEN DEBUGGING
---------------------------------------------------
-
-Find the root cause.
-
-Do not merely patch symptoms.
-
-Explain why the issue occurred.
-
---------------------------------------------------
-WHEN REFACTORING
---------------------------------------------------
-
-Improve:
-
-- readability
-- maintainability
-- architecture
-
-without changing behavior.
-
---------------------------------------------------
-WHEN WRITING NEW CODE
---------------------------------------------------
-
-Prefer production-ready implementations over toy examples.
-
-Avoid placeholders.
-
-Avoid pseudocode unless explicitly requested.
-
---------------------------------------------------
-OUTPUT REQUIREMENTS
---------------------------------------------------
-
-Generated code should:
-
-compile whenever possible
-
-follow language conventions
-
-include imports
-
-include necessary dependencies
-
-be complete
-
-not omit important sections
-
---------------------------------------------------
-FINAL VALIDATION
---------------------------------------------------
-
-Before finishing, internally verify:
-
-✓ Requirements satisfied
-
-✓ Logic is correct
-
-✓ Edge cases considered
-
-✓ Security reviewed
-
-✓ Performance acceptable
-
-✓ Code is maintainable
-
-✓ No unnecessary complexity
-
-Only then produce the final answer.
-
---------------------------------------------------
-OUTPUT FORMAT CONSTRAINT (CRITICAL — READ THIS)
---------------------------------------------------
-
-You can only return ONE code block per turn (one 'code' + one 'language' field).
-There is no mechanism to deliver separate files in the same turn.
-
-Because of this:
-- For any frontend/web task (HTML, CSS, JS, a "website", "app", "page", "UI"),
-  you MUST produce a single self-contained .html file with CSS inside a
-  <style> tag and JS inside a <script> tag, in the <head>/<body> of that
-  same file. NEVER write <link rel="stylesheet" href="styles.css"> or
-  <script src="app.js"> — those files will never exist, and the page will
-  silently render unstyled and non-functional.
-- If a task genuinely requires multiple real files (e.g. a Python package),
-  pick the single most important file for this step and say in your
-  explanation which other files still need separate follow-up turns —
-  do not silently drop files with no mention.
-"""
-
-# ----------------------------------------------------------------------
-# CODE MODE: Frontend vs Backend Detection (drives whether a live preview
-# is shown, the same way Gemini Canvas / Claude Artifacts only preview
-# renderable frontend code and just show a code block for backend code)
-# ----------------------------------------------------------------------
-
-FRONTEND_CODE_LANGUAGES = {
-    "html", "htm", "css", "scss", "sass", "javascript", "js", "jsx",
-    "typescript", "ts", "tsx", "vue", "svelte", "react",
-}
-BACKEND_CODE_LANGUAGES = {
-    "python", "py", "java", "c", "cpp", "c++", "csharp", "c#", "go", "golang",
-    "rust", "ruby", "php", "sql", "bash", "shell", "sh", "kotlin", "swift",
-    "scala", "perl", "r", "dart", "elixir", "haskell", "lua",
-}
-
-_FRONTEND_CODE_SIGNALS = (
-    "<html", "<!doctype html", "<div", "<body", "document.getelementbyid",
-    "usestate(", "import react", "from 'react'", "<template>", "createroot",
-    "addeventlistener", "queryselector", "export default function",
-)
-_BACKEND_CODE_SIGNALS = (
-    "def ", "import flask", "@app.route", "public static void main",
-    "using system;", "func main(", "package main", "import fastapi",
-    "select * from", "#include <", "class ", "require(",
-)
-
-def classify_code_target(language: str, code: str) -> bool:
-    """
-    Returns True if the code should be treated as frontend (preview-able), False if backend.
-    Trusts the explicit language first; falls back to a content heuristic only if the
-    language is missing or ambiguous.
-    """
-    lang = (language or "").strip().lower()
-    if lang in FRONTEND_CODE_LANGUAGES:
-        return True
-    if lang in BACKEND_CODE_LANGUAGES:
-        return False
-
-    code_lower = (code or "").lower()
-    fe_score = sum(1 for s in _FRONTEND_CODE_SIGNALS if s in code_lower)
-    be_score = sum(1 for s in _BACKEND_CODE_SIGNALS if s in code_lower)
-    if fe_score > be_score:
-        return True
-    return False  # default: no preview when unclear (safer than a broken preview)
-
-# ----------------------------------------------------------------------
-# CODE MODE: Single-file bundling guard
-#
-# The "always one self-contained HTML file" rule (see OUTPUT FORMAT CONSTRAINT
-# above) is enforced only by the prompt, so on a follow-up turn ("add a navbar")
-# the model sometimes answers just the narrow slice it was asked for instead of
-# re-emitting the whole bundled page. When that happens this does one cheap
-# follow-up call to merge the new snippet back into the previous full file, so
-# the frontend Canvas always gets a complete, runnable single file.
-# ----------------------------------------------------------------------
-
-async def merge_html_bundle(prior_code: str, new_snippet: str, model_key: str, temperature: float) -> str:
-    if not prior_code:
-        return new_snippet  # nothing to merge into (first turn) — return as-is
-
-    llm = get_code_llm(model_key, temperature)
-    prompt = (
-        "Merge the 'New Snippet' into the 'Existing File' below. Produce ONE complete, "
-        "self-contained HTML file with ALL CSS inside a single <style> tag and ALL JS inside "
-        "a single <script> tag, both inside that same file. Never use <link rel=\"stylesheet\"> "
-        "or <script src=...> pointing at separate files. Preserve everything from the existing "
-        "file that the new snippet doesn't change. Return ONLY the raw HTML — no explanation, "
-        "no markdown code fences.\n\n"
-        f"Existing File:\n{prior_code}\n\nNew Snippet:\n{new_snippet}"
-    )
-    try:
-        res = await llm.ainvoke([HumanMessage(content=prompt)])
-        merged = strip_thinking(res.content).strip()
-        fence_match = CODE_FENCE_RE.search(merged)  # strip fences if the model added them anyway
-        if fence_match:
-            merged = fence_match.group(2).strip()
-        return merged if merged else new_snippet
-    except Exception as e:
-        print(f"[CodeMode] HTML merge pass failed: {e}")
-        return new_snippet  # fall back to whatever we had rather than losing the answer
-
-# ----------------------------------------------------------------------
-# CODE MODE: Structured LLM Execution Helper (mirrors execute_llm_structured,
-# but uses CODE_SYSTEM_PROMPT instead of the GoalAI persona)
-# ----------------------------------------------------------------------
-
-async def execute_code_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic_model, state: dict, retries: int = 2):
-    """Executes an LLM call and ensures structured Pydantic output.
-
-    Returns (parsed_result, error_message). On success error_message is None.
-    On failure parsed_result is None and error_message holds the real reason
-    (e.g. an auth/rate-limit/timeout error from the model call, or the actual
-    parsing failure) — previously this was only printed to server logs, so
-    every failure looked identical to the caller and the user just saw a
-    generic canned message with no way to tell what actually went wrong.
-    """
-    parser = PydanticOutputParser(pydantic_object=pydantic_model)
-    format_instructions = parser.get_format_instructions()
-
-    base_system = CODE_SYSTEM_PROMPT if CODE_SYSTEM_PROMPT.strip() else "You are a coding assistant that returns structured, well-formatted output."
-
-    # format_instructions is raw JSON-schema text full of literal { } characters.
-    # It must be handed to ChatPromptTemplate as a template VARIABLE (filled in at
-    # .ainvoke time), never concatenated into the template string itself — otherwise
-    # LangChain tries to parse every brace in the schema as a template placeholder
-    # and throws on every single call. This mirrors execute_llm_structured above,
-    # which already does it the safe way.
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", base_system + "\n\n{format_instructions}"),
-        ("user", prompt_str)
-    ])
-
-    chain = prompt | llm
-
-    last_error = "Unknown error"
-    for attempt in range(retries):
-        try:
-            res = await chain.ainvoke({"format_instructions": format_instructions, **state})
-            content = strip_thinking(res.content).strip()
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-
-            return parser.parse(content.strip()), None
-        except Exception as e:
-            last_error = f"{type(e).__name__}: {e}"
-            print(f"[CodeMode] Structured Parsing Retry {attempt + 1}/{retries} failed: {e} | Raw content: {res.content[:300] if 'res' in dir() else 'N/A'}")
-            await asyncio.sleep(0.5)
-
-    return None, last_error
-
-def format_code_context(state: CodeAgentState) -> str:
-    msg_str = "\n".join([f"{m.type.capitalize()}: {m.content}" for m in state.get("messages", [])])
-
-    return f"""Conversation History:
-{msg_str}
-
-Current Internal State:
-- Goal: {state.get('goal', 'Not set')}
-- Constraints: {state.get('constraints', [])}
-- Plan: {state.get('plan', [])}
-- Completed Steps: {state.get('completed_steps', [])}
-- Current Step: {state.get('current_step', 'Not set')}
-- Prior Code Draft: {state.get('code', 'None')}
-- Prior Language: {state.get('language', 'None')}
-- Reflection on Draft: {state.get('reflection', 'None')}
-"""
-
-# ----------------------------------------------------------------------
-# CODE MODE: LangGraph Nodes
-# ----------------------------------------------------------------------
-
-async def understand_code_goal_node(state: CodeAgentState) -> dict:
-    llm = get_code_llm(state["model_key"], state["temperature"])
-    prompt = "Analyze this conversation and extract the core coding goal, language hint, constraints, and missing info.\n\n{context}"
-
-    res, err = await execute_code_llm_structured(llm, prompt, CodeGoalExtraction, {"context": format_code_context(state)})
-
-    return {
-        "goal": res.main_goal if res else "Write the requested code.",
-        "constraints": res.constraints if res else [],
-        "iteration": 0,
-        "completed_steps": [],
-        "plan": state.get("plan", []),
-        "last_error": err
-    }
-
-async def code_planner_node(state: CodeAgentState) -> dict:
-    llm = get_code_llm(state["model_key"], state["temperature"])
-    prompt = "Based on the goal and completed steps, create or update the technical plan. Identify the single immediate next step.\n\n{context}"
-
-    res, err = await execute_code_llm_structured(llm, prompt, CodePlannerOutput, {"context": format_code_context(state)})
-
-    iteration = state.get("iteration", 0) + 1
-
-    return {
-        "plan": res.plan if res else state.get("plan", []),
-        "current_step": res.current_step if res else "Write the code that satisfies the goal.",
-        "iteration": iteration,
-        "last_error": err
-    }
-
-async def code_executor_node(state: CodeAgentState) -> dict:
-    llm = get_code_llm(state["model_key"], state["temperature"])
-    prompt = "Execute the 'Current Step' to satisfy the coding 'Goal'. Return complete, runnable code plus its language and a brief explanation.\n\n{context}"
-
-    res, err = await execute_code_llm_structured(llm, prompt, CodeExecutorOutput, {"context": format_code_context(state)})
-
-    new_completed = state.get("completed_steps", []) + [state.get("current_step", "")]
-
-    if res:
-        language = res.language
-        code = res.code
-        try:
-            is_frontend = res.is_frontend if res.is_frontend is not None else classify_code_target(language, code)
-        except Exception as e:
-            print(f"[CodeMode] classify_code_target failed: {e}")
-            is_frontend = bool(res.is_frontend)
-        explanation = res.explanation
-    else:
-        language, code, is_frontend = "", "", False
-        # Surface the real reason instead of a generic canned message, so a bad
-        # API key / rate limit / model error is visible instead of looking like
-        # a random glitch every time.
-        explanation = f"I hit an issue generating code for this step: {err}" if err else "I hit an issue generating code for this step."
-
-    # Guard: a "frontend HTML" answer that dropped the required single-file bundling
-    # (e.g. a follow-up that only answered the narrow ask, "add a navbar", instead of
-    # re-emitting the full page) gets one cheap merge pass so the Canvas always gets a
-    # complete, runnable file instead of a bare fragment.
-    prior_code = state.get("code", "")
-    if code and is_frontend and language.strip().lower() in ("html", "htm") and prior_code:
-        has_style_or_script = ("<style" in code.lower()) or ("<script" in code.lower())
-        looks_like_full_page = ("<html" in code.lower()) or ("<!doctype" in code.lower())
-        if not (has_style_or_script and looks_like_full_page):
-            code = await merge_html_bundle(prior_code, code, state["model_key"], state["temperature"])
-
-    # Only emit a fenced code block when there IS code. An empty ```{lang}\n\n```
-    # fence still gets parsed as a real (empty) code block by the frontend's
-    # markdown renderer, and highlight.js then auto-detects a language on the
-    # empty content and labels it "undefined" — that's the stray "undefined"
-    # line that shows up after a failed generation.
-    response_text = f"{explanation}\n\n```{language}\n{code}\n```".strip() if code else explanation
-
-    return {
-        "code": code,
-        "language": language,
-        "is_frontend": is_frontend,
-        "explanation": explanation,
-        "response": response_text,
-        "completed_steps": new_completed,
-        "last_error": err
-    }
-
-async def code_reflector_node(state: CodeAgentState) -> dict:
-    llm = get_code_llm(state["model_key"], state["temperature"])
-    prompt = "Review the 'Prior Code Draft' against the 'Goal' and 'Constraints'. Check correctness, bugs, and quality.\n\n{context}"
-
-    res, err = await execute_code_llm_structured(llm, prompt, CodeReflectorOutput, {"context": format_code_context(state)})
-
-    reflection_str = "Looks solid."
-    if res:
-        reflection_str = f"Quality: {res.quality} | Correctness: {res.correctness} | Bugs: {res.bugs_found} | Improvements: {res.improvements}"
-    elif err:
-        reflection_str = f"Skipped review — the review step hit an error: {err}"
-
-    return {
-        "reflection": reflection_str,
-        "last_error": err
-    }
-
-async def code_evaluator_node(state: CodeAgentState) -> dict:
-    llm = get_code_llm(state["model_key"], state["temperature"])
-    prompt = "Based on the reflection, evaluate if the coding goal is now fully achieved (0-100 completion).\n\n{context}"
-
-    res, err = await execute_code_llm_structured(llm, prompt, CodeEvaluatorOutput, {"context": format_code_context(state)})
-
-    # Defaults to 100 on failure so the loop stops instead of retrying against
-    # a backend that's already failing, rather than implying the task is done.
-    score = res.completion_percentage if res else 100
-
-    return {
-        "completion_score": score,
-        "last_error": err
-    }
-
-def code_decision_edge(state: CodeAgentState) -> str:
-    """Decides whether to end the code reasoning loop or continue planning/executing."""
-    if state.get("completion_score", 0) >= 100:
-        return END
-    if state.get("iteration", 0) >= state.get("max_iterations", 3):
-        return END
-    return "code_planner"
-
-# ----------------------------------------------------------------------
-# CODE MODE: Workflow Graph (separate compiled graph from the normal app_graph)
-# ----------------------------------------------------------------------
-
-code_workflow = StateGraph(CodeAgentState)
-
-code_workflow.add_node("understand_code_goal", understand_code_goal_node)
-code_workflow.add_node("code_planner", code_planner_node)
-code_workflow.add_node("code_executor", code_executor_node)
-code_workflow.add_node("code_reflector", code_reflector_node)
-code_workflow.add_node("code_evaluator", code_evaluator_node)
-
-code_workflow.set_entry_point("understand_code_goal")
-code_workflow.add_edge("understand_code_goal", "code_planner")
-code_workflow.add_edge("code_planner", "code_executor")
-code_workflow.add_edge("code_executor", "code_reflector")
-code_workflow.add_edge("code_reflector", "code_evaluator")
-code_workflow.add_conditional_edges("code_evaluator", code_decision_edge)
-
-code_app_graph = code_workflow.compile()
-
-# ----------------------------------------------------------------------
-# CODE MODE: Direct-answer fallback (used for tiny messages, timeouts, errors)
-# ----------------------------------------------------------------------
-
-CODE_FENCE_RE = re.compile(r"```([\w+#.-]*)\n([\s\S]*?)```")
-
-def extract_code_from_answer(answer: str) -> tuple[str, str]:
-    """Pulls the first fenced code block out of a plain-text LLM answer, if any.
-    Needed because answer_code_directly (used for timeouts/errors/simple messages)
-    only ever produced free-text before — the code was inside that text but never
-    split out into its own field, so the frontend Canvas had nothing to render."""
-    match = CODE_FENCE_RE.search(answer or "")
-    if not match:
-        return "", ""
-    return (match.group(1) or "").strip(), match.group(2).strip()
-
-async def answer_code_directly(message: str, history: List[BaseMessage], model_key: str, temperature: float) -> dict:
-    """Always returns a real code answer — falls back to the other Code Mode model if the primary one fails."""
-    base_system = CODE_SYSTEM_PROMPT if CODE_SYSTEM_PROMPT.strip() else "You are a coding assistant. Respond with code and a brief explanation."
-    messages = [SystemMessage(content=base_system)]
-    messages.extend(history[-6:])
-    messages.append(HumanMessage(content=message))
-
-    fallback_key = "glm" if (model_key or "").strip().lower() != "glm" else "kimi"
-
-    for key in (model_key, fallback_key):
-        try:
-            llm = get_code_llm(key, temperature)
-            res = await llm.ainvoke(messages)
-            answer = strip_thinking(res.content).strip()
-            if answer:
-                language, code = extract_code_from_answer(answer)
-                is_frontend = classify_code_target(language, code) if code else False
-                return {"text": answer, "code": code, "language": language, "is_frontend": is_frontend}
-        except Exception as e:
-            print(f"[CodeMode] Model '{key}' failed: {e}")
-
-    return {"text": "I'm having trouble reaching the code model right now. Please try again in a moment.", "code": "", "language": "", "is_frontend": False}
-
-def code_graph_timeout_seconds(model_key: str, max_iterations: int) -> float:
-    """Sizes the overall graph timeout the same way the normal chat section does, but keyed off
-    the two Code Mode models: kimi (high-end reasoning) gets a larger per-call budget than glm (fast)."""
-    per_call_seconds = 140.0 if (model_key or "").strip().lower() == "kimi" else 90.0
-    worst_case_calls = 1 + (max_iterations * 4)
-    return min(worst_case_calls * per_call_seconds, 240.0)
-
-CODE_NODE_LABELS = {
-    "understand_code_goal": "Understanding the coding goal",
-    "code_planner": "Planning the implementation",
-    "code_executor": "Writing the code",
-    "code_reflector": "Reviewing the code",
-    "code_evaluator": "Confirming completion",
-}
-
-def code_node_detail(node_name: str, state: dict) -> str:
-    if node_name == "understand_code_goal":
-        err = state.get("last_error")
-        if err:
-            return f"Understanding the goal hit an error: {err}"
-        goal = state.get("goal", "")
-        return f"Understanding the goal: {goal}" if goal else "Understanding the coding goal."
-    if node_name == "code_planner":
-        err = state.get("last_error")
-        if err:
-            return f"Planning hit an error: {err}"
-        step = state.get("current_step", "")
-        return f"Planning the next step: {step}" if step else "Planning the implementation."
-    if node_name == "code_executor":
-        explanation = state.get("explanation", "")
-        return explanation if explanation else "Writing code for the current step."
-    if node_name == "code_reflector":
-        reflection = state.get("reflection", "")
-        return reflection if reflection else "Reviewing the code for bugs and quality."
-    if node_name == "code_evaluator":
-        score = state.get("completion_score", None)
-        return f"Completion check: {score}% of the task is done." if score is not None else "Checking whether the task is complete."
-    return CODE_NODE_LABELS.get(node_name, node_name)
-
-async def run_code_graph_streaming(initial_state: dict, timeout: float):
-    """Streams (node_name, state) tuples from the LangGraph run. Also yields periodic
-    (None, state_acc) heartbeats every ~12s so a single slow node call (these can take
-    60-140s with zero bytes sent in between) doesn't leave the SSE connection silent long
-    enough for a hosting platform's proxy (e.g. Render) to kill it as idle. That silent
-    kill — not a Python exception — is what shows up as 'thinking animation finishes,
-    then nothing': the connection dies mid-node, so there's nothing to catch or log."""
-    state_acc = dict(initial_state)
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout
-    agen = code_app_graph.astream(initial_state, stream_mode="updates")
-    HEARTBEAT_INTERVAL = 12.0
-    try:
-        while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                raise asyncio.TimeoutError()
-            wait_chunk = min(HEARTBEAT_INTERVAL, remaining)
-            try:
-                chunk = await asyncio.wait_for(agen.__anext__(), timeout=wait_chunk)
-            except asyncio.TimeoutError:
-                if wait_chunk >= remaining:
-                    raise
-                yield None, state_acc  # heartbeat only — no node finished yet
-                continue
-            node_name, node_output = next(iter(chunk.items()))
-            state_acc.update(node_output)
-            yield node_name, state_acc
-    except StopAsyncIteration:
-        return
-    finally:
-        await agen.aclose()
-
-async def generate_code_stream(request: "CodeChatRequest", session: dict, session_id: str):
-    """Streams SSE events for Code Mode: status updates while working, then the final
-    answer word-by-word, followed by one 'code_result' event carrying the code/language/
-    show_preview fields so the frontend can decide whether to render a live preview."""
-    max_iterations = get_code_max_iterations(request.reasoning_level)
-
-    if is_simple_message(request.message):
-        yield f"data: {json.dumps({'type': 'status', 'step': 'direct', 'label': 'Answering', 'detail': 'Short message — answering directly without the full coding loop.'})}\n\n"
-        result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
-        final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
-        final_state = {"completion_score": 100, "iteration": 1}
-    else:
-        initial_state = {
-            "messages": session["messages"],
-            "model_key": request.model,
-            "temperature": request.temperature,
-            "max_iterations": max_iterations,
-            "iteration": 0,
-            "completion_score": 0,
-            "completed_steps": [],
-            "plan": [],
-            # Seed the real previous code/language so follow-up turns amend the actual
-            # prior file instead of relying only on the plain-text chat history — this is
-            # what was causing "task completed, no code" replies on a second ask.
-            "code": session.get("last_code", ""),
-            "language": session.get("last_language", "")
-        }
-        timeout = code_graph_timeout_seconds(request.model, max_iterations)
-        final_state = initial_state
-
-        try:
-            async for node_name, state_so_far in run_code_graph_streaming(initial_state, timeout):
-                if node_name is None:
-                    yield ": keep-alive\n\n"  # SSE comment — keeps the connection alive, frontend ignores it
-                    continue
-                label = CODE_NODE_LABELS.get(node_name, node_name)
-                detail = code_node_detail(node_name, state_so_far)
-                yield f"data: {json.dumps({'type': 'status', 'step': node_name, 'label': label, 'detail': detail})}\n\n"
-                final_state = state_so_far
-            if "response" not in final_state:
-                print(f"[{session_id}] Code graph finished with no 'response' key. final_state keys: {list(final_state.keys())}")
-            final_response = final_state.get("response", "Task completed but no code was formulated.")
-            code = final_state.get("code", "")
-            language = final_state.get("language", "")
-            is_frontend = final_state.get("is_frontend", False)
-        except asyncio.TimeoutError:
-            print(f"[{session_id}] Code Mode streaming timed out after {timeout:.0f}s. Falling back to direct answer.")
-            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'The coding loop was taking too long, so falling back to a direct answer.'})}\n\n"
-            result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
-            final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
-            final_state = {"completion_score": 100, "iteration": 1}
-        except Exception as e:
-            print(f"[{session_id}] Code Mode streaming failed: {e}. Falling back to direct answer.")
-            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'Something went wrong in the coding loop, so falling back to a direct answer.'})}\n\n"
-            result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
-            final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
-            final_state = {"completion_score": 100, "iteration": 1}
-
-    # Hard guarantee: no matter what path got here, never let an empty string reach the
-    # frontend — that's what silently produced a blank bubble after the thinking animation
-    # ended (the animation still resolves to "Thought for Ns" either way, so an empty
-    # answer looked exactly like the whole thing just doing nothing).
-    if not (final_response or "").strip():
-        final_response = "I wasn't able to generate a response for that — please try again."
-
-    # Remember this turn's code so the NEXT turn can seed it back in (only overwrite
-    # when we actually got new code — a turn that produced none shouldn't wipe out a
-    # perfectly good previous file).
-    if code:
-        session["last_code"], session["last_language"] = code, language
-
-    session["messages"].append(AIMessage(content=final_response))
-
-    chunks = final_response.split(" ")
-    for i, chunk in enumerate(chunks):
-        space = " " if i < len(chunks) - 1 else ""
-        data = {
-            "type": "message",
-            "assistant_message": chunk + space,
-            "conversation_id": session_id,
-            "session_id": session_id,
-            "goal_complete": final_state.get("completion_score", 100) >= 100
-        }
-        yield f"data: {json.dumps(data)}\n\n"
-        await asyncio.sleep(0.015)
-
-    # One final event carrying the structured code result, so the frontend can render
-    # a live preview (Gemini-Canvas style) only when the code is frontend code.
-    yield f"data: {json.dumps({'type': 'code_result', 'code': code, 'language': language, 'show_preview': bool(is_frontend), 'session_id': session_id})}\n\n"
-
-# ----------------------------------------------------------------------
-# CODE MODE: FastAPI request models
-# ----------------------------------------------------------------------
-
-class CodeChatRequest(BaseModel):
-    message: str
-    session_id: str
-    model: str = "kimi"           # "kimi" -> moonshotai/kimi-k2.6, "glm" -> z-ai/glm-5.2
-    reasoning_level: str = "medium"  # "low" | "medium" | "high" | "max"
-    stream: bool = False
-    temperature: float = 0.2
-
-class ClearCodeSessionRequest(BaseModel):
-    session_id: str
-
-# ----------------------------------------------------------------------
-# CODE MODE: FastAPI endpoint
-# ----------------------------------------------------------------------
-
-@app.post("/code-chat")
-async def code_chat(request: CodeChatRequest):
-    try:
-        return await _handle_code_chat(request)
-    except Exception as e:
-        print(f"Code chat handler failed entirely: {e}")
-        return {
-            "response": "Something went wrong on my end — please try again.",
-            "session_id": request.session_id,
-            "code": "",
-            "language": "",
-            "show_preview": False,
-            "goal_progress": 0,
-            "completed": False,
-            "iterations": 0
+        function highlightCode(el) {
+            el.querySelectorAll('pre code').forEach(codeEl => {
+                hljs.highlightElement(codeEl);
+                const pre = codeEl.parentElement;
+                if (pre.parentElement.classList.contains('code-card')) return;
+
+                const langClass = [...codeEl.classList].find(c => c.startsWith('language-'));
+                const lang = langClass ? langClass.replace('language-', '') : 'text';
+                const isSvg = lang === 'svg' || codeEl.textContent.trim().startsWith('<svg');
+
+                const card = document.createElement('div');
+                card.className = 'code-card';
+                card.dataset.lang = lang;
+                const header = document.createElement('div');
+                header.className = 'code-card-header';
+
+                const copyBtnHtml = `
+                    <button class="copy-btn" type="button">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                        <span>Copy</span>
+                    </button>
+                `;
+
+                let previewDiv = null;
+
+                if (isSvg) {
+                    header.innerHTML = `
+                        <div class="artifact-tabs">
+                            <button class="artifact-tab active" type="button" data-tab="preview">Preview</button>
+                            <button class="artifact-tab" type="button" data-tab="code">Code</button>
+                        </div>
+                        ${copyBtnHtml}
+                    `;
+                    previewDiv = document.createElement('div');
+                    previewDiv.className = 'artifact-preview';
+                    previewDiv.innerHTML = DOMPurify.sanitize(codeEl.textContent, { USE_PROFILES: { svg: true, svgFilters: true } });
+                    pre.hidden = true;
+
+                    const tabs = header.querySelectorAll('.artifact-tab');
+                    tabs.forEach(tab => {
+                        tab.addEventListener('click', () => {
+                            tabs.forEach(t => t.classList.remove('active'));
+                            tab.classList.add('active');
+                            const showPreview = tab.dataset.tab === 'preview';
+                            previewDiv.hidden = !showPreview;
+                            pre.hidden = showPreview;
+                        });
+                    });
+                } else {
+                    header.innerHTML = `<span class="code-card-lang">${lang}</span>${copyBtnHtml}`;
+                }
+
+                const copyBtn = header.querySelector('.copy-btn');
+                const copyLabel = copyBtn.querySelector('span');
+                copyBtn.addEventListener('click', () => {
+                    navigator.clipboard.writeText(codeEl.textContent);
+                    copyLabel.textContent = 'Copied!';
+                    setTimeout(() => { copyLabel.textContent = 'Copy'; }, 1500);
+                });
+
+                pre.parentNode.insertBefore(card, pre);
+                card.appendChild(header);
+                if (previewDiv) card.appendChild(previewDiv);
+                card.appendChild(pre);
+            });
         }
 
-async def _handle_code_chat(request: CodeChatRequest):
-    session_id = request.session_id
+        // ================= CODE CANVAS =================
+        // Everything below only runs when Code mode calls updateCodeCanvas().
+        // Nothing here is invoked from the Chat mode code path.
 
-    if session_id not in code_sessions:
-        code_sessions[session_id] = {"messages": []}
-
-    session = code_sessions[session_id]
-    max_iterations = get_code_max_iterations(request.reasoning_level)
-    llm = get_code_llm(request.model, request.temperature)
-
-    session["messages"] = await summarize_memory(session["messages"], llm)
-    session["messages"].append(HumanMessage(content=request.message))
-
-    if request.stream:
-        return StreamingResponse(
-            generate_code_stream(request, session, session_id),
-            media_type="text/event-stream"
-        )
-
-    if is_simple_message(request.message):
-        result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
-        final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
-        final_state = {"completion_score": 100, "iteration": 1}
-    else:
-        initial_state = {
-            "messages": session["messages"],
-            "model_key": request.model,
-            "temperature": request.temperature,
-            "max_iterations": max_iterations,
-            "iteration": 0,
-            "completion_score": 0,
-            "completed_steps": [],
-            "plan": [],
-            # Seed the real previous code/language so follow-up turns amend the actual
-            # prior file instead of relying only on the plain-text chat history — this is
-            # what was causing "task completed, no code" replies on a second ask.
-            "code": session.get("last_code", ""),
-            "language": session.get("last_language", "")
+        function friendlyLangLabel(language) {
+            const lang = (language || '').trim();
+            if (!lang) return 'Code';
+            const known = { html: 'HTML', css: 'CSS', javascript: 'JavaScript', js: 'JavaScript', jsx: 'JSX', tsx: 'TSX', json: 'JSON', python: 'Python', py: 'Python' };
+            return known[lang.toLowerCase()] || (lang.charAt(0).toUpperCase() + lang.slice(1));
         }
-        timeout = code_graph_timeout_seconds(request.model, max_iterations)
 
-        try:
-            final_state = await asyncio.wait_for(code_app_graph.ainvoke(initial_state), timeout=timeout)
-            if "response" not in final_state:
-                print(f"[{session_id}] Code graph finished with no 'response' key. final_state keys: {list(final_state.keys())}")
-            final_response = final_state.get("response", "Task completed but no code was formulated.")
-            code = final_state.get("code", "")
-            language = final_state.get("language", "")
-            is_frontend = final_state.get("is_frontend", False)
-        except asyncio.TimeoutError:
-            print(f"[{session_id}] Code Mode workflow timed out after {timeout:.0f}s. Falling back to direct answer.")
-            result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
-            final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
-            final_state = {"completion_score": 100, "iteration": 1}
-        except Exception as e:
-            print(f"[{session_id}] Code Mode workflow failed: {e}. Falling back to direct answer.")
-            result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
-            final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
-            final_state = {"completion_score": 100, "iteration": 1}
+        function fileExtensionFor(language) {
+            const map = { html: 'html', css: 'css', javascript: 'js', js: 'js', jsx: 'jsx', tsx: 'tsx', typescript: 'ts', python: 'py', py: 'py', json: 'json' };
+            return map[(language || '').trim().toLowerCase()] || 'txt';
+        }
 
-    if not (final_response or "").strip():
-        final_response = "I wasn't able to generate a response for that — please try again."
+        // Called from Code mode's sendMessage() the moment a code_result arrives
+        // (streaming) or a non-streaming response with code comes back. Stores the
+        // result on modes.code and renders it only if Code mode is currently visible.
+        function updateCodeCanvas(language, code, showPreview) {
+            if (!code) return;
+            modes.code.canvas = {
+                open: true,
+                language: language || '',
+                code: code,
+                showPreview: !!showPreview,
+                tab: showPreview ? 'preview' : 'code'
+            };
+            if (currentMode === 'code') renderCodeCanvas();
+        }
 
-    # Remember this turn's code so the NEXT turn can seed it back in (only overwrite
-    # when we actually got new code — a turn that produced none shouldn't wipe out a
-    # perfectly good previous file).
-    if code:
-        session["last_code"], session["last_language"] = code, language
+        function renderCodeCanvas() {
+            const state = modes.code.canvas;
+            if (!state || !state.open) { codeCanvas.hidden = true; return; }
 
-    session["messages"].append(AIMessage(content=final_response))
+            canvasTitle.textContent = `${friendlyLangLabel(state.language)}${state.showPreview ? ' Preview' : ''}`;
+            canvasCodeEl.textContent = state.code;
+            canvasCodeEl.className = `language-${(state.language || 'plaintext').toLowerCase()}`;
+            canvasCodeEl.removeAttribute('data-highlighted');
+            hljs.highlightElement(canvasCodeEl);
 
-    return {
-        "response": final_response,
-        "session_id": session_id,
-        "code": code,
-        "language": language,
-        "show_preview": bool(is_frontend),   # frontend code -> True (render live preview); backend code -> False
-        "model": request.model,
-        "reasoning_level": request.reasoning_level,
-        "max_iterations": max_iterations,
-        "goal_progress": final_state.get("completion_score", 100),
-        "completed": final_state.get("completion_score", 100) >= 100,
-        "iterations": final_state.get("iteration", 1)
-    }
+            document.getElementById('canvasPreviewTabBtn').style.display = state.showPreview ? '' : 'none';
+            if (state.showPreview) {
+                canvasPreviewFrame.srcdoc = buildPreviewDoc(state.language, state.code);
+            }
 
-@app.post("/clear-code-session")
-async def clear_code_session(request: ClearCodeSessionRequest):
-    if request.session_id in code_sessions:
-        del code_sessions[request.session_id]
-    return {"status": "success", "message": f"Code session {request.session_id} cleared."}
+            setCanvasTab(state.showPreview ? state.tab : 'code');
+            codeCanvas.hidden = false;
+        }
 
-if __name__ == "__main__":
-    # Ensure uvicorn runs the correct file 'main' instead of 'app'
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+        function setCanvasTab(tab) {
+            if (modes.code.canvas) modes.code.canvas.tab = tab;
+            document.querySelectorAll('#canvasTabs button').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === tab));
+            document.getElementById('canvasPreviewView').hidden = tab !== 'preview';
+            document.getElementById('canvasCodeView').hidden = tab !== 'code';
+        }
+
+        document.querySelectorAll('#canvasTabs button').forEach(btn => {
+            btn.addEventListener('click', () => setCanvasTab(btn.dataset.tab));
+        });
+
+        document.getElementById('canvasCloseBtn').addEventListener('click', () => {
+            if (modes.code.canvas) modes.code.canvas.open = false;
+            codeCanvas.hidden = true;
+        });
+
+        document.getElementById('canvasDownloadBtn').addEventListener('click', () => {
+            const state = modes.code.canvas;
+            if (!state || !state.code) return;
+            const blob = new Blob([state.code], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `code.${fileExtensionFor(state.language)}`;
+            a.click();
+            URL.revokeObjectURL(url);
+        });
+
+        document.getElementById('canvasCopyBtn').addEventListener('click', () => {
+            const state = modes.code.canvas;
+            if (!state || !state.code) return;
+            navigator.clipboard.writeText(state.code);
+            const btn = document.getElementById('canvasCopyBtn');
+            const original = btn.title;
+            btn.title = 'Copied!';
+            setTimeout(() => { btn.title = original; }, 1200);
+        });
+
+        document.getElementById('canvasOpenNewTabBtn').addEventListener('click', () => {
+            const state = modes.code.canvas;
+            if (!state || !state.showPreview) return;
+            const win = window.open('', '_blank');
+            if (!win) return;
+            win.document.open();
+            win.document.write(buildPreviewDoc(state.language, state.code));
+            win.document.close();
+        });
+
+        // Removes the fenced code block from Code mode's answer text before it's shown
+        // in the chat bubble — the code itself now lives only in the Canvas panel,
+        // the chat bubble just gets the explanation plus a small chip to open it.
+        function stripCodeFence(text) {
+            if (!text) return text;
+            return text.replace(/```[\w+#.-]*\n[\s\S]*?```/, '').trim();
+        }
+
+        // Small "open the artifact" chip, shown in place of the removed code block.
+        // Clicking it (re)opens the Canvas panel — this is the ONLY other way besides
+        // auto-open to bring the panel back after the user has closed it with X.
+        function appendArtifactChip(container, language, code) {
+            if (!code) return;
+            const chip = document.createElement('div');
+            chip.className = 'artifact-chip';
+            const fileName = `code.${fileExtensionFor(language)}`;
+            const timestamp = new Date().toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+            chip.innerHTML = `
+                <div class="artifact-chip-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+                </div>
+                <div class="artifact-chip-info">
+                    <div class="artifact-chip-title">${fileName}</div>
+                    <div class="artifact-chip-meta">${timestamp}</div>
+                </div>
+                <button type="button" class="artifact-chip-btn">Open</button>
+            `;
+            chip.addEventListener('click', () => {
+                if (modes.code.canvas) modes.code.canvas.open = true;
+                renderCodeCanvas();
+            });
+            container.appendChild(chip);
+        }
+
+        const API_BASE = 'https://ailoops.onrender.com';
+
+        function generateUUID() {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        }
+
+        // ---------- Mode state: Chat and Code keep fully independent
+        // sessions, transcripts, and opening-scene text. Switching modes
+        // just swaps which one is visible; nothing is destroyed. ----------
+        const MODE_COPY = {
+            chat: { title: 'How can I help you achieve your goal?', subtitle: 'Execution destroys all excuses', placeholder: 'Describe your objective...' },
+            code: { title: 'What do you want to build?', subtitle: 'Code with reasoning, previewed instantly', placeholder: 'Describe the code you need...' }
+        };
+        const modes = {
+            chat: { sessionId: generateUUID(), html: '', hasMessages: false },
+            code: { sessionId: generateUUID(), html: '', hasMessages: false,
+                // Canvas is Code-mode-only state: the last generated file, whether
+                // it's live-previewable, which tab is active, and whether the user
+                // has closed it. Chat mode has no equivalent and never reads this.
+                canvas: { open: false, language: '', code: '', showPreview: false, tab: 'code' }
+            }
+        };
+        let currentMode = 'chat';
+        let isWaitingForResponse = false;
+
+        const sidebar = document.getElementById('sidebar');
+        const chatContainer = document.getElementById('chatContainer');
+        const chatContent = document.getElementById('chatContent');
+        const openingScene = document.getElementById('openingScene');
+        const openingTitle = document.getElementById('openingTitle');
+        const openingSubtitle = document.getElementById('openingSubtitle');
+        const userInput = document.getElementById('userInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const modeToggle = document.getElementById('modeToggle');
+        const chatSettings = document.getElementById('chatSettings');
+        const codeSettings = document.getElementById('codeSettings');
+        const codeCanvas = document.getElementById('codeCanvas');
+        const canvasTitle = document.getElementById('canvasTitle');
+        const canvasCodeEl = document.getElementById('canvasCode');
+        const canvasPreviewFrame = document.getElementById('canvasPreviewFrame');
+
+        function toggleSidebar() { sidebar.classList.toggle('collapsed'); }
+
+        function autoResize(textarea) {
+            textarea.style.height = 'auto';
+            textarea.style.height = (textarea.scrollHeight) + 'px';
+            if (textarea.value === '') textarea.style.height = 'auto';
+        }
+
+        function handleEnter(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        }
+
+        function refreshOpeningSceneVisibility() {
+            const state = modes[currentMode];
+            if (state.hasMessages) {
+                openingScene.style.display = 'none';
+                chatContent.style.display = 'flex';
+            } else {
+                openingScene.style.display = 'flex';
+                chatContent.style.display = 'none';
+            }
+        }
+
+        function switchMode(mode) {
+            if (mode === currentMode || isWaitingForResponse) return;
+
+            // Persist the current mode's transcript before swapping.
+            modes[currentMode].html = chatContent.innerHTML;
+
+            currentMode = mode;
+            modeToggle.classList.toggle('code-active', mode === 'code');
+            modeToggle.querySelectorAll('button').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.mode === mode);
+            });
+
+            chatSettings.hidden = mode !== 'chat';
+            codeSettings.hidden = mode !== 'code';
+
+            // Canvas only ever exists in Code mode: show it if a result is
+            // already sitting there (and the user hasn't closed it), otherwise
+            // make sure it's hidden. Chat mode always takes this "else" branch.
+            if (mode === 'code') { renderCodeCanvas(); } else { codeCanvas.hidden = true; }
+
+            const copy = MODE_COPY[mode];
+            openingTitle.style.opacity = 0;
+            openingSubtitle.style.opacity = 0;
+            setTimeout(() => {
+                openingTitle.textContent = copy.title;
+                openingSubtitle.textContent = copy.subtitle;
+                openingTitle.style.opacity = 1;
+                openingSubtitle.style.opacity = 1;
+            }, 150);
+            userInput.placeholder = copy.placeholder;
+
+            chatContent.classList.add('mode-fade-out');
+            setTimeout(() => {
+                chatContent.innerHTML = modes[mode].html;
+                refreshOpeningSceneVisibility();
+                chatContent.classList.remove('mode-fade-out');
+                chatContent.classList.add('mode-fade-in');
+                scrollToBottom();
+                setTimeout(() => chatContent.classList.remove('mode-fade-in'), 260);
+            }, 150);
+        }
+
+        function startNewChat() {
+            modes[currentMode].sessionId = generateUUID();
+            modes[currentMode].html = '';
+            modes[currentMode].hasMessages = false;
+
+            if (currentMode === 'code') {
+                modes.code.canvas = { open: false, language: '', code: '', showPreview: false, tab: 'code' };
+                codeCanvas.hidden = true;
+            }
+
+            chatContent.innerHTML = '';
+            refreshOpeningSceneVisibility();
+
+            userInput.value = '';
+            autoResize(userInput);
+            userInput.focus();
+
+            const historyList = document.getElementById('historyList');
+            const item = document.createElement('div');
+            item.className = 'history-item';
+            item.textContent = currentMode === 'code' ? 'New Code Session' : 'New Objective';
+            historyList.prepend(item);
+        }
+
+        function appendMessage(role, text) {
+            modes[currentMode].hasMessages = true;
+            openingScene.style.display = 'none';
+            chatContent.style.display = 'flex';
+
+            const row = document.createElement('div');
+            row.className = `message-row ${role}`;
+            const bubble = document.createElement('div');
+            bubble.className = 'message-bubble';
+
+            if (role === 'assistant') {
+                const avatar = document.createElement('svg');
+                avatar.setAttribute('class', 'assistant-avatar');
+                avatar.setAttribute('viewBox', '0 0 24 24');
+                avatar.setAttribute('fill', 'none');
+                avatar.setAttribute('stroke', 'currentColor');
+                avatar.setAttribute('stroke-width', '1.5');
+                avatar.setAttribute('stroke-linecap', 'round');
+                avatar.setAttribute('stroke-linejoin', 'round');
+                avatar.innerHTML = `
+                    <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+                    <polyline points="2 12 12 17 22 12"></polyline>
+                    <polyline points="2 17 12 22 22 17"></polyline>
+                `;
+
+                const body = document.createElement('div');
+                body.className = 'assistant-body';
+
+                const contentDiv = document.createElement('div');
+                contentDiv.className = 'message-text';
+                contentDiv.innerHTML = text ? marked.parse(normalizeMathDelimiters(text)) : '';
+                if (text) highlightCode(contentDiv);
+
+                // Thinking block starts EMPTY and expanded. It is only ever populated
+                // with real 'status' events from the backend (planner/executor/etc),
+                // and it stays open + growing until the first actual answer token
+                // arrives — exactly like Claude: think first, then answer.
+                // Identical wiring is used for both Chat mode and Code mode.
+                const statusDiv = document.createElement('div');
+                statusDiv.className = 'thinking-block';
+                statusDiv.style.display = 'none'; // hidden until we actually get a thought
+                statusDiv.innerHTML = `
+                    <button type="button" class="thinking-toggle">Thinking</button>
+                    <div class="thinking-content expanded"></div>
+                `;
+                statusDiv.querySelector('.thinking-toggle').addEventListener('click', () => {
+                    statusDiv.querySelector('.thinking-content').classList.toggle('expanded');
+                });
+
+                body.appendChild(statusDiv);
+                body.appendChild(contentDiv);
+                bubble.appendChild(avatar);
+                bubble.appendChild(body);
+            } else {
+                bubble.innerText = text;
+            }
+
+            row.appendChild(bubble);
+            chatContent.appendChild(row);
+            scrollToBottom();
+
+            return role === 'assistant' ? bubble : null;
+        }
+
+        function scrollToBottom() {
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const text = userInput.value.trim();
+            if (!text || isWaitingForResponse) return;
+
+            const mode = currentMode;
+            appendMessage('user', text);
+            userInput.value = '';
+            autoResize(userInput);
+            sendBtn.disabled = true;
+            isWaitingForResponse = true;
+
+            let apiUrl, payload, useStream;
+
+            if (mode === 'chat') {
+                const modelType = document.getElementById('modelType').value;
+                const temp = parseFloat(document.getElementById('tempSetting').value);
+                const maxIters = parseInt(document.getElementById('iterSetting').value);
+                useStream = document.getElementById('streamSetting').checked;
+                apiUrl = `${API_BASE}/chat`;
+                payload = {
+                    message: text,
+                    session_id: modes.chat.sessionId,
+                    model_type: modelType,
+                    stream: useStream,
+                    temperature: temp,
+                    max_iterations: maxIters
+                };
+            } else {
+                const codeModel = document.getElementById('codeModel').value;
+                const reasoningLevel = document.getElementById('codeReasoningLevel').value;
+                useStream = document.getElementById('codeStreamSetting').checked;
+                apiUrl = `${API_BASE}/code-chat`;
+                payload = {
+                    message: text,
+                    session_id: modes.code.sessionId,
+                    model: codeModel,
+                    reasoning_level: reasoningLevel,
+                    stream: useStream
+                    // No temperature — Code Mode intentionally omits it; backend applies its own default.
+                };
+            }
+
+            const assistantBubble = appendMessage('assistant', '');
+            const textContainer = assistantBubble.querySelector('.message-text');
+            const thinkingBlock = assistantBubble.querySelector('.thinking-block');
+            const thinkingToggle = thinkingBlock.querySelector('.thinking-toggle');
+            const thinkingContent = thinkingBlock.querySelector('.thinking-content');
+            const thinkingStartTime = Date.now();
+
+            let thinkingDone = false;      // true once the model has moved on to answering
+            let answerStarted = false;     // true once the first answer token has arrived
+            let thinkingFinalized = false; // true once "Thought for Ns" has been set for good
+
+            // Icons mapping for different thought types
+            const thoughtIcons = {
+                'web': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>`,
+                'search': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`,
+                'error': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>`,
+                'success': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`,
+                'plan': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line><path d="M9 16l2 2 4-4"></path></svg>`,
+                'default': `<div class="thought-bullet"></div>`
+            };
+
+            function getIconForLabel(label, detail) {
+                const t = ((label || '') + ' ' + (detail || '')).toLowerCase();
+                if (t.includes('plan')) return thoughtIcons['plan'];
+                if (t.includes('search')) return thoughtIcons['search'];
+                if (t.includes('fetch') || t.includes('web') || t.includes('url') || t.includes('http')) return thoughtIcons['web'];
+                if (t.includes('fail') || t.includes('error') || t.includes('unable')) return thoughtIcons['error'];
+                if (t.includes('finish') || t.includes('success') || t.includes('complete') || t.includes('done')) return thoughtIcons['success'];
+                if (t.includes('writing') || t.includes('code')) return thoughtIcons['plan'];
+                return thoughtIcons['default'];
+            }
+
+            // Real backend progress event (planner / executor / reflector / evaluator,
+            // or the Code Mode equivalents). Reveals the block on the first thought
+            // and keeps it expanded while it grows. Shared by both modes.
+            function addThought(label, detail) {
+                if (thinkingDone) return;
+                thinkingBlock.style.display = 'block';
+                thinkingToggle.textContent = label || 'Thinking';
+                thinkingToggle.classList.add('shimmer');
+
+                const item = document.createElement('div');
+                item.className = 'thought-item';
+
+                const icon = getIconForLabel(label, detail);
+                if (icon.includes('svg')) {
+                    item.innerHTML = `<div class="thought-icon-wrapper">${icon}</div>`;
+                } else {
+                    item.innerHTML = icon; // bullet
+                }
+
+                const content = document.createElement('div');
+                content.className = 'thought-content';
+                content.textContent = detail || label || '';
+                item.appendChild(content);
+
+                const showMore = document.createElement('button');
+                showMore.className = 'show-more-btn';
+                showMore.textContent = 'Show more';
+                item.appendChild(showMore);
+
+                thinkingContent.appendChild(item);
+
+                setTimeout(() => {
+                    if (content.scrollHeight > content.clientHeight) {
+                        showMore.style.display = 'block';
+                        showMore.onclick = () => {
+                            const isExpanded = content.classList.toggle('expanded');
+                            showMore.textContent = isExpanded ? 'Show less' : 'Show more';
+                        };
+                    }
+                }, 0);
+
+                scrollToBottom();
+            }
+
+            // Called the moment the answer actually starts streaming. Switches the main
+            // toggle from a shimmering "Thinking" to a shimmering "Answering" and
+            // collapses the thought log, but doesn't settle the final label yet.
+            function startAnswering() {
+                if (thinkingDone) return;
+                thinkingDone = true;
+                if (!thinkingContent.childElementCount) return;
+                thinkingToggle.textContent = 'Answering';
+                thinkingToggle.classList.add('shimmer');
+                thinkingContent.classList.remove('expanded');
+            }
+
+            // Called once the response is fully done (stream ended, or non-streaming
+            // reply received). Settles the main toggle into "Thought for Ns" and stops
+            // the shimmer for good, Claude-style. Same behavior for both modes.
+            function finishThinking() {
+                if (thinkingFinalized) return;
+                thinkingFinalized = true;
+                thinkingDone = true;
+                if (!thinkingContent.childElementCount) {
+                    thinkingBlock.remove();
+                    return;
+                }
+                const seconds = Math.max(1, Math.round((Date.now() - thinkingStartTime) / 1000));
+                thinkingToggle.textContent = `Thought for ${seconds}s`;
+                thinkingToggle.classList.remove('shimmer');
+                thinkingContent.classList.remove('expanded');
+            }
+
+            let assistantFullText = '';
+            let codeResult = null; // { code, language, show_preview } — Code Mode only
+
+            if (useStream) {
+                textContainer.innerHTML = THINKING_SVG;
+            }
+
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                if (!response.ok) throw new Error('Network response was not ok');
+
+                if (useStream) {
+                    const reader = response.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+
+                        buffer += decoder.decode(value, { stream: true });
+
+                        const events = buffer.split('\n\n');
+                        buffer = events.pop();
+
+                        for (const event of events) {
+                            const line = event.trim();
+                            if (!line.startsWith('data:')) continue;
+
+                            const jsonStr = line.slice(5).trim();
+                            try {
+                                const parsed = JSON.parse(jsonStr);
+                                if (parsed.type === 'status') {
+                                    addThought(parsed.label, parsed.detail);
+                                } else if (parsed.type === 'code_result') {
+                                    codeResult = parsed;
+                                } else if (parsed.assistant_message) {
+                                    if (!answerStarted) {
+                                        answerStarted = true;
+                                        finishThinking(); // collapse thoughts the instant the answer begins
+                                    }
+                                    assistantFullText += parsed.assistant_message;
+                                    textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText)) + THINKING_SVG;
+                                    scrollToBottom();
+                                }
+                            } catch (e) {
+                                console.error('Failed to parse SSE chunk:', jsonStr, e);
+                            }
+                        }
+                    }
+
+                    if (mode === 'code' && codeResult && codeResult.code) {
+                        textContainer.innerHTML = marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText)));
+                        highlightCode(textContainer);
+                        appendArtifactChip(textContainer, codeResult.language, codeResult.code);
+                        updateCodeCanvas(codeResult.language, codeResult.code, codeResult.show_preview);
+                    } else {
+                        textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText));
+                        highlightCode(textContainer);
+                    }
+
+                } else {
+                    const data = await response.json();
+                    assistantFullText = data.response;
+                    if (mode === 'code' && data.code) {
+                        textContainer.innerHTML = marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText)));
+                        highlightCode(textContainer);
+                        appendArtifactChip(textContainer, data.language, data.code);
+                        updateCodeCanvas(data.language, data.code, data.show_preview);
+                    } else {
+                        textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText));
+                        highlightCode(textContainer);
+                    }
+                }
+
+                finishThinking(); // no-op if already collapsed when the answer started
+
+            } catch (error) {
+                console.error('Error:', error);
+                thinkingBlock.remove();
+                textContainer.innerHTML = `<span style="color: var(--text-secondary)">Make sure your Python FastAPI backend is running.</span>`;
+            } finally {
+                sendBtn.disabled = false;
+                isWaitingForResponse = false;
+                userInput.focus();
+                const cursor = textContainer.querySelector('.thinking-indicator');
+                if (cursor) cursor.remove();
+                modes[mode].html = chatContent.innerHTML;
+            }
+        }
+
+        window.onload = () => {
+            setTimeout(() => {
+                const splash = document.getElementById('splashScreen');
+                if (splash) {
+                    splash.classList.add('hidden');
+                    setTimeout(() => splash.style.display = 'none', 700);
+                }
+                document.getElementById('userInput').focus();
+            }, 1500);
+        };
+    </script>
+</body>
+</html>
