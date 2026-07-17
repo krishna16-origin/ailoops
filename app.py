@@ -1205,6 +1205,15 @@ def classify_code_target(language: str, code: str) -> bool:
 # ----------------------------------------------------------------------
 
 async def execute_code_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic_model, state: dict, retries: int = 2):
+    """Executes an LLM call and ensures structured Pydantic output.
+
+    Returns (parsed_result, error_message). On success error_message is None.
+    On failure parsed_result is None and error_message holds the real reason
+    (e.g. an auth/rate-limit/timeout error from the model call, or the actual
+    parsing failure) — previously this was only printed to server logs, so
+    every failure looked identical to the caller and the user just saw a
+    generic canned message with no way to tell what actually went wrong.
+    """
     parser = PydanticOutputParser(pydantic_object=pydantic_model)
     format_instructions = parser.get_format_instructions()
 
@@ -1223,6 +1232,7 @@ async def execute_code_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic
 
     chain = prompt | llm
 
+    last_error = "Unknown error"
     for attempt in range(retries):
         try:
             res = await chain.ainvoke({"format_instructions": format_instructions, **state})
@@ -1234,12 +1244,13 @@ async def execute_code_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic
             if content.endswith("```"):
                 content = content[:-3]
 
-            return parser.parse(content.strip())
+            return parser.parse(content.strip()), None
         except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
             print(f"[CodeMode] Structured Parsing Retry {attempt + 1}/{retries} failed: {e} | Raw content: {res.content[:300] if 'res' in dir() else 'N/A'}")
             await asyncio.sleep(0.5)
 
-    return None
+    return None, last_error
 
 def format_code_context(state: CodeAgentState) -> str:
     msg_str = "\n".join([f"{m.type.capitalize()}: {m.content}" for m in state.get("messages", [])])
@@ -1266,35 +1277,37 @@ async def understand_code_goal_node(state: CodeAgentState) -> dict:
     llm = get_code_llm(state["model_key"], state["temperature"])
     prompt = "Analyze this conversation and extract the core coding goal, language hint, constraints, and missing info.\n\n{context}"
 
-    res = await execute_code_llm_structured(llm, prompt, CodeGoalExtraction, {"context": format_code_context(state)})
+    res, err = await execute_code_llm_structured(llm, prompt, CodeGoalExtraction, {"context": format_code_context(state)})
 
     return {
         "goal": res.main_goal if res else "Write the requested code.",
         "constraints": res.constraints if res else [],
         "iteration": 0,
         "completed_steps": [],
-        "plan": state.get("plan", [])
+        "plan": state.get("plan", []),
+        "last_error": err
     }
 
 async def code_planner_node(state: CodeAgentState) -> dict:
     llm = get_code_llm(state["model_key"], state["temperature"])
     prompt = "Based on the goal and completed steps, create or update the technical plan. Identify the single immediate next step.\n\n{context}"
 
-    res = await execute_code_llm_structured(llm, prompt, CodePlannerOutput, {"context": format_code_context(state)})
+    res, err = await execute_code_llm_structured(llm, prompt, CodePlannerOutput, {"context": format_code_context(state)})
 
     iteration = state.get("iteration", 0) + 1
 
     return {
         "plan": res.plan if res else state.get("plan", []),
         "current_step": res.current_step if res else "Write the code that satisfies the goal.",
-        "iteration": iteration
+        "iteration": iteration,
+        "last_error": err
     }
 
 async def code_executor_node(state: CodeAgentState) -> dict:
     llm = get_code_llm(state["model_key"], state["temperature"])
     prompt = "Execute the 'Current Step' to satisfy the coding 'Goal'. Return complete, runnable code plus its language and a brief explanation.\n\n{context}"
 
-    res = await execute_code_llm_structured(llm, prompt, CodeExecutorOutput, {"context": format_code_context(state)})
+    res, err = await execute_code_llm_structured(llm, prompt, CodeExecutorOutput, {"context": format_code_context(state)})
 
     new_completed = state.get("completed_steps", []) + [state.get("current_step", "")]
 
@@ -1304,9 +1317,18 @@ async def code_executor_node(state: CodeAgentState) -> dict:
         is_frontend = res.is_frontend if res.is_frontend is not None else classify_code_target(language, code)
         explanation = res.explanation
     else:
-        language, code, is_frontend, explanation = "", "", False, "I hit an issue generating code for this step."
+        language, code, is_frontend = "", "", False
+        # Surface the real reason instead of a generic canned message, so a bad
+        # API key / rate limit / model error is visible instead of looking like
+        # a random glitch every time.
+        explanation = f"I hit an issue generating code for this step: {err}" if err else "I hit an issue generating code for this step."
 
-    response_text = f"{explanation}\n\n```{language}\n{code}\n```".strip()
+    # Only emit a fenced code block when there IS code. An empty ```{lang}\n\n```
+    # fence still gets parsed as a real (empty) code block by the frontend's
+    # markdown renderer, and highlight.js then auto-detects a language on the
+    # empty content and labels it "undefined" — that's the stray "undefined"
+    # line that shows up after a failed generation.
+    response_text = f"{explanation}\n\n```{language}\n{code}\n```".strip() if code else explanation
 
     return {
         "code": code,
@@ -1314,33 +1336,40 @@ async def code_executor_node(state: CodeAgentState) -> dict:
         "is_frontend": is_frontend,
         "explanation": explanation,
         "response": response_text,
-        "completed_steps": new_completed
+        "completed_steps": new_completed,
+        "last_error": err
     }
 
 async def code_reflector_node(state: CodeAgentState) -> dict:
     llm = get_code_llm(state["model_key"], state["temperature"])
     prompt = "Review the 'Prior Code Draft' against the 'Goal' and 'Constraints'. Check correctness, bugs, and quality.\n\n{context}"
 
-    res = await execute_code_llm_structured(llm, prompt, CodeReflectorOutput, {"context": format_code_context(state)})
+    res, err = await execute_code_llm_structured(llm, prompt, CodeReflectorOutput, {"context": format_code_context(state)})
 
     reflection_str = "Looks solid."
     if res:
         reflection_str = f"Quality: {res.quality} | Correctness: {res.correctness} | Bugs: {res.bugs_found} | Improvements: {res.improvements}"
+    elif err:
+        reflection_str = f"Skipped review — the review step hit an error: {err}"
 
     return {
-        "reflection": reflection_str
+        "reflection": reflection_str,
+        "last_error": err
     }
 
 async def code_evaluator_node(state: CodeAgentState) -> dict:
     llm = get_code_llm(state["model_key"], state["temperature"])
     prompt = "Based on the reflection, evaluate if the coding goal is now fully achieved (0-100 completion).\n\n{context}"
 
-    res = await execute_code_llm_structured(llm, prompt, CodeEvaluatorOutput, {"context": format_code_context(state)})
+    res, err = await execute_code_llm_structured(llm, prompt, CodeEvaluatorOutput, {"context": format_code_context(state)})
 
+    # Defaults to 100 on failure so the loop stops instead of retrying against
+    # a backend that's already failing, rather than implying the task is done.
     score = res.completion_percentage if res else 100
 
     return {
-        "completion_score": score
+        "completion_score": score,
+        "last_error": err
     }
 
 def code_decision_edge(state: CodeAgentState) -> str:
@@ -1428,9 +1457,15 @@ CODE_NODE_LABELS = {
 
 def code_node_detail(node_name: str, state: dict) -> str:
     if node_name == "understand_code_goal":
+        err = state.get("last_error")
+        if err:
+            return f"Understanding the goal hit an error: {err}"
         goal = state.get("goal", "")
         return f"Understanding the goal: {goal}" if goal else "Understanding the coding goal."
     if node_name == "code_planner":
+        err = state.get("last_error")
+        if err:
+            return f"Planning hit an error: {err}"
         step = state.get("current_step", "")
         return f"Planning the next step: {step}" if step else "Planning the implementation."
     if node_name == "code_executor":
