@@ -839,8 +839,8 @@ code_sessions: Dict[str, Dict[str, Any]] = {}
 # ----------------------------------------------------------------------
 
 CODE_MODEL_MAP = {
-    "deepseek-ai/deepseek-v4-pro",   # high-end reasoning and coding
-    "nvidia/nemotron-3-ultra-550b-a55b",            # fast response with code
+    "kimi": "nvidia/nemotron-3-ultra-550b-a55b",   # high-end reasoning and coding
+    "glm": "deepseek-ai/deepseek-v4-pro",          # fast response with code
 }
 
 # Both models ship with "Thinking" mode ON by default on NVIDIA NIM. That's the
@@ -851,17 +851,17 @@ CODE_MODEL_MAP = {
 # reasoning_content instead of the answer. That's a documented NIM behavior for
 # both models (chat_template_kwargs), not something retries fix, since the same
 # elaborate system prompt makes the model "think" the same way every attempt.
-# Each model family uses a different toggle key, so this is keyed per model.
-CODE_MODEL_THINKING_KWARG = {
-    "deepseek-ai/deepseek-v4-pro": {"thinking": False},
-    "nvidia/nemotron-3-ultra-550b-a55b": {"enable_thinking": False},
-}
+# Different model families use different toggle keys ("thinking" vs "enable_thinking").
+# Sending both every time — instead of keying off a hardcoded model-name list —
+# means this keeps working no matter which models CODE_MODEL_MAP points to;
+# unrecognized keys are harmlessly ignored by the chat template.
+CODE_THINKING_OFF_KWARGS = {"thinking": False, "enable_thinking": False}
 
 def get_code_llm(model_key: str, temperature: float = 0.2) -> ChatNVIDIA:
     """Routes to one of the two Code Mode models. Uses the same NVIDIA_API_KEY as the rest of the app."""
     key = (model_key or "").strip().lower()
     model_name = CODE_MODEL_MAP.get(key, CODE_MODEL_MAP["kimi"])  # default to the high-reasoning model
-    thinking_kwargs = CODE_MODEL_THINKING_KWARG.get(model_name, {})
+    thinking_kwargs = CODE_THINKING_OFF_KWARGS
     return ChatNVIDIA(
         model=model_name,
         temperature=temperature,
