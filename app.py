@@ -1172,7 +1172,27 @@ Before finishing, internally verify:
 
 ✓ No unnecessary complexity
 
-Only then produce the final answer."""
+Only then produce the final answer.
+
+--------------------------------------------------
+OUTPUT FORMAT CONSTRAINT (CRITICAL — READ THIS)
+--------------------------------------------------
+
+You can only return ONE code block per turn (one 'code' + one 'language' field).
+There is no mechanism to deliver separate files in the same turn.
+
+Because of this:
+- For any frontend/web task (HTML, CSS, JS, a "website", "app", "page", "UI"),
+  you MUST produce a single self-contained .html file with CSS inside a
+  <style> tag and JS inside a <script> tag, in the <head>/<body> of that
+  same file. NEVER write <link rel="stylesheet" href="styles.css"> or
+  <script src="app.js"> — those files will never exist, and the page will
+  silently render unstyled and non-functional.
+- If a task genuinely requires multiple real files (e.g. a Python package),
+  pick the single most important file for this step and say in your
+  explanation which other files still need separate follow-up turns —
+  do not silently drop files with no mention.
+"""
 
 # ----------------------------------------------------------------------
 # CODE MODE: Frontend vs Backend Detection (drives whether a live preview
@@ -1335,7 +1355,11 @@ async def code_executor_node(state: CodeAgentState) -> dict:
     if res:
         language = res.language
         code = res.code
-        is_frontend = res.is_frontend if res.is_frontend is not None else classify_code_target(language, code)
+        try:
+            is_frontend = res.is_frontend if res.is_frontend is not None else classify_code_target(language, code)
+        except Exception as e:
+            print(f"[CodeMode] classify_code_target failed: {e}")
+            is_frontend = bool(res.is_frontend)
         explanation = res.explanation
     else:
         language, code, is_frontend = "", "", False
@@ -1567,6 +1591,8 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
                 detail = code_node_detail(node_name, state_so_far)
                 yield f"data: {json.dumps({'type': 'status', 'step': node_name, 'label': label, 'detail': detail})}\n\n"
                 final_state = state_so_far
+            if "response" not in final_state:
+                print(f"[{session_id}] Code graph finished with no 'response' key. final_state keys: {list(final_state.keys())}")
             final_response = final_state.get("response", "Task completed but no code was formulated.")
             code = final_state.get("code", "")
             language = final_state.get("language", "")
@@ -1684,6 +1710,8 @@ async def _handle_code_chat(request: CodeChatRequest):
 
         try:
             final_state = await asyncio.wait_for(code_app_graph.ainvoke(initial_state), timeout=timeout)
+            if "response" not in final_state:
+                print(f"[{session_id}] Code graph finished with no 'response' key. final_state keys: {list(final_state.keys())}")
             final_response = final_state.get("response", "Task completed but no code was formulated.")
             code = final_state.get("code", "")
             language = final_state.get("language", "")
