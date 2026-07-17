@@ -8,403 +8,767 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
-        :root { 
-            --bg-main:#212121; 
-            --bg-sidebar:#171717; 
-            --bg-input:#2f2f2f; 
-            --bg-hover:#2f2f2f; 
-            --text-primary:#ececec; 
-            --text-secondary:#b4b4b4; 
-            --accent:#10a37f; 
-            --border-color:rgba(255,255,255,0.1); 
-            --transition-bezier:cubic-bezier(0.2,0.8,0.2,1); 
-            --canvas-bg: #1e1e1e;
-        }
+        :root { --bg-main:#212121; --bg-sidebar:#171717; --bg-input:#2f2f2f; --bg-hover:#2f2f2f; --text-primary:#ececec; --text-secondary:#b4b4b4; --accent:#10a37f; --border-color:rgba(255,255,255,0.1); --transition-bezier:cubic-bezier(0.2,0.8,0.2,1); }
         * { box-sizing:border-box; margin:0; padding:0; font-family:'Inter',sans-serif; }
         body { background-color:var(--bg-main); color:var(--text-primary); display:flex; height:100vh; overflow:hidden; }
-        
-        /* Splash Screen */
-        .splash-screen { position:fixed; inset:0; background-color:var(--bg-main); z-index:9999; display:flex; flex-direction:column; align-items:center; justify-content:center; transition:opacity 0.8s var(--transition-bezier), visibility 0.8s; }
-        .splash-screen.hidden { opacity:0; visibility:hidden; }
-        .splash-logo-container { animation:splashPulse 2s infinite ease-in-out; margin-bottom:24px; }
-        .splash-logo { width:80px; height:80px; color:var(--text-primary); }
-        @keyframes splashPulse { 0%{transform:scale(0.95);opacity:0.7;} 50%{transform:scale(1.05);opacity:1;} 100%{transform:scale(0.95);opacity:0.7;} }
-        .splash-text { font-size:18px; font-weight:500; letter-spacing:3px; color:var(--text-primary); opacity:0.8; }
 
-        /* Sidebar */
+        /* ============== SPLASH SCREEN ============== */
+        .splash-screen { position:fixed; inset:0; background-color:var(--bg-main); z-index:9999; display:flex; flex-direction:column; align-items:center; justify-content:center; transition:opacity 0.7s var(--transition-bezier), visibility 0.7s; }
+        .splash-screen.hidden { opacity:0; visibility:hidden; }
+        .splash-logo-container { width:84px; height:84px; margin-bottom:28px; opacity:0; transform:scale(0.6); animation:splashEnter 0.7s cubic-bezier(0.34,1.56,0.64,1) 0.1s forwards; }
+        .splash-logo { width:100%; height:100%; color:var(--text-primary); }
+        .splash-logo path { stroke-dasharray:60; stroke-dashoffset:60; animation:splashDraw 1s ease-out 0.2s forwards, splashBreathe 2.2s ease-in-out 1.3s infinite; }
+        @keyframes splashEnter { to { opacity:1; transform:scale(1); } }
+        @keyframes splashDraw { to { stroke-dashoffset:0; } }
+        @keyframes splashBreathe { 0%,100% { transform:scale(1); opacity:1; } 50% { transform:scale(1.06); opacity:0.75; } }
+        .splash-text { font-size:16px; font-weight:500; letter-spacing:4px; color:var(--text-secondary); text-transform:uppercase; opacity:0; transform:translateY(8px); animation:splashTextIn 0.6s var(--transition-bezier) 0.55s forwards; }
+        @keyframes splashTextIn { to { opacity:0.9; transform:translateY(0); } }
+        .splash-dots { display:flex; gap:6px; margin-top:18px; opacity:0; animation:splashTextIn 0.5s var(--transition-bezier) 0.8s forwards; }
+        .splash-dots span { width:5px; height:5px; border-radius:50%; background-color:var(--text-secondary); animation:splashDotPulse 1.2s ease-in-out infinite; }
+        .splash-dots span:nth-child(2) { animation-delay:0.15s; }
+        .splash-dots span:nth-child(3) { animation-delay:0.3s; }
+        @keyframes splashDotPulse { 0%,80%,100% { opacity:0.25; transform:scale(0.85); } 40% { opacity:1; transform:scale(1.15); } }
+
+        /* ============== SIDEBAR ============== */
         .sidebar { width:260px; background-color:var(--bg-sidebar); display:flex; flex-direction:column; padding:10px; border-right:1px solid var(--border-color); transition:width 0.3s var(--transition-bezier), padding 0.3s var(--transition-bezier), opacity 0.3s var(--transition-bezier); overflow-x:hidden; white-space:nowrap; flex-shrink:0; }
         .sidebar.collapsed { width:0; padding-left:0; padding-right:0; border-right:none; opacity:0; }
         .sidebar-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; gap:10px; }
-        
-        .nav-sections { display: flex; flex-direction: column; gap: 4px; margin-bottom: 20px; }
-        .nav-item { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 8px; cursor: pointer; color: var(--text-secondary); transition: all 0.2s; font-size: 14px; font-weight: 500; }
-        .nav-item:hover { background-color: var(--bg-hover); color: var(--text-primary); }
-        .nav-item.active { background-color: var(--bg-hover); color: var(--text-primary); }
-        .nav-item svg { width: 18px; height: 18px; }
-
-        .icon-btn { background:transparent; border:none; color:var(--text-secondary); cursor:pointer; padding:8px; border-radius:6px; display:flex; align-items:center; justify-content:center; transition:background 0.2s, color 0.2s; }
+        .icon-btn { background:transparent; border:none; color:var(--text-secondary); cursor:pointer; padding:8px; border-radius:6px; display:flex; align-items:center; justify-content:center; transition:background 0.2s ease, color 0.2s ease, transform 0.15s ease; }
         .icon-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
-        
-        .new-chat-btn { flex:1; display:flex; align-items:center; justify-content:space-between; padding:10px 12px; background-color:transparent; color:var(--text-primary); border:1px solid var(--border-color); border-radius:8px; cursor:pointer; font-size:14px; font-weight:500; transition:background 0.2s; }
+        .icon-btn:active { transform:scale(0.92); }
+        .new-chat-btn { flex:1; display:flex; align-items:center; justify-content:space-between; padding:10px 12px; background-color:transparent; color:var(--text-primary); border:1px solid var(--border-color); border-radius:8px; cursor:pointer; font-size:14px; font-weight:500; transition:background 0.2s ease, transform 0.15s ease; }
         .new-chat-btn:hover { background-color:var(--bg-hover); }
-        
+        .new-chat-btn:active { transform:scale(0.98); }
         .history-list { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:5px; }
         .history-item { padding:12px; border-radius:8px; cursor:pointer; font-size:14px; overflow:hidden; text-overflow:ellipsis; color:var(--text-secondary); transition:background 0.2s, color 0.2s; }
         .history-item:hover { background-color:var(--bg-hover); color:var(--text-primary); }
-        
         .sidebar-settings { margin-top:auto; padding-top:16px; border-top:1px solid var(--border-color); display:flex; flex-direction:column; gap:12px; }
-        .sidebar-setting-item { display:flex; justify-content:space-between; align-items:center; color:var(--text-secondary); font-size:13px; }
+        .settings-panel { display:flex; flex-direction:column; gap:12px; animation:fadeInSettings 0.25s ease; }
+        @keyframes fadeInSettings { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
+        .settings-panel[hidden] { display:none; }
+        .sidebar-setting-item { display:flex; justify-content:space-between; align-items:center; color:var(--text-secondary); font-size:13px; gap:10px; }
         .sidebar-setting-item input[type="number"] { width:50px; background-color:var(--bg-main); color:var(--text-primary); border:1px solid transparent; padding:4px 8px; border-radius:6px; outline:none; transition:background 0.2s, border-color 0.2s; }
         .sidebar-setting-item input[type="number"]:hover, .sidebar-setting-item input[type="number"]:focus { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); }
         .sidebar-setting-item input[type="checkbox"] { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; }
-        .sidebar-setting-item select { background-color:var(--bg-main); color:var(--text-primary); border:1px solid transparent; padding:4px 8px; border-radius:6px; outline:none; font-size:13px; cursor:pointer; transition:background 0.2s, border-color 0.2s; }
+        .sidebar-setting-item select { background-color:var(--bg-main); color:var(--text-primary); border:1px solid transparent; padding:4px 8px; border-radius:6px; outline:none; font-size:13px; cursor:pointer; transition:background 0.2s, border-color 0.2s; max-width:150px; }
         .sidebar-setting-item select:hover, .sidebar-setting-item select:focus { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); }
 
-        /* Main Content */
-        .main-content { flex:1; display:flex; flex-direction:row; position:relative; min-width:0; }
-        .chat-view { flex:1; display:flex; flex-direction:column; position:relative; min-width:0; }
-        
+        /* ============== HEADER + MODE TOGGLE ============== */
+        .main-content { flex:1; display:flex; flex-direction:column; position:relative; min-width:0; }
         .header { height:60px; display:flex; align-items:center; justify-content:space-between; padding:0 16px; z-index:10; }
         .header-left { display:flex; align-items:center; gap:12px; }
         .sidebar-toggle-main { display:none; opacity:0; transform:scale(0.8); transition:opacity 0.3s var(--transition-bezier), transform 0.3s var(--transition-bezier); }
         .sidebar.collapsed ~ .main-content .sidebar-toggle-main { display:flex; opacity:1; transform:scale(1); }
 
+        .mode-toggle { display:flex; align-items:center; background-color:var(--bg-input); border-radius:999px; padding:3px; position:relative; }
+        .mode-toggle button { position:relative; z-index:1; border:none; background:transparent; color:var(--text-secondary); font-size:13px; font-weight:500; padding:7px 16px; border-radius:999px; cursor:pointer; transition:color 0.25s ease; display:flex; align-items:center; gap:6px; }
+        .mode-toggle button svg { width:14px; height:14px; }
+        .mode-toggle button.active { color:var(--bg-main); }
+        .mode-toggle-pill { position:absolute; top:3px; left:3px; height:calc(100% - 6px); width:calc(50% - 3px); background-color:var(--text-primary); border-radius:999px; transition:transform 0.3s var(--transition-bezier); z-index:0; }
+        .mode-toggle.code-active .mode-toggle-pill { transform:translateX(100%); }
+
+        /* ============== CHAT AREA (simplified) ============== */
         .chat-container { flex:1; overflow-y:auto; display:flex; flex-direction:column; align-items:center; scroll-behavior:smooth; }
-        .chat-content { width:100%; max-width:800px; padding:20px; display:flex; flex-direction:column; gap:32px; padding-bottom:150px; }
-        
-        /* Message Styles */
-        .message-row { display:flex; width:100%; opacity:0; transform:translateY(15px); animation:slideFadeIn 0.5s var(--transition-bezier) forwards; }
+        .chat-content { width:100%; max-width:760px; padding:20px; display:flex; flex-direction:column; gap:26px; padding-bottom:150px; }
+        .opening-scene { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; width:100%; text-align:center; padding:0 20px; }
+        .mono-logo-container { margin-bottom:20px; opacity:0; transform:scale(0.85) translateY(15px); animation:popFadeIn 0.6s var(--transition-bezier) forwards; }
+        .mono-logo { width:56px; height:56px; color:var(--text-primary); }
+        .swirl-spin { animation:spin 3s linear infinite; }
+        .opening-title { font-size:24px; font-weight:600; margin-bottom:10px; opacity:0; transform:translateY(12px); animation:slideFadeIn 0.6s var(--transition-bezier) 0.1s forwards; transition:opacity 0.2s ease; }
+        .opening-subtitle { color:var(--text-secondary); font-size:14px; opacity:0; transform:translateY(12px); animation:slideFadeIn 0.6s var(--transition-bezier) 0.2s forwards; transition:opacity 0.2s ease; }
+        @keyframes popFadeIn { to { opacity:1; transform:scale(1) translateY(0); } }
+        @keyframes slideFadeIn { to { opacity:1; transform:translateY(0); } }
+
+        .message-row { display:flex; width:100%; opacity:0; transform:translateY(10px); animation:slideFadeIn 0.4s var(--transition-bezier) forwards; }
         .message-row.user { justify-content:flex-end; }
         .message-row.assistant { justify-content:flex-start; }
-        .message-bubble { max-width:85%; padding:16px 20px; font-size:15px; line-height:1.6; }
-        .user .message-bubble { background-color:var(--bg-input); border-radius:24px 24px 6px 24px; white-space:pre-wrap; }
-        .assistant .message-bubble { background-color:transparent; border-radius:8px; color:var(--text-primary); display:flex; flex-direction:column; gap:12px; padding-left:0; }
-        .assistant-header { display:flex; align-items:center; gap:12px; font-weight:600; font-size:16px; }
-        .assistant-logo { width:24px; height:24px; padding:4px; border-radius:50%; border:1px solid var(--border-color); }
+        .message-bubble { max-width:88%; padding:14px 18px; font-size:15px; line-height:1.6; }
+        .user .message-bubble { background-color:var(--bg-input); border-radius:20px 20px 6px 20px; white-space:pre-wrap; }
+
+        /* Simplified assistant message: no repeated title per bubble, just a small quiet avatar */
+        .assistant .message-bubble { background-color:transparent; border-radius:8px; color:var(--text-primary); display:flex; gap:12px; padding-left:0; align-items:flex-start; }
+        .assistant-avatar { flex-shrink:0; width:26px; height:26px; padding:5px; border-radius:50%; border:1px solid var(--border-color); color:var(--text-secondary); margin-top:2px; }
+        .assistant-body { flex:1; min-width:0; display:flex; flex-direction:column; gap:10px; }
+
         .message-text { word-break:break-word; }
         .message-text p { margin-bottom:12px; }
         .message-text p:last-child { margin-bottom:0; }
-        
-        /* Thinking Block */
-        .thinking-block { margin-top:8px; }
+        .message-text h1, .message-text h2, .message-text h3, .message-text h4 { margin:18px 0 8px 0; font-weight:600; color:#fff; }
+        .message-text h1 { font-size:1.4em; }
+        .message-text h2 { font-size:1.25em; }
+        .message-text h3 { font-size:1.1em; }
+        .message-text ul, .message-text ol { margin:10px 0; padding-left:22px; }
+        .message-text li { margin-bottom:6px; }
+        .message-text table { width:100%; border-collapse:collapse; margin:14px 0; background-color:rgba(0,0,0,0.15); border-radius:8px; overflow:hidden; display:block; overflow-x:auto; }
+        .message-text th, .message-text td { border:1px solid var(--border-color); padding:9px 13px; text-align:left; }
+        .message-text th { background-color:rgba(255,255,255,0.05); font-weight:600; }
+
+        .message-text .code-card { margin:14px 0; border-radius:10px; overflow:hidden; border:1px solid var(--border-color); }
+        .message-text .code-card-header { display:flex; justify-content:space-between; align-items:center; background-color:#2a2a2a; padding:8px 16px; font-size:12px; color:var(--text-secondary); border-bottom:1px solid var(--border-color); }
+        .message-text .code-card-lang { font-family:'Courier New', Courier, monospace; text-transform:lowercase; }
+        .message-text .artifact-tabs { display:flex; gap:2px; }
+        .message-text .artifact-tab { background:transparent; border:none; color:var(--text-secondary); font-size:12px; padding:4px 10px; border-radius:6px; cursor:pointer; transition:background 0.2s, color 0.2s; }
+        .message-text .artifact-tab:hover { color:var(--text-primary); }
+        .message-text .artifact-tab.active { background-color:var(--bg-input); color:var(--text-primary); }
+        .message-text .artifact-preview { background-color:#ffffff; padding:24px; display:flex; align-items:center; justify-content:center; overflow:auto; }
+        .message-text .artifact-preview svg { max-width:100%; height:auto; }
+        .message-text .artifact-preview.code-preview-frame { padding:0; display:block; }
+        .message-text .code-preview-frame iframe { width:100%; min-height:360px; border:none; display:block; background:#fff; }
+        .message-text .code-card [hidden] { display:none !important; }
+        .message-text .copy-btn { display:flex; align-items:center; gap:6px; background:transparent; border:none; color:var(--text-secondary); font-size:12px; cursor:pointer; padding:4px 8px; border-radius:6px; transition:background 0.2s, color 0.2s; }
+        .message-text .copy-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
+        .message-text .copy-btn svg { width:14px; height:14px; }
+        .message-text pre { background-color:#111; padding:16px; overflow-x:auto; margin:0; border:none; border-radius:0; }
+        .message-text code { font-family:'Courier New', Courier, monospace; background-color:rgba(255,255,255,0.1); padding:2px 6px; border-radius:4px; font-size:0.9em; }
+        .message-text pre code { background-color:transparent; padding:0; font-size:0.9em; border:none; }
+        .message-text blockquote { border-left:4px solid var(--accent); padding-left:12px; color:var(--text-secondary); margin:12px 0; }
+
+        .thinking-block { margin-top:2px; }
         .thinking-toggle { background:none; border:none; padding:0; font-size:13px; font-family:inherit; color:var(--text-secondary); cursor:pointer; }
         .thinking-toggle:hover { color:var(--text-primary); text-decoration:underline; }
         .thinking-toggle.shimmer {
-            background-image: linear-gradient(90deg, var(--text-secondary) 0%, var(--text-secondary) 35%, var(--text-primary) 50%, var(--text-secondary) 65%, var(--text-secondary) 100%);
+            background-image: linear-gradient(
+                90deg,
+                var(--text-secondary) 0%,
+                var(--text-secondary) 35%,
+                var(--text-primary) 50%,
+                var(--text-secondary) 65%,
+                var(--text-secondary) 100%
+            );
             background-size: 200% 100%;
             background-clip: text;
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             animation: thinkingShimmer 1.6s linear infinite;
         }
-        @keyframes thinkingShimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
-        .thinking-content { display:none; margin:12px 0 12px 12px; padding-left:24px; border-left:1px solid var(--border-color); font-size:14px; line-height:1.6; color:var(--text-secondary); }
+        @keyframes thinkingShimmer {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+        .thinking-content { display:none; margin:10px 0 10px 12px; padding-left:22px; border-left:1px solid var(--border-color); font-size:14px; line-height:1.6; color:var(--text-secondary); }
         .thinking-content.expanded { display:block; }
-        .thought-item { position: relative; margin-bottom: 16px; }
-        .thought-icon-wrapper { position: absolute; left: -36px; top: 0px; width: 24px; height: 24px; background-color: var(--bg-main); display: flex; align-items: center; justify-content: center; z-index: 2; }
+        .thought-item { position: relative; margin-bottom: 14px; }
+        .thought-item:last-child { margin-bottom: 0; }
+        .thought-bullet { position: absolute; left: -26.5px; top: 8px; width: 8px; height: 8px; background-color: #555; border-radius: 50%; z-index: 1; }
+        .thought-icon-wrapper { position: absolute; left: -34px; top: 0px; width: 24px; height: 24px; background-color: var(--bg-main); display: flex; align-items: center; justify-content: center; z-index: 2; }
         .thought-icon-wrapper svg { width: 20px; height: 20px; color: var(--text-secondary); }
         .thought-content { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
         .thought-content.expanded { -webkit-line-clamp: unset; }
-
-        /* Input Box */
-        .input-container { position:absolute; bottom:0; left:0; width:100%; padding:24px; background:linear-gradient(180deg, rgba(33,33,33,0) 0%, var(--bg-main) 40%); display:flex; justify-content:center; }
-        .input-wrapper { width:100%; max-width:800px; display:flex; flex-direction:column; gap:8px; }
-        .input-controls { display: flex; gap: 8px; padding: 0 8px; }
-        .control-pill { background-color: var(--bg-input); border: 1px solid var(--border-color); border-radius: 16px; padding: 4px 12px; display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); cursor: pointer; transition: all 0.2s; }
-        .control-pill:hover { border-color: rgba(255,255,255,0.3); color: var(--text-primary); }
-        .control-pill select { background: transparent; border: none; color: inherit; font-size: inherit; outline: none; cursor: pointer; }
-        
-        .input-box { background-color:var(--bg-input); border-radius:24px; border:1px solid var(--border-color); display:flex; align-items:flex-end; padding:12px 16px; box-shadow:0 4px 20px rgba(0,0,0,0.15); transition:border-color 0.3s; }
-        .input-box:focus-within { border-color:rgba(255,255,255,0.3); }
-        .input-box textarea { flex:1; background:transparent; border:none; color:var(--text-primary); font-size:16px; resize:none; outline:none; max-height:200px; padding:8px 4px; line-height:1.5; }
-        .send-btn { background:var(--text-primary); color:var(--bg-main); border:none; border-radius:50%; width:36px; height:36px; display:flex; align-items:center; justify-content:center; cursor:pointer; transition:opacity 0.2s, transform 0.2s var(--transition-bezier); margin-left:12px; margin-bottom:4px; }
-        .send-btn:disabled { opacity:0.3; cursor:not-allowed; }
-
-        /* Canvas View */
-        .canvas-view { width: 50%; border-left: 1px solid var(--border-color); background-color: var(--canvas-bg); display: none; flex-direction: column; }
-        .canvas-view.active { display: flex; }
-        .canvas-header { height: 60px; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; border-bottom: 1px solid var(--border-color); }
-        .canvas-tabs { display: flex; gap: 4px; background: rgba(0,0,0,0.2); padding: 4px; border-radius: 8px; }
-        .canvas-tab { padding: 6px 12px; border-radius: 6px; font-size: 13px; cursor: pointer; color: var(--text-secondary); transition: all 0.2s; }
-        .canvas-tab.active { background: var(--bg-input); color: var(--text-primary); }
-        .canvas-content { flex: 1; overflow: hidden; position: relative; }
-        .canvas-code { position: absolute; inset: 0; padding: 20px; overflow: auto; font-family: 'Fira Code', monospace; font-size: 14px; }
-        .canvas-preview { position: absolute; inset: 0; background: white; display: none; }
-        .canvas-preview.active { display: block; }
-        .canvas-preview iframe { width: 100%; height: 100%; border: none; }
-        .canvas-close { cursor: pointer; color: var(--text-secondary); }
-        .canvas-close:hover { color: var(--text-primary); }
-
-        @keyframes slideFadeIn { to { opacity:1; transform:translateY(0); } }
+        .show-more-btn { background: none; border: none; color: var(--text-primary); cursor: pointer; font-size: 12px; padding: 4px 0; margin-top: 2px; display: none; opacity: 0.7; }
+        .show-more-btn:hover { opacity: 1; text-decoration: underline; }
+        .spinner { width:14px; height:14px; border:2px solid var(--text-secondary); border-top:2px solid transparent; border-radius:50%; animation:spin 1s linear infinite; }
         @keyframes spin { 0%{transform:rotate(0deg);} 100%{transform:rotate(360deg);} }
-        
-        pre { background-color:#111; padding:16px; overflow-x:auto; border-radius:8px; margin: 12px 0; }
-        code { font-family:'Courier New', Courier, monospace; }
-        
-        [hidden] { display: none !important; }
+
+        /* ============== INPUT ============== */
+        .input-container { position:absolute; bottom:0; left:0; width:100%; padding:22px; background:linear-gradient(180deg, rgba(33,33,33,0) 0%, var(--bg-main) 40%); display:flex; justify-content:center; }
+        .input-box { width:100%; max-width:760px; background-color:var(--bg-input); border-radius:22px; border:1px solid var(--border-color); display:flex; align-items:flex-end; padding:11px 15px; box-shadow:0 4px 20px rgba(0,0,0,0.15); transition:border-color 0.25s ease, box-shadow 0.25s ease; }
+        .input-box:focus-within { border-color:rgba(255,255,255,0.3); box-shadow:0 4px 24px rgba(0,0,0,0.22); }
+        .input-box textarea { flex:1; background:transparent; border:none; color:var(--text-primary); font-size:15.5px; resize:none; outline:none; max-height:200px; padding:8px 4px; line-height:1.5; }
+        .input-box textarea::placeholder { color:var(--text-secondary); }
+        .send-btn { background:var(--text-primary); color:var(--bg-main); border:none; border-radius:50%; width:34px; height:34px; display:flex; align-items:center; justify-content:center; cursor:pointer; transition:opacity 0.2s, transform 0.2s var(--transition-bezier); margin-left:10px; margin-bottom:3px; }
+        .send-btn:hover:not(:disabled) { transform:scale(1.06); }
+        .send-btn:active:not(:disabled) { transform:scale(0.94); }
+        .send-btn:disabled { opacity:0.3; cursor:not-allowed; }
+        .send-btn svg { width:17px; height:17px; }
+
+        .thinking-indicator { display:inline-block; width:26px; height:26px; vertical-align:middle; margin-left:4px; overflow:visible; }
+        .thinking-indicator svg { width:100%; height:100%; overflow:visible; }
+        .thinking-indicator .petal-group { transform-origin:100px 100px; animation:thinkingMove 2s cubic-bezier(0.45,0,0.55,1) infinite; }
+        .thinking-indicator .petal-group:nth-child(1) { animation-delay:0.00s; }
+        .thinking-indicator .petal-group:nth-child(2) { animation-delay:0.10s; }
+        .thinking-indicator .petal-group:nth-child(3) { animation-delay:0.20s; }
+        .thinking-indicator .petal-group:nth-child(4) { animation-delay:0.30s; }
+        .thinking-indicator .petal-group:nth-child(5) { animation-delay:0.40s; }
+        .thinking-indicator .petal-group:nth-child(6) { animation-delay:0.50s; }
+        .thinking-indicator .petal-group:nth-child(7) { animation-delay:0.60s; }
+        .thinking-indicator .petal-group:nth-child(8) { animation-delay:0.70s; }
+        .thinking-indicator .petal { fill:var(--bg-main); stroke:var(--text-primary); stroke-width:6; stroke-linejoin:round; stroke-linecap:round; }
+        @keyframes thinkingMove { 0% { opacity:1; transform:scale(1) rotate(0deg); } 50% { opacity:0.3; transform:scale(0.85) rotate(8deg); } 100% { opacity:1; transform:scale(1) rotate(0deg); } }
+
+        /* Smooth cross-fade when swapping between Chat / Code content */
+        .mode-fade-out { animation:modeFadeOut 0.15s ease forwards; }
+        .mode-fade-in { animation:modeFadeIn 0.25s ease forwards; }
+        @keyframes modeFadeOut { to { opacity:0; transform:translateY(4px); } }
+        @keyframes modeFadeIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
     </style>
 </head>
 <body>
-    <div id="splashScreen" class="splash-screen">
+    <div class="splash-screen" id="splashScreen">
         <div class="splash-logo-container">
-            <svg class="splash-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path></svg>
+            <svg class="splash-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 12c-1.657 0-3 1.343-3 3 0 1.657 1.343 3 3 3 3.314 0 6-2.686 6-6 0-3.314-2.686-6-6-6-4.97 0-9 4.03-9 9 0 4.97 4.03 9 9 9"></path>
+            </svg>
         </div>
-        <div class="splash-text">MAXIMUS</div>
+        <div class="splash-text">Maximus</div>
+        <div class="splash-dots"><span></span><span></span><span></span></div>
     </div>
 
-    <aside class="sidebar" id="sidebar">
+    <div class="sidebar" id="sidebar">
         <div class="sidebar-header">
+            <button class="icon-btn" onclick="toggleSidebar()" title="Close sidebar">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                    <line x1="9" y1="3" x2="9" y2="21"></line>
+                </svg>
+            </button>
             <button class="new-chat-btn" onclick="startNewChat()">
-                <span>New Chat</span>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-            </button>
-            <button class="icon-btn" onclick="toggleSidebar()">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="3" x2="9" y2="21"></line></svg>
+                <span>New session</span>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 5v14M5 12h14"></path>
+                </svg>
             </button>
         </div>
-
-        <nav class="nav-sections">
-            <div class="nav-item active" id="nav-chat" onclick="setMode('chat')">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
-                <span>Chat</span>
-            </div>
-            <div class="nav-item" id="nav-code" onclick="setMode('code')">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
-                <span>Code</span>
-            </div>
-        </nav>
-
         <div class="history-list" id="historyList"></div>
-
         <div class="sidebar-settings">
-            <div class="sidebar-setting-item" id="sidebar-model-container">
-                <span>Model</span>
-                <select id="modelType">
-                    <option value="reasoning">Reasoning (Nemotron)</option>
-                    <option value="fast">Fast (DeepSeek)</option>
-                </select>
-            </div>
-            <div class="sidebar-setting-item" id="sidebar-temp-container">
-                <span>Temperature</span>
-                <input type="number" id="tempSetting" value="0.7" step="0.1" min="0" max="1">
-            </div>
-            <div class="sidebar-setting-item">
-                <span>Max Iterations</span>
-                <input type="number" id="iterSetting" value="2" min="1" max="5">
-            </div>
-            <div class="sidebar-setting-item">
-                <span>Stream</span>
-                <input type="checkbox" id="streamSetting" checked>
-            </div>
-        </div>
-    </aside>
-
-    <main class="main-content">
-        <div class="chat-view">
-            <header class="header">
-                <div class="header-left">
-                    <button class="icon-btn sidebar-toggle-main" onclick="toggleSidebar()">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><line x1="9" y1="3" x2="9" y2="21"></line></svg>
-                    </button>
-                    <h2 id="view-title">Chat</h2>
+            <!-- Chat mode settings -->
+            <div class="settings-panel" id="chatSettings">
+                <div class="sidebar-setting-item">
+                    <label title="Model">Model</label>
+                    <select id="modelType">
+                        <option value="fast">Horus</option>
+                        <option value="balanced" selected>Osiris</option>
+                        <option value="reasoning">Amun-Ra</option>
+                    </select>
                 </div>
-            </header>
-
-            <div class="chat-container" id="chatContainer">
-                <div class="chat-content" id="chatContent">
-                    <div class="opening-scene" id="openingScene">
-                        <div class="mono-logo-container">
-                            <svg class="mono-logo swirl-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path></svg>
-                        </div>
-                        <h1 class="opening-title">How can I help you today?</h1>
-                        <p class="opening-subtitle">Intelligent goal-oriented assistance.</p>
-                    </div>
+                <div class="sidebar-setting-item">
+                    <label title="Model Temperature">Temperature</label>
+                    <input type="number" id="tempSetting" value="0.7" step="0.1" min="0" max="1">
+                </div>
+                <div class="sidebar-setting-item">
+                    <label title="Maximum Goal Iterations">Max Iterations</label>
+                    <input type="number" id="iterSetting" value="2" min="1" max="10">
+                </div>
+                <div class="sidebar-setting-item">
+                    <label title="Stream Response Tokens">Stream Response</label>
+                    <input type="checkbox" id="streamSetting" checked>
                 </div>
             </div>
 
-            <div class="input-container">
-                <div class="input-wrapper">
-                    <div class="input-controls" id="inputControls">
-                        <div class="control-pill" id="model-pill">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 1 0 10 10H12V2z"></path><path d="M12 2a10 10 0 0 1 10 10h-10V2z"></path></svg>
-                            <select id="inputModelType">
-                                <option value="glm">GLM (Fast)</option>
-                                <option value="kimi">Kimi (Reasoning)</option>
-                            </select>
-                        </div>
-                        <div class="control-pill" id="effort-pill">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
-                            <select id="reasoningLevel">
-                                <option value="low">Low Effort</option>
-                                <option value="medium" selected>Medium Effort</option>
-                                <option value="high">High Effort</option>
-                                <option value="max">Max Effort</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div class="input-box">
-                        <textarea id="userInput" placeholder="Message Maximus..." rows="1" oninput="autoResize(this)"></textarea>
-                        <button class="send-btn" id="sendBtn" onclick="sendMessage()">
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
-                        </button>
-                    </div>
+            <!-- Code mode settings (no temperature) -->
+            <div class="settings-panel" id="codeSettings" hidden>
+                <div class="sidebar-setting-item">
+                    <label title="Model">Model</label>
+                    <select id="codeModel">
+                        <option value="kimi" selected>Kimi K2.6</option>
+                        <option value="glm">GLM 5.2</option>
+                    </select>
+                </div>
+                <div class="sidebar-setting-item">
+                    <label title="Reasoning Depth">Reasoning</label>
+                    <select id="codeReasoningLevel">
+                        <option value="low">Low</option>
+                        <option value="medium" selected>Medium</option>
+                        <option value="high">High</option>
+                        <option value="max">Max</option>
+                    </select>
+                </div>
+                <div class="sidebar-setting-item">
+                    <label title="Stream Response Tokens">Stream Response</label>
+                    <input type="checkbox" id="codeStreamSetting" checked>
                 </div>
             </div>
         </div>
+    </div>
 
-        <div class="canvas-view" id="canvasView">
-            <div class="canvas-header">
-                <div class="canvas-tabs">
-                    <div class="canvas-tab active" id="tab-code" onclick="setCanvasTab('code')">Code</div>
-                    <div class="canvas-tab" id="tab-preview" onclick="setCanvasTab('preview')">Preview</div>
-                </div>
-                <div class="canvas-close" onclick="closeCanvas()">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-                </div>
+    <div class="main-content">
+        <div class="header">
+            <div class="header-left">
+                <button class="icon-btn sidebar-toggle-main" onclick="toggleSidebar()" title="Open sidebar">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                        <line x1="9" y1="3" x2="9" y2="21"></line>
+                    </svg>
+                </button>
             </div>
-            <div class="canvas-content">
-                <div class="canvas-code" id="canvasCode"></div>
-                <div class="canvas-preview" id="canvasPreview">
-                    <iframe id="previewFrame"></iframe>
+            <div class="mode-toggle" id="modeToggle">
+                <div class="mode-toggle-pill"></div>
+                <button type="button" class="active" data-mode="chat" onclick="switchMode('chat')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
+                    Chat
+                </button>
+                <button type="button" data-mode="code" onclick="switchMode('code')">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+                    Code
+                </button>
+            </div>
+            <div style="width:36px"></div>
+        </div>
+
+        <div class="chat-container" id="chatContainer">
+            <div class="opening-scene" id="openingScene">
+                <div class="mono-logo-container">
+                    <svg class="mono-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+                        <polyline points="2 12 12 17 22 12"></polyline>
+                        <polyline points="2 17 12 22 22 17"></polyline>
+                    </svg>
                 </div>
+                <h1 class="opening-title" id="openingTitle">How can I help you achieve your goal?</h1>
+                <p class="opening-subtitle" id="openingSubtitle">Execution destroys all excuses</p>
+            </div>
+            <div class="chat-content" id="chatContent" style="display: none;"></div>
+        </div>
+
+        <div class="input-container">
+            <div class="input-box">
+                <textarea id="userInput" rows="1" placeholder="Describe your objective..." oninput="autoResize(this)" onkeydown="handleEnter(event)"></textarea>
+                <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="12" y1="19" x2="12" y2="5"></line>
+                        <polyline points="5 12 12 5 19 12"></polyline>
+                    </svg>
+                </button>
             </div>
         </div>
-    </main>
+    </div>
 
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked-katex-extension/lib/index.umd.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.5/purify.min.js"></script>
+
     <script>
-        let currentMode = 'chat';
-        let currentSessionId = Math.random().toString(36).substring(2, 15);
-        let isWaitingForResponse = false;
-        let lastCode = '';
-        let lastLang = '';
+        marked.use(markedKatex({ throwOnError: false }));
 
-        const chatContainer = document.getElementById('chatContainer');
-        const chatContent = document.getElementById('chatContent');
-        const userInput = document.getElementById('userInput');
-        const sendBtn = document.getElementById('sendBtn');
-        const sidebar = document.getElementById('sidebar');
-        const canvasView = document.getElementById('canvasView');
+        // marked-katex-extension only recognizes $...$ and $$...$$ delimiters.
+        // A lot of model output uses the LaTeX-style \( ... \) and \[ ... \]
+        // delimiters instead, which silently fail to render without this.
+        // Converting them to $ / $$ before handing text to marked() fixes that.
+        function normalizeMathDelimiters(text) {
+            if (!text) return text;
+            return text
+                .replace(/\\\[([\s\S]*?)\\\]/g, (_, expr) => `$$${expr}$$`)
+                .replace(/\\\(([\s\S]*?)\\\)/g, (_, expr) => `$${expr}$`);
+        }
 
-        function setMode(mode) {
-            currentMode = mode;
-            document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-            document.getElementById(`nav-${mode}`).classList.add('active');
-            document.getElementById('view-title').textContent = mode.charAt(0).toUpperCase() + mode.slice(1);
-            
-            const sidebarModel = document.getElementById('sidebar-model-container');
-            const sidebarTemp = document.getElementById('sidebar-temp-container');
-            const inputControls = document.getElementById('inputControls');
-            
-            if (mode === 'code') {
-                sidebarModel.style.display = 'none';
-                sidebarTemp.style.display = 'none';
-                inputControls.style.display = 'flex';
-                userInput.placeholder = "Write code with Maximus...";
-            } else {
-                sidebarModel.style.display = 'flex';
-                sidebarTemp.style.display = 'flex';
-                inputControls.style.display = 'none';
-                userInput.placeholder = "Message Maximus...";
-                closeCanvas();
+        // Claude-style "thinking" indicator: an 8-petal flower that
+        // wobbles/breathes/fades in a staggered ring. Shown wherever the
+        // old blinking text cursor used to appear while a response streams.
+        // Used identically by both Chat mode and Code mode.
+        const THINKING_SVG = `<span class="thinking-indicator"><svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+      <g class="flower">
+        <g class="petal-group">
+          <path class="petal" transform="rotate(0 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+        <g class="petal-group">
+          <path class="petal" transform="rotate(45 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+        <g class="petal-group">
+          <path class="petal" transform="rotate(90 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+        <g class="petal-group">
+          <path class="petal" transform="rotate(135 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+        <g class="petal-group">
+          <path class="petal" transform="rotate(180 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+        <g class="petal-group">
+          <path class="petal" transform="rotate(225 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+        <g class="petal-group">
+          <path class="petal" transform="rotate(270 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+        <g class="petal-group">
+          <path class="petal" transform="rotate(315 100 100)"
+            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
+               C108,18 118,28 132,36 L116,44 L132,58
+               C126,78 112,92 100,100 Z" />
+        </g>
+      </g>
+    </svg></span>`;
+
+        // Maps a language to whatever markup is needed to actually see something
+        // rendered in a sandboxed iframe. Used only for Code Mode "show_preview" results.
+        function buildPreviewDoc(language, code) {
+            const lang = (language || '').trim().toLowerCase();
+            const safeCode = code || '';
+
+            if (lang.includes('html')) {
+                return safeCode;
             }
-            startNewChat();
+            if (lang.includes('css')) {
+                return `<!DOCTYPE html><html><head><style>${safeCode}</style></head><body style="font-family:sans-serif;padding:20px;"><h1>Heading</h1><p>Sample paragraph text to preview your CSS against.</p><button>Sample Button</button></body></html>`;
+            }
+            if (lang.includes('jsx') || lang.includes('tsx') || lang.includes('react')) {
+                return `<!DOCTYPE html><html><head>
+                    <script src="https://unpkg.com/react@18/umd/react.development.js"><\/script>
+                    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"><\/script>
+                    <script src="https://unpkg.com/@babel/standalone/babel.min.js"><\/script>
+                </head><body><div id="root"></div>
+                <script type="text/babel">
+                    ${safeCode}
+                    try {
+                        const rootEl = document.getElementById('root');
+                        const Comp = typeof App !== 'undefined' ? App : (typeof default1 !== 'undefined' ? default1 : null);
+                        if (Comp) { ReactDOM.createRoot(rootEl).render(React.createElement(Comp)); }
+                    } catch (e) { document.getElementById('root').innerText = 'Preview error: ' + e.message; }
+                <\/script></body></html>`;
+            }
+            // Plain JS or anything else frontend-ish: run inside a minimal page.
+            return `<!DOCTYPE html><html><body>
+                <script>${safeCode}<\/script>
+            </body></html>`;
         }
 
-        // Initialize UI
-        setMode('chat');
+        function highlightCode(el) {
+            el.querySelectorAll('pre code').forEach(codeEl => {
+                hljs.highlightElement(codeEl);
+                const pre = codeEl.parentElement;
+                if (pre.parentElement.classList.contains('code-card')) return;
 
-        function toggleSidebar() {
-            sidebar.classList.toggle('collapsed');
+                const langClass = [...codeEl.classList].find(c => c.startsWith('language-'));
+                const lang = langClass ? langClass.replace('language-', '') : 'text';
+                const isSvg = lang === 'svg' || codeEl.textContent.trim().startsWith('<svg');
+
+                const card = document.createElement('div');
+                card.className = 'code-card';
+                card.dataset.lang = lang;
+                const header = document.createElement('div');
+                header.className = 'code-card-header';
+
+                const copyBtnHtml = `
+                    <button class="copy-btn" type="button">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                        <span>Copy</span>
+                    </button>
+                `;
+
+                let previewDiv = null;
+
+                if (isSvg) {
+                    header.innerHTML = `
+                        <div class="artifact-tabs">
+                            <button class="artifact-tab active" type="button" data-tab="preview">Preview</button>
+                            <button class="artifact-tab" type="button" data-tab="code">Code</button>
+                        </div>
+                        ${copyBtnHtml}
+                    `;
+                    previewDiv = document.createElement('div');
+                    previewDiv.className = 'artifact-preview';
+                    previewDiv.innerHTML = DOMPurify.sanitize(codeEl.textContent, { USE_PROFILES: { svg: true, svgFilters: true } });
+                    pre.hidden = true;
+
+                    const tabs = header.querySelectorAll('.artifact-tab');
+                    tabs.forEach(tab => {
+                        tab.addEventListener('click', () => {
+                            tabs.forEach(t => t.classList.remove('active'));
+                            tab.classList.add('active');
+                            const showPreview = tab.dataset.tab === 'preview';
+                            previewDiv.hidden = !showPreview;
+                            pre.hidden = showPreview;
+                        });
+                    });
+                } else {
+                    header.innerHTML = `<span class="code-card-lang">${lang}</span>${copyBtnHtml}`;
+                }
+
+                const copyBtn = header.querySelector('.copy-btn');
+                const copyLabel = copyBtn.querySelector('span');
+                copyBtn.addEventListener('click', () => {
+                    navigator.clipboard.writeText(codeEl.textContent);
+                    copyLabel.textContent = 'Copied!';
+                    setTimeout(() => { copyLabel.textContent = 'Copy'; }, 1500);
+                });
+
+                pre.parentNode.insertBefore(card, pre);
+                card.appendChild(header);
+                if (previewDiv) card.appendChild(previewDiv);
+                card.appendChild(pre);
+            });
         }
 
-        function startNewChat() {
-            currentSessionId = Math.random().toString(36).substring(2, 15);
-            chatContent.innerHTML = `
-                <div class="opening-scene" id="openingScene">
-                    <div class="mono-logo-container">
-                        <svg class="mono-logo swirl-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path></svg>
-                    </div>
-                    <h1 class="opening-title">${currentMode === 'chat' ? 'How can I help you today?' : 'What should we build?'}</h1>
-                    <p class="opening-subtitle">${currentMode === 'chat' ? 'Intelligent goal-oriented assistance.' : 'Expert coding with reasoning.'}</p>
+        // Called only for Code Mode answers where the backend said show_preview=true.
+        // Converts the plain code-card that already exists for the fenced code block
+        // into a Preview/Code tabbed card — same interaction pattern as the SVG case above.
+        function addPreviewToLastCodeCard(container, language, code) {
+            const cards = container.querySelectorAll('.code-card');
+            if (!cards.length) return;
+            const card = cards[cards.length - 1];
+            if (card.querySelector('.artifact-preview')) return; // already has a preview
+
+            const header = card.querySelector('.code-card-header');
+            const pre = card.querySelector('pre');
+            if (!header || !pre) return;
+
+            const copyBtn = header.querySelector('.copy-btn');
+            header.innerHTML = `
+                <div class="artifact-tabs">
+                    <button class="artifact-tab active" type="button" data-tab="preview">Preview</button>
+                    <button class="artifact-tab" type="button" data-tab="code">Code</button>
                 </div>
             `;
-            closeCanvas();
+            if (copyBtn) header.appendChild(copyBtn);
+
+            const previewDiv = document.createElement('div');
+            previewDiv.className = 'artifact-preview code-preview-frame';
+            const iframe = document.createElement('iframe');
+            iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-modals');
+            iframe.srcdoc = buildPreviewDoc(language, code);
+            previewDiv.appendChild(iframe);
+
+            pre.hidden = true;
+            card.insertBefore(previewDiv, pre);
+
+            const tabs = header.querySelectorAll('.artifact-tab');
+            tabs.forEach(tab => {
+                tab.addEventListener('click', () => {
+                    tabs.forEach(t => t.classList.remove('active'));
+                    tab.classList.add('active');
+                    const showPreview = tab.dataset.tab === 'preview';
+                    previewDiv.hidden = !showPreview;
+                    pre.hidden = showPreview;
+                });
+            });
         }
+
+        const API_BASE = 'https://ailoops.onrender.com';
+
+        function generateUUID() {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        }
+
+        // ---------- Mode state: Chat and Code keep fully independent
+        // sessions, transcripts, and opening-scene text. Switching modes
+        // just swaps which one is visible; nothing is destroyed. ----------
+        const MODE_COPY = {
+            chat: { title: 'How can I help you achieve your goal?', subtitle: 'Execution destroys all excuses', placeholder: 'Describe your objective...' },
+            code: { title: 'What do you want to build?', subtitle: 'Code with reasoning, previewed instantly', placeholder: 'Describe the code you need...' }
+        };
+        const modes = {
+            chat: { sessionId: generateUUID(), html: '', hasMessages: false },
+            code: { sessionId: generateUUID(), html: '', hasMessages: false }
+        };
+        let currentMode = 'chat';
+        let isWaitingForResponse = false;
+
+        const sidebar = document.getElementById('sidebar');
+        const chatContainer = document.getElementById('chatContainer');
+        const chatContent = document.getElementById('chatContent');
+        const openingScene = document.getElementById('openingScene');
+        const openingTitle = document.getElementById('openingTitle');
+        const openingSubtitle = document.getElementById('openingSubtitle');
+        const userInput = document.getElementById('userInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const modeToggle = document.getElementById('modeToggle');
+        const chatSettings = document.getElementById('chatSettings');
+        const codeSettings = document.getElementById('codeSettings');
+
+        function toggleSidebar() { sidebar.classList.toggle('collapsed'); }
 
         function autoResize(textarea) {
             textarea.style.height = 'auto';
-            textarea.style.height = textarea.scrollHeight + 'px';
+            textarea.style.height = (textarea.scrollHeight) + 'px';
+            if (textarea.value === '') textarea.style.height = 'auto';
         }
 
-        userInput.addEventListener('keydown', (e) => {
+        function handleEnter(e) {
             if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 sendMessage();
             }
-        });
+        }
 
-        function scrollToBottom() {
-            chatContainer.scrollTop = chatContainer.scrollHeight;
+        function refreshOpeningSceneVisibility() {
+            const state = modes[currentMode];
+            if (state.hasMessages) {
+                openingScene.style.display = 'none';
+                chatContent.style.display = 'flex';
+            } else {
+                openingScene.style.display = 'flex';
+                chatContent.style.display = 'none';
+            }
+        }
+
+        function switchMode(mode) {
+            if (mode === currentMode || isWaitingForResponse) return;
+
+            // Persist the current mode's transcript before swapping.
+            modes[currentMode].html = chatContent.innerHTML;
+
+            currentMode = mode;
+            modeToggle.classList.toggle('code-active', mode === 'code');
+            modeToggle.querySelectorAll('button').forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.mode === mode);
+            });
+
+            chatSettings.hidden = mode !== 'chat';
+            codeSettings.hidden = mode !== 'code';
+
+            const copy = MODE_COPY[mode];
+            openingTitle.style.opacity = 0;
+            openingSubtitle.style.opacity = 0;
+            setTimeout(() => {
+                openingTitle.textContent = copy.title;
+                openingSubtitle.textContent = copy.subtitle;
+                openingTitle.style.opacity = 1;
+                openingSubtitle.style.opacity = 1;
+            }, 150);
+            userInput.placeholder = copy.placeholder;
+
+            chatContent.classList.add('mode-fade-out');
+            setTimeout(() => {
+                chatContent.innerHTML = modes[mode].html;
+                refreshOpeningSceneVisibility();
+                chatContent.classList.remove('mode-fade-out');
+                chatContent.classList.add('mode-fade-in');
+                scrollToBottom();
+                setTimeout(() => chatContent.classList.remove('mode-fade-in'), 260);
+            }, 150);
+        }
+
+        function startNewChat() {
+            modes[currentMode].sessionId = generateUUID();
+            modes[currentMode].html = '';
+            modes[currentMode].hasMessages = false;
+
+            chatContent.innerHTML = '';
+            refreshOpeningSceneVisibility();
+
+            userInput.value = '';
+            autoResize(userInput);
+            userInput.focus();
+
+            const historyList = document.getElementById('historyList');
+            const item = document.createElement('div');
+            item.className = 'history-item';
+            item.textContent = currentMode === 'code' ? 'New Code Session' : 'New Objective';
+            historyList.prepend(item);
         }
 
         function appendMessage(role, text) {
-            const openingScene = document.getElementById('openingScene');
-            if (openingScene) openingScene.remove();
+            modes[currentMode].hasMessages = true;
+            openingScene.style.display = 'none';
+            chatContent.style.display = 'flex';
 
             const row = document.createElement('div');
             row.className = `message-row ${role}`;
-            
-            if (role === 'user') {
-                row.innerHTML = `<div class="message-bubble">${text}</div>`;
-            } else {
-                row.innerHTML = `
-                    <div class="message-bubble">
-                        <div class="assistant-header">
-                            <svg class="assistant-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path></svg>
-                            <span>Maximus</span>
-                        </div>
-                        <div class="thinking-block" style="display: none;">
-                            <button class="thinking-toggle">Thinking</button>
-                            <div class="thinking-content"></div>
-                        </div>
-                        <div class="message-text"></div>
-                    </div>
+            const bubble = document.createElement('div');
+            bubble.className = 'message-bubble';
+
+            if (role === 'assistant') {
+                const avatar = document.createElement('svg');
+                avatar.setAttribute('class', 'assistant-avatar');
+                avatar.setAttribute('viewBox', '0 0 24 24');
+                avatar.setAttribute('fill', 'none');
+                avatar.setAttribute('stroke', 'currentColor');
+                avatar.setAttribute('stroke-width', '1.5');
+                avatar.setAttribute('stroke-linecap', 'round');
+                avatar.setAttribute('stroke-linejoin', 'round');
+                avatar.innerHTML = `
+                    <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+                    <polyline points="2 12 12 17 22 12"></polyline>
+                    <polyline points="2 17 12 22 22 17"></polyline>
                 `;
+
+                const body = document.createElement('div');
+                body.className = 'assistant-body';
+
+                const contentDiv = document.createElement('div');
+                contentDiv.className = 'message-text';
+                contentDiv.innerHTML = text ? marked.parse(normalizeMathDelimiters(text)) : '';
+                if (text) highlightCode(contentDiv);
+
+                // Thinking block starts EMPTY and expanded. It is only ever populated
+                // with real 'status' events from the backend (planner/executor/etc),
+                // and it stays open + growing until the first actual answer token
+                // arrives — exactly like Claude: think first, then answer.
+                // Identical wiring is used for both Chat mode and Code mode.
+                const statusDiv = document.createElement('div');
+                statusDiv.className = 'thinking-block';
+                statusDiv.style.display = 'none'; // hidden until we actually get a thought
+                statusDiv.innerHTML = `
+                    <button type="button" class="thinking-toggle">Thinking</button>
+                    <div class="thinking-content expanded"></div>
+                `;
+                statusDiv.querySelector('.thinking-toggle').addEventListener('click', () => {
+                    statusDiv.querySelector('.thinking-content').classList.toggle('expanded');
+                });
+
+                body.appendChild(statusDiv);
+                body.appendChild(contentDiv);
+                bubble.appendChild(avatar);
+                bubble.appendChild(body);
+            } else {
+                bubble.innerText = text;
             }
-            
+
+            row.appendChild(bubble);
             chatContent.appendChild(row);
             scrollToBottom();
-            return row;
+
+            return role === 'assistant' ? bubble : null;
+        }
+
+        function scrollToBottom() {
+            chatContainer.scrollTop = chatContainer.scrollHeight;
         }
 
         async function sendMessage() {
             const text = userInput.value.trim();
             if (!text || isWaitingForResponse) return;
 
+            const mode = currentMode;
             appendMessage('user', text);
             userInput.value = '';
             autoResize(userInput);
             sendBtn.disabled = true;
             isWaitingForResponse = true;
 
-            const endpoint = currentMode === 'chat' ? '/chat' : '/code-chat';
-            const payload = currentMode === 'chat' ? {
-                message: text,
-                session_id: currentSessionId,
-                model_type: document.getElementById('modelType').value,
-                stream: document.getElementById('streamSetting').checked,
-                temperature: parseFloat(document.getElementById('tempSetting').value),
-                max_iterations: parseInt(document.getElementById('iterSetting').value)
-            } : {
-                message: text,
-                session_id: currentSessionId,
-                model: document.getElementById('inputModelType').value,
-                reasoning_level: document.getElementById('reasoningLevel').value,
-                stream: document.getElementById('streamSetting').checked,
-                temperature: 0.2
-            };
+            let apiUrl, payload, useStream;
+
+            if (mode === 'chat') {
+                const modelType = document.getElementById('modelType').value;
+                const temp = parseFloat(document.getElementById('tempSetting').value);
+                const maxIters = parseInt(document.getElementById('iterSetting').value);
+                useStream = document.getElementById('streamSetting').checked;
+                apiUrl = `${API_BASE}/chat`;
+                payload = {
+                    message: text,
+                    session_id: modes.chat.sessionId,
+                    model_type: modelType,
+                    stream: useStream,
+                    temperature: temp,
+                    max_iterations: maxIters
+                };
+            } else {
+                const codeModel = document.getElementById('codeModel').value;
+                const reasoningLevel = document.getElementById('codeReasoningLevel').value;
+                useStream = document.getElementById('codeStreamSetting').checked;
+                apiUrl = `${API_BASE}/code-chat`;
+                payload = {
+                    message: text,
+                    session_id: modes.code.sessionId,
+                    model: codeModel,
+                    reasoning_level: reasoningLevel,
+                    stream: useStream
+                    // No temperature — Code Mode intentionally omits it; backend applies its own default.
+                };
+            }
 
             const assistantBubble = appendMessage('assistant', '');
             const textContainer = assistantBubble.querySelector('.message-text');
@@ -413,10 +777,34 @@
             const thinkingContent = thinkingBlock.querySelector('.thinking-content');
             const thinkingStartTime = Date.now();
 
-            let thinkingDone = false;
-            let answerStarted = false;
-            let assistantFullText = '';
+            let thinkingDone = false;      // true once the model has moved on to answering
+            let answerStarted = false;     // true once the first answer token has arrived
+            let thinkingFinalized = false; // true once "Thought for Ns" has been set for good
 
+            // Icons mapping for different thought types
+            const thoughtIcons = {
+                'web': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>`,
+                'search': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`,
+                'error': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>`,
+                'success': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`,
+                'plan': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line><path d="M9 16l2 2 4-4"></path></svg>`,
+                'default': `<div class="thought-bullet"></div>`
+            };
+
+            function getIconForLabel(label, detail) {
+                const t = ((label || '') + ' ' + (detail || '')).toLowerCase();
+                if (t.includes('plan')) return thoughtIcons['plan'];
+                if (t.includes('search')) return thoughtIcons['search'];
+                if (t.includes('fetch') || t.includes('web') || t.includes('url') || t.includes('http')) return thoughtIcons['web'];
+                if (t.includes('fail') || t.includes('error') || t.includes('unable')) return thoughtIcons['error'];
+                if (t.includes('finish') || t.includes('success') || t.includes('complete') || t.includes('done')) return thoughtIcons['success'];
+                if (t.includes('writing') || t.includes('code')) return thoughtIcons['plan'];
+                return thoughtIcons['default'];
+            }
+
+            // Real backend progress event (planner / executor / reflector / evaluator,
+            // or the Code Mode equivalents). Reveals the block on the first thought
+            // and keeps it expanded while it grows. Shared by both modes.
             function addThought(label, detail) {
                 if (thinkingDone) return;
                 thinkingBlock.style.display = 'block';
@@ -425,24 +813,85 @@
 
                 const item = document.createElement('div');
                 item.className = 'thought-item';
-                item.innerHTML = `
-                    <div class="thought-icon-wrapper">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-                    </div>
-                    <div class="thought-content">${detail || label}</div>
-                `;
+
+                const icon = getIconForLabel(label, detail);
+                if (icon.includes('svg')) {
+                    item.innerHTML = `<div class="thought-icon-wrapper">${icon}</div>`;
+                } else {
+                    item.innerHTML = icon; // bullet
+                }
+
+                const content = document.createElement('div');
+                content.className = 'thought-content';
+                content.textContent = detail || label || '';
+                item.appendChild(content);
+
+                const showMore = document.createElement('button');
+                showMore.className = 'show-more-btn';
+                showMore.textContent = 'Show more';
+                item.appendChild(showMore);
+
                 thinkingContent.appendChild(item);
+
+                setTimeout(() => {
+                    if (content.scrollHeight > content.clientHeight) {
+                        showMore.style.display = 'block';
+                        showMore.onclick = () => {
+                            const isExpanded = content.classList.toggle('expanded');
+                            showMore.textContent = isExpanded ? 'Show less' : 'Show more';
+                        };
+                    }
+                }, 0);
+
                 scrollToBottom();
             }
 
+            // Called the moment the answer actually starts streaming. Switches the main
+            // toggle from a shimmering "Thinking" to a shimmering "Answering" and
+            // collapses the thought log, but doesn't settle the final label yet.
+            function startAnswering() {
+                if (thinkingDone) return;
+                thinkingDone = true;
+                if (!thinkingContent.childElementCount) return;
+                thinkingToggle.textContent = 'Answering';
+                thinkingToggle.classList.add('shimmer');
+                thinkingContent.classList.remove('expanded');
+            }
+
+            // Called once the response is fully done (stream ended, or non-streaming
+            // reply received). Settles the main toggle into "Thought for Ns" and stops
+            // the shimmer for good, Claude-style. Same behavior for both modes.
+            function finishThinking() {
+                if (thinkingFinalized) return;
+                thinkingFinalized = true;
+                thinkingDone = true;
+                if (!thinkingContent.childElementCount) {
+                    thinkingBlock.remove();
+                    return;
+                }
+                const seconds = Math.max(1, Math.round((Date.now() - thinkingStartTime) / 1000));
+                thinkingToggle.textContent = `Thought for ${seconds}s`;
+                thinkingToggle.classList.remove('shimmer');
+                thinkingContent.classList.remove('expanded');
+            }
+
+            let assistantFullText = '';
+            let codeResult = null; // { code, language, show_preview } — Code Mode only
+
+            if (useStream) {
+                textContainer.innerHTML = THINKING_SVG;
+            }
+
             try {
-                const response = await fetch(endpoint, {
+                const response = await fetch(apiUrl, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
                 });
 
-                if (payload.stream) {
+                if (!response.ok) throw new Error('Network response was not ok');
+
+                if (useStream) {
                     const reader = response.body.getReader();
                     const decoder = new TextDecoder();
                     let buffer = '';
@@ -450,95 +899,68 @@
                     while (true) {
                         const { value, done } = await reader.read();
                         if (done) break;
+
                         buffer += decoder.decode(value, { stream: true });
+
                         const events = buffer.split('\n\n');
                         buffer = events.pop();
 
                         for (const event of events) {
                             const line = event.trim();
                             if (!line.startsWith('data:')) continue;
+
                             const jsonStr = line.slice(5).trim();
                             try {
                                 const parsed = JSON.parse(jsonStr);
                                 if (parsed.type === 'status') {
                                     addThought(parsed.label, parsed.detail);
+                                } else if (parsed.type === 'code_result') {
+                                    codeResult = parsed;
                                 } else if (parsed.assistant_message) {
                                     if (!answerStarted) {
                                         answerStarted = true;
-                                        thinkingDone = true;
-                                        thinkingToggle.classList.remove('shimmer');
-                                        thinkingToggle.textContent = `Thought for ${Math.round((Date.now() - thinkingStartTime)/1000)}s`;
+                                        finishThinking(); // collapse thoughts the instant the answer begins
                                     }
                                     assistantFullText += parsed.assistant_message;
-                                    textContainer.innerHTML = marked.parse(assistantFullText);
+                                    textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText)) + THINKING_SVG;
                                     scrollToBottom();
-                                } else if (parsed.type === 'code_result') {
-                                    handleCodeResult(parsed);
                                 }
-                            } catch (e) {}
+                            } catch (e) {
+                                console.error('Failed to parse SSE chunk:', jsonStr, e);
+                            }
                         }
                     }
+
+                    textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText));
+                    highlightCode(textContainer);
+                    if (codeResult && codeResult.show_preview) {
+                        addPreviewToLastCodeCard(textContainer, codeResult.language, codeResult.code);
+                    }
+
                 } else {
                     const data = await response.json();
-                    textContainer.innerHTML = marked.parse(data.response);
-                    if (data.code) handleCodeResult(data);
+                    assistantFullText = data.response;
+                    textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText));
+                    highlightCode(textContainer);
+                    if (mode === 'code' && data.show_preview) {
+                        addPreviewToLastCodeCard(textContainer, data.language, data.code);
+                    }
                 }
+
+                finishThinking(); // no-op if already collapsed when the answer started
+
             } catch (error) {
                 console.error('Error:', error);
-                textContainer.innerHTML = 'Error communicating with backend.';
+                thinkingBlock.remove();
+                textContainer.innerHTML = `<span style="color: var(--text-secondary)">Make sure your Python FastAPI backend is running.</span>`;
             } finally {
                 sendBtn.disabled = false;
                 isWaitingForResponse = false;
-                hljs.highlightAll();
+                userInput.focus();
+                const cursor = textContainer.querySelector('.thinking-indicator');
+                if (cursor) cursor.remove();
+                modes[mode].html = chatContent.innerHTML;
             }
-        }
-
-        function handleCodeResult(data) {
-            if (!data.code) return;
-            lastCode = data.code;
-            lastLang = data.language;
-            
-            canvasView.classList.add('active');
-            document.getElementById('canvasCode').innerHTML = `<pre><code class="language-${data.language}">${escapeHtml(data.code)}</code></pre>`;
-            hljs.highlightElement(document.getElementById('canvasCode').querySelector('code'));
-            
-            const previewTab = document.getElementById('tab-preview');
-            if (data.show_preview) {
-                previewTab.style.display = 'block';
-                updatePreview(data.code);
-            } else {
-                previewTab.style.display = 'none';
-                setCanvasTab('code');
-            }
-        }
-
-        function updatePreview(code) {
-            const iframe = document.getElementById('previewFrame');
-            const blob = new Blob([code], { type: 'text/html' });
-            iframe.src = URL.createObjectURL(blob);
-        }
-
-        function setCanvasTab(tab) {
-            document.querySelectorAll('.canvas-tab').forEach(el => el.classList.remove('active'));
-            document.getElementById(`tab-${tab}`).classList.add('active');
-            
-            if (tab === 'code') {
-                document.getElementById('canvasCode').style.display = 'block';
-                document.getElementById('canvasPreview').classList.remove('active');
-            } else {
-                document.getElementById('canvasCode').style.display = 'none';
-                document.getElementById('canvasPreview').classList.add('active');
-            }
-        }
-
-        function closeCanvas() {
-            canvasView.classList.remove('active');
-        }
-
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
         }
 
         window.onload = () => {
@@ -546,10 +968,10 @@
                 const splash = document.getElementById('splashScreen');
                 if (splash) {
                     splash.classList.add('hidden');
-                    setTimeout(() => splash.style.display = 'none', 800);
+                    setTimeout(() => splash.style.display = 'none', 700);
                 }
-                userInput.focus();
-            }, 1600);
+                document.getElementById('userInput').focus();
+            }, 1500);
         };
     </script>
 </body>
