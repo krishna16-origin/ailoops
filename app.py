@@ -1182,12 +1182,21 @@ You can only return ONE code block per turn (one 'code' + one 'language' field).
 There is no mechanism to deliver separate files in the same turn.
 
 Because of this:
-- For any frontend/web task (HTML, CSS, JS, a "website", "app", "page", "UI"),
-  you MUST produce a single self-contained .html file with CSS inside a
-  <style> tag and JS inside a <script> tag, in the <head>/<body> of that
-  same file. NEVER write <link rel="stylesheet" href="styles.css"> or
+- For any frontend/web task (HTML, CSS, JS, React, Vue, Svelte, a "website",
+  "app", "page", "component", "UI"), you MUST produce a single self-contained
+  .html file with ALL CSS inside a <style> tag and ALL JS inside a <script>
+  tag, in the <head>/<body> of that same file. The 'language' field for
+  every such task MUST be "html" — never "css", "javascript", "jsx", "tsx",
+  "vue", or "svelte" on their own. Those languages cannot run standalone in
+  a browser preview with no build step; only a plain .html file can.
+  NEVER write <link rel="stylesheet" href="styles.css"> or
   <script src="app.js"> — those files will never exist, and the page will
   silently render unstyled and non-functional.
+- If the user explicitly asks for React/Vue/Svelte source code itself (not a
+  preview of it running), that's fine to return as its own language — but
+  if the goal is to SHOW or PREVIEW a working UI, always compile it down to
+  vanilla HTML/CSS/JS (or load the framework from a CDN <script> tag inside
+  the same HTML file) rather than returning bare framework source.
 - If a task genuinely requires multiple real files (e.g. a Python package),
   pick the single most important file for this step and say in your
   explanation which other files still need separate follow-up turns —
@@ -1275,6 +1284,35 @@ async def merge_html_bundle(prior_code: str, new_snippet: str, model_key: str, t
     except Exception as e:
         print(f"[CodeMode] HTML merge pass failed: {e}")
         return new_snippet  # fall back to whatever we had rather than losing the answer
+
+async def bundle_into_html(code: str, language: str, goal: str, prior_code: str, model_key: str, temperature: float) -> str:
+    """Converts a non-HTML frontend answer (bare CSS, bare JS, a JSX component, a Vue SFC,
+    etc.) into one self-contained HTML file. Nothing but plain HTML can be dropped into an
+    iframe and previewed with no build step, so whatever framework/language the model chose,
+    this compiles it down to vanilla HTML/CSS/JS (or a CDN <script> tag for the framework,
+    if the snippet genuinely needs the framework itself) inside a single file."""
+    llm = get_code_llm(model_key, temperature)
+    context = f"Existing HTML file to merge into:\n{prior_code}\n\n" if prior_code else ""
+    prompt = (
+        f"The snippet below is written in {language}, which cannot run standalone in a "
+        "browser preview with no build step. Convert it into ONE complete, self-contained "
+        "HTML file: put all CSS inside a single <style> tag and all JS inside a single "
+        "<script> tag, both inside that same file. Prefer plain vanilla JS/CSS equivalents; "
+        "only load a framework from a CDN <script> tag if the snippet genuinely can't work "
+        f"without it. Goal: {goal}\n\n{context}"
+        f"Snippet ({language}):\n{code}\n\n"
+        "Return ONLY the raw HTML — no explanation, no markdown code fences."
+    )
+    try:
+        res = await llm.ainvoke([HumanMessage(content=prompt)])
+        bundled = strip_thinking(res.content).strip()
+        fence_match = CODE_FENCE_RE.search(bundled)
+        if fence_match:
+            bundled = fence_match.group(2).strip()
+        return bundled if bundled else code
+    except Exception as e:
+        print(f"[CodeMode] bundle_into_html pass failed: {e}")
+        return code  # fall back to the unconverted snippet rather than losing the answer
 
 # A deliberately generous keyword list: false positives just cost one extra cheap LLM
 # call (add_missing_js is a no-op-safe repair), false negatives silently ship a dead
@@ -1446,13 +1484,24 @@ async def code_executor_node(state: CodeAgentState) -> dict:
         # a random glitch every time.
         explanation = f"I hit an issue generating code for this step: {err}" if err else "I hit an issue generating code for this step."
 
+    # Guard 0: any frontend answer that ISN'T plain HTML — bare CSS, bare JS, a JSX
+    # component, a Vue SFC, etc. — can't be dropped into an iframe and previewed with no
+    # build step. Bundle/compile it down into one self-contained HTML file first so every
+    # frontend language ends up as something the preview can actually render, and so the
+    # drop-detection guards below always have real HTML to check against.
+    prior_code = state.get("code", "")
+    lang_lower = language.strip().lower()
+    if code and is_frontend and lang_lower in FRONTEND_CODE_LANGUAGES and lang_lower not in ("html", "htm"):
+        code = await bundle_into_html(code, language, state.get("goal", ""), prior_code, state["model_key"], state["temperature"])
+        language = "html"
+        lang_lower = "html"
+
     # Guard 1: a "frontend HTML" answer that dropped something the PRIOR file already had
     # (e.g. a follow-up that only answered the narrow ask, "add a navbar", and quietly
     # dropped the <script> block that was there before) gets merged back into the full
     # file. Checked per-tag (not "style OR script") — otherwise an answer that kept CSS
     # but silently lost JS looked "bundled enough" and slipped through uncaught.
-    prior_code = state.get("code", "")
-    if code and is_frontend and language.strip().lower() in ("html", "htm") and prior_code:
+    if code and is_frontend and lang_lower in ("html", "htm") and prior_code:
         code_lower, prior_lower = code.lower(), prior_code.lower()
         looks_like_full_page = ("<html" in code_lower) or ("<!doctype" in code_lower)
         dropped_style = ("<style" in prior_lower) and ("<style" not in code_lower)
@@ -1465,7 +1514,7 @@ async def code_executor_node(state: CodeAgentState) -> dict:
     # calculator, form validation, game, etc. that doesn't actually do anything without
     # it). If the goal/current step matches an interactivity keyword and there's still
     # no <script> tag at all, do one repair pass that adds the missing behavior.
-    if code and is_frontend and language.strip().lower() in ("html", "htm") and "<script" not in code.lower():
+    if code and is_frontend and lang_lower in ("html", "htm") and "<script" not in code.lower():
         if _needs_js(state.get("goal", ""), state.get("current_step", "")):
             code = await add_missing_js(code, state.get("goal", ""), state.get("current_step", ""), state["model_key"], state["temperature"])
 
