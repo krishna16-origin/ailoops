@@ -1501,16 +1501,30 @@ def code_node_detail(node_name: str, state: dict) -> str:
     return CODE_NODE_LABELS.get(node_name, node_name)
 
 async def run_code_graph_streaming(initial_state: dict, timeout: float):
+    """Streams (node_name, state) tuples from the LangGraph run. Also yields periodic
+    (None, state_acc) heartbeats every ~12s so a single slow node call (these can take
+    60-140s with zero bytes sent in between) doesn't leave the SSE connection silent long
+    enough for a hosting platform's proxy (e.g. Render) to kill it as idle. That silent
+    kill — not a Python exception — is what shows up as 'thinking animation finishes,
+    then nothing': the connection dies mid-node, so there's nothing to catch or log."""
     state_acc = dict(initial_state)
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
     agen = code_app_graph.astream(initial_state, stream_mode="updates")
+    HEARTBEAT_INTERVAL = 12.0
     try:
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise asyncio.TimeoutError()
-            chunk = await asyncio.wait_for(agen.__anext__(), timeout=remaining)
+            wait_chunk = min(HEARTBEAT_INTERVAL, remaining)
+            try:
+                chunk = await asyncio.wait_for(agen.__anext__(), timeout=wait_chunk)
+            except asyncio.TimeoutError:
+                if wait_chunk >= remaining:
+                    raise
+                yield None, state_acc  # heartbeat only — no node finished yet
+                continue
             node_name, node_output = next(iter(chunk.items()))
             state_acc.update(node_output)
             yield node_name, state_acc
@@ -1546,6 +1560,9 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
 
         try:
             async for node_name, state_so_far in run_code_graph_streaming(initial_state, timeout):
+                if node_name is None:
+                    yield ": keep-alive\n\n"  # SSE comment — keeps the connection alive, frontend ignores it
+                    continue
                 label = CODE_NODE_LABELS.get(node_name, node_name)
                 detail = code_node_detail(node_name, state_so_far)
                 yield f"data: {json.dumps({'type': 'status', 'step': node_name, 'label': label, 'detail': detail})}\n\n"
@@ -1566,6 +1583,13 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
             result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
             final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
             final_state = {"completion_score": 100, "iteration": 1}
+
+    # Hard guarantee: no matter what path got here, never let an empty string reach the
+    # frontend — that's what silently produced a blank bubble after the thinking animation
+    # ended (the animation still resolves to "Thought for Ns" either way, so an empty
+    # answer looked exactly like the whole thing just doing nothing).
+    if not (final_response or "").strip():
+        final_response = "I wasn't able to generate a response for that — please try again."
 
     session["messages"].append(AIMessage(content=final_response))
 
@@ -1674,6 +1698,9 @@ async def _handle_code_chat(request: CodeChatRequest):
             result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
             final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
             final_state = {"completion_score": 100, "iteration": 1}
+
+    if not (final_response or "").strip():
+        final_response = "I wasn't able to generate a response for that — please try again."
 
     session["messages"].append(AIMessage(content=final_response))
 
