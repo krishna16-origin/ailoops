@@ -959,6 +959,7 @@
             let thinkingDone = false;      // true once the model has moved on to answering
             let answerStarted = false;     // true once the first answer token has arrived
             let thinkingFinalized = false; // true once "Thought for Ns" has been set for good
+            let liveThoughtEl = null;      // growing text node for the raw token-by-token reasoning stream (Code Mode)
 
             // Icons mapping for different thought types
             const thoughtIcons = {
@@ -1022,6 +1023,36 @@
                     }
                 }, 0);
 
+                scrollToBottom();
+            }
+
+            // Genuine token-by-token reasoning stream (Code Mode only, before the plan/
+            // execute loop starts). Creates one growing thought bubble that fills in as
+            // 'thinking' delta events arrive, instead of the discrete per-node bubbles
+            // addThought() creates for 'status' events. Returns the text node to append to.
+            function startLiveThought() {
+                if (thinkingDone) return null;
+                thinkingBlock.style.display = 'block';
+                thinkingToggle.textContent = 'Thinking';
+                thinkingToggle.classList.add('shimmer');
+                thinkingContent.classList.add('expanded');
+
+                const item = document.createElement('div');
+                item.className = 'thought-item';
+                item.innerHTML = `<div class="thought-icon-wrapper">${thoughtIcons['default']}</div>`;
+
+                const content = document.createElement('div');
+                content.className = 'thought-content expanded';
+                item.appendChild(content);
+
+                thinkingContent.appendChild(item);
+                scrollToBottom();
+                return content;
+            }
+
+            function appendLiveThought(delta) {
+                if (!liveThoughtEl || !delta) return;
+                liveThoughtEl.textContent += delta;
                 scrollToBottom();
             }
 
@@ -1091,7 +1122,14 @@
                             const jsonStr = line.slice(5).trim();
                             try {
                                 const parsed = JSON.parse(jsonStr);
-                                if (parsed.type === 'status') {
+                                if (parsed.type === 'thinking_start') {
+                                    liveThoughtEl = startLiveThought();
+                                } else if (parsed.type === 'thinking') {
+                                    appendLiveThought(parsed.delta);
+                                } else if (parsed.type === 'thinking_done') {
+                                    // Real per-node status bubbles (understanding/planning/etc.)
+                                    // follow right after this — nothing else to do here.
+                                } else if (parsed.type === 'status') {
                                     addThought(parsed.label, parsed.detail);
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
