@@ -587,11 +587,34 @@
             return map[(language || '').trim().toLowerCase()] || 'txt';
         }
 
+        // Live-fills the code canvas as code_delta events arrive, the same way the
+        // thinking panel fills token-by-token — never touches the chat bubble. The panel
+        // itself has a fixed height with internal scrolling (see .canvas-view CSS), so this
+        // only ever scrolls the code view; it can't make the box grow.
+        function startCodeCanvasStream(language, filename) {
+            streamingActive = true;
+            canvasTitle.textContent = filename || friendlyLangLabel(language) || 'Code';
+            canvasCodeEl.textContent = '';
+            canvasCodeEl.className = `language-${(language || 'plaintext').toLowerCase()}`;
+            canvasCodeEl.removeAttribute('data-highlighted');
+            document.getElementById('canvasPreviewTabBtn').style.display = 'none'; // no preview until the file is complete
+            setCanvasTab('code');
+            codeCanvas.hidden = false;
+        }
+
+        function appendCodeCanvasStream(delta) {
+            if (!delta) return;
+            canvasCodeEl.textContent += delta;
+            const view = document.getElementById('canvasCodeView');
+            view.scrollTop = view.scrollHeight; // keep the "typewriter" pinned to the latest line
+        }
+
         // Called from Code mode's sendMessage() the moment a code_result arrives
         // (streaming) or a non-streaming response with code comes back. Stores the
         // result on modes.code and renders it only if Code mode is currently visible.
         function updateCodeCanvas(language, code, showPreview) {
             if (!code) return;
+            streamingActive = false;
             modes.code.canvas = {
                 open: true,
                 language: language || '',
@@ -745,6 +768,7 @@
         const codeCanvas = document.getElementById('codeCanvas');
         const canvasTitle = document.getElementById('canvasTitle');
         const canvasCodeEl = document.getElementById('canvasCode');
+        let streamingActive = false; // true while code_delta events are live-filling the canvas
         const canvasPreviewFrame = document.getElementById('canvasPreviewFrame');
 
         function toggleSidebar() { sidebar.classList.toggle('collapsed'); }
@@ -1131,6 +1155,12 @@
                                     // follow right after this — nothing else to do here.
                                 } else if (parsed.type === 'status') {
                                     addThought(parsed.label, parsed.detail);
+                                } else if (parsed.type === 'code_start') {
+                                    startCodeCanvasStream(parsed.language, '');
+                                } else if (parsed.type === 'code_file_start') {
+                                    startCodeCanvasStream(parsed.language, parsed.filename);
+                                } else if (parsed.type === 'code_delta') {
+                                    appendCodeCanvasStream(parsed.delta);
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
                                 } else if (parsed.assistant_message) {
