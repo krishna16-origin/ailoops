@@ -123,6 +123,20 @@
         .message-text .artifact-chip-title { font-size:13.5px; font-weight:500; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .message-text .artifact-chip-meta { font-size:12px; color:var(--text-secondary); margin-top:2px; }
         .message-text .artifact-chip-btn { flex-shrink:0; background-color:var(--text-primary); color:var(--bg-main); border:none; border-radius:999px; font-size:12.5px; font-weight:600; padding:6px 14px; cursor:pointer; pointer-events:none; }
+        /* Small live-fill box shown INSIDE the chat message while code is being generated —
+           the chat-visible counterpart to the canvas stream. Fixed height with internal
+           scroll: it never grows the chat bubble no matter how large the file gets, it just
+           tails the latest lines like a small log window. Replaced by .artifact-chip once
+           the file is complete (see the code_result handler). */
+        .message-text .inline-code-stream { margin:14px 0; border:1px solid var(--border-color); border-radius:12px; overflow:hidden; background-color:#111; max-width:560px; }
+        .message-text .inline-code-stream-header { display:flex; align-items:center; gap:8px; padding:8px 12px; background-color:#1c1c1c; border-bottom:1px solid var(--border-color); }
+        .message-text .inline-code-stream-header svg { width:14px; height:14px; color:var(--accent); flex-shrink:0; }
+        .message-text .inline-code-stream-filename { font-size:12.5px; font-weight:500; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .message-text .inline-code-stream-status { font-size:11.5px; color:var(--text-secondary); margin-left:auto; flex-shrink:0; display:flex; align-items:center; gap:6px; }
+        .message-text .inline-code-stream-status .dot { width:6px; height:6px; border-radius:50%; background-color:var(--accent); animation:inlineStreamPulse 1s ease-in-out infinite; }
+        @keyframes inlineStreamPulse { 0%,100% { opacity:0.3; } 50% { opacity:1; } }
+        .message-text .inline-code-stream-body { margin:0; padding:10px 14px; max-height:150px; overflow-y:auto; }
+        .message-text .inline-code-stream-body code { font-size:12px; line-height:1.55; font-family:'Courier New', Courier, monospace; color:var(--text-secondary); white-space:pre-wrap; word-break:break-all; }
         .message-text .copy-btn { display:flex; align-items:center; gap:6px; background:transparent; border:none; color:var(--text-secondary); font-size:12px; cursor:pointer; padding:4px 8px; border-radius:6px; transition:background 0.2s, color 0.2s; }
         .message-text .copy-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
         .message-text .copy-btn svg { width:14px; height:14px; }
