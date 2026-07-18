@@ -1543,7 +1543,39 @@ async def execute_code_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic
                 except Exception as salvage_err:
                     print(f"[CodeMode] Salvage construction failed: {salvage_err}")
 
+    # Same idea for the planner: a big multi-file plan (20-30 detailed steps for something
+    # like a full SaaS app) can brush max_tokens and get cut off mid-array. Because the prompt
+    # and temperature are the same on every retry, this tends to truncate at the same point
+    # every attempt — plain retries alone rarely fix it. Recovering whichever plan items did
+    # complete before the cutoff beats returning an empty plan, which used to end the whole
+    # multi-file loop immediately with zero files ever produced (see code_decision_edge).
+    if pydantic_model is CodePlannerOutput and last_raw_content:
+        plan_match = re.search(r'"plan"\s*:\s*\[(.*?)(?:\]|$)', last_raw_content, re.DOTALL)
+        if plan_match:
+            raw_items = re.findall(r'"((?:[^"\\]|\\.)*)"', plan_match.group(1))
+            salvaged_plan = []
+            for raw_item in raw_items:
+                try:
+                    salvaged_plan.append(json.loads(f'"{raw_item}"'))
+                except Exception:
+                    salvaged_plan.append(raw_item)
+            salvaged_plan = [p for p in salvaged_plan if p.strip()]
+            if salvaged_plan:
+                step_match = re.search(r'"current_step"\s*:\s*"((?:[^"\\]|\\.)*)"', last_raw_content)
+                target_match = re.search(r'"target_file"\s*:\s*"((?:[^"\\]|\\.)*)"', last_raw_content)
+                print(f"[CodeMode] Salvaged a {len(salvaged_plan)}-step plan from truncated JSON output.")
+                try:
+                    return CodePlannerOutput(
+                        plan=salvaged_plan,
+                        current_step=(step_match.group(1) if step_match else salvaged_plan[0]),
+                        target_file=(target_match.group(1) if target_match else ""),
+                        approach="Recovered from a truncated planning response — the JSON got cut off but the plan items were intact.",
+                    ), None
+                except Exception as salvage_err:
+                    print(f"[CodeMode] Plan salvage construction failed: {salvage_err}")
+
     return None, last_error
+
 
 def format_code_context(state: CodeAgentState) -> str:
     msg_str = "\n".join([f"{m.type.capitalize()}: {m.content}" for m in state.get("messages", [])])
@@ -1772,6 +1804,15 @@ def code_decision_edge(state: CodeAgentState) -> str:
     if bool(state.get("is_multi_file")):
         plan = state.get("plan", []) or []
         files_done = len(state.get("files", {}))
+
+        # Bug fix: an empty plan used to fall straight through to END, because
+        # `files_done (0) < len(plan) (0)` is False. That's not "nothing left to do" —
+        # it's the planner never having produced a plan at all (its structured JSON call
+        # failed or got truncated, which is common on large multi-file asks with 20-30
+        # steps). Retry planning instead of silently giving up with zero files.
+        if not plan and not out_of_iterations:
+            return "code_planner"
+
         # Keep looping until every planned file exists, or we run out of room — a
         # multi-file build finishing early just because ONE file exists and the
         # evaluator liked it is exactly what used to collapse "20-feature SaaS app"
