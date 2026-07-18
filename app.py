@@ -2146,7 +2146,17 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
 
     session["messages"].append(AIMessage(content=final_response))
 
-    chunks = final_response.split(" ")
+    # Only stream the prose/explanation into the chat bubble. `final_response` still
+    # has the full fenced code glued on the end (see code_executor_node), but that
+    # code is delivered once, in full, via the `code_result` event right below and
+    # rendered into the dedicated code canvas. Streaming the fenced block word-by-word
+    # here is what made the whole file appear to get typed out inside the chat like a
+    # raw paste, with it only "moving" into the code panel after the fact.
+    chat_text = final_response.split("```")[0].strip() if "```" in final_response else final_response
+    if not chat_text:
+        chat_text = "Here's the code:" if code else final_response
+
+    chunks = chat_text.split(" ")
     for i, chunk in enumerate(chunks):
         space = " " if i < len(chunks) - 1 else ""
         data = {
