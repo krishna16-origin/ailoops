@@ -2131,7 +2131,7 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
 class CodeChatRequest(BaseModel):
     message: str
     session_id: str
-    model: str = "kimi"           # "kimi" -> moonshotai/kimi-k2.6, "glm" -> z-ai/glm-5.2
+    model: str = "kimi"           # "kimi" -> nvidia/nemotron-3-ultra-550b-a55b, "glm" -> deepseek-ai/deepseek-v4-pro (see CODE_MODEL_MAP)
     reasoning_level: str = "medium"  # "low" | "medium" | "high" | "max"
     stream: bool = False
     temperature: float = 0.2
@@ -2154,6 +2154,7 @@ async def code_chat(request: CodeChatRequest):
             "session_id": request.session_id,
             "code": "",
             "language": "",
+            "files": {},
             "show_preview": False,
             "goal_progress": 0,
             "completed": False,
@@ -2179,6 +2180,9 @@ async def _handle_code_chat(request: CodeChatRequest):
             media_type="text/event-stream"
         )
 
+    is_multi = False
+    files: Dict[str, str] = {}
+
     if is_simple_code_message(request.message):
         result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
         final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
@@ -2193,11 +2197,17 @@ async def _handle_code_chat(request: CodeChatRequest):
             "completion_score": 0,
             "completed_steps": [],
             "plan": [],
-            # Seed the real previous code/language so follow-up turns amend the actual
-            # prior file instead of relying only on the plain-text chat history — this is
-            # what was causing "task completed, no code" replies on a second ask.
+            "target_file": "",
+            "is_multi_file": False,
+            "estimated_file_count": 1,
+            # Seed the real previous code/language (and any previously accumulated
+            # multi-file build) so follow-up turns amend the actual prior work instead of
+            # relying only on the plain-text chat history — this is what was causing
+            # "task completed, no code" replies on a second ask.
             "code": session.get("last_code", ""),
-            "language": session.get("last_language", "")
+            "language": session.get("last_language", ""),
+            "files": dict(session.get("last_files", {})),
+            "file_languages": dict(session.get("last_file_languages", {}))
         }
         timeout = code_graph_timeout_seconds(request.model, max_iterations)
 
@@ -2209,45 +2219,69 @@ async def _handle_code_chat(request: CodeChatRequest):
             code = final_state.get("code", "")
             language = final_state.get("language", "")
             is_frontend = final_state.get("is_frontend", False)
+            is_multi = bool(final_state.get("is_multi_file"))
+            files = final_state.get("files", {}) if is_multi else {}
 
             # Hard safety net: code_decision_edge now avoids ending the loop before code
             # exists, but if iterations still ran out with none (e.g. reasoning_level
             # "low" giving very few passes), don't hand back an explanation with nothing
             # to show — make one guaranteed direct attempt at real code instead.
-            if not code.strip():
-                print(f"[{session_id}] Code graph ended with empty code — falling back to direct generation.")
+            has_any_output = bool(files) if is_multi else bool(code.strip())
+            if not has_any_output:
+                print(f"[{session_id}] Code graph ended with no output — falling back to direct generation.")
                 fallback = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
                 if fallback["code"].strip():
                     final_response, code, language, is_frontend = fallback["text"], fallback["code"], fallback["language"], fallback["is_frontend"]
+                    is_multi, files = False, {}
         except asyncio.TimeoutError:
             print(f"[{session_id}] Code Mode workflow timed out after {timeout:.0f}s. Falling back to direct answer.")
             result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
             final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
             final_state = {"completion_score": 100, "iteration": 1}
+            is_multi, files = False, {}
         except Exception as e:
             print(f"[{session_id}] Code Mode workflow failed: {e}. Falling back to direct answer.")
             result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
             final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
             final_state = {"completion_score": 100, "iteration": 1}
+            is_multi, files = False, {}
 
-    # Enforce single-file bundling ONCE here, on the final settled answer — not on every
-    # internal loop iteration (see enforce_single_file_frontend's docstring for why).
-    goal_hint = final_state.get("goal", "") or request.message
-    prior_code_for_guard = session.get("last_code", "")
-    new_code, new_language, new_is_frontend = await enforce_single_file_frontend(
-        code, language, is_frontend, goal_hint, prior_code_for_guard, request.model, request.temperature
-    )
-    if new_code != code:
-        final_response = rebuild_response_with_code(final_response, new_code, new_language)
-        code, language, is_frontend = new_code, new_language, new_is_frontend
+    if is_multi and files:
+        # Big multi-file build: assemble every accumulated file into the final answer as
+        # its own fenced block, and hand the raw per-file dict back too (see 'files' below)
+        # instead of only ever returning the single last file that code_executor_node
+        # happened to run on last — that's what was silently dropping every other file.
+        file_languages = final_state.get("file_languages", {})
+        intro = final_state.get("goal", "") and f"Built {len(files)} files for: {final_state.get('goal')}"
+        parts = [intro] if intro else [f"Built {len(files)} files."]
+        for fname, fcode in files.items():
+            flang = file_languages.get(fname, "")
+            parts.append(f"**{fname}**\n```{flang}\n{fcode}\n```")
+        final_response = "\n\n".join(p for p in parts if p and p.strip())
+        code, language = "", ""
+        is_frontend = any(f.lower().endswith((".html", ".htm")) for f in files)
+    else:
+        # Single-file path: enforce single-file bundling ONCE here, on the final settled
+        # answer — not on every internal loop iteration (see enforce_single_file_frontend's
+        # docstring for why).
+        goal_hint = final_state.get("goal", "") or request.message
+        prior_code_for_guard = session.get("last_code", "")
+        new_code, new_language, new_is_frontend = await enforce_single_file_frontend(
+            code, language, is_frontend, goal_hint, prior_code_for_guard, request.model, request.temperature
+        )
+        if new_code != code:
+            final_response = rebuild_response_with_code(final_response, new_code, new_language)
+            code, language, is_frontend = new_code, new_language, new_is_frontend
 
     if not (final_response or "").strip():
         final_response = "I wasn't able to generate a response for that — please try again."
 
-    # Remember this turn's code so the NEXT turn can seed it back in (only overwrite
-    # when we actually got new code — a turn that produced none shouldn't wipe out a
-    # perfectly good previous file).
-    if code:
+    # Remember this turn's output so the NEXT turn can seed it back in (only overwrite
+    # when we actually got new output — a turn that produced none shouldn't wipe out a
+    # perfectly good previous build).
+    if is_multi and files:
+        session["last_files"], session["last_file_languages"] = files, final_state.get("file_languages", {})
+    elif code:
         session["last_code"], session["last_language"] = code, language
 
     session["messages"].append(AIMessage(content=final_response))
@@ -2257,6 +2291,7 @@ async def _handle_code_chat(request: CodeChatRequest):
         "session_id": session_id,
         "code": code,
         "language": language,
+        "files": files,
         "show_preview": bool(is_frontend),   # frontend code -> True (render live preview); backend code -> False
         "model": request.model,
         "reasoning_level": request.reasoning_level,
