@@ -2034,6 +2034,19 @@ async def stream_code_thinking(model_key: str, temperature: float, message: str,
     except Exception as e:
         print(f"[CodeMode] Thinking stream failed (non-fatal, coding loop still runs): {e}")
 
+def iter_code_chunks(text: str, target_chunks: int = 60, min_chunk: int = 24, max_chunk: int = 800):
+    """Splits an already-generated code string into pieces for progressive delivery to the
+    code canvas — a Claude/Gemini-Canvas-style 'typewriter' fill instead of the whole file
+    landing in the box in one blob. `target_chunks` keeps the total number of SSE events (and
+    the added latency from the small sleep between them) roughly constant regardless of file
+    size: a 2KB file and a 200KB file both stream in about the same number of steps, just with
+    bigger pieces for the bigger file, so this never meaningfully slows down delivery."""
+    if not text:
+        return
+    chunk_size = max(min_chunk, min(max_chunk, (len(text) // target_chunks) + 1))
+    for i in range(0, len(text), chunk_size):
+        yield text[i:i + chunk_size]
+
 async def generate_code_stream(request: "CodeChatRequest", session: dict, session_id: str):
     """Streams SSE events for Code Mode: status updates while working, then the final
     answer word-by-word, followed by one 'code_result' event carrying the code/language/
@@ -2194,6 +2207,27 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
         }
         yield f"data: {json.dumps(data)}\n\n"
         await asyncio.sleep(0.015)
+
+    # Stream the generated code into the dedicated code canvas — never into the chat
+    # bubble — so it fills in progressively like Claude's/Gemini's artifact panel instead
+    # of the whole file appearing all at once when code_result lands. code_result (below)
+    # remains the authoritative final payload the frontend reconciles against, so a dropped
+    # or out-of-order delta can never leave the canvas showing something wrong or partial.
+    if is_multi and files:
+        file_languages = final_state.get("file_languages", {})
+        for fname, fcode in files.items():
+            if not fcode:
+                continue
+            flang = file_languages.get(fname, "")
+            yield f"data: {json.dumps({'type': 'code_file_start', 'filename': fname, 'language': flang, 'session_id': session_id})}\n\n"
+            for delta in iter_code_chunks(fcode):
+                yield f"data: {json.dumps({'type': 'code_delta', 'filename': fname, 'delta': delta, 'session_id': session_id})}\n\n"
+                await asyncio.sleep(0.01)
+    elif code:
+        yield f"data: {json.dumps({'type': 'code_start', 'language': language, 'session_id': session_id})}\n\n"
+        for delta in iter_code_chunks(code):
+            yield f"data: {json.dumps({'type': 'code_delta', 'delta': delta, 'session_id': session_id})}\n\n"
+            await asyncio.sleep(0.01)
 
     # One final event carrying the structured code result, so the frontend can render
     # a live preview (Gemini-Canvas style) only when the code is frontend code. `files`
