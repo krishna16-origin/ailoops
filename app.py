@@ -1522,26 +1522,31 @@ async def execute_code_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic
             await asyncio.sleep(0.5)
 
     # Last-ditch salvage: a truncated/malformed JSON response (e.g. hit max_tokens mid-object)
-    # very often still contains a perfectly good fenced code block inside the raw text — pulling
-    # that out beats silently returning None, which is what produced "task completed, no code
-    # was formulated" even when the model had actually written real code.
+    # very often still contains a perfectly good — or partially-written — code block inside
+    # the raw text. Pulling that out beats silently returning None, which is what produced
+    # "task completed, no code was formulated" even when the model had actually written real
+    # (possibly incomplete) code.
     if pydantic_model is CodeExecutorOutput and last_raw_content:
-        match = CODE_FENCE_RE.search(last_raw_content)
-        if match:
-            salvaged_lang = (match.group(1) or "").strip()
-            salvaged_code = match.group(2).strip()
-            if salvaged_code:
-                print(f"[CodeMode] Salvaged a code block from malformed JSON output ({len(salvaged_code)} chars).")
-                try:
-                    return CodeExecutorOutput(
-                        code=salvaged_code,
-                        language=salvaged_lang or "text",
-                        filename="",
-                        explanation="Recovered from a truncated response — the JSON got cut off but the code itself was intact.",
-                        is_frontend=classify_code_target(salvaged_lang, salvaged_code),
-                    ), None
-                except Exception as salvage_err:
-                    print(f"[CodeMode] Salvage construction failed: {salvage_err}")
+        salvaged_lang, salvaged_code, was_truncated = extract_code_fence(last_raw_content)
+        if salvaged_code:
+            print(f"[CodeMode] Salvaged a code block from malformed JSON output ({len(salvaged_code)} chars, truncated={was_truncated}).")
+            try:
+                explanation = (
+                    "The file was large enough that the response got cut off before it finished — "
+                    "what's below is everything generated up to that point, so the end of it may be "
+                    "incomplete. Ask me to continue and I'll pick up where it left off."
+                    if was_truncated else
+                    "Recovered from a truncated response — the JSON got cut off but the code itself was intact."
+                )
+                return CodeExecutorOutput(
+                    code=salvaged_code,
+                    language=salvaged_lang or "text",
+                    filename="",
+                    explanation=explanation,
+                    is_frontend=classify_code_target(salvaged_lang, salvaged_code),
+                ), None
+            except Exception as salvage_err:
+                print(f"[CodeMode] Salvage construction failed: {salvage_err}")
 
     # Same idea for the planner: a big multi-file plan (20-30 detailed steps for something
     # like a full SaaS app) can brush max_tokens and get cut off mid-array. Because the prompt
@@ -1857,15 +1862,36 @@ code_app_graph = code_workflow.compile()
 
 CODE_FENCE_RE = re.compile(r"```([\w+#.-]*)\n([\s\S]*?)```")
 
+# A response that got cut off by max_tokens (very plausible for something like a full,
+# feature-heavy SaaS app crammed into one file) ends with an OPENING fence but never
+# reaches a closing one — CODE_FENCE_RE alone can't match that, so a genuinely large
+# build that ran out of room came back with nothing recovered at all, even though the
+# model had already written a large amount of real, usable code before hitting the
+# limit. This second pattern matches "from the last opening fence to the end of the
+# text" so that code is recovered too, instead of being thrown away.
+CODE_FENCE_OPEN_RE = re.compile(r"```([\w+#.-]*)\n([\s\S]*)$")
+
+def extract_code_fence(text: str) -> tuple[str, str, bool]:
+    """Returns (language, code, was_truncated). Tries a properly closed fence first;
+    if none exists, falls back to an unclosed trailing fence so a max_tokens cutoff
+    still recovers whatever code the model managed to write before running out of
+    room, instead of surfacing as 'no code was formulated'."""
+    text = text or ""
+    match = CODE_FENCE_RE.search(text)
+    if match:
+        return (match.group(1) or "").strip(), match.group(2).strip(), False
+    match = CODE_FENCE_OPEN_RE.search(text)
+    if match:
+        return (match.group(1) or "").strip(), match.group(2).strip(), True
+    return "", "", False
+
 def extract_code_from_answer(answer: str) -> tuple[str, str]:
     """Pulls the first fenced code block out of a plain-text LLM answer, if any.
     Needed because answer_code_directly (used for timeouts/errors/simple messages)
     only ever produced free-text before — the code was inside that text but never
     split out into its own field, so the frontend Canvas had nothing to render."""
-    match = CODE_FENCE_RE.search(answer or "")
-    if not match:
-        return "", ""
-    return (match.group(1) or "").strip(), match.group(2).strip()
+    language, code, _was_truncated = extract_code_fence(answer)
+    return language, code
 
 async def answer_code_directly(message: str, history: List[BaseMessage], model_key: str, temperature: float) -> dict:
     """Always returns a real code answer — falls back to the other Code Mode model if the primary one fails."""
@@ -2084,7 +2110,7 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
             has_any_output = bool(files) if is_multi else bool(code.strip())
             if not has_any_output:
                 print(f"[{session_id}] Code graph ended with no output — falling back to direct generation.")
-                yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'The coding loop finished without code, so falling back to a direct answer.'})}\n\n"
+                yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'The build hit its output limit before any usable code came back (common on large, feature-heavy requests) — making one more direct attempt.'})}\n\n"
                 fallback = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
                 if fallback["code"].strip():
                     final_response, code, language, is_frontend = fallback["text"], fallback["code"], fallback["language"], fallback["is_frontend"]
