@@ -1139,7 +1139,11 @@
                                         finishThinking(); // collapse thoughts the instant the answer begins
                                     }
                                     assistantFullText += parsed.assistant_message;
-                                    textContainer.innerHTML = marked.parse(normalizeMathDelimiters(assistantFullText)) + THINKING_SVG;
+                                    // In Code mode, never let a fenced code block render inside the
+                                    // chat bubble while it's still streaming in — it belongs in the
+                                    // code canvas (via code_result below), not typed out as raw text.
+                                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : assistantFullText;
+                                    textContainer.innerHTML = marked.parse(normalizeMathDelimiters(liveText)) + THINKING_SVG;
                                     scrollToBottom();
                                 }
                             } catch (e) {
