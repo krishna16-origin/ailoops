@@ -782,15 +782,19 @@ class CodeGoalExtraction(BaseModel):
     language_hint: str = Field(description="Programming language / framework implied by the request, if any (empty string if unclear)")
     constraints: List[str] = Field(description="Technical constraints or requirements to follow")
     missing_information: List[str] = Field(description="What we need to ask the user, if anything")
+    is_multi_file: bool = Field(description="True only if this genuinely needs several distinct files/pages/modules (e.g. a full multi-page app with landing page + dashboard + settings, etc.) that cannot reasonably live in one runnable file. False for anything that fits naturally in a single file/component/instant preview.")
+    estimated_file_count: int = Field(description="Rough number of separate files needed to build this well. Use 1 for single-file tasks.")
 
 class CodePlannerOutput(BaseModel):
-    plan: List[str] = Field(description="Ordered list of technical steps to build the solution")
+    plan: List[str] = Field(description="Ordered list of technical steps to build the solution. For multi-file tasks, each step should correspond to exactly one file.")
     current_step: str = Field(description="The single immediate next step to execute")
+    target_file: str = Field(default="", description="The filename this step will produce, e.g. 'index.html', 'auth.js'. Leave empty for single-file tasks.")
     approach: str = Field(description="Technical approach / design decision for this step")
 
 class CodeExecutorOutput(BaseModel):
     code: str = Field(description="The generated code for the current step, complete and runnable")
     language: str = Field(description="Programming language of the code, e.g. python, javascript, html, jsx, css")
+    filename: str = Field(default="", description="The filename this code belongs to for multi-file tasks, e.g. 'index.html'. Empty string for single-file tasks.")
     explanation: str = Field(description="Brief explanation of what the code does")
     is_frontend: bool = Field(description="True if this code renders a UI in a browser (html/css/js/react/vue/etc), false if it is backend/server/CLI/script code")
 
@@ -815,6 +819,7 @@ class CodeAgentState(TypedDict):
     constraints: List[str]
     plan: List[str]
     current_step: str
+    target_file: str
     completed_steps: List[str]
     reflection: str
     completion_score: int
@@ -827,6 +832,11 @@ class CodeAgentState(TypedDict):
     response: str
     model_key: str
     temperature: float
+    is_multi_file: bool
+    estimated_file_count: int
+    files: Dict[str, str]
+    file_languages: Dict[str, str]
+    last_error: Optional[str]
 
 # ----------------------------------------------------------------------
 # CODE MODE: Session Memory (kept separate from the normal chat sessions)
@@ -882,6 +892,9 @@ CODE_REASONING_ITERATIONS = {
 }
 
 def get_code_max_iterations(reasoning_level: str) -> int:
+    """Starting floor for iterations. For multi-file builds this gets raised dynamically
+    by code_planner_node once the real plan length is known (see there) — a 15-file app
+    needs more passes than any fixed reasoning-level ceiling allows for."""
     return CODE_REASONING_ITERATIONS.get((reasoning_level or "").strip().lower(), CODE_REASONING_ITERATIONS["medium"])
 
 # ----------------------------------------------------------------------
@@ -1489,10 +1502,12 @@ async def execute_code_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic
     chain = prompt | llm
 
     last_error = "Unknown error"
+    last_raw_content = ""
     for attempt in range(retries):
         try:
             res = await chain.ainvoke({"format_instructions": format_instructions, **state})
-            content = strip_thinking(res.content).strip()
+            last_raw_content = res.content or ""
+            content = strip_thinking(last_raw_content).strip()
             if content.startswith("```json"):
                 content = content[7:]
             if content.startswith("```"):
@@ -1506,20 +1521,47 @@ async def execute_code_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic
             print(f"[CodeMode] Structured Parsing Retry {attempt + 1}/{retries} failed: {e} | Raw content: {res.content[:300] if 'res' in dir() else 'N/A'}")
             await asyncio.sleep(0.5)
 
+    # Last-ditch salvage: a truncated/malformed JSON response (e.g. hit max_tokens mid-object)
+    # very often still contains a perfectly good fenced code block inside the raw text — pulling
+    # that out beats silently returning None, which is what produced "task completed, no code
+    # was formulated" even when the model had actually written real code.
+    if pydantic_model is CodeExecutorOutput and last_raw_content:
+        match = CODE_FENCE_RE.search(last_raw_content)
+        if match:
+            salvaged_lang = (match.group(1) or "").strip()
+            salvaged_code = match.group(2).strip()
+            if salvaged_code:
+                print(f"[CodeMode] Salvaged a code block from malformed JSON output ({len(salvaged_code)} chars).")
+                try:
+                    return CodeExecutorOutput(
+                        code=salvaged_code,
+                        language=salvaged_lang or "text",
+                        filename="",
+                        explanation="Recovered from a truncated response — the JSON got cut off but the code itself was intact.",
+                        is_frontend=classify_code_target(salvaged_lang, salvaged_code),
+                    ), None
+                except Exception as salvage_err:
+                    print(f"[CodeMode] Salvage construction failed: {salvage_err}")
+
     return None, last_error
 
 def format_code_context(state: CodeAgentState) -> str:
     msg_str = "\n".join([f"{m.type.capitalize()}: {m.content}" for m in state.get("messages", [])])
+    files = state.get("files", {})
+    files_summary = ", ".join(files.keys()) if files else "None yet"
 
     return f"""Conversation History:
 {msg_str}
 
 Current Internal State:
 - Goal: {state.get('goal', 'Not set')}
+- Multi-file build: {state.get('is_multi_file', False)} (~{state.get('estimated_file_count', 1)} files estimated)
 - Constraints: {state.get('constraints', [])}
 - Plan: {state.get('plan', [])}
 - Completed Steps: {state.get('completed_steps', [])}
+- Files built so far (do not rebuild these unless fixing them): {files_summary}
 - Current Step: {state.get('current_step', 'Not set')}
+- Target File For This Step: {state.get('target_file', 'N/A')}
 - Prior Code Draft: {state.get('code', 'None')}
 - Prior Language: {state.get('language', 'None')}
 - Reflection on Draft: {state.get('reflection', 'None')}
@@ -1531,49 +1573,88 @@ Current Internal State:
 
 async def understand_code_goal_node(state: CodeAgentState) -> dict:
     llm = get_code_llm(state["model_key"], state["temperature"])
-    prompt = "Analyze this conversation and extract the core coding goal, language hint, constraints, and missing info.\n\n{context}"
+    prompt = (
+        "Analyze this conversation and extract the core coding goal, language hint, constraints, "
+        "missing info, and whether this genuinely needs multiple separate files. Only mark "
+        "is_multi_file=True for requests describing several distinct pages/screens/modules "
+        "(e.g. a full app with landing page + dashboard + settings + billing, etc.) that cannot "
+        "reasonably be one runnable file. Small asks, single components, or single-page tools "
+        "should be is_multi_file=False so they render as one instant preview.\n\n{context}"
+    )
 
     res, err = await execute_code_llm_structured(llm, prompt, CodeGoalExtraction, {"context": format_code_context(state)})
 
     return {
         "goal": res.main_goal if res else "Write the requested code.",
         "constraints": res.constraints if res else [],
+        "is_multi_file": bool(res.is_multi_file) if res else False,
+        "estimated_file_count": max(1, res.estimated_file_count) if res else 1,
         "iteration": 0,
         "completed_steps": [],
         "plan": state.get("plan", []),
+        "files": state.get("files", {}),
+        "file_languages": state.get("file_languages", {}),
         "last_error": err
     }
 
 async def code_planner_node(state: CodeAgentState) -> dict:
     llm = get_code_llm(state["model_key"], state["temperature"])
-    prompt = "Based on the goal and completed steps, create or update the technical plan. Identify the single immediate next step.\n\n{context}"
+    prompt = (
+        "Based on the goal and completed steps, create or update the technical plan. Identify the "
+        "single immediate next step. If this is a multi-file build, each plan step must correspond "
+        "to exactly one file, target_file must name that file (e.g. 'index.html', 'dashboard.jsx'), "
+        "and you must not re-plan a file that's already listed under 'Files built so far'.\n\n{context}"
+    )
 
     res, err = await execute_code_llm_structured(llm, prompt, CodePlannerOutput, {"context": format_code_context(state)})
 
     iteration = state.get("iteration", 0) + 1
+    plan = res.plan if res else state.get("plan", [])
+
+    # A multi-file build genuinely needs one planner/executor pass per file. The fixed
+    # CODE_REASONING_ITERATIONS ceiling (max 5) was sized for single-file asks — once the
+    # planner has actually decomposed the work, raise the ceiling to fit the real plan
+    # instead of cutting a big multi-file app off after a handful of steps.
+    max_iterations = state.get("max_iterations", 3)
+    if state.get("is_multi_file") and plan:
+        max_iterations = max(max_iterations, len(plan) + 2)
 
     return {
-        "plan": res.plan if res else state.get("plan", []),
+        "plan": plan,
         "current_step": res.current_step if res else "Write the code that satisfies the goal.",
+        "target_file": (res.target_file.strip() if res and res.target_file else ""),
         "iteration": iteration,
+        "max_iterations": max_iterations,
         "last_error": err
     }
 
 async def code_executor_node(state: CodeAgentState) -> dict:
     llm = get_code_llm(state["model_key"], state["temperature"])
+    is_multi = bool(state.get("is_multi_file"))
+    target_file = state.get("target_file", "")
+
     prompt = (
         "Execute the 'Current Step' to satisfy the coding 'Goal'. Return complete, runnable "
         "code plus its language and a brief explanation. IMPORTANT: the 'code' field must "
         "never be left empty for a coding task — even if this step is just a review, a small "
         "tweak, or you believe the goal is already met, return the full current version of the "
         "code (unchanged if nothing needed to change), not just an explanation with no code."
-        "\n\n{context}"
+        + (
+            f" This is a multi-file build: this step must produce exactly the file "
+            f"'{target_file}' — set filename to '{target_file}' and write ONLY that file's "
+            f"code, not the whole app." if is_multi and target_file else ""
+        )
+        + "\n\n{context}"
     )
 
     res, err = await execute_code_llm_structured(llm, prompt, CodeExecutorOutput, {"context": format_code_context(state)})
 
     new_completed = state.get("completed_steps", []) + [state.get("current_step", "")]
     prior_code = state.get("code", "")
+    # Accumulate into the files dict instead of overwriting a single code field — this is
+    # what stops one truncated/failed step from wiping out every file built before it.
+    files = dict(state.get("files", {}))
+    file_languages = dict(state.get("file_languages", {}))
 
     if res:
         language = res.language
@@ -1589,13 +1670,20 @@ async def code_executor_node(state: CodeAgentState) -> dict:
         # That should never happen on a genuine coding task when a working prior file
         # already exists — carry the prior file forward instead of resolving to
         # "explanation only, no code", which is exactly what showed up as
-        # "task completed, no code was formulated".
-        if not code and prior_code:
+        # "task completed, no code was formulated". (Only applies to single-file mode —
+        # in multi-file mode an empty step just means that one file didn't land, and the
+        # files already in the dict are untouched.)
+        if not code and prior_code and not is_multi:
             code = prior_code
             language = language or state.get("language", "")
             is_frontend = is_frontend or bool(state.get("is_frontend", False))
             if not explanation.strip():
                 explanation = "No changes were needed for this step — carrying the existing code forward."
+
+        if is_multi and code:
+            fname = (res.filename or target_file or f"file_{len(files) + 1}.{language or 'txt'}").strip()
+            files[fname] = code
+            file_languages[fname] = language
     else:
         language, code, is_frontend = "", "", False
         # Surface the real reason instead of a generic canned message, so a bad
@@ -1603,18 +1691,25 @@ async def code_executor_node(state: CodeAgentState) -> dict:
         # a random glitch every time.
         explanation = f"I hit an issue generating code for this step: {err}" if err else "I hit an issue generating code for this step."
         # Same carry-forward here: an LLM/parsing failure shouldn't wipe out a
-        # perfectly good previous file either.
-        if prior_code:
+        # perfectly good previous file either (single-file mode only — multi-file mode
+        # already preserves everything via the accumulating `files` dict above).
+        if prior_code and not is_multi:
             code = prior_code
             language = state.get("language", "")
             is_frontend = bool(state.get("is_frontend", False))
 
-    # Only emit a fenced code block when there IS code. An empty ```{lang}\n\n```
-    # fence still gets parsed as a real (empty) code block by the frontend's
-    # markdown renderer, and highlight.js then auto-detects a language on the
-    # empty content and labels it "undefined" — that's the stray "undefined"
-    # line that shows up after a failed generation.
-    response_text = f"{explanation}\n\n```{language}\n{code}\n```".strip() if code else explanation
+    if is_multi:
+        # Keep the per-step chat response short — the full multi-file bundle gets
+        # assembled once at the end (see generate_code_stream / _handle_code_chat),
+        # not re-emitted as a giant fenced block on every single intermediate step.
+        response_text = explanation.strip() or f"Built {target_file or 'a file'}."
+    else:
+        # Only emit a fenced code block when there IS code. An empty ```{lang}\n\n```
+        # fence still gets parsed as a real (empty) code block by the frontend's
+        # markdown renderer, and highlight.js then auto-detects a language on the
+        # empty content and labels it "undefined" — that's the stray "undefined"
+        # line that shows up after a failed generation.
+        response_text = f"{explanation}\n\n```{language}\n{code}\n```".strip() if code else explanation
 
     return {
         "code": code,
@@ -1623,6 +1718,8 @@ async def code_executor_node(state: CodeAgentState) -> dict:
         "explanation": explanation,
         "response": response_text,
         "completed_steps": new_completed,
+        "files": files,
+        "file_languages": file_languages,
         "last_error": err
     }
 
@@ -1670,9 +1767,20 @@ def code_decision_edge(state: CodeAgentState) -> str:
     remain, an empty 'code' field forces at least one more planner/executor
     pass before the loop is allowed to end.
     """
-    has_code = bool((state.get("code") or "").strip())
     out_of_iterations = state.get("iteration", 0) >= state.get("max_iterations", 3)
 
+    if bool(state.get("is_multi_file")):
+        plan = state.get("plan", []) or []
+        files_done = len(state.get("files", {}))
+        # Keep looping until every planned file exists, or we run out of room — a
+        # multi-file build finishing early just because ONE file exists and the
+        # evaluator liked it is exactly what used to collapse "20-feature SaaS app"
+        # down to a single file.
+        if files_done < len(plan) and not out_of_iterations:
+            return "code_planner"
+        return END
+
+    has_code = bool((state.get("code") or "").strip())
     if not has_code and not out_of_iterations:
         return "code_planner"
     if state.get("completion_score", 0) >= 100:
@@ -1743,10 +1851,17 @@ async def answer_code_directly(message: str, history: List[BaseMessage], model_k
 
 def code_graph_timeout_seconds(model_key: str, max_iterations: int) -> float:
     """Sizes the overall graph timeout the same way the normal chat section does, but keyed off
-    the two Code Mode models: kimi (high-end reasoning) gets a larger per-call budget than glm (fast)."""
+    the two Code Mode models: kimi (high-end reasoning) gets a larger per-call budget than glm (fast).
+
+    Previously capped at a flat 240s no matter what max_iterations was — worst_case_calls blows
+    past that almost immediately even at "medium", so every run was effectively capped at 240s
+    regardless of how many steps were actually planned. That's what silently truncated big
+    multi-file builds partway through. The ceiling now actually scales with iteration count (up
+    to a generous absolute limit); the heartbeat pings in run_code_graph_streaming keep the SSE
+    connection alive for the platform proxy the whole time, so a longer run is safe to allow."""
     per_call_seconds = 140.0 if (model_key or "").strip().lower() == "kimi" else 90.0
     worst_case_calls = 1 + (max_iterations * 4)
-    return min(worst_case_calls * per_call_seconds, 240.0)
+    return min(worst_case_calls * per_call_seconds, 1500.0)
 
 CODE_NODE_LABELS = {
     "understand_code_goal": "Understanding the coding goal",
@@ -1768,9 +1883,17 @@ def code_node_detail(node_name: str, state: dict) -> str:
         if err:
             return f"Planning hit an error: {err}"
         step = state.get("current_step", "")
+        target = state.get("target_file", "")
+        if state.get("is_multi_file") and state.get("plan"):
+            progress = f"({len(state.get('files', {}))}/{len(state.get('plan', []))} files)"
+            return f"Planning {target or 'the next file'} {progress}: {step}" if step else f"Planning the implementation {progress}."
         return f"Planning the next step: {step}" if step else "Planning the implementation."
     if node_name == "code_executor":
         explanation = state.get("explanation", "")
+        if state.get("is_multi_file"):
+            target = state.get("target_file", "")
+            base = f"Writing {target}" if target else "Writing the next file"
+            return f"{base} — {explanation}" if explanation else f"{base}."
         return explanation if explanation else "Writing code for the current step."
     if node_name == "code_reflector":
         reflection = state.get("reflection", "")
@@ -1813,11 +1936,44 @@ async def run_code_graph_streaming(initial_state: dict, timeout: float):
     finally:
         await agen.aclose()
 
+async def stream_code_thinking(model_key: str, temperature: float, message: str, history: List[BaseMessage]):
+    """Streams a genuine reasoning trace token-by-token before the coding loop starts — the
+    Claude.ai-style 'Thinking' panel. This is a plain free-text call (no Pydantic parser), with
+    thinking turned ON, so the entire token budget goes toward real reasoning instead of
+    competing with a JSON schema the way it would inside execute_code_llm_structured (that's the
+    documented reason thinking is forced OFF for every structured call — see CODE_THINKING_OFF_KWARGS
+    above). Kept short (max_tokens=4096) and on its own model instance so it never eats into the
+    32K budget reserved for the actual code-generating calls."""
+    model_name = CODE_MODEL_MAP.get((model_key or "").strip().lower(), CODE_MODEL_MAP["kimi"])
+    thinking_llm = ChatNVIDIA(
+        model=model_name,
+        temperature=temperature,
+        max_tokens=4096,
+        timeout=60,
+        model_kwargs={"chat_template_kwargs": {"thinking": True, "enable_thinking": True}},
+    )
+    context = "\n".join([f"{m.type.capitalize()}: {m.content}" for m in history[-6:]])
+    prompt = (
+        f"{context}\n\nUser's new request: {message}\n\n"
+        "Think through how you'd build this: what it actually needs, whether it needs one file "
+        "or several, the technical approach, and any risks or tricky parts. Reason it through out "
+        "loud, in your own words — don't write final code yet."
+    )
+    try:
+        async for chunk in thinking_llm.astream(prompt):
+            piece = getattr(chunk, "content", "") or ""
+            if piece:
+                yield piece
+    except Exception as e:
+        print(f"[CodeMode] Thinking stream failed (non-fatal, coding loop still runs): {e}")
+
 async def generate_code_stream(request: "CodeChatRequest", session: dict, session_id: str):
     """Streams SSE events for Code Mode: status updates while working, then the final
     answer word-by-word, followed by one 'code_result' event carrying the code/language/
     show_preview fields so the frontend can decide whether to render a live preview."""
     max_iterations = get_code_max_iterations(request.reasoning_level)
+    is_multi = False
+    files: Dict[str, str] = {}
 
     if is_simple_code_message(request.message):
         yield f"data: {json.dumps({'type': 'status', 'step': 'direct', 'label': 'Answering', 'detail': 'Short message — answering directly without the full coding loop.'})}\n\n"
@@ -1825,6 +1981,19 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
         final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
         final_state = {"completion_score": 100, "iteration": 1}
     else:
+        # Real Claude.ai-style thinking: stream the model's actual reasoning token-by-token
+        # BEFORE the structured plan/execute loop starts, as its own SSE event type. The
+        # frontend renders these `thinking` deltas into a collapsible panel and, on
+        # `thinking_done`, headers it "Thought for {elapsed}s" — same shape as Claude.ai.
+        yield f"data: {json.dumps({'type': 'thinking_start'})}\n\n"
+        thinking_start = asyncio.get_event_loop().time()
+        thinking_text = ""
+        async for piece in stream_code_thinking(request.model, request.temperature, request.message, session["messages"]):
+            thinking_text += piece
+            yield f"data: {json.dumps({'type': 'thinking', 'delta': piece})}\n\n"
+        thinking_elapsed = round(asyncio.get_event_loop().time() - thinking_start, 1)
+        yield f"data: {json.dumps({'type': 'thinking_done', 'elapsed': thinking_elapsed})}\n\n"
+
         initial_state = {
             "messages": session["messages"],
             "model_key": request.model,
@@ -1834,11 +2003,17 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
             "completion_score": 0,
             "completed_steps": [],
             "plan": [],
-            # Seed the real previous code/language so follow-up turns amend the actual
-            # prior file instead of relying only on the plain-text chat history — this is
-            # what was causing "task completed, no code" replies on a second ask.
+            "target_file": "",
+            "is_multi_file": False,
+            "estimated_file_count": 1,
+            # Seed the real previous code/language (and any previously accumulated
+            # multi-file build) so follow-up turns amend the actual prior work instead of
+            # relying only on the plain-text chat history — this is what was causing
+            # "task completed, no code" replies on a second ask.
             "code": session.get("last_code", ""),
-            "language": session.get("last_language", "")
+            "language": session.get("last_language", ""),
+            "files": dict(session.get("last_files", {})),
+            "file_languages": dict(session.get("last_file_languages", {}))
         }
         timeout = code_graph_timeout_seconds(request.model, max_iterations)
         final_state = initial_state
@@ -1858,40 +2033,60 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
             code = final_state.get("code", "")
             language = final_state.get("language", "")
             is_frontend = final_state.get("is_frontend", False)
+            is_multi = bool(final_state.get("is_multi_file"))
+            files = final_state.get("files", {}) if is_multi else {}
 
             # Hard safety net: code_decision_edge now avoids ending the loop before code
             # exists, but if iterations still ran out with none (e.g. reasoning_level
             # "low" giving very few passes), don't hand back an explanation with nothing
             # to show — make one guaranteed direct attempt at real code instead.
-            if not code.strip():
-                print(f"[{session_id}] Code graph ended with empty code — falling back to direct generation.")
+            has_any_output = bool(files) if is_multi else bool(code.strip())
+            if not has_any_output:
+                print(f"[{session_id}] Code graph ended with no output — falling back to direct generation.")
                 yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'The coding loop finished without code, so falling back to a direct answer.'})}\n\n"
                 fallback = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
                 if fallback["code"].strip():
                     final_response, code, language, is_frontend = fallback["text"], fallback["code"], fallback["language"], fallback["is_frontend"]
+                    is_multi, files = False, {}
         except asyncio.TimeoutError:
             print(f"[{session_id}] Code Mode streaming timed out after {timeout:.0f}s. Falling back to direct answer.")
             yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'The coding loop was taking too long, so falling back to a direct answer.'})}\n\n"
             result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
             final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
             final_state = {"completion_score": 100, "iteration": 1}
+            is_multi, files = False, {}
         except Exception as e:
             print(f"[{session_id}] Code Mode streaming failed: {e}. Falling back to direct answer.")
             yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'Something went wrong in the coding loop, so falling back to a direct answer.'})}\n\n"
             result = await answer_code_directly(request.message, session["messages"], request.model, request.temperature)
             final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
             final_state = {"completion_score": 100, "iteration": 1}
+            is_multi, files = False, {}
 
-    # Enforce single-file bundling ONCE here, on the final settled answer — not on every
-    # internal loop iteration (see enforce_single_file_frontend's docstring for why).
-    goal_hint = final_state.get("goal", "") or request.message
-    prior_code_for_guard = session.get("last_code", "")
-    new_code, new_language, new_is_frontend = await enforce_single_file_frontend(
-        code, language, is_frontend, goal_hint, prior_code_for_guard, request.model, request.temperature
-    )
-    if new_code != code:
-        final_response = rebuild_response_with_code(final_response, new_code, new_language)
-        code, language, is_frontend = new_code, new_language, new_is_frontend
+    if is_multi and files:
+        # Big multi-file build: assemble every accumulated file into the final answer as
+        # its own fenced block instead of forcing everything into one bundled HTML file.
+        file_languages = final_state.get("file_languages", {})
+        intro = final_state.get("goal", "") and f"Built {len(files)} files for: {final_state.get('goal')}"
+        parts = [intro] if intro else [f"Built {len(files)} files."]
+        for fname, fcode in files.items():
+            flang = file_languages.get(fname, "")
+            parts.append(f"**{fname}**\n```{flang}\n{fcode}\n```")
+        final_response = "\n\n".join(p for p in parts if p and p.strip())
+        code, language = "", ""
+        is_frontend = any(f.lower().endswith((".html", ".htm")) for f in files)
+    else:
+        # Single-file path (unchanged): enforce single-file bundling ONCE here, on the
+        # final settled answer — not on every internal loop iteration (see
+        # enforce_single_file_frontend's docstring for why).
+        goal_hint = final_state.get("goal", "") or request.message
+        prior_code_for_guard = session.get("last_code", "")
+        new_code, new_language, new_is_frontend = await enforce_single_file_frontend(
+            code, language, is_frontend, goal_hint, prior_code_for_guard, request.model, request.temperature
+        )
+        if new_code != code:
+            final_response = rebuild_response_with_code(final_response, new_code, new_language)
+            code, language, is_frontend = new_code, new_language, new_is_frontend
 
     # Hard guarantee: no matter what path got here, never let an empty string reach the
     # frontend — that's what silently produced a blank bubble after the thinking animation
@@ -1900,10 +2095,12 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
     if not (final_response or "").strip():
         final_response = "I wasn't able to generate a response for that — please try again."
 
-    # Remember this turn's code so the NEXT turn can seed it back in (only overwrite
-    # when we actually got new code — a turn that produced none shouldn't wipe out a
-    # perfectly good previous file).
-    if code:
+    # Remember this turn's output so the NEXT turn can seed it back in (only overwrite
+    # when we actually got new output — a turn that produced none shouldn't wipe out
+    # perfectly good previous work).
+    if is_multi and files:
+        session["last_files"], session["last_file_languages"] = files, final_state.get("file_languages", {})
+    elif code:
         session["last_code"], session["last_language"] = code, language
 
     session["messages"].append(AIMessage(content=final_response))
@@ -1922,8 +2119,10 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
         await asyncio.sleep(0.015)
 
     # One final event carrying the structured code result, so the frontend can render
-    # a live preview (Gemini-Canvas style) only when the code is frontend code.
-    yield f"data: {json.dumps({'type': 'code_result', 'code': code, 'language': language, 'show_preview': bool(is_frontend), 'session_id': session_id})}\n\n"
+    # a live preview (Gemini-Canvas style) only when the code is frontend code. `files`
+    # is populated (and `code`/`language` left blank) for multi-file builds so the
+    # frontend can render a per-file tree/tab view instead of a single blob.
+    yield f"data: {json.dumps({'type': 'code_result', 'code': code, 'language': language, 'files': files, 'show_preview': bool(is_frontend), 'session_id': session_id})}\n\n"
 
 # ----------------------------------------------------------------------
 # CODE MODE: FastAPI request models
