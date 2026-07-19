@@ -851,7 +851,7 @@ code_sessions: Dict[str, Dict[str, Any]] = {}
 CODE_MODEL_MAP = {
     "kimi": "nvidia/nemotron-3-ultra-550b-a55b",   # high-end reasoning and coding
     "glm": "deepseek-ai/deepseek-v4-pro",          # fast response with code
-    "kimik2.6": "moonshotai/kimi-k2.6",            # real Kimi K2.6 — runs WITH thinking on, see below
+    "kimik2.6": "poolside/laguna-xs-2.1",          # real Kimi K2.6 — runs WITH thinking on, see below
 }
 
 # "kimi" and "glm" ship with "Thinking" mode ON by default on NVIDIA NIM. That's
