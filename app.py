@@ -845,33 +845,44 @@ class CodeAgentState(TypedDict):
 code_sessions: Dict[str, Dict[str, Any]] = {}
 
 # ----------------------------------------------------------------------
-# CODE MODE: Model Router — only two models, both selectable by the user
+# CODE MODE: Model Router — three models, all selectable by the user
 # ----------------------------------------------------------------------
 
 CODE_MODEL_MAP = {
     "kimi": "nvidia/nemotron-3-ultra-550b-a55b",   # high-end reasoning and coding
     "glm": "deepseek-ai/deepseek-v4-pro",          # fast response with code
+    "kimik2.6": "moonshotai/kimi-k2.6",            # real Kimi K2.6 — runs WITH thinking on, see below
 }
 
-# Both models ship with "Thinking" mode ON by default on NVIDIA NIM. That's the
-# actual reason Code Mode was returning no real answers: for structured JSON
-# calls (goal extraction, planning, execution, reflection, evaluation), when the
-# model's reasoning trace doesn't finish closing before max_tokens is hit, the
-# API hands back an empty/null final `content` — the whole token budget went to
-# reasoning_content instead of the answer. That's a documented NIM behavior for
-# both models (chat_template_kwargs), not something retries fix, since the same
-# elaborate system prompt makes the model "think" the same way every attempt.
-# Different model families use different toggle keys ("thinking" vs "enable_thinking").
-# Sending both every time — instead of keying off a hardcoded model-name list —
-# means this keeps working no matter which models CODE_MODEL_MAP points to;
-# unrecognized keys are harmlessly ignored by the chat template.
+# "kimi" and "glm" ship with "Thinking" mode ON by default on NVIDIA NIM. That's
+# the actual reason Code Mode was returning no real answers for them: for
+# structured JSON calls (goal extraction, planning, execution, reflection,
+# evaluation), when the model's reasoning trace doesn't finish closing before
+# max_tokens is hit, the API hands back an empty/null final `content` — the
+# whole token budget went to reasoning_content instead of the answer. That's a
+# documented NIM behavior (chat_template_kwargs), not something retries fix,
+# since the same elaborate system prompt makes the model "think" the same way
+# every attempt. Different model families use different toggle keys ("thinking"
+# vs "enable_thinking"); sending both every time — instead of keying off a
+# hardcoded model-name list — means this keeps working no matter which models
+# CODE_MODEL_MAP points to; unrecognized keys are harmlessly ignored by the
+# chat template.
 CODE_THINKING_OFF_KWARGS = {"thinking": False, "enable_thinking": False}
 
+# kimik2.6 is the one deliberate exception: thinking is left ON for it (same
+# max_tokens=32768 budget as the other two models below — nothing about the
+# budget changes, the model just gets to spend part of it on a visible
+# reasoning trace instead of having that trace suppressed). This reintroduces
+# the empty-content risk described above for kimik2.6's structured calls inside
+# the coding graph (goal/plan/execute/reflect/evaluate) if its reasoning runs
+# long — that tradeoff is intentional here, not an oversight.
+CODE_THINKING_ON_KWARGS = {"thinking": True, "enable_thinking": True}
+
 def get_code_llm(model_key: str, temperature: float = 0.2) -> ChatNVIDIA:
-    """Routes to one of the two Code Mode models. Uses the same NVIDIA_API_KEY as the rest of the app."""
+    """Routes to one of the three Code Mode models. Uses the same NVIDIA_API_KEY as the rest of the app."""
     key = (model_key or "").strip().lower()
     model_name = CODE_MODEL_MAP.get(key, CODE_MODEL_MAP["kimi"])  # default to the high-reasoning model
-    thinking_kwargs = CODE_THINKING_OFF_KWARGS
+    thinking_kwargs = CODE_THINKING_ON_KWARGS if key == "kimik2.6" else CODE_THINKING_OFF_KWARGS
     return ChatNVIDIA(
         model=model_name,
         temperature=temperature,
@@ -1930,7 +1941,7 @@ async def answer_code_directly(message: str, history: List[BaseMessage], model_k
     messages.extend(history[-6:])
     messages.append(HumanMessage(content=message))
 
-    fallback_key = "glm" if (model_key or "").strip().lower() != "glm" else "kimi"
+    fallback_key = "glm" if (model_key or "").strip().lower() != "glm" else "kimi"  # covers "kimi" and "kimik2.6" alike
 
     for key in (model_key, fallback_key):
         try:
@@ -1956,7 +1967,7 @@ def code_graph_timeout_seconds(model_key: str, max_iterations: int) -> float:
     multi-file builds partway through. The ceiling now actually scales with iteration count (up
     to a generous absolute limit); the heartbeat pings in run_code_graph_streaming keep the SSE
     connection alive for the platform proxy the whole time, so a longer run is safe to allow."""
-    per_call_seconds = 140.0 if (model_key or "").strip().lower() == "kimi" else 90.0
+    per_call_seconds = 140.0 if (model_key or "").strip().lower() in ("kimi", "kimik2.6") else 90.0
     worst_case_calls = 1 + (max_iterations * 4)
     return min(worst_case_calls * per_call_seconds, 1500.0)
 
@@ -2272,7 +2283,8 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
 class CodeChatRequest(BaseModel):
     message: str
     session_id: str
-    model: str = "kimi"           # "kimi" -> nvidia/nemotron-3-ultra-550b-a55b, "glm" -> deepseek-ai/deepseek-v4-pro (see CODE_MODEL_MAP)
+    model: str = "kimi"           # "kimi" -> nvidia/nemotron-3-ultra-550b-a55b, "glm" -> deepseek-ai/deepseek-v4-pro,
+                                   # "kimik2.6" -> moonshotai/kimi-k2.6 (thinking ON, see CODE_MODEL_MAP)
     reasoning_level: str = "medium"  # "low" | "medium" | "high" | "max"
     stream: bool = False
     temperature: float = 0.2
