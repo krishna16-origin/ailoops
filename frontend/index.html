@@ -908,8 +908,12 @@
 
                 const contentDiv = document.createElement('div');
                 contentDiv.className = 'message-text';
-                contentDiv.innerHTML = text ? marked.parse(normalizeMathDelimiters(text)) : '';
-                if (text) highlightCode(contentDiv);
+                // Prose lives in its own child so re-rendering it (every streamed token
+                // re-runs marked.parse on the whole thing) never wipes out sibling
+                // elements appended directly to .message-text — the inline code-stream
+                // box and the artifact chip both rely on surviving those re-renders.
+                contentDiv.innerHTML = `<div class="message-prose">${text ? marked.parse(normalizeMathDelimiters(text)) : ''}</div>`;
+                if (text) highlightCode(contentDiv.querySelector('.message-prose'));
 
                 // Thinking block starts EMPTY and expanded. It is only ever populated
                 // with real 'status' events from the backend (planner/executor/etc),
