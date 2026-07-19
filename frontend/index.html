@@ -135,12 +135,6 @@
         .message-text .inline-code-stream-status { font-size:11.5px; color:var(--text-secondary); margin-left:auto; flex-shrink:0; display:flex; align-items:center; gap:6px; }
         .message-text .inline-code-stream-status .dot { width:6px; height:6px; border-radius:50%; background-color:var(--accent); animation:inlineStreamPulse 1s ease-in-out infinite; }
         @keyframes inlineStreamPulse { 0%,100% { opacity:0.3; } 50% { opacity:1; } }
-        /* Header actions shown once the file is finished streaming — copy + expand icons,
-           replacing the "Writing code…" status (see finishInlineCodeStream). */
-        .message-text .inline-code-stream-actions { margin-left:auto; display:flex; align-items:center; gap:2px; flex-shrink:0; }
-        .message-text .inline-code-stream-actions .expand-btn { display:flex; align-items:center; justify-content:center; background:transparent; border:none; color:var(--text-secondary); cursor:pointer; padding:4px 8px; border-radius:6px; transition:background 0.2s, color 0.2s; }
-        .message-text .inline-code-stream-actions .expand-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
-        .message-text .inline-code-stream-actions .expand-btn svg { width:14px; height:14px; display:block; }
         .message-text .inline-code-stream-body { margin:0; padding:10px 14px; max-height:320px; overflow:auto; }
         .message-text .inline-code-stream-body code { font-size:12.5px; line-height:1.6; font-family:'Courier New', Courier, monospace; color:var(--text-secondary); white-space:pre; }
         .message-text .copy-btn { display:flex; align-items:center; gap:6px; background:transparent; border:none; color:var(--text-secondary); font-size:12px; cursor:pointer; padding:4px 8px; border-radius:6px; transition:background 0.2s, color 0.2s; }
@@ -595,13 +589,10 @@
 
         // ================= INLINE CODE STREAM (chat-visible counterpart to the canvas) =================
         // Renders directly inside the assistant's message bubble, as a sibling of .message-prose,
-        // so re-rendering the prose on every streamed token never wipes it out (see the comment in
-        // appendMessage). This is what actually shows the code being written live in the main chat
-        // area, Claude-artifact style. The side canvas panel keeps working in parallel underneath —
-        // it's simply the "pop out" destination for this card's expand button.
-        const COPY_ICON_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>`;
-        const CHECK_ICON_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`;
-        const EXPAND_ICON_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"></polyline><polyline points="9 21 3 21 3 15"></polyline><line x1="21" y1="3" x2="14" y2="10"></line><line x1="3" y1="21" x2="10" y2="14"></line></svg>`;
+        // so re-rendering the prose on every streamed token never wipes it out. This box exists
+        // ONLY to show code being written live, token by token, while it streams. The instant
+        // generation finishes it's removed — the finished file lives in the canvas panel (and the
+        // artifact chip below), exactly as before this box existed.
 
         // Called the moment code_start / code_file_start arrives — creates the box with a
         // pulsing "Writing code…" status in the header and an empty body ready to be filled.
@@ -627,45 +618,11 @@
             state.bodyEl.scrollTop = state.bodyEl.scrollHeight;
         }
 
-        // Called once the file is complete (code_result, or a non-streaming response). Applies
-        // real syntax highlighting and swaps the "Writing…" status for Copy + Expand icon
-        // buttons — Expand reuses the existing canvas panel as its "pop out" view.
-        function finishInlineCodeStream(state, language, fullCode) {
-            if (!state) return;
-            if (fullCode != null) state.codeEl.textContent = fullCode;
-            const lang = (language || state.language || '').trim().toLowerCase();
-            state.codeEl.className = `language-${lang || 'plaintext'}`;
-            state.codeEl.removeAttribute('data-highlighted');
-            hljs.highlightElement(state.codeEl);
-
-            const header = state.card.querySelector('.inline-code-stream-header');
-            header.querySelector('.inline-code-stream-filename').textContent = friendlyLangLabel(language || state.language);
-            const status = header.querySelector('.inline-code-stream-status');
-            if (status) {
-                status.outerHTML = `
-                    <span class="inline-code-stream-actions">
-                        <button type="button" class="copy-btn" title="Copy">${COPY_ICON_SVG}</button>
-                        <button type="button" class="expand-btn" title="Expand">${EXPAND_ICON_SVG}</button>
-                    </span>
-                `;
-            }
-
-            const copyBtn = header.querySelector('.copy-btn');
-            if (copyBtn) {
-                copyBtn.addEventListener('click', () => {
-                    navigator.clipboard.writeText(state.codeEl.textContent);
-                    copyBtn.innerHTML = CHECK_ICON_SVG;
-                    setTimeout(() => { copyBtn.innerHTML = COPY_ICON_SVG; }, 1200);
-                });
-            }
-
-            const expandBtn = header.querySelector('.expand-btn');
-            if (expandBtn) {
-                expandBtn.addEventListener('click', () => {
-                    if (modes.code.canvas) modes.code.canvas.open = true;
-                    renderCodeCanvas();
-                });
-            }
+        // Called once a file is done streaming (next file starting, or the whole response
+        // complete) — just removes the live box. Nothing about the finished code is rendered
+        // here; updateCodeCanvas() + appendArtifactChip() (called separately) take over.
+        function removeInlineCodeStream(state) {
+            if (state && state.card) state.card.remove();
         }
 
         // ================= CODE CANVAS =================
@@ -1276,9 +1233,9 @@
                                     startCodeCanvasStream(parsed.language, '');
                                     inlineCodeState = startInlineCodeStream(textContainer, parsed.language, '');
                                 } else if (parsed.type === 'code_file_start') {
-                                    // Multi-file builds: finish whatever card was streaming (with
-                                    // whatever it had accumulated) before starting the next file's.
-                                    if (inlineCodeState) finishInlineCodeStream(inlineCodeState, inlineCodeState.language, null);
+                                    // Multi-file builds: the previous file's box is done being
+                                    // "live" — remove it before starting the next file's.
+                                    removeInlineCodeStream(inlineCodeState);
                                     startCodeCanvasStream(parsed.language, parsed.filename);
                                     inlineCodeState = startInlineCodeStream(textContainer, parsed.language, parsed.filename);
                                 } else if (parsed.type === 'code_delta') {
@@ -1308,13 +1265,13 @@
                     if (mode === 'code' && codeResult && codeResult.code) {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText))));
                         highlightCode(textContainer);
-                        // The card was already built live via code_start/code_delta above — just
-                        // finish it in place (syntax highlight + swap status for copy/expand icons).
-                        // Fallback covers the rare case no code_start event was seen.
-                        if (!inlineCodeState) inlineCodeState = startInlineCodeStream(textContainer, codeResult.language, '');
-                        finishInlineCodeStream(inlineCodeState, codeResult.language, codeResult.code);
+                        // Generation is done — the live box's job is over. The finished file
+                        // goes to the canvas + chip, same as before this box existed.
+                        removeInlineCodeStream(inlineCodeState);
+                        appendArtifactChip(textContainer, codeResult.language, codeResult.code);
                         updateCodeCanvas(codeResult.language, codeResult.code, codeResult.show_preview);
                     } else {
+                        removeInlineCodeStream(inlineCodeState);
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
                         highlightCode(textContainer);
                     }
@@ -1325,10 +1282,9 @@
                     if (mode === 'code' && data.code) {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText))));
                         highlightCode(textContainer);
-                        // Non-streaming response: the full code arrives in one shot, so build
-                        // and finish the card together instead of growing it incrementally.
-                        const inlineState = startInlineCodeStream(textContainer, data.language, '');
-                        finishInlineCodeStream(inlineState, data.language, data.code);
+                        // Non-streaming response: the full code arrives in one shot, so there's
+                        // no "live" phase to show — go straight to the chip, as before.
+                        appendArtifactChip(textContainer, data.language, data.code);
                         updateCodeCanvas(data.language, data.code, data.show_preview);
                     } else {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
