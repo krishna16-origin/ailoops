@@ -1942,26 +1942,120 @@ async def code_planner_node(state: CodeAgentState) -> dict:
         "last_error": err
     }
 
+
+# code_executor_node pushes real code tokens onto this per-request queue the instant
+# they're generated (see stream_code_execution below) — mirrors _current_token_queue /
+# stream_plain_response used by the normal chat's executor_node higher up in this file.
+# A LangGraph node function only ever receives `state`, so the per-request queue has to
+# be handed in via a ContextVar instead of a normal function argument.
+CODE_STREAM_DELIM = "###CODE_STREAM_START###"
+_current_code_token_queue: "contextvars.ContextVar" = contextvars.ContextVar("current_code_token_queue", default=None)
+
+async def stream_code_execution(llm: ChatNVIDIA, prompt: str, token_queue: Optional[asyncio.Queue]):
+    """
+    Streams the actual code generation live, token-by-token, instead of waiting on a
+    single blocking structured (Pydantic/JSON) response. THIS is the fix for code only
+    appearing after the model had already finished writing the whole file: JSON can't be
+    parsed until its closing brace arrives, so execute_code_llm_structured — used
+    everywhere else in Code Mode — is inherently all-or-nothing for the 'code' field.
+
+    The model is asked for two short header lines (LANGUAGE / EXPLANATION), then the
+    literal delimiter, then the raw code with no fence wrapper. Everything written AFTER
+    the delimiter is pushed onto token_queue as ('token', piece) the instant it's
+    generated — that's what lets the frontend fill the code canvas in real time, the same
+    way stream_plain_response does for the chat bubble in the normal /chat flow.
+
+    Returns (language, explanation, code) once the stream ends. If the model wraps the
+    code in a ```fence``` anyway despite being told not to, the fence markers are stripped
+    from the returned `code`, but note the raw fence markers will still have been streamed
+    live as tokens — harmless, since the canvas just displays text as it arrives and gets
+    reconciled against the final code_result event afterward regardless.
+    """
+    full = ""
+    delim_seen = False
+    pending_after = ""
+    started = False
+
+    async for chunk in llm.astream([HumanMessage(content=prompt)]):
+        piece = getattr(chunk, "content", "") or ""
+        if not piece:
+            continue
+        full += piece
+
+        if not delim_seen:
+            if CODE_STREAM_DELIM in full:
+                delim_seen = True
+                pending_after = full.split(CODE_STREAM_DELIM, 1)[1]
+            else:
+                continue
+        else:
+            pending_after += piece
+
+        if not started:
+            stripped = pending_after.lstrip("\r\n")
+            if not stripped:
+                continue  # only whitespace since the delimiter so far — keep waiting
+            started = True
+            if token_queue is not None:
+                await token_queue.put(("token", stripped))
+            pending_after = ""
+            continue
+
+        if token_queue is not None:
+            await token_queue.put(("token", piece))
+
+    header, code_part = (full.split(CODE_STREAM_DELIM, 1) if CODE_STREAM_DELIM in full else (full, ""))
+    code_part = strip_thinking(code_part).strip()
+
+    # Strip a wrapping ```lang fence if the model added one anyway.
+    fence_lang, fenced_code, _truncated = extract_code_fence(code_part)
+    if fenced_code:
+        code_part = fenced_code
+
+    language, explanation = fence_lang, ""
+    for line in header.splitlines():
+        line = line.strip()
+        if line.upper().startswith("LANGUAGE:"):
+            language = line.split(":", 1)[1].strip() or language
+        elif line.upper().startswith("EXPLANATION:"):
+            explanation = line.split(":", 1)[1].strip()
+
+    return language, explanation, code_part
+
 async def code_executor_node(state: CodeAgentState) -> dict:
     llm = get_code_llm(state["model_key"], state["temperature"])
     is_multi = bool(state.get("is_multi_file"))
     target_file = state.get("target_file", "")
+    token_queue = _current_code_token_queue.get()
 
+    multi_note = (
+        f" This is a multi-file build: this step must produce exactly the file "
+        f"'{target_file}' — write ONLY that file's code, not the whole app."
+        if is_multi and target_file else ""
+    )
     prompt = (
-        "Execute the 'Current Step' to satisfy the coding 'Goal'. Return complete, runnable "
-        "code plus its language and a brief explanation. IMPORTANT: the 'code' field must "
-        "never be left empty for a coding task — even if this step is just a review, a small "
-        "tweak, or you believe the goal is already met, return the full current version of the "
-        "code (unchanged if nothing needed to change), not just an explanation with no code."
-        + (
-            f" This is a multi-file build: this step must produce exactly the file "
-            f"'{target_file}' — set filename to '{target_file}' and write ONLY that file's "
-            f"code, not the whole app." if is_multi and target_file else ""
-        )
-        + "\n\n{context}"
+        "Execute the 'Current Step' to satisfy the coding 'Goal'. Write complete, runnable "
+        "code. IMPORTANT: you must never leave the code empty for a coding task — even if "
+        "this step is just a review, a small tweak, or you believe the goal is already met, "
+        "write out the full current version of the code (unchanged if nothing needed to "
+        f"change), not just an explanation with no code.{multi_note}\n\n"
+        f"{format_code_context(state)}\n\n"
+        "Respond in exactly this shape, nothing else:\n"
+        "LANGUAGE: <the programming language, e.g. python, javascript, html, jsx>\n"
+        "EXPLANATION: <one short sentence on what this code does>\n"
+        f"{CODE_STREAM_DELIM}\n"
+        "<the raw code only — no markdown fence, no commentary before or after it>"
     )
 
-    res, err = await execute_code_llm_structured(llm, prompt, CodeExecutorOutput, {"context": format_code_context(state)})
+    if token_queue is not None:
+        await token_queue.put(("code_executor_start", target_file if is_multi else None))
+
+    try:
+        language, explanation, code = await stream_code_execution(llm, prompt, token_queue)
+        err = None
+    except Exception as e:
+        print(f"[CodeMode] code_executor_node streaming failed: {e}")
+        language, explanation, code, err = "", "", "", f"{type(e).__name__}: {e}"
 
     new_completed = state.get("completed_steps", []) + [state.get("current_step", "")]
     prior_code = state.get("code", "")
@@ -1970,15 +2064,15 @@ async def code_executor_node(state: CodeAgentState) -> dict:
     files = dict(state.get("files", {}))
     file_languages = dict(state.get("file_languages", {}))
 
-    if res:
-        language = res.language
-        code = res.code
+    if code or not err:
         try:
-            is_frontend = res.is_frontend if res.is_frontend is not None else classify_code_target(language, code)
+            is_frontend = classify_code_target(language, code) if code else False
         except Exception as e:
             print(f"[CodeMode] classify_code_target failed: {e}")
-            is_frontend = bool(res.is_frontend)
-        explanation = res.explanation
+            is_frontend = False
+
+        if not explanation.strip():
+            explanation = "Wrote the code for this step."
 
         # Guard -1: the model decided no new code was needed and left 'code' blank.
         # That should never happen on a genuine coding task when a working prior file
@@ -1991,11 +2085,10 @@ async def code_executor_node(state: CodeAgentState) -> dict:
             code = prior_code
             language = language or state.get("language", "")
             is_frontend = is_frontend or bool(state.get("is_frontend", False))
-            if not explanation.strip():
-                explanation = "No changes were needed for this step — carrying the existing code forward."
+            explanation = "No changes were needed for this step — carrying the existing code forward."
 
         if is_multi and code:
-            fname = (res.filename or target_file or f"file_{len(files) + 1}.{language or 'txt'}").strip()
+            fname = (target_file or f"file_{len(files) + 1}.{language or 'txt'}").strip()
             files[fname] = code
             file_languages[fname] = language
     else:
@@ -2003,8 +2096,8 @@ async def code_executor_node(state: CodeAgentState) -> dict:
         # Surface the real reason instead of a generic canned message, so a bad
         # API key / rate limit / model error is visible instead of looking like
         # a random glitch every time.
-        explanation = f"I hit an issue generating code for this step: {err}" if err else "I hit an issue generating code for this step."
-        # Same carry-forward here: an LLM/parsing failure shouldn't wipe out a
+        explanation = f"I hit an issue generating code for this step: {err}"
+        # Same carry-forward here: an LLM/streaming failure shouldn't wipe out a
         # perfectly good previous file either (single-file mode only — multi-file mode
         # already preserves everything via the accumulating `files` dict above).
         if prior_code and not is_multi:
@@ -2247,37 +2340,73 @@ def code_node_detail(node_name: str, state: dict) -> str:
         return f"Completion check: {score}% of the task is done." if score is not None else "Checking whether the task is complete."
     return CODE_NODE_LABELS.get(node_name, node_name)
 
-async def run_code_graph_streaming(initial_state: dict, timeout: float):
-    """Streams (node_name, state) tuples from the LangGraph run. Also yields periodic
-    (None, state_acc) heartbeats every ~12s so a single slow node call (these can take
-    60-140s with zero bytes sent in between) doesn't leave the SSE connection silent long
-    enough for a hosting platform's proxy (e.g. Render) to kill it as idle. That silent
-    kill — not a Python exception — is what shows up as 'thinking animation finishes,
-    then nothing': the connection dies mid-node, so there's nothing to catch or log."""
+async def run_code_graph_streaming(initial_state: dict, timeout: float, token_queue: asyncio.Queue):
+    """
+    Runs the Code Mode LangGraph node-by-node AND, concurrently, relays whatever
+    code_executor_node pushes onto token_queue as it writes code — interleaving both into
+    one chronological stream of events:
+      ("status", node_name, state_so_far) — a node just finished (real backend progress)
+      ("code_reset", filename)            — code_executor_node is about to start writing a
+                                             file live; filename is None for single-file
+      ("token", text)                     — a real, live delta of code being written,
+                                             straight from the model, the instant it arrives
+      ("heartbeat", None)                 — nothing new yet, just keeping the SSE connection
+                                             alive during a long non-streaming node call
+                                             (understand_code_goal / code_planner / etc.)
+    Still enforces the same overall timeout budget, and still emits the same ~12s
+    heartbeats as before so a slow non-streaming node (these can take 60-140s) doesn't
+    leave the SSE connection silent long enough for a hosting proxy to kill it as idle.
+    """
     state_acc = dict(initial_state)
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
     agen = code_app_graph.astream(initial_state, stream_mode="updates")
     HEARTBEAT_INTERVAL = 12.0
+
+    graph_next = asyncio.ensure_future(agen.__anext__())
+    queue_next = asyncio.ensure_future(token_queue.get())
+
     try:
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise asyncio.TimeoutError()
             wait_chunk = min(HEARTBEAT_INTERVAL, remaining)
-            try:
-                chunk = await asyncio.wait_for(agen.__anext__(), timeout=wait_chunk)
-            except asyncio.TimeoutError:
-                if wait_chunk >= remaining:
-                    raise
-                yield None, state_acc  # heartbeat only — no node finished yet
+
+            done, _ = await asyncio.wait(
+                {graph_next, queue_next}, timeout=wait_chunk, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                yield ("heartbeat", None)
                 continue
-            node_name, node_output = next(iter(chunk.items()))
-            state_acc.update(node_output)
-            yield node_name, state_acc
+
+            if queue_next in done:
+                kind, payload = queue_next.result()
+                if kind == "code_executor_start":
+                    yield ("code_reset", payload)
+                else:
+                    yield ("token", payload)
+                queue_next = asyncio.ensure_future(token_queue.get())
+
+            if graph_next in done:
+                try:
+                    chunk = graph_next.result()
+                except StopAsyncIteration:
+                    break
+                node_name, node_output = next(iter(chunk.items()))
+                state_acc.update(node_output)
+                yield ("status", node_name, state_acc)
+                graph_next = asyncio.ensure_future(agen.__anext__())
     except StopAsyncIteration:
         return
     finally:
+        for t in (graph_next, queue_next):
+            t.cancel()
+        for t in (graph_next, queue_next):
+            try:
+                await t
+            except (asyncio.CancelledError, StopAsyncIteration, Exception):
+                pass
         await agen.aclose()
 
 async def stream_code_thinking(model_key: str, temperature: float, message: str, history: List[BaseMessage]):
@@ -2331,6 +2460,10 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
     max_iterations = get_code_max_iterations(request.reasoning_level)
     is_multi = False
     files: Dict[str, str] = {}
+    # True once code has already been streamed live to the frontend via code_reset/token
+    # events (see the non-simple branch below) — stays False for the simple/direct path
+    # and for any non-streaming fallback call, which still need the old chunked replay.
+    streamed_live = False
 
     if is_simple_code_message(request.message):
         yield f"data: {json.dumps({'type': 'status', 'step': 'direct', 'label': 'Answering', 'detail': 'Short message — answering directly without the full coding loop.'})}\n\n"
@@ -2375,11 +2508,47 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
         timeout = code_graph_timeout_seconds(request.model, max_iterations)
         final_state = initial_state
 
+        # streamed_live tracks whether the code currently in `code`/`files` already went
+        # out to the frontend in real time via code_reset/token events below (the actual
+        # live-generation fix). It's set back to False whenever code instead came from a
+        # non-streaming fallback call (answer_code_directly), so the trailing "stream code
+        # into the canvas" section further down knows it still needs the old chunked
+        # typewriter replay for THOSE cases — there's nothing to relay live for a call
+        # that already ran to completion with .ainvoke().
+        streamed_live = False
+        active_filename = None  # tracks which file is currently being live-typed, for multi-file
+
+        code_token_queue: asyncio.Queue = asyncio.Queue()
+        qtoken = _current_code_token_queue.set(code_token_queue)
         try:
-            async for node_name, state_so_far in run_code_graph_streaming(initial_state, timeout):
-                if node_name is None:
+            async for evt in run_code_graph_streaming(initial_state, timeout, code_token_queue):
+                kind = evt[0]
+
+                if kind == "heartbeat":
                     yield ": keep-alive\n\n"  # SSE comment — keeps the connection alive, frontend ignores it
                     continue
+
+                if kind == "code_reset":
+                    # code_executor_node is about to start writing a file live — open the
+                    # canvas now so the tokens that follow have somewhere to land.
+                    active_filename = evt[1]
+                    streamed_live = True
+                    if active_filename:
+                        yield f"data: {json.dumps({'type': 'code_file_start', 'filename': active_filename, 'language': '', 'session_id': session_id})}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'type': 'code_start', 'language': '', 'session_id': session_id})}\n\n"
+                    continue
+
+                if kind == "token":
+                    delta = evt[1]
+                    if active_filename:
+                        yield f"data: {json.dumps({'type': 'code_delta', 'filename': active_filename, 'delta': delta, 'session_id': session_id})}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'type': 'code_delta', 'delta': delta, 'session_id': session_id})}\n\n"
+                    continue
+
+                # kind == "status"
+                _, node_name, state_so_far = evt
                 label = CODE_NODE_LABELS.get(node_name, node_name)
                 detail = code_node_detail(node_name, state_so_far)
                 yield f"data: {json.dumps({'type': 'status', 'step': node_name, 'label': label, 'detail': detail})}\n\n"
@@ -2405,6 +2574,7 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
                 if fallback["code"].strip():
                     final_response, code, language, is_frontend = fallback["text"], fallback["code"], fallback["language"], fallback["is_frontend"]
                     is_multi, files = False, {}
+                    streamed_live = False  # this code came from a fresh, non-streamed call
         except asyncio.TimeoutError:
             print(f"[{session_id}] Code Mode streaming timed out after {timeout:.0f}s. Falling back to direct answer.")
             yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'The coding loop was taking too long, so falling back to a direct answer.'})}\n\n"
@@ -2412,6 +2582,7 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
             final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
             final_state = {"completion_score": 100, "iteration": 1}
             is_multi, files = False, {}
+            streamed_live = False
         except Exception as e:
             print(f"[{session_id}] Code Mode streaming failed: {e}. Falling back to direct answer.")
             yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'Something went wrong in the coding loop, so falling back to a direct answer.'})}\n\n"
@@ -2419,6 +2590,9 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
             final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
             final_state = {"completion_score": 100, "iteration": 1}
             is_multi, files = False, {}
+            streamed_live = False
+        finally:
+            _current_code_token_queue.reset(qtoken)
 
     if is_multi and files:
         # Big multi-file build: assemble every accumulated file into the final answer as
@@ -2438,12 +2612,18 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
         # enforce_single_file_frontend's docstring for why).
         goal_hint = final_state.get("goal", "") or request.message
         prior_code_for_guard = session.get("last_code", "")
+        code_before_bundling = code
         new_code, new_language, new_is_frontend = await enforce_single_file_frontend(
             code, language, is_frontend, goal_hint, prior_code_for_guard, request.model, request.temperature
         )
         if new_code != code:
             final_response = rebuild_response_with_code(final_response, new_code, new_language)
             code, language, is_frontend = new_code, new_language, new_is_frontend
+            # Bundling rewrote what was already streamed live (e.g. wrapped bare JSX into
+            # a full HTML file) — the canvas is now showing stale content, so this one
+            # case still needs a re-stream of the corrected code below.
+            if code_before_bundling != code and streamed_live:
+                streamed_live = False
 
     # Hard guarantee: no matter what path got here, never let an empty string reach the
     # frontend — that's what silently produced a blank bubble after the thinking animation
@@ -2490,7 +2670,16 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
     # of the whole file appearing all at once when code_result lands. code_result (below)
     # remains the authoritative final payload the frontend reconciles against, so a dropped
     # or out-of-order delta can never leave the canvas showing something wrong or partial.
-    if is_multi and files:
+    #
+    # If streamed_live is True, the code above already went out token-by-token, straight
+    # from the model, via code_reset/code_delta events emitted inside the run_code_graph_streaming
+    # loop — that's the actual live-generation fix. This chunked replay only runs for code
+    # that was never streamed: the simple/direct path, timeout/error fallbacks, and the
+    # rare case where post-processing (enforce_single_file_frontend) rewrote code that had
+    # already been streamed.
+    if streamed_live:
+        pass
+    elif is_multi and files:
         file_languages = final_state.get("file_languages", {})
         for fname, fcode in files.items():
             if not fcode:
