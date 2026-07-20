@@ -455,15 +455,25 @@ async def planner_node(state: AgentState) -> dict:
 
 async def executor_node(state: AgentState) -> dict:
     """
-    Drafts the actual user-facing answer. Unlike the other nodes, this one's output is
-    shown live in the chat bubble as it's generated — so it deliberately skips
-    execute_llm_structured()'s Pydantic/JSON parsing (which would mean streaming raw
-    JSON syntax) and instead uses a plain-text prompt + delimiter, streamed via
-    stream_plain_response(). Real tokens are pushed to the per-request queue (set in
-    generate_stream via the _current_token_queue contextvar) the instant they arrive.
+    Drafts the actual user-facing answer.
+
+    Only the FINAL iteration's draft is streamed to the chat bubble. Earlier
+    iterations still make a real LLM call (the reflector/evaluator need something
+    genuine to review each pass), but that draft is kept internal — nothing goes
+    out over token_queue for it. Without this, every single iteration pushed an
+    "executor_start" (which clears the chat bubble) followed by its own live draft,
+    so the user watched an answer appear, then get wiped and replaced, once per
+    iteration — i.e. exactly "giving an answer after each iteration" instead of
+    thinking through all of them first. Now nothing reaches the user until the
+    pass where iteration == max_iterations, which is also the same pass after
+    which decision_edge ends the loop — so what streams out is always the final,
+    fully-reasoned-through answer, never an intermediate one.
     """
     llm = get_llm(state["model_type"], state["temperature"])
     token_queue = _current_token_queue.get()
+
+    is_final_pass = state.get("iteration", 0) >= state.get("max_iterations", 2)
+    live_queue = token_queue if is_final_pass else None
 
     prompt = (
         "Execute the 'Current Step' to satisfy the user's 'Goal'.\n\n"
@@ -474,19 +484,19 @@ async def executor_node(state: AgentState) -> dict:
         "commentary before or after it."
     )
 
-    if token_queue is not None:
-        await token_queue.put(("executor_start", None))
+    if live_queue is not None:
+        await live_queue.put(("executor_start", None))
 
     try:
-        reasoning, response_text = await stream_plain_response(llm, prompt, token_queue)
+        reasoning, response_text = await stream_plain_response(llm, prompt, live_queue)
     except Exception as e:
         print(f"executor_node streaming failed: {e}")
         reasoning, response_text = "", ""
 
     if not response_text:
         response_text = "I apologize, I encountered an issue formulating my answer."
-        if token_queue is not None:
-            await token_queue.put(("token", response_text))
+        if live_queue is not None:
+            await live_queue.put(("token", response_text))
 
     new_completed = state.get("completed_steps", []) + [state.get("current_step", "")]
 
@@ -523,9 +533,18 @@ async def evaluator_node(state: AgentState) -> dict:
     }
 
 def decision_edge(state: AgentState) -> str:
-    """Decides whether to end the reasoning loop or continue planning/executing."""
-    if state.get("completion_score", 0) >= 100:
-        return END
+    """Decides whether to end the reasoning loop or continue planning/executing.
+
+    Chat mode is meant to think it through, not stop at the first pass that looks
+    good enough — so this no longer ends the loop just because the evaluator scored
+    the goal complete after one iteration. It now always spends the full
+    'max_iterations' budget (planner -> executor -> reflector -> evaluator, repeated),
+    refining the draft each time, and only lets the final iteration's answer reach the
+    user. The only remaining exit condition is running out of iterations.
+    (graph_timeout_seconds already sizes its budget for worst_case_calls = 1 +
+    max_iterations * 4, i.e. every iteration actually running — so this doesn't
+    risk the timeout, it was already provisioned for this.)
+    """
     if state.get("iteration", 0) >= state.get("max_iterations", 2):
         return END
     return "planner"
