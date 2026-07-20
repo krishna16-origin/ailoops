@@ -6,6 +6,7 @@ import json
 import re
 import random
 import asyncio
+import contextvars
 from typing import TypedDict, List, Dict, Any, Optional, Annotated
 
 from dotenv import load_dotenv
@@ -136,6 +137,73 @@ def strip_thinking(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
     return text.strip()
+
+# ==================================================
+# REAL TOKEN-BY-TOKEN STREAMING
+#
+# Structured/Pydantic-parsed LLM calls (execute_llm_structured, below) can't be
+# streamed cleanly — the raw tokens are JSON syntax, not readable prose, until the
+# whole object is complete. So for any node whose output is meant to be shown to
+# the user live (currently: the chat executor node), we bypass structured parsing
+# entirely and use a plain-text prompt with one delimiter line instead. Everything
+# after the delimiter is the literal user-facing text, and can be relayed to the
+# frontend the instant each token arrives.
+#
+# _current_token_queue carries the per-request asyncio.Queue into executor_node via
+# a contextvar (set right before the graph run starts) instead of putting it in the
+# LangGraph state dict, so it never touches the AgentState/TypedDict schema.
+# ==================================================
+
+STREAM_DELIM = "###FINAL_ANSWER###"
+_current_token_queue: "contextvars.ContextVar" = contextvars.ContextVar("current_token_queue", default=None)
+
+async def stream_plain_response(llm: ChatNVIDIA, prompt: str, token_queue: Optional[asyncio.Queue]):
+    """
+    Calls the LLM with .astream() on a plain-text prompt that asks for brief reasoning,
+    then the literal delimiter line, then the final user-facing text. Only the text
+    AFTER the delimiter is pushed onto token_queue as ('token', piece) items, live, as
+    it's generated. Returns (reasoning, final_text) once the stream ends.
+    """
+    full = ""
+    delim_seen = False
+    pending_after = ""  # text seen since the delimiter, held back until it's non-whitespace
+    started = False     # True once the first real (non-whitespace) char after the delimiter has been sent
+
+    async for chunk in llm.astream([HumanMessage(content=prompt)]):
+        piece = getattr(chunk, "content", "") or ""
+        if not piece:
+            continue
+        full += piece
+
+        if not delim_seen:
+            if STREAM_DELIM in full:
+                delim_seen = True
+                pending_after = full.split(STREAM_DELIM, 1)[1]
+            else:
+                continue
+        else:
+            pending_after += piece
+
+        if not started:
+            stripped = pending_after.lstrip("\r\n")
+            if not stripped:
+                continue  # only whitespace since the delimiter so far — keep waiting
+            started = True
+            if token_queue is not None:
+                await token_queue.put(("token", stripped))
+            pending_after = ""
+            continue
+
+        if token_queue is not None:
+            await token_queue.put(("token", piece))
+
+    if STREAM_DELIM in full:
+        reasoning, final_text = full.split(STREAM_DELIM, 1)
+    else:
+        # Model didn't emit the delimiter (rare) — treat the whole thing as the answer
+        # rather than silently dropping it.
+        reasoning, final_text = "", full
+    return strip_thinking(reasoning).strip(), strip_thinking(final_text).strip()
 
 
 async def execute_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic_model, state: dict, retries: int = 2):
@@ -386,16 +454,45 @@ async def planner_node(state: AgentState) -> dict:
     }
 
 async def executor_node(state: AgentState) -> dict:
+    """
+    Drafts the actual user-facing answer. Unlike the other nodes, this one's output is
+    shown live in the chat bubble as it's generated — so it deliberately skips
+    execute_llm_structured()'s Pydantic/JSON parsing (which would mean streaming raw
+    JSON syntax) and instead uses a plain-text prompt + delimiter, streamed via
+    stream_plain_response(). Real tokens are pushed to the per-request queue (set in
+    generate_stream via the _current_token_queue contextvar) the instant they arrive.
+    """
     llm = get_llm(state["model_type"], state["temperature"])
-    prompt = "Execute the 'Current Step' to satisfy the user's 'Goal'. Provide your generated response text and reasoning.\n\n{context}"
-    
-    res = await execute_llm_structured(llm, prompt, ExecutorOutput, {"context": format_context(state)})
-    
+    token_queue = _current_token_queue.get()
+
+    prompt = (
+        "Execute the 'Current Step' to satisfy the user's 'Goal'.\n\n"
+        f"{format_context(state)}\n\n"
+        "First, in one short sentence, note why this response is correct and helpful. "
+        f"Then, on its own line, write exactly: {STREAM_DELIM}\n"
+        "Then write ONLY the final response text the user should see — no extra "
+        "commentary before or after it."
+    )
+
+    if token_queue is not None:
+        await token_queue.put(("executor_start", None))
+
+    try:
+        reasoning, response_text = await stream_plain_response(llm, prompt, token_queue)
+    except Exception as e:
+        print(f"executor_node streaming failed: {e}")
+        reasoning, response_text = "", ""
+
+    if not response_text:
+        response_text = "I apologize, I encountered an issue formulating my answer."
+        if token_queue is not None:
+            await token_queue.put(("token", response_text))
+
     new_completed = state.get("completed_steps", []) + [state.get("current_step", "")]
-    
+
     return {
-        "response": res.response if res else "I apologize, I encountered an issue formulating my answer.",
-        "executor_reasoning": res.reasoning_summary if res else "",
+        "response": response_text,
+        "executor_reasoning": reasoning,
         "completed_steps": new_completed
     }
 
@@ -533,44 +630,87 @@ def node_detail(node_name: str, state: dict) -> str:
         return f"Completion check: {score}% of the goal is done." if score is not None else "Checking whether the goal is complete."
     return NODE_LABELS.get(node_name, node_name)
 
-async def run_graph_streaming(initial_state: dict, timeout: float):
+async def run_graph_streaming(initial_state: dict, timeout: float, token_queue: asyncio.Queue):
     """
-    Runs the LangGraph workflow node-by-node, yielding (node_name, state_so_far) the moment each
-    node actually finishes — this is real backend progress, not a simulated/canned timer. Enforces
-    the same overall timeout budget as the non-streaming path so a slow run still falls back cleanly.
+    Runs the LangGraph workflow node-by-node AND, concurrently, relays whatever
+    executor_node pushes onto token_queue as it generates the answer — interleaving both
+    into one chronological stream of events:
+      ("status", node_name, state_so_far)  — a node just finished (real backend progress)
+      ("reset", None)                      — a new executor pass is starting (e.g. the loop
+                                              went around for another iteration); the caller
+                                              should clear whatever draft it's shown so far
+      ("token", text)                      — a real, live delta of the answer being written,
+                                              straight from the model, the instant it arrives
+    Enforces the same overall timeout budget as before so a slow run still falls back cleanly.
     """
     state_acc = dict(initial_state)
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
     agen = app_graph.astream(initial_state, stream_mode="updates")
+
+    graph_next = asyncio.ensure_future(agen.__anext__())
+    queue_next = asyncio.ensure_future(token_queue.get())
+
     try:
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise asyncio.TimeoutError()
-            chunk = await asyncio.wait_for(agen.__anext__(), timeout=remaining)
-            node_name, node_output = next(iter(chunk.items()))
-            state_acc.update(node_output)
-            yield node_name, state_acc
-    except StopAsyncIteration:
-        return
+
+            done, _ = await asyncio.wait(
+                {graph_next, queue_next}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not done:
+                raise asyncio.TimeoutError()
+
+            if queue_next in done:
+                kind, payload = queue_next.result()
+                if kind == "executor_start":
+                    yield ("reset", None)
+                else:
+                    yield ("token", payload)
+                queue_next = asyncio.ensure_future(token_queue.get())
+
+            if graph_next in done:
+                try:
+                    chunk = graph_next.result()
+                except StopAsyncIteration:
+                    break
+                node_name, node_output = next(iter(chunk.items()))
+                state_acc.update(node_output)
+                yield ("status", node_name, state_acc)
+                graph_next = asyncio.ensure_future(agen.__anext__())
     finally:
+        for t in (graph_next, queue_next):
+            t.cancel()
+        for t in (graph_next, queue_next):
+            try:
+                await t
+            except (asyncio.CancelledError, StopAsyncIteration, Exception):
+                pass
         await agen.aclose()
 
 async def generate_stream(request: "ChatRequest", session: dict, session_id: str):
     """
-    Streams two kinds of SSE events to the frontend:
-      - {"type": "status", "step": <node name>, "label": <text>}  while the agent is actually working
-      - {"type": "message", "assistant_message": <word chunk>, ...}  once the final answer is ready
-    The status events mirror whichever LangGraph node just finished, so the "thought process" shown
-    in the UI is synced to real backend state instead of a client-side simulated cycle.
+    Streams SSE events to the frontend:
+      - {"type": "status", "step": <node name>, "label": <text>}   real backend progress
+      - {"type": "message_reset"}                                  a redo iteration started;
+                                                                     clear the chat bubble
+      - {"type": "message", "assistant_message": <delta>, ...}     a REAL token, live from
+                                                                     the model — not a replay
+                                                                     of an already-finished string
     """
+    final_response = ""
+
     if is_simple_message(request.message):
         yield f"data: {json.dumps({'type': 'status', 'step': 'direct', 'label': 'Answering', 'detail': 'This is a short message, so answering directly without the full planning loop.'})}\n\n"
-        final_response = await answer_directly(
+        async for piece in answer_directly_stream(
             request.message, session["messages"], request.model_type, request.temperature
-        )
+        ):
+            final_response += piece
+            yield f"data: {json.dumps({'type': 'message', 'assistant_message': piece, 'conversation_id': session_id, 'session_id': session_id, 'goal_complete': True})}\n\n"
         final_state = {"completion_score": 100, "iteration": 1}
+
     else:
         initial_state = {
             "messages": session["messages"],
@@ -584,45 +724,65 @@ async def generate_stream(request: "ChatRequest", session: dict, session_id: str
         }
         timeout = graph_timeout_seconds(request.model_type, request.max_iterations)
         final_state = initial_state
+        token_queue: asyncio.Queue = asyncio.Queue()
+        qtoken = _current_token_queue.set(token_queue)
 
         try:
-            async for node_name, state_so_far in run_graph_streaming(initial_state, timeout):
-                label = NODE_LABELS.get(node_name, node_name)
-                detail = node_detail(node_name, state_so_far)
-                yield f"data: {json.dumps({'type': 'status', 'step': node_name, 'label': label, 'detail': detail})}\n\n"
-                final_state = state_so_far
-            final_response = final_state.get("response", "Task completed but no response was formulated.")
+            async for evt in run_graph_streaming(initial_state, timeout, token_queue):
+                kind = evt[0]
+                if kind == "status":
+                    _, node_name, state_so_far = evt
+                    label = NODE_LABELS.get(node_name, node_name)
+                    detail = node_detail(node_name, state_so_far)
+                    yield f"data: {json.dumps({'type': 'status', 'step': node_name, 'label': label, 'detail': detail})}\n\n"
+                    final_state = state_so_far
+                elif kind == "reset":
+                    # Another planning iteration started — the draft streamed so far gets
+                    # superseded by a fresh executor pass, so clear the bubble instead of
+                    # appending the new draft onto the stale one.
+                    final_response = ""
+                    yield f"data: {json.dumps({'type': 'message_reset'})}\n\n"
+                elif kind == "token":
+                    final_response += evt[1]
+                    yield f"data: {json.dumps({'type': 'message', 'assistant_message': evt[1], 'conversation_id': session_id, 'session_id': session_id, 'goal_complete': False})}\n\n"
+
+            if not final_response.strip():
+                # Safety net: state has a response but somehow no tokens made it onto the
+                # queue (shouldn't normally happen) — still get an answer to the user.
+                fallback_text = final_state.get("response", "Task completed but no response was formulated.")
+                if fallback_text:
+                    final_response = fallback_text
+                    yield f"data: {json.dumps({'type': 'message', 'assistant_message': fallback_text, 'conversation_id': session_id, 'session_id': session_id, 'goal_complete': True})}\n\n"
+
         except asyncio.TimeoutError:
             print(f"[{session_id}] Streaming workflow timed out after {timeout:.0f}s. Falling back to direct answer.")
             yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'The full reasoning loop was taking too long, so falling back to a direct answer.'})}\n\n"
-            final_response = await answer_directly(
+            if final_response:
+                yield f"data: {json.dumps({'type': 'message_reset'})}\n\n"
+            final_response = ""
+            async for piece in answer_directly_stream(
                 request.message, session["messages"], request.model_type, request.temperature
-            )
+            ):
+                final_response += piece
+                yield f"data: {json.dumps({'type': 'message', 'assistant_message': piece, 'conversation_id': session_id, 'session_id': session_id, 'goal_complete': True})}\n\n"
             final_state = {"completion_score": 100, "iteration": 1}
         except Exception as e:
             print(f"[{session_id}] Streaming workflow failed: {e}. Falling back to direct answer.")
             yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'Something went wrong in the reasoning loop, so falling back to a direct answer.'})}\n\n"
-            final_response = await answer_directly(
+            if final_response:
+                yield f"data: {json.dumps({'type': 'message_reset'})}\n\n"
+            final_response = ""
+            async for piece in answer_directly_stream(
                 request.message, session["messages"], request.model_type, request.temperature
-            )
+            ):
+                final_response += piece
+                yield f"data: {json.dumps({'type': 'message', 'assistant_message': piece, 'conversation_id': session_id, 'session_id': session_id, 'goal_complete': True})}\n\n"
             final_state = {"completion_score": 100, "iteration": 1}
+        finally:
+            _current_token_queue.reset(qtoken)
 
     # Now that we actually have the final answer, save it to memory
     session["messages"].append(AIMessage(content=final_response))
-
-    # Stream the final answer word-by-word (ChatGPT-style typing effect)
-    chunks = final_response.split(" ")
-    for i, chunk in enumerate(chunks):
-        space = " " if i < len(chunks) - 1 else ""
-        data = {
-            "type": "message",
-            "assistant_message": chunk + space,
-            "conversation_id": session_id,
-            "session_id": session_id,
-            "goal_complete": final_state.get("completion_score", 100) >= 100
-        }
-        yield f"data: {json.dumps(data)}\n\n"
-        await asyncio.sleep(0.015) # Simulated typing delay
 
 def is_simple_message(message: str) -> bool:
     """Quick heuristic: short greetings/small talk don't need the full plan/execute/reflect loop."""
@@ -673,6 +833,82 @@ async def answer_directly(message: str, history: List[BaseMessage], model_type: 
 
     # Absolute last resort — user still gets a real response, never a crash
     return "I'm having trouble reaching the model right now. Please try again in a moment."
+
+async def answer_directly_stream(message: str, history: List[BaseMessage], model_type: str, temperature: float):
+    """
+    Real streaming counterpart to answer_directly(): yields token deltas the instant they
+    arrive from the model, instead of returning a single completed string. Used by
+    generate_stream() for the short/direct-message path and as its fallback on error/timeout.
+    """
+    messages = [SystemMessage(content="You are GoalAI, a helpful, friendly assistant. Respond naturally and concisely.")]
+    messages.extend(history[-6:])
+    messages.append(HumanMessage(content=message))
+
+    THINK_TAG = "<think>"
+
+    async def _stream_from(llm):
+        # Some models emit a leading <think>...</think> block before the real answer.
+        # strip_thinking() worked on a complete string; on a live stream we buffer just
+        # until we're past </think>, so those tags never reach the chat bubble.
+        #
+        # Small-chunk models (many stream token-by-token, sometimes near char-by-char)
+        # mean the opening tag itself can arrive split across several deltas — e.g. "<",
+        # "th", "ink>". Deciding "not a think tag" the moment the buffer merely fails a
+        # full startswith("<think>") check would leak those leading characters before
+        # we've actually seen enough to know. Instead: keep waiting as long as what
+        # we've buffered so far is still a valid PREFIX of "<think>"; only resolve once
+        # it either matches in full or definitively diverges.
+        buf = ""
+        in_think = False
+        resolved_think = False
+        async for chunk in llm.astream(messages):
+            piece = getattr(chunk, "content", "") or ""
+            if not piece:
+                continue
+            if not resolved_think:
+                buf += piece
+                stripped = buf.lstrip()
+                if not in_think:
+                    if stripped.startswith(THINK_TAG):
+                        in_think = True
+                    elif THINK_TAG.startswith(stripped):
+                        continue  # still an ambiguous prefix — wait for more chars
+                    else:
+                        resolved_think = True
+                        if buf:
+                            yield buf
+                        continue
+                if in_think:
+                    if "</think>" in buf:
+                        buf = buf.split("</think>", 1)[1]
+                        in_think = False
+                        resolved_think = True
+                        if buf:
+                            yield buf
+                    continue  # still inside <think>, nothing to emit yet
+                continue
+            yield piece
+
+    got_any = False
+    try:
+        async for piece in _stream_from(get_llm(model_type, temperature)):
+            got_any = True
+            yield piece
+    except Exception as e:
+        print(f"Primary model streaming failed: {e}")
+
+    if got_any:
+        return
+
+    try:
+        async for piece in _stream_from(get_llm("fast", temperature)):
+            got_any = True
+            yield piece
+    except Exception as e:
+        print(f"Fallback model streaming also failed: {e}")
+
+    if not got_any:
+        yield "I'm having trouble reaching the model right now. Please try again in a moment."
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
