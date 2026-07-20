@@ -1,0 +1,197 @@
+--- a/app.py
++++ b/app.py
+@@ -1942,6 +1942,88 @@
+         "last_error": err
+     }
+ 
++# ----------------------------------------------------------------------
++# CODE MODE: Incremental (diff-based) edits
++#
++# Root cause of "it regenerates the whole file for every tiny change": the
++# executor prompt used to unconditionally say "write out the full current
++# version of the code", so a one-line CSS tweak cost exactly as many output
++# tokens as the original build — and that cost only grows as the file grows,
++# since every single step re-emits the entire thing.
++#
++# On any follow-up turn where a prior draft already exists for the thing
++# this step is about to touch (and the ask isn't an explicit full rewrite),
++# code_executor_node below asks the model for a small SEARCH/REPLACE diff
++# instead and applies it locally with plain string replacement — the model
++# only pays for the lines that actually change. If the diff can't be parsed
++# or a SEARCH block doesn't match verbatim, this fails closed (returns
++# ok=False) so the caller falls back to the original full-file generation
++# instead of silently applying a garbled edit.
++# ----------------------------------------------------------------------
++
++EDIT_BLOCK_RE = re.compile(
++    r"<{5,}\s*SEARCH\s*\n(.*?)\n={5,}\s*\n(.*?)\n>{5,}\s*REPLACE",
++    re.DOTALL,
++)
++
++_REWRITE_KEYWORDS = (
++    "rewrite everything", "rewrite the whole", "start over", "start from scratch",
++    "from scratch", "redo the whole", "redesign completely", "throw away",
++    "completely different", "scrap it", "rebuild it", "new version of the whole",
++)
++
++def wants_full_rewrite(goal: str, current_step: str) -> bool:
++    """Heuristic: does the request explicitly call for replacing the whole file
++    rather than a targeted change? Deliberately biased toward False (i.e. toward
++    the cheaper diff path) — a false negative here just costs one harmless extra
++    SEARCH/REPLACE round trip if the diff attempt doesn't apply cleanly, while a
++    false positive pays for a full regenerate when a diff would have done."""
++    text = f"{goal} {current_step}".lower()
++    return any(kw in text for kw in _REWRITE_KEYWORDS)
++
++def apply_code_edits(original: str, edit_text: str) -> tuple[str, bool]:
++    """Parses one or more SEARCH/REPLACE blocks out of `edit_text` and applies them
++    to `original` in order. Returns (new_code, ok). ok is False if no blocks were
++    found, an empty (and therefore ambiguous) SEARCH block was used, or any block's
++    SEARCH text doesn't appear verbatim in the code as it stands at that point —
++    callers should fall back to a full regenerate rather than apply a partial or
++    garbled edit."""
++    blocks = EDIT_BLOCK_RE.findall(edit_text)
++    if not blocks:
++        return original, False
++
++    code = original
++    for search, replace in blocks:
++        if search == "":
++            return original, False  # ambiguous — could match anywhere, refuse to guess
++        if search not in code:
++            return original, False
++        code = code.replace(search, replace, 1)
++    return code, True
++
++def build_edit_prompt(prior_code: str, language: str, goal: str, current_step: str) -> str:
++    return (
++        "The 'Existing Code' below already satisfies most of the goal. Make ONLY the "
++        "change described by the 'Current Step' — do not rewrite anything else.\n\n"
++        "Respond with one or more SEARCH/REPLACE blocks in exactly this shape, and "
++        "nothing else — no full file, no markdown fences, no commentary:\n\n"
++        "<<<<<<< SEARCH\n"
++        "<exact existing lines to find, copied character-for-character>\n"
++        "=======\n"
++        "<the new lines that replace them>\n"
++        ">>>>>>> REPLACE\n\n"
++        "Rules:\n"
++        "- Every SEARCH block must match the Existing Code EXACTLY, including whitespace.\n"
++        "- Keep each SEARCH block as short as possible while still being unique in the file.\n"
++        "- Use several SEARCH/REPLACE blocks for several separate changes.\n"
++        "- To insert code, include a short unique anchor line in SEARCH and put that anchor "
++        "plus the new lines in REPLACE.\n"
++        "- To delete code, put it in SEARCH and leave REPLACE empty.\n\n"
++        f"Goal: {goal}\n"
++        f"Current Step: {current_step}\n"
++        f"Language: {language}\n\n"
++        f"Existing Code:\n{prior_code}"
++    )
+ 
+ # code_executor_node pushes real code tokens onto this per-request queue the instant
+ # they're generated (see stream_code_execution below) — mirrors _current_token_queue /
+@@ -2028,34 +2110,80 @@
+     target_file = state.get("target_file", "")
+     token_queue = _current_code_token_queue.get()
+ 
+-    multi_note = (
+-        f" This is a multi-file build: this step must produce exactly the file "
+-        f"'{target_file}' — write ONLY that file's code, not the whole app."
+-        if is_multi and target_file else ""
+-    )
+-    prompt = (
+-        "Execute the 'Current Step' to satisfy the coding 'Goal'. Write complete, runnable "
+-        "code. IMPORTANT: you must never leave the code empty for a coding task — even if "
+-        "this step is just a review, a small tweak, or you believe the goal is already met, "
+-        "write out the full current version of the code (unchanged if nothing needed to "
+-        f"change), not just an explanation with no code.{multi_note}\n\n"
+-        f"{format_code_context(state)}\n\n"
+-        "Respond in exactly this shape, nothing else:\n"
+-        "LANGUAGE: <the programming language, e.g. python, javascript, html, jsx>\n"
+-        "EXPLANATION: <one short sentence on what this code does>\n"
+-        f"{CODE_STREAM_DELIM}\n"
+-        "<the raw code only — no markdown fence, no commentary before or after it>"
++    # What (if anything) already exists for the thing this step is about to touch —
++    # single-file: the one prior draft; multi-file: whatever this target_file already
++    # holds (empty if it hasn't been written yet, which naturally falls through to a
++    # full generate below, same as before).
++    if is_multi:
++        prior_code_for_step = state.get("files", {}).get(target_file, "")
++        prior_language_for_step = state.get("file_languages", {}).get(target_file, "")
++    else:
++        prior_code_for_step = state.get("code", "")
++        prior_language_for_step = state.get("language", "")
++
++    edit_mode = bool(prior_code_for_step.strip()) and not wants_full_rewrite(
++        state.get("goal", ""), state.get("current_step", "")
+     )
+ 
+-    if token_queue is not None:
+-        await token_queue.put(("code_executor_start", target_file if is_multi else None))
++    language, explanation, code, err = "", "", "", None
++
++    if edit_mode:
++        # Cheap path: ask for only the lines that change, apply them locally instead
++        # of paying to have the model re-emit the whole file. Deliberately NOT pushed
++        # through token_queue — the diff markup itself should never appear live in the
++        # canvas. If this succeeds, `code` below is already the full reconstructed
++        # file, and generate_code_stream's post-loop chunk-replay (streamed_live stays
++        # False for this turn) fills the canvas from it exactly like the existing
++        # non-streaming fallback path already does.
++        try:
++            edit_prompt = build_edit_prompt(
++                prior_code_for_step, prior_language_for_step,
++                state.get("goal", ""), state.get("current_step", "")
++            )
++            res = await llm.ainvoke([HumanMessage(content=edit_prompt)])
++            edit_text = strip_thinking(res.content).strip()
++            new_code, ok = apply_code_edits(prior_code_for_step, edit_text)
++            if ok:
++                code = new_code
++                language = prior_language_for_step
++                explanation = "Applied a targeted edit to the existing code."
++        except Exception as e:
++            print(f"[CodeMode] edit-mode generation failed, falling back to full generate: {e}")
++        # ok == False (or an exception) falls through to the full-generate path below
++        # instead of returning nothing or a garbled partial edit.
++
++    if not code:
++        # First draft for this file (no prior code to edit), an explicit full-rewrite
++        # ask, or the diff attempt above didn't land — fall back to the original
++        # "write the whole file" path.
++        multi_note = (
++            f" This is a multi-file build: this step must produce exactly the file "
++            f"'{target_file}' — write ONLY that file's code, not the whole app."
++            if is_multi and target_file else ""
++        )
++        prompt = (
++            "Execute the 'Current Step' to satisfy the coding 'Goal'. Write complete, runnable "
++            "code. IMPORTANT: you must never leave the code empty for a coding task — even if "
++            "this step is just a review, a small tweak, or you believe the goal is already met, "
++            "write out the full current version of the code (unchanged if nothing needed to "
++            f"change), not just an explanation with no code.{multi_note}\n\n"
++            f"{format_code_context(state)}\n\n"
++            "Respond in exactly this shape, nothing else:\n"
++            "LANGUAGE: <the programming language, e.g. python, javascript, html, jsx>\n"
++            "EXPLANATION: <one short sentence on what this code does>\n"
++            f"{CODE_STREAM_DELIM}\n"
++            "<the raw code only — no markdown fence, no commentary before or after it>"
++        )
++
++        if token_queue is not None:
++            await token_queue.put(("code_executor_start", target_file if is_multi else None))
+ 
+-    try:
+-        language, explanation, code = await stream_code_execution(llm, prompt, token_queue)
+-        err = None
+-    except Exception as e:
+-        print(f"[CodeMode] code_executor_node streaming failed: {e}")
+-        language, explanation, code, err = "", "", "", f"{type(e).__name__}: {e}"
++        try:
++            language, explanation, code = await stream_code_execution(llm, prompt, token_queue)
++            err = None
++        except Exception as e:
++            print(f"[CodeMode] code_executor_node streaming failed: {e}")
++            language, explanation, code, err = "", "", "", f"{type(e).__name__}: {e}"
+ 
+     new_completed = state.get("completed_steps", []) + [state.get("current_step", "")]
+     prior_code = state.get("code", "")
