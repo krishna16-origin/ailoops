@@ -1243,6 +1243,12 @@
                                     appendInlineCodeStream(inlineCodeState, parsed.delta);
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
+                                } else if (parsed.type === 'message_reset') {
+                                    // The backend started a fresh answer draft (another planning
+                                    // iteration ran) — what's streamed so far is stale, so clear
+                                    // the bubble instead of appending the new draft onto it.
+                                    assistantFullText = '';
+                                    setProse(textContainer, THINKING_SVG);
                                 } else if (parsed.assistant_message) {
                                     if (!answerStarted) {
                                         answerStarted = true;
