@@ -1,6 +1,28 @@
 --- a/app.py
 +++ b/app.py
-@@ -1942,6 +1942,88 @@
+@@ -523,9 +523,18 @@
+     }
+ 
+ def decision_edge(state: AgentState) -> str:
+-    """Decides whether to end the reasoning loop or continue planning/executing."""
+-    if state.get("completion_score", 0) >= 100:
+-        return END
++    """Decides whether to end the reasoning loop or continue planning/executing.
++
++    Chat mode is meant to think it through, not stop at the first pass that looks
++    good enough — so this no longer ends the loop just because the evaluator scored
++    the goal complete after one iteration. It now always spends the full
++    'max_iterations' budget (planner -> executor -> reflector -> evaluator, repeated),
++    refining the draft each time, and only lets the final iteration's answer reach the
++    user. The only remaining exit condition is running out of iterations.
++    (graph_timeout_seconds already sizes its budget for worst_case_calls = 1 +
++    max_iterations * 4, i.e. every iteration actually running — so this doesn't
++    risk the timeout, it was already provisioned for this.)
++    """
+     if state.get("iteration", 0) >= state.get("max_iterations", 2):
+         return END
+     return "planner"
+@@ -1942,6 +1951,88 @@
          "last_error": err
      }
  
@@ -89,7 +111,7 @@
  
  # code_executor_node pushes real code tokens onto this per-request queue the instant
  # they're generated (see stream_code_execution below) — mirrors _current_token_queue /
-@@ -2028,34 +2110,80 @@
+@@ -2028,34 +2119,80 @@
      target_file = state.get("target_file", "")
      token_queue = _current_code_token_queue.get()
  
@@ -128,7 +150,13 @@
 -    if token_queue is not None:
 -        await token_queue.put(("code_executor_start", target_file if is_multi else None))
 +    language, explanation, code, err = "", "", "", None
-+
+ 
+-    try:
+-        language, explanation, code = await stream_code_execution(llm, prompt, token_queue)
+-        err = None
+-    except Exception as e:
+-        print(f"[CodeMode] code_executor_node streaming failed: {e}")
+-        language, explanation, code, err = "", "", "", f"{type(e).__name__}: {e}"
 +    if edit_mode:
 +        # Cheap path: ask for only the lines that change, apply them locally instead
 +        # of paying to have the model re-emit the whole file. Deliberately NOT pushed
@@ -179,13 +207,7 @@
 +
 +        if token_queue is not None:
 +            await token_queue.put(("code_executor_start", target_file if is_multi else None))
- 
--    try:
--        language, explanation, code = await stream_code_execution(llm, prompt, token_queue)
--        err = None
--    except Exception as e:
--        print(f"[CodeMode] code_executor_node streaming failed: {e}")
--        language, explanation, code, err = "", "", "", f"{type(e).__name__}: {e}"
++
 +        try:
 +            language, explanation, code = await stream_code_execution(llm, prompt, token_queue)
 +            err = None
