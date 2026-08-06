@@ -627,6 +627,66 @@ NODE_LABELS = {
 # times out or errors and the app falls back to a direct answer.
 FALLBACK_LABELS = ["Fathoming", "Pondering", "Discovering", "Triangulating", "Sifting"]
 
+# ==================================================
+# CHAT MODE ONLY: Topic-aware "spinner" words — mirrors Claude's own animated
+# status text (a single playful gerund shown while real backend work is
+# happening), except the word pool is chosen based on what the user's message
+# is actually about, so a math question spins through math-flavored words, a
+# physics question spins through physics-flavored words, and everything else
+# falls back to a general pool. This block and its use in generate_stream()
+# below are the only things touched — Code Mode keeps its own separate
+# NODE_LABELS / FALLBACK_LABELS usage untouched.
+# ==================================================
+
+SPINNER_WORDS = {
+    "math": [
+        "Calculating", "Computing", "Crunching", "Cerebrating", "Reticulating",
+        "Determining", "Deciphering", "Quantumizing", "Combobulating", "Cogitating",
+    ],
+    "physics": [
+        "Orbiting", "Levitating", "Precipitating", "Ionizing", "Warping",
+        "Undulating", "Thundering", "Nucleating", "Gusting", "Ebbing", "Photosynthesizing",
+    ],
+    "general": [
+        "Pondering", "Thinking", "Musing", "Mulling", "Ruminating", "Contemplating",
+        "Considering", "Noodling", "Puzzling", "Deliberating", "Mustering", "Working",
+        "Doodling", "Wandering", "Cultivating",
+    ],
+}
+
+_MATH_KEYWORDS = (
+    "equation", "algebra", "calculus", "integral", "derivative", "matrix",
+    "geometry", "trigonometry", "theorem", "proof", "solve for", "sum of",
+    "probability", "statistics", "polynomial", "sqrt", "logarithm",
+    "arithmetic", "fraction", "factorial", "eigenvalue", "differentiate",
+)
+_PHYSICS_KEYWORDS = (
+    "velocity", "acceleration", "force", "gravity", "momentum", "energy",
+    "quantum", "relativity", "electromagnetic", "thermodynamics", "friction",
+    "newton's", "electric field", "magnetic field", "wavelength", "frequency",
+    "particle", "photon", "voltage", "circuit", "kinetic", "potential energy",
+    "torque", "entropy",
+)
+
+def classify_topic(message: str) -> str:
+    """Lightweight keyword classifier used only to pick a themed spinner word —
+    not a real intent classifier, so it deliberately errs toward 'general'
+    rather than guessing on ambiguous text."""
+    text = f" {message.lower()} "
+    if any(kw in text for kw in _MATH_KEYWORDS):
+        return "math"
+    if any(kw in text for kw in _PHYSICS_KEYWORDS):
+        return "physics"
+    return "general"
+
+def spinner_word(topic: str, exclude: Optional[str] = None) -> str:
+    """Picks a random themed spinner word, avoiding an immediate repeat of the
+    word shown last time so the status text always visibly changes, the same
+    way Claude's own indicator never sits on one word for two updates in a row."""
+    words = SPINNER_WORDS.get(topic, SPINNER_WORDS["general"])
+    choices = [w for w in words if w != exclude] or words
+    return random.choice(choices)
+
 def node_detail(node_name: str, state: dict) -> str:
     """
     Turns whatever a node actually produced into a real sentence of reasoning text,
@@ -660,8 +720,16 @@ async def run_graph_streaming(initial_state: dict, timeout: float, token_queue: 
                                               should clear whatever draft it's shown so far
       ("token", text)                      — a real, live delta of the answer being written,
                                               straight from the model, the instant it arrives
+      ("spinner_tick", None)               — nothing new finished yet, just a signal to cycle
+                                              the spinner word so the status text keeps visibly
+                                              changing during a single long-running node call,
+                                              the same way Claude's own indicator does
     Enforces the same overall timeout budget as before so a slow run still falls back cleanly.
     """
+    SPINNER_HEARTBEAT_INTERVAL = 2.5  # how often to emit a fresh spinner word while a single
+                                       # node call is still in flight, instead of only getting
+                                       # a new status word once per finished node.
+
     state_acc = dict(initial_state)
     loop = asyncio.get_event_loop()
     deadline = loop.time() + timeout
@@ -675,12 +743,14 @@ async def run_graph_streaming(initial_state: dict, timeout: float, token_queue: 
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise asyncio.TimeoutError()
+            wait_chunk = min(SPINNER_HEARTBEAT_INTERVAL, remaining)
 
             done, _ = await asyncio.wait(
-                {graph_next, queue_next}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                {graph_next, queue_next}, timeout=wait_chunk, return_when=asyncio.FIRST_COMPLETED
             )
             if not done:
-                raise asyncio.TimeoutError()
+                yield ("spinner_tick", None)
+                continue
 
             if queue_next in done:
                 kind, payload = queue_next.result()
@@ -712,7 +782,16 @@ async def run_graph_streaming(initial_state: dict, timeout: float, token_queue: 
 async def generate_stream(request: "ChatRequest", session: dict, session_id: str):
     """
     Streams SSE events to the frontend:
-      - {"type": "status", "step": <node name>, "label": <text>}   real backend progress
+      - {"type": "status", "step": <node name>, "label": <text>}   real backend progress —
+                                                                     "label" is a themed spinner
+                                                                     word (e.g. "Calculating",
+                                                                     "Orbiting", "Pondering")
+                                                                     drawn from a pool matched to
+                                                                     the topic of the user's
+                                                                     message, the same way
+                                                                     Claude's own status
+                                                                     indicator cycles through
+                                                                     playful words while it works
       - {"type": "message_reset"}                                  a redo iteration started;
                                                                      clear the chat bubble
       - {"type": "message", "assistant_message": <delta>, ...}     a REAL token, live from
@@ -720,9 +799,13 @@ async def generate_stream(request: "ChatRequest", session: dict, session_id: str
                                                                      of an already-finished string
     """
     final_response = ""
+    topic = classify_topic(request.message)  # "math" | "physics" | "general" — picks the
+                                               # spinner word pool for this whole turn
+    last_spinner: Optional[str] = None
 
     if is_simple_message(request.message):
-        yield f"data: {json.dumps({'type': 'status', 'step': 'direct', 'label': 'Answering', 'detail': 'This is a short message, so answering directly without the full planning loop.'})}\n\n"
+        last_spinner = spinner_word(topic)
+        yield f"data: {json.dumps({'type': 'status', 'step': 'direct', 'label': last_spinner, 'detail': 'This is a short message, so answering directly without the full planning loop.'})}\n\n"
         async for piece in answer_directly_stream(
             request.message, session["messages"], request.model_type, request.temperature
         ):
@@ -751,10 +834,16 @@ async def generate_stream(request: "ChatRequest", session: dict, session_id: str
                 kind = evt[0]
                 if kind == "status":
                     _, node_name, state_so_far = evt
-                    label = NODE_LABELS.get(node_name, node_name)
+                    last_spinner = spinner_word(topic, exclude=last_spinner)
                     detail = node_detail(node_name, state_so_far)
-                    yield f"data: {json.dumps({'type': 'status', 'step': node_name, 'label': label, 'detail': detail})}\n\n"
+                    yield f"data: {json.dumps({'type': 'status', 'step': node_name, 'label': last_spinner, 'detail': detail})}\n\n"
                     final_state = state_so_far
+                elif kind == "spinner_tick":
+                    # A single node call is still in flight — cycle the spinner word so the
+                    # status text keeps visibly changing instead of freezing until that node
+                    # finishes, matching how Claude's own indicator behaves mid-thought.
+                    last_spinner = spinner_word(topic, exclude=last_spinner)
+                    yield f"data: {json.dumps({'type': 'status', 'step': 'thinking', 'label': last_spinner, 'detail': 'Still working on it...'})}\n\n"
                 elif kind == "reset":
                     # Another planning iteration started — the draft streamed so far gets
                     # superseded by a fresh executor pass, so clear the bubble instead of
@@ -775,7 +864,8 @@ async def generate_stream(request: "ChatRequest", session: dict, session_id: str
 
         except asyncio.TimeoutError:
             print(f"[{session_id}] Streaming workflow timed out after {timeout:.0f}s. Falling back to direct answer.")
-            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'The full reasoning loop was taking too long, so falling back to a direct answer.'})}\n\n"
+            last_spinner = spinner_word(topic, exclude=last_spinner)
+            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': last_spinner, 'detail': 'The full reasoning loop was taking too long, so falling back to a direct answer.'})}\n\n"
             if final_response:
                 yield f"data: {json.dumps({'type': 'message_reset'})}\n\n"
             final_response = ""
@@ -787,7 +877,8 @@ async def generate_stream(request: "ChatRequest", session: dict, session_id: str
             final_state = {"completion_score": 100, "iteration": 1}
         except Exception as e:
             print(f"[{session_id}] Streaming workflow failed: {e}. Falling back to direct answer.")
-            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': random.choice(FALLBACK_LABELS), 'detail': 'Something went wrong in the reasoning loop, so falling back to a direct answer.'})}\n\n"
+            last_spinner = spinner_word(topic, exclude=last_spinner)
+            yield f"data: {json.dumps({'type': 'status', 'step': 'fallback', 'label': last_spinner, 'detail': 'Something went wrong in the reasoning loop, so falling back to a direct answer.'})}\n\n"
             if final_response:
                 yield f"data: {json.dumps({'type': 'message_reset'})}\n\n"
             final_response = ""
