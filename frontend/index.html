@@ -193,6 +193,13 @@
         .send-btn:disabled { opacity:0.3; cursor:not-allowed; }
         .send-btn svg { width:17px; height:17px; }
 
+        /* Floating "jump to latest" button — only shown once the user has scrolled
+           up away from the bottom during a response, exactly like ChatGPT. Clicking
+           it (or scrolling back down manually) re-engages auto-scroll. */
+        .scroll-to-bottom-btn { position:absolute; left:50%; bottom:130px; transform:translateX(-50%) translateY(10px); width:36px; height:36px; border-radius:50%; background-color:var(--bg-input); border:1px solid var(--border-color); color:var(--text-primary); display:flex; align-items:center; justify-content:center; cursor:pointer; box-shadow:0 4px 14px rgba(0,0,0,0.25); opacity:0; pointer-events:none; transition:opacity 0.2s ease, transform 0.2s var(--transition-bezier); z-index:5; }
+        .scroll-to-bottom-btn.visible { opacity:1; pointer-events:auto; transform:translateX(-50%) translateY(0); }
+        .scroll-to-bottom-btn svg { width:16px; height:16px; }
+
         .thinking-indicator { display:inline-block; width:26px; height:26px; vertical-align:middle; margin-left:4px; overflow:visible; }
         .thinking-indicator svg { width:100%; height:100%; overflow:visible; }
         .thinking-indicator .petal-group { transform-origin:100px 100px; animation:thinkingMove 2s cubic-bezier(0.45,0,0.55,1) infinite; }
@@ -356,6 +363,10 @@
             </div>
             <div class="chat-content" id="chatContent" style="display: none;"></div>
         </div>
+
+        <button type="button" class="scroll-to-bottom-btn" id="scrollToBottomBtn" onclick="jumpToBottom()" title="Scroll to latest">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><polyline points="19 12 12 19 5 12"></polyline></svg>
+        </button>
 
         <div class="input-container">
             <div class="input-box">
@@ -807,10 +818,16 @@
         };
         let currentMode = 'chat';
         let isWaitingForResponse = false;
+        // Whether the view should keep auto-scrolling as new content streams in.
+        // True as long as the user is at (or near) the bottom; false the instant
+        // they scroll up to read something — same as ChatGPT, so a streaming
+        // answer never yanks them back down against their will.
+        let isPinnedToBottom = true;
 
         const sidebar = document.getElementById('sidebar');
         const chatContainer = document.getElementById('chatContainer');
         const chatContent = document.getElementById('chatContent');
+        const scrollToBottomBtn = document.getElementById('scrollToBottomBtn');
         const openingScene = document.getElementById('openingScene');
         const openingTitle = document.getElementById('openingTitle');
         const openingSubtitle = document.getElementById('openingSubtitle');
@@ -888,7 +905,7 @@
                 refreshOpeningSceneVisibility();
                 chatContent.classList.remove('mode-fade-out');
                 chatContent.classList.add('mode-fade-in');
-                scrollToBottom();
+                scrollToBottom(true);
                 setTimeout(() => chatContent.classList.remove('mode-fade-in'), 260);
             }, 150);
         }
@@ -980,14 +997,39 @@
 
             row.appendChild(bubble);
             chatContent.appendChild(row);
-            scrollToBottom();
+            scrollToBottom(true); // new message = always jump down and re-pin
 
             return role === 'assistant' ? bubble : null;
         }
 
-        function scrollToBottom() {
+        // distance (px) from the true bottom that still counts as "at the bottom" —
+        // gives a little slack so a stray sub-pixel scroll doesn't unpin the view
+        const SCROLL_BOTTOM_THRESHOLD = 80;
+
+        // Auto-scroll during streaming, but ONLY while the user is already pinned
+        // to the bottom. If they've scrolled up — e.g. to re-read something while
+        // the thinking/answer keeps streaming in — this becomes a no-op instead of
+        // yanking them back down, matching ChatGPT's behavior. Pass force=true for
+        // moments that should always jump (sending a message, clicking the button).
+        function scrollToBottom(force = false) {
+            if (!force && !isPinnedToBottom) return;
             chatContainer.scrollTop = chatContainer.scrollHeight;
+            isPinnedToBottom = true;
+            scrollToBottomBtn.classList.remove('visible');
         }
+
+        // Wired to the floating jump button.
+        function jumpToBottom() {
+            scrollToBottom(true);
+        }
+
+        // Tracks whether the user has manually scrolled away from the bottom, and
+        // shows/hides the floating jump button accordingly.
+        chatContainer.addEventListener('scroll', () => {
+            const distanceFromBottom = chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight;
+            isPinnedToBottom = distanceFromBottom <= SCROLL_BOTTOM_THRESHOLD;
+            scrollToBottomBtn.classList.toggle('visible', !isPinnedToBottom && modes[currentMode].hasMessages);
+        });
 
         // Updates just the .message-prose child of a message-text container, creating it if
         // needed. Unlike assigning textContainer.innerHTML directly (the old approach), this
@@ -1058,6 +1100,10 @@
             let thinkingFinalized = false; // true once "Thought for Ns" has been set for good
             let liveThoughtEl = null;      // growing text node for the raw token-by-token reasoning stream (Code Mode)
             let inlineCodeState = null;    // the in-chat Claude-style code card currently being filled (Code Mode)
+            let lastThoughtStep = null;    // step name of the most recently rendered thought bubble
+            let lastThoughtContentEl = null; // its .thought-content node, so a repeat 'thinking'
+                                              // heartbeat can update it in place instead of piling
+                                              // up duplicate "Still working on it..." bubbles
 
             // Icons mapping for different thought types
             const thoughtIcons = {
@@ -1083,11 +1129,25 @@
             // Real backend progress event (planner / executor / reflector / evaluator,
             // or the Code Mode equivalents). Reveals the block on the first thought
             // and keeps it expanded while it grows. Shared by both modes.
-            function addThought(label, detail) {
+            function addThought(label, detail, step) {
                 if (thinkingDone) return;
                 thinkingBlock.style.display = 'block';
                 thinkingToggle.textContent = label || 'Thinking';
                 thinkingToggle.classList.add('shimmer');
+
+                // A 'thinking' step is a spinner_tick heartbeat — the backend hasn't
+                // finished anything new, it's just cycling the status word so the UI
+                // doesn't look frozen while one node call runs long. If the previous
+                // bubble was ALSO a heartbeat (no real step landed in between), update
+                // that same bubble's text instead of appending another identical
+                // "Still working on it..." line — this is exactly how Claude's own
+                // status indicator behaves: one line updating in place, not a growing
+                // stack of duplicates. A genuinely new step always gets its own bubble.
+                if (step === 'thinking' && lastThoughtStep === 'thinking' && lastThoughtContentEl) {
+                    lastThoughtContentEl.textContent = detail || label || '';
+                    scrollToBottom();
+                    return;
+                }
 
                 const item = document.createElement('div');
                 item.className = 'thought-item';
@@ -1120,6 +1180,9 @@
                         };
                     }
                 }, 0);
+
+                lastThoughtStep = step || null;
+                lastThoughtContentEl = content;
 
                 scrollToBottom();
             }
@@ -1228,7 +1291,7 @@
                                     // Real per-node status bubbles (understanding/planning/etc.)
                                     // follow right after this — nothing else to do here.
                                 } else if (parsed.type === 'status') {
-                                    addThought(parsed.label, parsed.detail);
+                                    addThought(parsed.label, parsed.detail, parsed.step);
                                 } else if (parsed.type === 'code_start') {
                                     startCodeCanvasStream(parsed.language, '');
                                     inlineCodeState = startInlineCodeStream(textContainer, parsed.language, '');
