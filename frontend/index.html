@@ -1146,6 +1146,13 @@
             const thinkingContent = thinkingBlock.querySelector('.thinking-content');
             const thinkingStartTime = Date.now();
 
+            // Show "Thinking" the instant the request goes out — like Claude.ai — rather
+            // than waiting for a real backend status event, which may never arrive for
+            // quick replies that skip the planning loop entirely (e.g. "hi").
+            thinkingBlock.style.display = 'block';
+            thinkingToggle.textContent = 'Thinking';
+            thinkingToggle.classList.add('shimmer');
+
             let thinkingDone = false;      // true once the model has moved on to answering
             let answerStarted = false;     // true once the first answer token has arrived
             let thinkingFinalized = false; // true once "Thought for Ns" has been set for good
@@ -1274,7 +1281,6 @@
             function startAnswering() {
                 if (thinkingDone) return;
                 thinkingDone = true;
-                if (!thinkingContent.childElementCount) return;
                 thinkingToggle.textContent = 'Answering';
                 thinkingToggle.classList.add('shimmer');
                 thinkingContent.classList.remove('expanded');
@@ -1287,14 +1293,17 @@
                 if (thinkingFinalized) return;
                 thinkingFinalized = true;
                 thinkingDone = true;
-                if (!thinkingContent.childElementCount) {
-                    thinkingBlock.remove();
-                    return;
-                }
                 const seconds = Math.max(1, Math.round((Date.now() - thinkingStartTime) / 1000));
                 thinkingToggle.textContent = `Thought for ${seconds}s`;
                 thinkingToggle.classList.remove('shimmer');
                 thinkingContent.classList.remove('expanded');
+                // Nothing to expand into if no detailed step events ever arrived —
+                // drop the (now inert) toggle affordance rather than leave a button
+                // that opens onto an empty panel.
+                if (!thinkingContent.childElementCount) {
+                    thinkingToggle.style.cursor = 'default';
+                    thinkingToggle.style.pointerEvents = 'none';
+                }
             }
 
             let assistantFullText = '';
@@ -1303,11 +1312,9 @@
             // Lives outside .message-prose so setProse() re-parsing the prose HTML
             // on every streamed token never touches it — see createThinkingIndicator.
             let indicatorEl = null;
-            if (useStream) {
-                setProse(textContainer, '');
-                indicatorEl = createThinkingIndicator('thinking');
-                textContainer.appendChild(indicatorEl);
-            }
+            setProse(textContainer, '');
+            indicatorEl = createThinkingIndicator('thinking');
+            textContainer.appendChild(indicatorEl);
 
             try {
                 const response = await fetch(apiUrl, {
