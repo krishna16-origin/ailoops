@@ -1121,21 +1121,24 @@ async def _handle_chat(request: ChatRequest):
 
 # ----------------------------------------------------------------------
 # CODE MODE: Structured Output Models
+#
+# Deliberately just two shapes now, mirroring how an engineer (or Claude Code)
+# actually works: think before you touch anything, then look over what you
+# just wrote before calling it done. No separate "extract the goal" pass, no
+# ahead-of-time multi-step plan, and no 0-100 "completion percentage" score —
+# those were artificial scaffolding on top of what's really a single
+# read -> act -> check loop.
 # ----------------------------------------------------------------------
 
-class CodeGoalExtraction(BaseModel):
-    main_goal: str = Field(description="The coding task the user actually wants solved")
-    language_hint: str = Field(description="Programming language / framework implied by the request, if any (empty string if unclear)")
-    constraints: List[str] = Field(description="Technical constraints or requirements to follow")
-    missing_information: List[str] = Field(description="What we need to ask the user, if anything")
-    is_multi_file: bool = Field(description="True only if this genuinely needs several distinct files/pages/modules (e.g. a full multi-page app with landing page + dashboard + settings, etc.) that cannot reasonably live in one runnable file. False for anything that fits naturally in a single file/component/instant preview.")
-    estimated_file_count: int = Field(description="Rough number of separate files needed to build this well. Use 1 for single-file tasks.")
-
-class CodePlannerOutput(BaseModel):
-    plan: List[str] = Field(description="Ordered list of technical steps to build the solution. For multi-file tasks, each step should correspond to exactly one file.")
-    current_step: str = Field(description="The single immediate next step to execute")
-    target_file: str = Field(default="", description="The filename this step will produce, e.g. 'index.html', 'auth.js'. Leave empty for single-file tasks.")
-    approach: str = Field(description="Technical approach / design decision for this step")
+class CodeAnalysis(BaseModel):
+    understanding: str = Field(description="Plain-language restatement of what's actually being asked, the way an engineer would summarize a ticket to themselves before opening an editor")
+    relevant_context: str = Field(default="", description="What in the existing code (if any) is relevant here: which functions, files, or behavior this touches and what they currently do. Empty string if there's no existing code yet.")
+    root_cause: str = Field(default="", description="For a bug report: the actual underlying cause of the problem, not just the symptom. Empty string if this isn't a bug fix.")
+    next_step: str = Field(description="The exact, concrete next action to take — specific enough to act on immediately, e.g. 'fix the off-by-one in the pagination loop' or 'build the login form component'")
+    is_multi_file: bool = Field(description="True only if this genuinely needs several distinct files/pages/modules that cannot reasonably live in one runnable file. False for anything that fits naturally in a single file/component/instant preview.")
+    estimated_file_count: int = Field(default=1, description="Rough number of separate files needed to build this well. Use 1 for single-file tasks.")
+    target_file: str = Field(default="", description="The filename next_step targets, e.g. 'index.html', 'auth.js'. Leave empty for single-file tasks.")
+    already_done: bool = Field(default=False, description="True only if, having looked at what already exists, nothing further is actually needed")
 
 class CodeExecutorOutput(BaseModel):
     code: str = Field(description="The generated code for the current step, complete and runnable")
@@ -1144,16 +1147,10 @@ class CodeExecutorOutput(BaseModel):
     explanation: str = Field(description="Brief explanation of what the code does")
     is_frontend: bool = Field(description="True if this code renders a UI in a browser (html/css/js/react/vue/etc), false if it is backend/server/CLI/script code")
 
-class CodeReflectorOutput(BaseModel):
-    quality: str = Field(description="Assessment of the code quality")
-    correctness: str = Field(description="Is the code correct / free of bugs?")
-    bugs_found: str = Field(description="Any bugs, edge cases, or issues found")
-    improvements: str = Field(description="Actionable advice to improve the code")
-
-class CodeEvaluatorOutput(BaseModel):
-    completion_percentage: int = Field(description="0 to 100 representing how complete the coding task is")
-    confidence: float = Field(description="Confidence in this evaluation (0.0 to 1.0)")
-    should_continue: bool = Field(description="Whether more iterations are needed to finish the task")
+class CodeReview(BaseModel):
+    looks_correct: bool = Field(description="False if there's a real bug, missed requirement, or broken edge case in what was just written")
+    issues: str = Field(default="", description="Specific, concrete problems found — exact enough to act on directly. Empty string if none.")
+    notes: str = Field(default="", description="Anything else worth mentioning about quality or trade-offs, even when looks_correct is True")
 
 # ----------------------------------------------------------------------
 # CODE MODE: Graph State
@@ -1162,12 +1159,12 @@ class CodeEvaluatorOutput(BaseModel):
 class CodeAgentState(TypedDict):
     messages: List[BaseMessage]
     goal: str
-    constraints: List[str]
-    plan: List[str]
     current_step: str
     target_file: str
-    completed_steps: List[str]
-    reflection: str
+    analysis_notes: str
+    review_notes: str
+    needs_fix: bool
+    already_done: bool
     completion_score: int
     iteration: int
     max_iterations: int
@@ -1250,8 +1247,8 @@ CODE_REASONING_ITERATIONS = {
 
 def get_code_max_iterations(reasoning_level: str) -> int:
     """Starting floor for iterations. For multi-file builds this gets raised dynamically
-    by code_planner_node once the real plan length is known (see there) — a 15-file app
-    needs more passes than any fixed reasoning-level ceiling allows for."""
+    by code_analysis_node once it estimates how many files are actually needed (see there)
+    — a 15-file app needs more passes than any fixed reasoning-level ceiling allows for."""
     return CODE_REASONING_ITERATIONS.get((reasoning_level or "").strip().lower(), CODE_REASONING_ITERATIONS["medium"])
 
 # ----------------------------------------------------------------------
@@ -1807,7 +1804,7 @@ async def add_missing_js(code: str, goal: str, current_step: str, model_key: str
 # CODE MODE: Single-file frontend enforcement — runs ONCE per user turn
 #
 # Guards 0/1/2 (bundle non-HTML into HTML, restore dropped style/script, add missing JS)
-# used to run inside code_executor_node itself, i.e. on every internal planner/executor
+# used to run inside code_executor_node itself, i.e. on every internal think/act
 # loop iteration. Only the LAST iteration's output actually reaches the user (each
 # iteration overwrites "code"/"language" in state), so re-running these checks on every
 # earlier iteration wasted calls for nothing AND stacked several extra sequential LLM
@@ -1935,36 +1932,28 @@ async def execute_code_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic
             except Exception as salvage_err:
                 print(f"[CodeMode] Salvage construction failed: {salvage_err}")
 
-    # Same idea for the planner: a big multi-file plan (20-30 detailed steps for something
-    # like a full SaaS app) can brush max_tokens and get cut off mid-array. Because the prompt
-    # and temperature are the same on every retry, this tends to truncate at the same point
-    # every attempt — plain retries alone rarely fix it. Recovering whichever plan items did
-    # complete before the cutoff beats returning an empty plan, which used to end the whole
-    # multi-file loop immediately with zero files ever produced (see code_decision_edge).
-    if pydantic_model is CodePlannerOutput and last_raw_content:
-        plan_match = re.search(r'"plan"\s*:\s*\[(.*?)(?:\]|$)', last_raw_content, re.DOTALL)
-        if plan_match:
-            raw_items = re.findall(r'"((?:[^"\\]|\\.)*)"', plan_match.group(1))
-            salvaged_plan = []
-            for raw_item in raw_items:
-                try:
-                    salvaged_plan.append(json.loads(f'"{raw_item}"'))
-                except Exception:
-                    salvaged_plan.append(raw_item)
-            salvaged_plan = [p for p in salvaged_plan if p.strip()]
-            if salvaged_plan:
-                step_match = re.search(r'"current_step"\s*:\s*"((?:[^"\\]|\\.)*)"', last_raw_content)
-                target_match = re.search(r'"target_file"\s*:\s*"((?:[^"\\]|\\.)*)"', last_raw_content)
-                print(f"[CodeMode] Salvaged a {len(salvaged_plan)}-step plan from truncated JSON output.")
-                try:
-                    return CodePlannerOutput(
-                        plan=salvaged_plan,
-                        current_step=(step_match.group(1) if step_match else salvaged_plan[0]),
-                        target_file=(target_match.group(1) if target_match else ""),
-                        approach="Recovered from a truncated planning response — the JSON got cut off but the plan items were intact.",
-                    ), None
-                except Exception as salvage_err:
-                    print(f"[CodeMode] Plan salvage construction failed: {salvage_err}")
+    # Same idea for the thinking step: a long analysis (lots of reasoning about a big
+    # existing file, or a wide multi-file context) can brush max_tokens and get cut off
+    # mid-object. Because the prompt and temperature are the same on every retry, this
+    # tends to truncate at the same point every attempt — plain retries alone rarely fix
+    # it. Recovering whichever fields did complete before the cutoff beats returning
+    # nothing, which used to end the whole loop immediately with zero code produced.
+    if pydantic_model is CodeAnalysis and last_raw_content:
+        step_match = re.search(r'"next_step"\s*:\s*"((?:[^"\\]|\\.)*)"', last_raw_content)
+        if step_match:
+            understanding_match = re.search(r'"understanding"\s*:\s*"((?:[^"\\]|\\.)*)"', last_raw_content)
+            target_match = re.search(r'"target_file"\s*:\s*"((?:[^"\\]|\\.)*)"', last_raw_content)
+            multi_match = re.search(r'"is_multi_file"\s*:\s*(true|false)', last_raw_content, re.IGNORECASE)
+            print(f"[CodeMode] Salvaged a next step from truncated JSON output.")
+            try:
+                return CodeAnalysis(
+                    understanding=(understanding_match.group(1) if understanding_match else "Continue the coding task."),
+                    next_step=step_match.group(1),
+                    target_file=(target_match.group(1) if target_match else ""),
+                    is_multi_file=(multi_match.group(1).lower() == "true" if multi_match else False),
+                ), None
+            except Exception as salvage_err:
+                print(f"[CodeMode] Analysis salvage construction failed: {salvage_err}")
 
     return None, last_error
 
@@ -1980,76 +1969,84 @@ def format_code_context(state: CodeAgentState) -> str:
 Current Internal State:
 - Goal: {state.get('goal', 'Not set')}
 - Multi-file build: {state.get('is_multi_file', False)} (~{state.get('estimated_file_count', 1)} files estimated)
-- Constraints: {state.get('constraints', [])}
-- Plan: {state.get('plan', [])}
-- Completed Steps: {state.get('completed_steps', [])}
 - Files built so far (do not rebuild these unless fixing them): {files_summary}
+- Prior thinking: {state.get('analysis_notes', 'None yet')}
 - Current Step: {state.get('current_step', 'Not set')}
 - Target File For This Step: {state.get('target_file', 'N/A')}
 - Prior Code Draft: {state.get('code', 'None')}
 - Prior Language: {state.get('language', 'None')}
-- Reflection on Draft: {state.get('reflection', 'None')}
+- Review Notes From Last Pass: {state.get('review_notes', 'None')}
 """
 
 # ----------------------------------------------------------------------
 # CODE MODE: LangGraph Nodes
 # ----------------------------------------------------------------------
 
-async def understand_code_goal_node(state: CodeAgentState) -> dict:
+async def code_analysis_node(state: CodeAgentState) -> dict:
+    """The 'think before you touch anything' step — this is where the Claude-Code feel
+    actually lives. One pass that reads the request and whatever code already exists,
+    figures out what's really being asked, and — for a bug — digs for the root cause
+    instead of jumping straight to a patch. Replaces what used to be two separate
+    structured calls (extract-the-goal, then build-a-plan) with the single judgment call
+    an engineer actually makes before writing anything: what does this need, and what's
+    the very next concrete thing to do about it."""
     llm = get_code_llm(state["model_key"], state["temperature"])
     prompt = (
-        "Analyze this conversation and extract the core coding goal, language hint, constraints, "
-        "missing info, and whether this genuinely needs multiple separate files. Only mark "
-        "is_multi_file=True for requests describing several distinct pages/screens/modules "
-        "(e.g. a full app with landing page + dashboard + settings + billing, etc.) that cannot "
-        "reasonably be one runnable file. Small asks, single components, or single-page tools "
-        "should be is_multi_file=False so they render as one instant preview.\n\n{context}"
+        "Before writing or changing any code, think it through like an engineer picking up "
+        "this task: what is actually being asked, what (if anything) in the existing code is "
+        "relevant, and — if this is a bug report — what the real root cause is, not just the "
+        "symptom. Then decide the single, concrete next action to take.\n\n"
+        "If this is a multi-file build, only mark is_multi_file=True when it genuinely needs "
+        "several distinct files/pages/modules that cannot reasonably live in one runnable file "
+        "— small asks, single components, or single-page tools should stay is_multi_file=False "
+        "so they render as one instant preview. When it is multi-file, target_file must name the "
+        "exact next file to write (e.g. 'index.html', 'dashboard.jsx'), and you must not target a "
+        "file that's already listed under 'Files built so far' unless you're fixing it because of "
+        "review notes. If, having actually looked at what's already built, there's truly nothing "
+        "left to do, set already_done=True instead of inventing more work.\n\n{context}"
     )
 
-    res, err = await execute_code_llm_structured(llm, prompt, CodeGoalExtraction, {"context": format_code_context(state)})
-
-    return {
-        "goal": res.main_goal if res else "Write the requested code.",
-        "constraints": res.constraints if res else [],
-        "is_multi_file": bool(res.is_multi_file) if res else False,
-        "estimated_file_count": max(1, res.estimated_file_count) if res else 1,
-        "iteration": 0,
-        "completed_steps": [],
-        "plan": state.get("plan", []),
-        "files": state.get("files", {}),
-        "file_languages": state.get("file_languages", {}),
-        "last_error": err
-    }
-
-async def code_planner_node(state: CodeAgentState) -> dict:
-    llm = get_code_llm(state["model_key"], state["temperature"])
-    prompt = (
-        "Based on the goal and completed steps, create or update the technical plan. Identify the "
-        "single immediate next step. If this is a multi-file build, each plan step must correspond "
-        "to exactly one file, target_file must name that file (e.g. 'index.html', 'dashboard.jsx'), "
-        "and you must not re-plan a file that's already listed under 'Files built so far'.\n\n{context}"
-    )
-
-    res, err = await execute_code_llm_structured(llm, prompt, CodePlannerOutput, {"context": format_code_context(state)})
+    res, err = await execute_code_llm_structured(llm, prompt, CodeAnalysis, {"context": format_code_context(state)})
 
     iteration = state.get("iteration", 0) + 1
-    plan = res.plan if res else state.get("plan", [])
 
-    # A multi-file build genuinely needs one planner/executor pass per file. The fixed
+    if not res:
+        return {
+            "goal": state.get("goal") or "Write the requested code.",
+            "current_step": state.get("current_step") or "Write the code that satisfies the goal.",
+            "iteration": iteration,
+            "last_error": err,
+        }
+
+    notes = res.understanding
+    if res.relevant_context:
+        notes += f"\n\nWhat's already there: {res.relevant_context}"
+    if res.root_cause:
+        notes += f"\n\nRoot cause: {res.root_cause}"
+
+    is_multi_file = bool(res.is_multi_file)
+    estimated_file_count = max(1, res.estimated_file_count or 1)
+
+    # A multi-file build genuinely needs one think/act pass per file. The fixed
     # CODE_REASONING_ITERATIONS ceiling (max 5) was sized for single-file asks — once the
-    # planner has actually decomposed the work, raise the ceiling to fit the real plan
-    # instead of cutting a big multi-file app off after a handful of steps.
+    # first real estimate exists, raise the ceiling to fit it instead of cutting a big
+    # multi-file app off after a handful of steps.
     max_iterations = state.get("max_iterations", 3)
-    if state.get("is_multi_file") and plan:
-        max_iterations = max(max_iterations, len(plan) + 2)
+    if is_multi_file:
+        max_iterations = max(max_iterations, estimated_file_count + 2)
 
     return {
-        "plan": plan,
-        "current_step": res.current_step if res else "Write the code that satisfies the goal.",
-        "target_file": (res.target_file.strip() if res and res.target_file else ""),
+        "goal": res.understanding,
+        "analysis_notes": notes,
+        "current_step": res.next_step,
+        "target_file": (res.target_file or "").strip(),
+        "is_multi_file": is_multi_file,
+        "estimated_file_count": estimated_file_count,
+        "already_done": bool(res.already_done),
+        "needs_fix": False,
         "iteration": iteration,
         "max_iterations": max_iterations,
-        "last_error": err
+        "last_error": err,
     }
 
 # ----------------------------------------------------------------------
@@ -2295,7 +2292,6 @@ async def code_executor_node(state: CodeAgentState) -> dict:
             print(f"[CodeMode] code_executor_node streaming failed: {e}")
             language, explanation, code, err = "", "", "", f"{type(e).__name__}: {e}"
 
-    new_completed = state.get("completed_steps", []) + [state.get("current_step", "")]
     prior_code = state.get("code", "")
     # Accumulate into the files dict instead of overwriting a single code field — this is
     # what stops one truncated/failed step from wiping out every file built before it.
@@ -2362,105 +2358,101 @@ async def code_executor_node(state: CodeAgentState) -> dict:
         "is_frontend": is_frontend,
         "explanation": explanation,
         "response": response_text,
-        "completed_steps": new_completed,
         "files": files,
         "file_languages": file_languages,
         "last_error": err
     }
 
-async def code_reflector_node(state: CodeAgentState) -> dict:
+async def code_review_node(state: CodeAgentState) -> dict:
+    """The 'look over your own diff before calling it done' step — this is where
+    Claude Code's bug-finding actually happens. One honest pass against the goal and the
+    step that was just executed: is it really correct, not just present. No separate
+    0-100 'completion percentage' call — that was a second LLM opinion asked to rate
+    something the review pass had already judged; here the judgment itself (looks_correct)
+    is what drives the loop."""
     llm = get_code_llm(state["model_key"], state["temperature"])
-    prompt = "Review the 'Prior Code Draft' against the 'Goal' and 'Constraints'. Check correctness, bugs, and quality.\n\n{context}"
+    prompt = (
+        "Re-read the code you just wrote (the 'Prior Code Draft') against the goal and the "
+        "step it was supposed to satisfy — the way you'd look over your own diff before "
+        "calling it done. Look specifically for real bugs, missed requirements, and broken "
+        "edge cases, not just style nitpicks. Be honest: if it's genuinely correct, say so "
+        "rather than inventing issues.\n\n{context}"
+    )
 
-    res, err = await execute_code_llm_structured(llm, prompt, CodeReflectorOutput, {"context": format_code_context(state)})
+    res, err = await execute_code_llm_structured(llm, prompt, CodeReview, {"context": format_code_context(state)})
 
-    reflection_str = "Looks solid."
-    if res:
-        reflection_str = f"Quality: {res.quality} | Correctness: {res.correctness} | Bugs: {res.bugs_found} | Improvements: {res.improvements}"
-    elif err:
-        reflection_str = f"Skipped review — the review step hit an error: {err}"
+    if not res:
+        # Couldn't get a reliable review — don't block the loop on it, treat it as passing
+        # rather than looping forever against a backend that's already failing.
+        return {
+            "review_notes": f"Skipped review — hit an error: {err}" if err else "Looks solid.",
+            "needs_fix": False,
+            "completion_score": 100,
+            "last_error": err,
+        }
+
+    if res.looks_correct:
+        review_str = res.notes or "Looks correct."
+    else:
+        review_str = f"Found an issue: {res.issues}" if res.issues.strip() else "Found an issue that needs another pass."
 
     return {
-        "reflection": reflection_str,
-        "last_error": err
-    }
-
-async def code_evaluator_node(state: CodeAgentState) -> dict:
-    llm = get_code_llm(state["model_key"], state["temperature"])
-    prompt = "Based on the reflection, evaluate if the coding goal is now fully achieved (0-100 completion).\n\n{context}"
-
-    res, err = await execute_code_llm_structured(llm, prompt, CodeEvaluatorOutput, {"context": format_code_context(state)})
-
-    # Defaults to 100 on failure so the loop stops instead of retrying against
-    # a backend that's already failing, rather than implying the task is done.
-    score = res.completion_percentage if res else 100
-
-    return {
-        "completion_score": score,
-        "last_error": err
+        "review_notes": review_str,
+        "needs_fix": (not res.looks_correct) and bool(res.issues.strip()),
+        "completion_score": 100 if res.looks_correct else 70,
+        "last_error": err,
     }
 
 def code_decision_edge(state: CodeAgentState) -> str:
-    """Decides whether to end the code reasoning loop or continue planning/executing.
+    """Decides whether the think -> write -> review loop is done or needs another pass.
 
-    Bug fix: this used to end the loop purely on the evaluator's own opinion of
-    "is this done?", with no check that code had actually been produced. If the
-    planner's first step was something non-code-producing (e.g. "clarify
-    requirements") and the evaluator still scored it 100% complete, the loop
-    ended having never generated any code — surfacing as "task completed but
-    no code was formulated" with nothing to show. Now: as long as iterations
-    remain, an empty 'code' field forces at least one more planner/executor
-    pass before the loop is allowed to end.
+    No artificial completion-percentage evaluator: for multi-file builds this trusts the
+    analysis step's own judgment on whether more files are actually needed (already_done)
+    — the same way an engineer decides "anything else left?" by looking at what's built,
+    not by ticking off a plan written before any code existed. For single-file work it
+    loops back only when the review pass found a concrete, real issue.
+
+    Still keeps the original safety net: as long as iterations remain, the loop is never
+    allowed to end having produced zero code.
     """
     out_of_iterations = state.get("iteration", 0) >= state.get("max_iterations", 3)
 
     if bool(state.get("is_multi_file")):
-        plan = state.get("plan", []) or []
         files_done = len(state.get("files", {}))
-
-        # Bug fix: an empty plan used to fall straight through to END, because
-        # `files_done (0) < len(plan) (0)` is False. That's not "nothing left to do" —
-        # it's the planner never having produced a plan at all (its structured JSON call
-        # failed or got truncated, which is common on large multi-file asks with 20-30
-        # steps). Retry planning instead of silently giving up with zero files.
-        if not plan and not out_of_iterations:
-            return "code_planner"
-
-        # Keep looping until every planned file exists, or we run out of room — a
-        # multi-file build finishing early just because ONE file exists and the
-        # evaluator liked it is exactly what used to collapse "20-feature SaaS app"
-        # down to a single file.
-        if files_done < len(plan) and not out_of_iterations:
-            return "code_planner"
-        return END
+        if out_of_iterations:
+            return END
+        if state.get("already_done") and files_done > 0:
+            return END
+        return "code_analysis"
 
     has_code = bool((state.get("code") or "").strip())
     if not has_code and not out_of_iterations:
-        return "code_planner"
-    if state.get("completion_score", 0) >= 100:
-        return END
+        return "code_analysis"
     if out_of_iterations:
         return END
-    return "code_planner"
+    if state.get("needs_fix"):
+        return "code_analysis"
+    return END
 
 # ----------------------------------------------------------------------
 # CODE MODE: Workflow Graph (separate compiled graph from the normal app_graph)
+#
+# Three nodes instead of the original five: think about it (code_analysis), do it
+# (code_executor), check it (code_review). That's the actual shape of how Claude Code
+# works a task — read/understand, make the change, look it over — rather than a
+# multi-stage plan-then-verify-percentage pipeline.
 # ----------------------------------------------------------------------
 
 code_workflow = StateGraph(CodeAgentState)
 
-code_workflow.add_node("understand_code_goal", understand_code_goal_node)
-code_workflow.add_node("code_planner", code_planner_node)
+code_workflow.add_node("code_analysis", code_analysis_node)
 code_workflow.add_node("code_executor", code_executor_node)
-code_workflow.add_node("code_reflector", code_reflector_node)
-code_workflow.add_node("code_evaluator", code_evaluator_node)
+code_workflow.add_node("code_review", code_review_node)
 
-code_workflow.set_entry_point("understand_code_goal")
-code_workflow.add_edge("understand_code_goal", "code_planner")
-code_workflow.add_edge("code_planner", "code_executor")
-code_workflow.add_edge("code_executor", "code_reflector")
-code_workflow.add_edge("code_reflector", "code_evaluator")
-code_workflow.add_conditional_edges("code_evaluator", code_decision_edge)
+code_workflow.set_entry_point("code_analysis")
+code_workflow.add_edge("code_analysis", "code_executor")
+code_workflow.add_edge("code_executor", "code_review")
+code_workflow.add_conditional_edges("code_review", code_decision_edge)
 
 code_app_graph = code_workflow.compile()
 
@@ -2539,43 +2531,34 @@ def code_graph_timeout_seconds(model_key: str, max_iterations: int) -> float:
     return min(worst_case_calls * per_call_seconds, 1500.0)
 
 CODE_NODE_LABELS = {
-    "understand_code_goal": "Understanding the coding goal",
-    "code_planner": "Planning the implementation",
+    "code_analysis": "Reading the code and thinking it through",
     "code_executor": "Writing the code",
-    "code_reflector": "Reviewing the code",
-    "code_evaluator": "Confirming completion",
+    "code_review": "Reviewing the change",
 }
 
 def code_node_detail(node_name: str, state: dict) -> str:
-    if node_name == "understand_code_goal":
+    if node_name == "code_analysis":
         err = state.get("last_error")
         if err:
-            return f"Understanding the goal hit an error: {err}"
-        goal = state.get("goal", "")
-        return f"Understanding the goal: {goal}" if goal else "Understanding the coding goal."
-    if node_name == "code_planner":
-        err = state.get("last_error")
-        if err:
-            return f"Planning hit an error: {err}"
+            return f"Thinking hit an error: {err}"
         step = state.get("current_step", "")
         target = state.get("target_file", "")
-        if state.get("is_multi_file") and state.get("plan"):
-            progress = f"({len(state.get('files', {}))}/{len(state.get('plan', []))} files)"
-            return f"Planning {target or 'the next file'} {progress}: {step}" if step else f"Planning the implementation {progress}."
-        return f"Planning the next step: {step}" if step else "Planning the implementation."
+        if state.get("is_multi_file"):
+            files_done = len(state.get("files", {}))
+            progress = f"({files_done} file{'s' if files_done != 1 else ''} built so far)"
+            label = f"{target or 'the next file'} {progress}"
+            return f"Figuring out {label}: {step}" if step else f"Thinking through the build {progress}."
+        return step if step else "Reading through the request and the existing code."
     if node_name == "code_executor":
         explanation = state.get("explanation", "")
         if state.get("is_multi_file"):
             target = state.get("target_file", "")
             base = f"Writing {target}" if target else "Writing the next file"
             return f"{base} — {explanation}" if explanation else f"{base}."
-        return explanation if explanation else "Writing code for the current step."
-    if node_name == "code_reflector":
-        reflection = state.get("reflection", "")
-        return reflection if reflection else "Reviewing the code for bugs and quality."
-    if node_name == "code_evaluator":
-        score = state.get("completion_score", None)
-        return f"Completion check: {score}% of the task is done." if score is not None else "Checking whether the task is complete."
+        return explanation if explanation else "Writing the code."
+    if node_name == "code_review":
+        notes = state.get("review_notes", "")
+        return notes if notes else "Reviewing the change for bugs and correctness."
     return CODE_NODE_LABELS.get(node_name, node_name)
 
 async def run_code_graph_streaming(initial_state: dict, timeout: float, token_queue: asyncio.Queue):
