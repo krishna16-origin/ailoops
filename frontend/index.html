@@ -550,43 +550,7 @@
                 return safeCode;
             }
             if (lang.includes('css')) {
-                return `<!DOCTYPE html><html><head><style>${safeCode}</style></head><body style="font-family:sans-serif;padding:20px;"><h1>Heading</h1><p>Sample paragraph text to preview your CSS against.</p><button>Sample Button</button>
-<script>
-// ---- PREVIEW-ONLY MOCK BACKEND (not part of your real app) ----
-// Intercepts fetch() to your API and fakes an SSE stream identical in
-// shape to your real backend: status -> assistant_message chunks -> end.
-(function(){
-    const realFetch = window.fetch;
-    window.fetch = async function(url, opts) {
-        if (typeof url === 'string' && (url.includes('/chat') || url.includes('/code-chat'))) {
-            const encoder = new TextEncoder();
-            const events = [
-                {type:'status', label:'Understanding request', detail:'', step:'plan'},
-                {type:'status', label:'Planning response', detail:'', step:'plan'},
-            ];
-            const answer = "Here's the new indicator wired to your real SSE events — thinking while waiting, listening while the text streams in, then it disappears once the turn ends.";
-            const words = answer.split(' ');
-            let chunks = [];
-            for (const e of events) chunks.push(`data: ${JSON.stringify(e)}\n\n`);
-            for (let i = 0; i < words.length; i++) {
-                chunks.push(`data: ${JSON.stringify({assistant_message: (i?' ':'') + words[i]})}\n\n`);
-            }
-            const stream = new ReadableStream({
-                async start(controller) {
-                    for (const c of chunks) {
-                        await new Promise(r => setTimeout(r, c.includes('status') ? 500 : 90));
-                        controller.enqueue(encoder.encode(c));
-                    }
-                    controller.close();
-                }
-            });
-            return new Response(stream, { status: 200, headers: {'Content-Type':'text/event-stream'} });
-        }
-        return realFetch(url, opts);
-    };
-})();
-</script>
-</body></html>`;
+                return `<!DOCTYPE html><html><head><style>${safeCode}</style></head><body style="font-family:sans-serif;padding:20px;"><h1>Heading</h1><p>Sample paragraph text to preview your CSS against.</p><button>Sample Button</button></body></html>`;
             }
             if (lang.includes('jsx') || lang.includes('tsx') || lang.includes('react')) {
                 return `<!DOCTYPE html><html><head>
