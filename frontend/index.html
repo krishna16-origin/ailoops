@@ -225,19 +225,30 @@
         .scroll-to-bottom-btn.visible { opacity:1; pointer-events:auto; transform:translateX(-50%) translateY(0); }
         .scroll-to-bottom-btn svg { width:16px; height:16px; }
 
-        .thinking-indicator { display:inline-block; width:26px; height:26px; vertical-align:middle; margin-left:4px; overflow:visible; }
-        .thinking-indicator svg { width:100%; height:100%; overflow:visible; }
-        .thinking-indicator .petal-group { transform-origin:100px 100px; animation:thinkingMove 2s cubic-bezier(0.45,0,0.55,1) infinite; }
-        .thinking-indicator .petal-group:nth-child(1) { animation-delay:0.00s; }
-        .thinking-indicator .petal-group:nth-child(2) { animation-delay:0.10s; }
-        .thinking-indicator .petal-group:nth-child(3) { animation-delay:0.20s; }
-        .thinking-indicator .petal-group:nth-child(4) { animation-delay:0.30s; }
-        .thinking-indicator .petal-group:nth-child(5) { animation-delay:0.40s; }
-        .thinking-indicator .petal-group:nth-child(6) { animation-delay:0.50s; }
-        .thinking-indicator .petal-group:nth-child(7) { animation-delay:0.60s; }
-        .thinking-indicator .petal-group:nth-child(8) { animation-delay:0.70s; }
-        .thinking-indicator .petal { fill:var(--bg-main); stroke:var(--text-primary); stroke-width:6; stroke-linejoin:round; stroke-linecap:round; }
-        @keyframes thinkingMove { 0% { opacity:1; transform:scale(1) rotate(0deg); } 50% { opacity:0.3; transform:scale(0.85) rotate(8deg); } 100% { opacity:1; transform:scale(1) rotate(0deg); } }
+        /* Nexus-spark indicator. Container is a fixed 30px inline slot; the inner
+           .logo-container is kept at its original authored 280x280 box and scaled
+           down with a CSS transform, so every value below (blur radii, stroke
+           widths, keyframe %, easing curves, colors) is byte-for-byte what was
+           provided — nothing was hand-tuned for the smaller size, only shrunk. */
+        .thinking-indicator { display:inline-flex; width:30px; height:30px; vertical-align:middle; margin-left:4px; overflow:hidden; }
+        .thinking-indicator .logo-container { position:relative; width:280px; height:280px; display:flex; justify-content:center; align-items:center; transform:scale(0.107); transform-origin:center; }
+        .thinking-indicator .ai-svg { width:100%; height:100%; overflow:visible; filter:drop-shadow(0 0 30px rgba(139,92,246,0.2)); transition:filter 0.5s ease; }
+        .thinking-indicator .spark-group { transform-origin:50px 50px; transition:all 0.5s cubic-bezier(0.4,0,0.2,1); }
+        .thinking-indicator .core-dot { transform-origin:50px 50px; transition:all 0.5s cubic-bezier(0.4,0,0.2,1); }
+        @keyframes think-spin-primary { 0% { transform:rotate(0deg) scale(0.8); } 50% { transform:rotate(180deg) scale(1.1); } 100% { transform:rotate(360deg) scale(0.8); } }
+        @keyframes think-spin-secondary { 0% { transform:rotate(45deg) scale(1.1); } 50% { transform:rotate(-135deg) scale(0.8); } 100% { transform:rotate(-315deg) scale(1.1); } }
+        @keyframes think-core { 0%, 100% { transform:scale(0.5); opacity:0.5; } 50% { transform:scale(1.5); opacity:1; } }
+        @keyframes listen-pulse-primary { 0%, 100% { transform:rotate(45deg) scale(0.95); } 50% { transform:rotate(45deg) scale(1.15); } }
+        @keyframes listen-pulse-secondary { 0%, 100% { transform:rotate(0deg) scale(0.85); } 50% { transform:rotate(0deg) scale(1.05); } }
+        @keyframes listen-core { 0%, 100% { transform:scale(1); opacity:0.9; } 25% { transform:scale(1.4); opacity:1; } 50% { transform:scale(1.2); opacity:0.9; } 75% { transform:scale(1.4); opacity:1; } }
+        .thinking-indicator .state-thinking .ai-svg { filter:drop-shadow(0 0 50px rgba(236,72,153,0.4)); }
+        .thinking-indicator .state-thinking .spark-primary { animation:think-spin-primary 3s cubic-bezier(0.68,-0.55,0.265,1.55) infinite; }
+        .thinking-indicator .state-thinking .spark-secondary { animation:think-spin-secondary 4s cubic-bezier(0.68,-0.55,0.265,1.55) infinite; }
+        .thinking-indicator .state-thinking .core-dot { animation:think-core 1.5s ease-in-out infinite; fill:#ec4899; }
+        .thinking-indicator .state-listening .ai-svg { filter:drop-shadow(0 0 40px rgba(56,189,248,0.4)); }
+        .thinking-indicator .state-listening .spark-primary { animation:listen-pulse-primary 2s ease-in-out infinite; }
+        .thinking-indicator .state-listening .spark-secondary { animation:listen-pulse-secondary 2s ease-in-out infinite 0.2s; }
+        .thinking-indicator .state-listening .core-dot { animation:listen-core 2s ease-in-out infinite; fill:#38bdf8; }
 
         /* Smooth cross-fade when swapping between Chat / Code content */
         .mode-fade-out { animation:modeFadeOut 0.15s ease forwards; }
@@ -465,62 +476,69 @@
                 .replace(/\\\(([\s\S]*?)\\\)/g, (_, expr) => `$${expr}$`);
         }
 
-        // Claude-style "thinking" indicator: an 8-petal flower that
-        // wobbles/breathes/fades in a staggered ring. Shown wherever the
-        // old blinking text cursor used to appear while a response streams.
+        // Nexus-spark indicator (replaces the old 8-petal flower). Shown wherever
+        // the old blinking text cursor used to appear while a response streams.
         // Used identically by both Chat mode and Code mode.
-        const THINKING_SVG = `<span class="thinking-indicator"><svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
-      <g class="flower">
-        <g class="petal-group">
-          <path class="petal" transform="rotate(0 100 100)"
-            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
-               C108,18 118,28 132,36 L116,44 L132,58
-               C126,78 112,92 100,100 Z" />
-        </g>
-        <g class="petal-group">
-          <path class="petal" transform="rotate(45 100 100)"
-            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
-               C108,18 118,28 132,36 L116,44 L132,58
-               C126,78 112,92 100,100 Z" />
-        </g>
-        <g class="petal-group">
-          <path class="petal" transform="rotate(90 100 100)"
-            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
-               C108,18 118,28 132,36 L116,44 L132,58
-               C126,78 112,92 100,100 Z" />
-        </g>
-        <g class="petal-group">
-          <path class="petal" transform="rotate(135 100 100)"
-            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
-               C108,18 118,28 132,36 L116,44 L132,58
-               C126,78 112,92 100,100 Z" />
-        </g>
-        <g class="petal-group">
-          <path class="petal" transform="rotate(180 100 100)"
-            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
-               C108,18 118,28 132,36 L116,44 L132,58
-               C126,78 112,92 100,100 Z" />
-        </g>
-        <g class="petal-group">
-          <path class="petal" transform="rotate(225 100 100)"
-            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
-               C108,18 118,28 132,36 L116,44 L132,58
-               C126,78 112,92 100,100 Z" />
-        </g>
-        <g class="petal-group">
-          <path class="petal" transform="rotate(270 100 100)"
-            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
-               C108,18 118,28 132,36 L116,44 L132,58
-               C126,78 112,92 100,100 Z" />
-        </g>
-        <g class="petal-group">
-          <path class="petal" transform="rotate(315 100 100)"
-            d="M100,100 C100,72 78,46 63,28 C76,12 92,6 100,10
-               C108,18 118,28 132,36 L116,44 L132,58
-               C126,78 112,92 100,100 Z" />
-        </g>
-      </g>
-    </svg></span>`;
+        //
+        // This is a DOM-node factory, not a plain string, because the indicator
+        // now needs to survive being reclassed between "thinking" and "listening"
+        // mid-turn (see the assistant_message handler below) — if it were baked
+        // into the HTML string that setProse() re-parses on every streamed token,
+        // its CSS animation would restart from frame 0 on every single token.
+        // Gradient/filter ids get a unique suffix per instance so two indicators
+        // (e.g. an old one mid-removal, a new one for the next turn) never clash.
+        let thinkingIndicatorInstanceCount = 0;
+        function createThinkingIndicator(state) {
+            thinkingIndicatorInstanceCount++;
+            const uid = `ti${thinkingIndicatorInstanceCount}`;
+            const wrapper = document.createElement('span');
+            wrapper.className = 'thinking-indicator';
+            wrapper.innerHTML = `<div class="logo-container state-${state}">
+        <svg class="ai-svg" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+                <linearGradient id="grad-primary-${uid}" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" stop-color="#8b5cf6" />
+                    <stop offset="50%" stop-color="#6366f1" />
+                    <stop offset="100%" stop-color="#06b6d4" />
+                </linearGradient>
+                <linearGradient id="grad-secondary-${uid}" x1="100%" y1="0%" x2="0%" y2="100%">
+                    <stop offset="0%" stop-color="#ec4899" />
+                    <stop offset="50%" stop-color="#f43f5e" />
+                    <stop offset="100%" stop-color="#f59e0b" />
+                </linearGradient>
+                <filter id="glow-${uid}" x="-20%" y="-20%" width="140%" height="140%">
+                    <feGaussianBlur stdDeviation="3" result="blur" />
+                    <feComposite in="SourceGraphic" in2="blur" operator="over" />
+                </filter>
+            </defs>
+            <circle cx="50" cy="50" r="35" fill="url(#grad-primary-${uid})" opacity="0.1" filter="blur(10px)" class="core-dot"/>
+            <g class="spark-group spark-secondary">
+                <path d="M 50 12 Q 50 50 88 50 Q 50 50 50 88 Q 50 50 12 50 Q 50 50 50 12 Z"
+                      fill="none" stroke="url(#grad-secondary-${uid})" stroke-width="1.5" opacity="0.8" />
+                <path d="M 50 15 Q 50 50 85 50 Q 50 50 50 85 Q 50 50 15 50 Q 50 50 50 15 Z"
+                      fill="url(#grad-secondary-${uid})" opacity="0.3" style="mix-blend-mode: screen;" />
+            </g>
+            <g class="spark-group spark-primary">
+                <path d="M 50 5 Q 50 50 95 50 Q 50 50 50 95 Q 50 50 5 50 Q 50 50 50 5 Z"
+                      fill="url(#grad-primary-${uid})" filter="url(#glow-${uid})" opacity="0.9" />
+                <path d="M 50 15 Q 50 50 85 50 Q 50 50 50 85 Q 50 50 15 50 Q 50 50 50 15 Z"
+                      fill="none" stroke="#ffffff" stroke-width="0.5" opacity="0.5" />
+            </g>
+            <circle cx="50" cy="50" r="4.5" fill="#ffffff" class="core-dot" filter="url(#glow-${uid})" />
+        </svg>
+    </div>`;
+            return wrapper;
+        }
+
+        // Switches an existing indicator node's state in place (rather than
+        // recreating it) so the CSS transitions already defined on .spark-group /
+        // .core-dot / .ai-svg (0.5s) actually get to play between states.
+        function setThinkingIndicatorState(indicatorEl, state) {
+            const logo = indicatorEl && indicatorEl.querySelector('.logo-container');
+            if (!logo) return;
+            logo.classList.remove('state-thinking', 'state-listening');
+            logo.classList.add(`state-${state}`);
+        }
 
         // Maps a language to whatever markup is needed to actually see something
         // rendered in a sandboxed iframe. Used only for Code Mode "show_preview" results.
@@ -532,7 +550,43 @@
                 return safeCode;
             }
             if (lang.includes('css')) {
-                return `<!DOCTYPE html><html><head><style>${safeCode}</style></head><body style="font-family:sans-serif;padding:20px;"><h1>Heading</h1><p>Sample paragraph text to preview your CSS against.</p><button>Sample Button</button></body></html>`;
+                return `<!DOCTYPE html><html><head><style>${safeCode}</style></head><body style="font-family:sans-serif;padding:20px;"><h1>Heading</h1><p>Sample paragraph text to preview your CSS against.</p><button>Sample Button</button>
+<script>
+// ---- PREVIEW-ONLY MOCK BACKEND (not part of your real app) ----
+// Intercepts fetch() to your API and fakes an SSE stream identical in
+// shape to your real backend: status -> assistant_message chunks -> end.
+(function(){
+    const realFetch = window.fetch;
+    window.fetch = async function(url, opts) {
+        if (typeof url === 'string' && (url.includes('/chat') || url.includes('/code-chat'))) {
+            const encoder = new TextEncoder();
+            const events = [
+                {type:'status', label:'Understanding request', detail:'', step:'plan'},
+                {type:'status', label:'Planning response', detail:'', step:'plan'},
+            ];
+            const answer = "Here's the new indicator wired to your real SSE events — thinking while waiting, listening while the text streams in, then it disappears once the turn ends.";
+            const words = answer.split(' ');
+            let chunks = [];
+            for (const e of events) chunks.push(`data: ${JSON.stringify(e)}\n\n`);
+            for (let i = 0; i < words.length; i++) {
+                chunks.push(`data: ${JSON.stringify({assistant_message: (i?' ':'') + words[i]})}\n\n`);
+            }
+            const stream = new ReadableStream({
+                async start(controller) {
+                    for (const c of chunks) {
+                        await new Promise(r => setTimeout(r, c.includes('status') ? 500 : 90));
+                        controller.enqueue(encoder.encode(c));
+                    }
+                    controller.close();
+                }
+            });
+            return new Response(stream, { status: 200, headers: {'Content-Type':'text/event-stream'} });
+        }
+        return realFetch(url, opts);
+    };
+})();
+</script>
+</body></html>`;
             }
             if (lang.includes('jsx') || lang.includes('tsx') || lang.includes('react')) {
                 return `<!DOCTYPE html><html><head>
@@ -1274,8 +1328,13 @@
             let assistantFullText = '';
             let codeResult = null; // { code, language, show_preview } — Code Mode only
 
+            // Lives outside .message-prose so setProse() re-parsing the prose HTML
+            // on every streamed token never touches it — see createThinkingIndicator.
+            let indicatorEl = null;
             if (useStream) {
-                setProse(textContainer, THINKING_SVG);
+                setProse(textContainer, '');
+                indicatorEl = createThinkingIndicator('thinking');
+                textContainer.appendChild(indicatorEl);
             }
 
             try {
@@ -1336,18 +1395,25 @@
                                     // iteration ran) — what's streamed so far is stale, so clear
                                     // the bubble instead of appending the new draft onto it.
                                     assistantFullText = '';
-                                    setProse(textContainer, THINKING_SVG);
+                                    setProse(textContainer, '');
+                                    if (indicatorEl) indicatorEl.remove();
+                                    indicatorEl = createThinkingIndicator('thinking');
+                                    textContainer.appendChild(indicatorEl);
                                 } else if (parsed.assistant_message) {
                                     if (!answerStarted) {
                                         answerStarted = true;
                                         finishThinking(); // collapse thoughts the instant the answer begins
+                                        // First real content token — hand off from "thinking" to
+                                        // "listening" on the *same* node so the transition plays.
+                                        if (indicatorEl) setThinkingIndicatorState(indicatorEl, 'listening');
                                     }
                                     assistantFullText += parsed.assistant_message;
                                     // In Code mode, never let a fenced code block render inside the
                                     // chat bubble while it's still streaming in — it belongs in the
                                     // code canvas (via code_result below), not typed out as raw text.
                                     const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : assistantFullText;
-                                    setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)) + THINKING_SVG);
+                                    setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)));
+                                    if (indicatorEl) textContainer.appendChild(indicatorEl);
                                     scrollToBottom();
                                 }
                             } catch (e) {
