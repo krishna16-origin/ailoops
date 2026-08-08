@@ -26,6 +26,10 @@ from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
+# Web Search — free, no API key required (queries DuckDuckGo and other free
+# engines via the "auto" backend, with automatic fallback between them)
+from ddgs import DDGS
+
 # Load environment variables
 load_dotenv()
 
@@ -87,6 +91,10 @@ class AgentState(TypedDict):
     conversation_summary: str
     model_type: str
     temperature: float
+    web_search_query: str
+    web_search_results: str
+    web_search_links: List[Dict[str, str]]
+    web_search_images: List[Dict[str, str]]
 
 # ==================================================
 # MEMORY (In-Memory Sessions)
@@ -137,6 +145,205 @@ def strip_thinking(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
     return text.strip()
+
+# ==================================================
+# WEB SEARCH (free — DuckDuckGo, with automatic fallback to other free
+# engines via ddgs's "auto" backend; no API key required)
+#
+# Shared by both sections of the app: the Chat graph's understand_goal_node
+# and the Code graph's idea_node. DDGS().text() is a blocking network call,
+# so it always runs inside asyncio.to_thread (never directly on the event
+# loop), and the whole thing is wrapped in its own timeout + try/except so a
+# slow or rate-limited search can never take a request down — it just
+# degrades to "no results" and the graph carries on exactly as it did before
+# this feature existed.
+# ==================================================
+
+WEB_SEARCH_TIMEOUT = 12.0
+WEB_SEARCH_MAX_RESULTS = 5
+
+def _run_web_search_sync(query: str, max_results: int) -> list:
+    """Blocking DuckDuckGo (auto-backend) text search. Only ever called via asyncio.to_thread."""
+    with DDGS() as ddgs:
+        return ddgs.text(query, max_results=max_results)
+
+async def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> tuple[str, list]:
+    """
+    Runs a free web search (DuckDuckGo, falling back to other free engines) and
+    returns (formatted_text, raw_results):
+      - formatted_text: plain text ready to drop straight into an LLM prompt.
+      - raw_results: the raw list of {title, href, body} dicts from ddgs, so a
+        caller that wants real clickable links (Chat mode — see
+        build_web_sources_markdown below) doesn't have to re-parse the text.
+    Never raises — any failure (network issue, rate limit, timeout) becomes a
+    short human-readable formatted_text (with an empty raw_results list)
+    instead of an exception, so callers can always safely use the return value
+    without extra error handling of their own.
+    """
+    query = (query or "").strip()
+    if not query:
+        return "No search query.", []
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.to_thread(_run_web_search_sync, query, max_results),
+            timeout=WEB_SEARCH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        return f"Web search for '{query}' timed out.", []
+    except Exception as e:
+        print(f"Web search failed for '{query}': {e}")
+        return f"Web search for '{query}' failed and returned no results.", []
+
+    if not results:
+        return f"No web search results found for '{query}'.", []
+
+    lines = [f"Web search results for '{query}':"]
+    for i, r in enumerate(results, start=1):
+        title = (r.get("title") or "").strip()
+        snippet = (r.get("body") or "").strip()
+        url = (r.get("href") or "").strip()
+        lines.append(f"{i}. {title}\n   {snippet}\n   Source: {url}")
+    return "\n".join(lines), results
+
+# ==================================================
+# CHAT MODE ONLY: image search + Markdown sources/images block.
+#
+# Code Mode intentionally does NOT use these — code answers stay plain
+# text/code, only the Chat graph's executor_node renders sources/images in
+# the response. Images use ddgs's image search (same free, no-API-key
+# DuckDuckGo-backed engine as web_search above); everything here fails
+# closed to an empty list/string on any error so a flaky image search never
+# breaks or blanks out an otherwise-good chat answer.
+# ==================================================
+
+WEB_IMAGE_SEARCH_MAX_RESULTS = 4
+
+def _run_web_image_search_sync(query: str, max_results: int) -> list:
+    """Blocking DuckDuckGo (auto-backend) image search. Only ever called via asyncio.to_thread."""
+    with DDGS() as ddgs:
+        return ddgs.images(query, max_results=max_results)
+
+async def web_image_search(query: str, max_results: int = WEB_IMAGE_SEARCH_MAX_RESULTS) -> list:
+    """Chat-mode-only free image search. Returns a list of {title, image, url}
+    dicts (ddgs's native shape) capped at max_results, or [] on any failure —
+    never raises."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    try:
+        results = await asyncio.wait_for(
+            asyncio.to_thread(_run_web_image_search_sync, query, max_results),
+            timeout=WEB_SEARCH_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        print(f"Image search for '{query}' timed out.")
+        return []
+    except Exception as e:
+        print(f"Image search failed for '{query}': {e}")
+        return []
+    return results or []
+
+def _escape_md_brackets(text: str) -> str:
+    """Markdown link/image text can't safely contain raw '[' ']' — they'd
+    prematurely close the link label. Strip them rather than escaping, since a
+    source title is display text, not something that needs to round-trip."""
+    return (text or "").replace("[", "").replace("]", "").strip()
+
+def build_web_sources_markdown(links: list, images: list) -> str:
+    """
+    Deterministically builds a Markdown block listing source links and, if any
+    were found, a row of clickable thumbnail images — instead of trusting the
+    model to reliably emit correctly-formatted Markdown for these every time.
+    Appended (never asked of the LLM) onto the Chat graph's final answer by
+    executor_node so real links/images always render, exactly once, only when
+    a web search actually ran for that turn.
+
+    marked.js (already used by the frontend to render every assistant message)
+    turns standard `[text](url)` and `![alt](src)` Markdown straight into real
+    <a> and <img> tags, so no frontend changes are needed for these to render
+    and be clickable.
+    """
+    if not links and not images:
+        return ""
+
+    parts = ["\n\n---"]
+
+    if links:
+        parts.append("**Sources**")
+        source_lines = []
+        for i, item in enumerate(links, start=1):
+            title = _escape_md_brackets(item.get("title") or item.get("href") or f"Source {i}")
+            url = (item.get("href") or "").strip()
+            if not url:
+                continue
+            source_lines.append(f"{i}. [{title}]({url})")
+        if source_lines:
+            parts.append("\n".join(source_lines))
+
+    if images:
+        parts.append("**Images**")
+        image_lines = []
+        for item in images:
+            title = _escape_md_brackets(item.get("title") or "Image")
+            image_url = (item.get("image") or "").strip()
+            source_url = (item.get("url") or image_url or "").strip()
+            if not image_url:
+                continue
+            # Image wrapped in a link to its source page, so clicking it opens
+            # the page it came from, not just the raw image file.
+            image_lines.append(f"[![{title}]({image_url})]({source_url})")
+        if image_lines:
+            parts.append(" ".join(image_lines))
+
+    return "\n\n".join(parts) if len(parts) > 1 else ""
+
+# Lightweight heuristic — deliberately in the same spirit as classify_topic()
+# further down: not a real intent classifier, just a fast, free way to decide
+# whether a message is likely asking about something current/external enough
+# that the model's own training data can't be trusted for it (news, prices,
+# versions, "latest", specific recent years, named external things to look
+# up, etc). Errs toward NOT searching on ambiguous text, since every search
+# adds real latency and most chat/code messages don't need one.
+_WEB_SEARCH_KEYWORDS = (
+    "latest", "current", "currently", "today", "right now", "this week",
+    "this month", "this year", "recent", "recently", "up to date", "up-to-date",
+    "news", "release", "released", "released version", "changelog",
+    "price", "cost", "stock", "exchange rate", "weather", "score",
+    "who is", "who won", "what is the", "when did", "when is", "when was",
+    "how much does", "search for", "look up", "google ", "duckduckgo",
+    "documentation for", "docs for", "official docs", "api for", "library for",
+    "package for", "npm package", "pip package",
+)
+
+_EXPLICIT_SEARCH_PREFIXES = ("search:", "/search", "search for:")
+
+def needs_web_search(message: str) -> bool:
+    """True if the message looks like it needs current/external information a
+    free web search can help with, rather than something already fully knowable
+    from the model's own training."""
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+    if text.startswith(_EXPLICIT_SEARCH_PREFIXES):
+        return True
+    if any(kw in text for kw in _WEB_SEARCH_KEYWORDS):
+        return True
+    # A bare 4-digit "recent-ish" year (e.g. "2026 F1 calendar") is a strong
+    # signal the question is time-sensitive even without any keyword above.
+    if re.search(r"\b20[2-9]\d\b", text):
+        return True
+    return False
+
+def extract_search_query(message: str) -> str:
+    """Strips an explicit search prefix (e.g. '/search ', 'search:') off the
+    front of a message, if present, so the query sent to DDGS is clean."""
+    text = (message or "").strip()
+    lowered = text.lower()
+    for prefix in _EXPLICIT_SEARCH_PREFIXES:
+        if lowered.startswith(prefix):
+            return text[len(prefix):].strip()
+    return text
 
 # ==================================================
 # REAL TOKEN-BY-TOKEN STREAMING
@@ -418,6 +625,9 @@ Current Internal State:
 - Current Step: {state.get('current_step', 'Not set')}
 - Prior Response Draft: {state.get('response', 'None')}
 - Reflection on Draft: {state.get('reflection', 'None')}
+
+Web Search Results (use these for anything current/time-sensitive; ignore if 'None'):
+{state.get('web_search_results') or 'None — no web search was performed for this request.'}
 """
 
 # ==================================================
@@ -425,18 +635,49 @@ Current Internal State:
 # ==================================================
 
 async def understand_goal_node(state: AgentState) -> dict:
+    # Web search runs FIRST, before goal extraction, so the goal itself (and
+    # every node downstream of it, via format_context) can see fresh,
+    # current information rather than relying only on the model's training
+    # data. Only fires when the latest user message actually looks
+    # time-sensitive (see needs_web_search) — most messages skip this
+    # entirely and pay no extra latency.
+    #
+    # Text search and image search run concurrently (asyncio.gather) rather
+    # than one after the other, so fetching images for the response (Chat
+    # Mode only — see executor_node/build_web_sources_markdown) doesn't add
+    # its own separate round-trip on top of the text search's.
+    messages = state.get("messages", [])
+    latest_user_message = messages[-1].content if messages else ""
+    web_search_query = ""
+    web_search_results = ""
+    web_search_raw_links: list = []
+    web_search_images: list = []
+    if needs_web_search(latest_user_message):
+        web_search_query = extract_search_query(latest_user_message)
+        (web_search_results, web_search_raw_links), web_search_images = await asyncio.gather(
+            web_search(web_search_query),
+            web_image_search(web_search_query),
+        )
+
     llm = get_llm(state["model_type"], state["temperature"])
-    prompt = "Analyze this conversation and extract the core goal, intent, constraints, and missing info.\n\n{context}"
-    
-    res = await execute_llm_structured(llm, prompt, GoalExtraction, {"context": format_context(state)})
-    
+    prompt = "Analyze this conversation and extract the core goal, intent, constraints, and missing info. If web search results are present in the context, use them to ground the goal in current, accurate information.\n\n{context}"
+
+    res = await execute_llm_structured(
+        llm, prompt, GoalExtraction,
+        {"context": format_context({**state, "web_search_results": web_search_results})}
+    )
+
     return {
         "goal": res.main_goal if res else "Provide a helpful response.",
         "hidden_intent": res.hidden_intent if res else "",
         "constraints": res.constraints if res else [],
         "iteration": 0,
         "completed_steps": [],
-        "plan": state.get("plan", [])
+        "plan": state.get("plan", []),
+        "web_search_query": web_search_query,
+        "web_search_results": web_search_results,
+        "web_search_links": web_search_raw_links,
+        "web_search_images": web_search_images,
     }
 
 async def planner_node(state: AgentState) -> dict:
@@ -497,6 +738,22 @@ async def executor_node(state: AgentState) -> dict:
         response_text = "I apologize, I encountered an issue formulating my answer."
         if live_queue is not None:
             await live_queue.put(("token", response_text))
+
+    # Chat Mode only: if a web search ran for this turn (see understand_goal_node),
+    # deterministically append real clickable source links + image thumbnails to
+    # the FINAL answer — never asked of the LLM, so it always renders correctly
+    # (marked.js on the frontend turns this Markdown into real <a>/<img> tags).
+    # Only done on the final pass: earlier iterations' drafts are never shown to
+    # the user and get fed back into the reflector as "Prior Response Draft", so
+    # appending here too would just add noise for the reflector to reason about.
+    if is_final_pass:
+        sources_md = build_web_sources_markdown(
+            state.get("web_search_links") or [], state.get("web_search_images") or []
+        )
+        if sources_md:
+            response_text += sources_md
+            if live_queue is not None:
+                await live_queue.put(("token", sources_md))
 
     new_completed = state.get("completed_steps", []) + [state.get("current_step", "")]
 
@@ -694,7 +951,9 @@ def node_detail(node_name: str, state: dict) -> str:
     """
     if node_name == "understand_goal":
         goal = state.get("goal", "")
-        return f"Understanding the goal: {goal}" if goal else "Understanding the goal."
+        search_query = state.get("web_search_query", "")
+        prefix = f"Searched the web for '{search_query}'. " if search_query else ""
+        return f"{prefix}Understanding the goal: {goal}" if goal else f"{prefix}Understanding the goal."
     if node_name == "planner":
         step = state.get("current_step", "")
         return f"Planning the next step: {step}" if step else "Planning the next step."
@@ -917,7 +1176,25 @@ def graph_timeout_seconds(model_type: str, max_iterations: int) -> float:
 
 async def answer_directly(message: str, history: List[BaseMessage], model_type: str, temperature: float) -> str:
     """Always returns a real answer — falls back to the fast model if the primary one times out."""
-    messages = [SystemMessage(content="You are GoalAI, a helpful, friendly assistant. Respond naturally and concisely.")]
+    # Short/greeting messages can still be genuinely time-sensitive (e.g. "bitcoin
+    # price today" is <=20 chars and counts as "simple" per is_simple_message), so
+    # this fast path gets the same free web search + Markdown sources/images
+    # treatment as the full graph's understand_goal_node/executor_node, just
+    # condensed into one function since there's no multi-node pipeline here.
+    web_search_results = ""
+    sources_md = ""
+    if needs_web_search(message):
+        query = extract_search_query(message)
+        (web_search_results, links), images = await asyncio.gather(
+            web_search(query), web_image_search(query)
+        )
+        sources_md = build_web_sources_markdown(links, images)
+
+    system_content = "You are GoalAI, a helpful, friendly assistant. Respond naturally and concisely."
+    if web_search_results:
+        system_content += f"\n\nWeb Search Results (use these for anything current/time-sensitive):\n{web_search_results}"
+
+    messages = [SystemMessage(content=system_content)]
     messages.extend(history[-6:])
     messages.append(HumanMessage(content=message))
 
@@ -927,7 +1204,7 @@ async def answer_directly(message: str, history: List[BaseMessage], model_type: 
         res = await llm.ainvoke(messages)
         answer = strip_thinking(res.content).strip()
         if answer:
-            return answer
+            return answer + sources_md
     except Exception as e:
         print(f"Primary model failed: {e}")
 
@@ -937,7 +1214,7 @@ async def answer_directly(message: str, history: List[BaseMessage], model_type: 
         res = await fallback_llm.ainvoke(messages)
         answer = strip_thinking(res.content).strip()
         if answer:
-            return answer
+            return answer + sources_md
     except Exception as e:
         print(f"Fallback model also failed: {e}")
 
@@ -950,7 +1227,22 @@ async def answer_directly_stream(message: str, history: List[BaseMessage], model
     arrive from the model, instead of returning a single completed string. Used by
     generate_stream() for the short/direct-message path and as its fallback on error/timeout.
     """
-    messages = [SystemMessage(content="You are GoalAI, a helpful, friendly assistant. Respond naturally and concisely.")]
+    # Same web search + sources/images treatment as answer_directly() above —
+    # see its comment for why this fast path needs it too.
+    web_search_results = ""
+    sources_md = ""
+    if needs_web_search(message):
+        query = extract_search_query(message)
+        (web_search_results, links), images = await asyncio.gather(
+            web_search(query), web_image_search(query)
+        )
+        sources_md = build_web_sources_markdown(links, images)
+
+    system_content = "You are GoalAI, a helpful, friendly assistant. Respond naturally and concisely."
+    if web_search_results:
+        system_content += f"\n\nWeb Search Results (use these for anything current/time-sensitive):\n{web_search_results}"
+
+    messages = [SystemMessage(content=system_content)]
     messages.extend(history[-6:])
     messages.append(HumanMessage(content=message))
 
@@ -1008,6 +1300,8 @@ async def answer_directly_stream(message: str, history: List[BaseMessage], model
         print(f"Primary model streaming failed: {e}")
 
     if got_any:
+        if sources_md:
+            yield sources_md
         return
 
     try:
@@ -1019,6 +1313,8 @@ async def answer_directly_stream(message: str, history: List[BaseMessage], model
 
     if not got_any:
         yield "I'm having trouble reaching the model right now. Please try again in a moment."
+    elif sources_md:
+        yield sources_md
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
@@ -1197,6 +1493,8 @@ class CodeAgentState(TypedDict):
     files: Dict[str, str]
     file_languages: Dict[str, str]
     last_error: Optional[str]
+    web_search_query: str
+    web_search_results: str
 
 # ----------------------------------------------------------------------
 # CODE MODE: Session Memory (kept separate from the normal chat sessions)
@@ -2007,6 +2305,9 @@ Current Internal State:
 - Prior Language: {state.get('language', 'None')}
 - Test Notes From Last Pass: {state.get('test_notes', 'None')}
 - Review Notes From Last Pass: {state.get('review_notes', 'None')}
+
+Web Search Results (use these for current library/API/version info; ignore if 'None'):
+{state.get('web_search_results') or 'None — no web search was performed for this request.'}
 """
 
 # ----------------------------------------------------------------------
@@ -2019,23 +2320,46 @@ async def idea_node(state: CodeAgentState) -> dict:
     ticket to themselves before opening an editor. For a bug report, this is also where
     the real root cause gets identified instead of the surface symptom. No code gets
     written or planned yet; this stage only builds understanding."""
+    # Same free web search used in Chat Mode (see web_search()/needs_web_search()
+    # near the top of the file), fired here — before any planning or code gets
+    # written — so idea_node (and everything downstream of it via
+    # format_code_context: plan/code/fix) can ground itself in current library
+    # versions, API docs, or other external facts instead of only the model's
+    # training data. Only runs when the request actually looks like it needs
+    # that (e.g. "latest version of X", "docs for Y", a named recent year) —
+    # most code asks skip this and pay no extra latency.
+    messages = state.get("messages", [])
+    latest_user_message = messages[-1].content if messages else ""
+    web_search_query = ""
+    web_search_results = ""
+    if needs_web_search(latest_user_message):
+        web_search_query = extract_search_query(latest_user_message)
+        web_search_results, _unused_raw_links = await web_search(web_search_query)
+
     llm = get_code_llm(state["model_key"], state["temperature"])
     prompt = (
         "Before anything gets planned or written, understand this task the way an "
         "engineer reads a ticket: what is actually being asked, what (if anything) in "
         "the existing code is relevant, and — if this is a bug report — what the real "
-        "root cause is, not just the symptom. If, having actually looked at what's "
+        "root cause is, not just the symptom. If web search results are present in the "
+        "context, use them to ground your understanding in current library/API/version "
+        "facts rather than guessing from memory. If, having actually looked at what's "
         "already built, there's truly nothing left to do, set already_done=True instead "
         "of inventing more work.\n\n{context}"
     )
 
-    res, err = await execute_code_llm_structured(llm, prompt, IdeaAnalysis, {"context": format_code_context(state)})
+    res, err = await execute_code_llm_structured(
+        llm, prompt, IdeaAnalysis,
+        {"context": format_code_context({**state, "web_search_results": web_search_results})}
+    )
 
     if not res:
         return {
             "goal": state.get("goal") or "Write the requested code.",
             "needs_fix": False,
             "last_error": err,
+            "web_search_query": web_search_query,
+            "web_search_results": web_search_results,
         }
 
     notes = res.understanding
@@ -2043,6 +2367,8 @@ async def idea_node(state: CodeAgentState) -> dict:
         notes += f"\n\nWhat's already there: {res.relevant_context}"
     if res.root_cause:
         notes += f"\n\nRoot cause: {res.root_cause}"
+    if web_search_query:
+        notes += f"\n\nSearched the web for: '{web_search_query}'"
 
     return {
         "goal": res.understanding,
@@ -2050,6 +2376,8 @@ async def idea_node(state: CodeAgentState) -> dict:
         "already_done": bool(res.already_done),
         "needs_fix": False,
         "last_error": err,
+        "web_search_query": web_search_query,
+        "web_search_results": web_search_results,
     }
 
 async def plan_node(state: CodeAgentState) -> dict:
