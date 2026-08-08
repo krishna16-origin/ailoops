@@ -1122,23 +1122,32 @@ async def _handle_chat(request: ChatRequest):
 # ----------------------------------------------------------------------
 # CODE MODE: Structured Output Models
 #
-# Deliberately just two shapes now, mirroring how an engineer (or Claude Code)
-# actually works: think before you touch anything, then look over what you
-# just wrote before calling it done. No separate "extract the goal" pass, no
-# ahead-of-time multi-step plan, and no 0-100 "completion percentage" score —
-# those were artificial scaffolding on top of what's really a single
-# read -> act -> check loop.
+# One shape per stage of the Claude AI coding workflow:
+#
+#   Idea -> Plan -> Code -> Test -> Review -> Fix -> Commit
+#
+# IdeaAnalysis and CodePlan split what used to be a single combined
+# "think about it" call into two real stages (understand the ask, THEN decide
+# the concrete next step) — the same read-before-you-touch-anything judgment
+# an engineer makes, just modeled as two explicit steps instead of one. Code
+# reuses CodeExecutorOutput's shape conceptually (see code_node). Test and
+# Review are separate, honest passes — no artificial 0-100 "completion
+# percentage" score; the judgment calls (already_done, passed, looks_correct)
+# are what drive the loop. Fix reuses the Code stage's generation path. Commit
+# is a lightweight plain-text summary, not a structured call (see commit_node).
 # ----------------------------------------------------------------------
 
-class CodeAnalysis(BaseModel):
+class IdeaAnalysis(BaseModel):
     understanding: str = Field(description="Plain-language restatement of what's actually being asked, the way an engineer would summarize a ticket to themselves before opening an editor")
     relevant_context: str = Field(default="", description="What in the existing code (if any) is relevant here: which functions, files, or behavior this touches and what they currently do. Empty string if there's no existing code yet.")
     root_cause: str = Field(default="", description="For a bug report: the actual underlying cause of the problem, not just the symptom. Empty string if this isn't a bug fix.")
+    already_done: bool = Field(default=False, description="True only if, having looked at what already exists, nothing further is actually needed")
+
+class CodePlan(BaseModel):
     next_step: str = Field(description="The exact, concrete next action to take — specific enough to act on immediately, e.g. 'fix the off-by-one in the pagination loop' or 'build the login form component'")
     is_multi_file: bool = Field(description="True only if this genuinely needs several distinct files/pages/modules that cannot reasonably live in one runnable file. False for anything that fits naturally in a single file/component/instant preview.")
     estimated_file_count: int = Field(default=1, description="Rough number of separate files needed to build this well. Use 1 for single-file tasks.")
     target_file: str = Field(default="", description="The filename next_step targets, e.g. 'index.html', 'auth.js'. Leave empty for single-file tasks.")
-    already_done: bool = Field(default=False, description="True only if, having looked at what already exists, nothing further is actually needed")
 
 class CodeExecutorOutput(BaseModel):
     code: str = Field(description="The generated code for the current step, complete and runnable")
@@ -1146,6 +1155,11 @@ class CodeExecutorOutput(BaseModel):
     filename: str = Field(default="", description="The filename this code belongs to for multi-file tasks, e.g. 'index.html'. Empty string for single-file tasks.")
     explanation: str = Field(description="Brief explanation of what the code does")
     is_frontend: bool = Field(description="True if this code renders a UI in a browser (html/css/js/react/vue/etc), false if it is backend/server/CLI/script code")
+
+class TestReport(BaseModel):
+    passed: bool = Field(description="True if the code, reasoned through against realistic unit/integration/edge-case tests, would actually pass them")
+    test_notes: str = Field(default="", description="What was checked (concrete test cases and edge cases considered) and the result — concise, like a test-run summary")
+    issues: str = Field(default="", description="Specific, concrete failures found — exact enough to act on directly. Empty string if none.")
 
 class CodeReview(BaseModel):
     looks_correct: bool = Field(description="False if there's a real bug, missed requirement, or broken edge case in what was just written")
@@ -1162,6 +1176,8 @@ class CodeAgentState(TypedDict):
     current_step: str
     target_file: str
     analysis_notes: str
+    test_notes: str
+    test_passed: bool
     review_notes: str
     needs_fix: bool
     already_done: bool
@@ -1173,6 +1189,7 @@ class CodeAgentState(TypedDict):
     is_frontend: bool
     explanation: str
     response: str
+    commit_message: str
     model_key: str
     temperature: float
     is_multi_file: bool
@@ -1247,7 +1264,7 @@ CODE_REASONING_ITERATIONS = {
 
 def get_code_max_iterations(reasoning_level: str) -> int:
     """Starting floor for iterations. For multi-file builds this gets raised dynamically
-    by code_analysis_node once it estimates how many files are actually needed (see there)
+    by plan_node once it estimates how many files are actually needed (see there)
     — a 15-file app needs more passes than any fixed reasoning-level ceiling allows for."""
     return CODE_REASONING_ITERATIONS.get((reasoning_level or "").strip().lower(), CODE_REASONING_ITERATIONS["medium"])
 
@@ -1804,7 +1821,7 @@ async def add_missing_js(code: str, goal: str, current_step: str, model_key: str
 # CODE MODE: Single-file frontend enforcement — runs ONCE per user turn
 #
 # Guards 0/1/2 (bundle non-HTML into HTML, restore dropped style/script, add missing JS)
-# used to run inside code_executor_node itself, i.e. on every internal think/act
+# used to run inside code_node itself, i.e. on every internal think/act
 # loop iteration. Only the LAST iteration's output actually reaches the user (each
 # iteration overwrites "code"/"language" in state), so re-running these checks on every
 # earlier iteration wasted calls for nothing AND stacked several extra sequential LLM
@@ -1938,22 +1955,35 @@ async def execute_code_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic
     # tends to truncate at the same point every attempt — plain retries alone rarely fix
     # it. Recovering whichever fields did complete before the cutoff beats returning
     # nothing, which used to end the whole loop immediately with zero code produced.
-    if pydantic_model is CodeAnalysis and last_raw_content:
+    # Same idea, split across the Plan and Idea stages: Plan's
+    # next_step/target_file/is_multi_file, and Idea's understanding/root_cause.
+    if pydantic_model is CodePlan and last_raw_content:
         step_match = re.search(r'"next_step"\s*:\s*"((?:[^"\\]|\\.)*)"', last_raw_content)
         if step_match:
-            understanding_match = re.search(r'"understanding"\s*:\s*"((?:[^"\\]|\\.)*)"', last_raw_content)
             target_match = re.search(r'"target_file"\s*:\s*"((?:[^"\\]|\\.)*)"', last_raw_content)
             multi_match = re.search(r'"is_multi_file"\s*:\s*(true|false)', last_raw_content, re.IGNORECASE)
             print(f"[CodeMode] Salvaged a next step from truncated JSON output.")
             try:
-                return CodeAnalysis(
-                    understanding=(understanding_match.group(1) if understanding_match else "Continue the coding task."),
+                return CodePlan(
                     next_step=step_match.group(1),
                     target_file=(target_match.group(1) if target_match else ""),
                     is_multi_file=(multi_match.group(1).lower() == "true" if multi_match else False),
                 ), None
             except Exception as salvage_err:
-                print(f"[CodeMode] Analysis salvage construction failed: {salvage_err}")
+                print(f"[CodeMode] Plan salvage construction failed: {salvage_err}")
+
+    if pydantic_model is IdeaAnalysis and last_raw_content:
+        understanding_match = re.search(r'"understanding"\s*:\s*"((?:[^"\\]|\\.)*)"', last_raw_content)
+        if understanding_match:
+            root_cause_match = re.search(r'"root_cause"\s*:\s*"((?:[^"\\]|\\.)*)"', last_raw_content)
+            print(f"[CodeMode] Salvaged an idea from truncated JSON output.")
+            try:
+                return IdeaAnalysis(
+                    understanding=understanding_match.group(1),
+                    root_cause=(root_cause_match.group(1) if root_cause_match else ""),
+                ), None
+            except Exception as salvage_err:
+                print(f"[CodeMode] Idea salvage construction failed: {salvage_err}")
 
     return None, last_error
 
@@ -1975,6 +2005,7 @@ Current Internal State:
 - Target File For This Step: {state.get('target_file', 'N/A')}
 - Prior Code Draft: {state.get('code', 'None')}
 - Prior Language: {state.get('language', 'None')}
+- Test Notes From Last Pass: {state.get('test_notes', 'None')}
 - Review Notes From Last Pass: {state.get('review_notes', 'None')}
 """
 
@@ -1982,39 +2013,28 @@ Current Internal State:
 # CODE MODE: LangGraph Nodes
 # ----------------------------------------------------------------------
 
-async def code_analysis_node(state: CodeAgentState) -> dict:
-    """The 'think before you touch anything' step — this is where the Claude-Code feel
-    actually lives. One pass that reads the request and whatever code already exists,
-    figures out what's really being asked, and — for a bug — digs for the root cause
-    instead of jumping straight to a patch. Replaces what used to be two separate
-    structured calls (extract-the-goal, then build-a-plan) with the single judgment call
-    an engineer actually makes before writing anything: what does this need, and what's
-    the very next concrete thing to do about it."""
+async def idea_node(state: CodeAgentState) -> dict:
+    """Stage 1 of the workflow: IDEA. Reads the request and whatever code already
+    exists, and figures out what's really being asked — the way an engineer restates a
+    ticket to themselves before opening an editor. For a bug report, this is also where
+    the real root cause gets identified instead of the surface symptom. No code gets
+    written or planned yet; this stage only builds understanding."""
     llm = get_code_llm(state["model_key"], state["temperature"])
     prompt = (
-        "Before writing or changing any code, think it through like an engineer picking up "
-        "this task: what is actually being asked, what (if anything) in the existing code is "
-        "relevant, and — if this is a bug report — what the real root cause is, not just the "
-        "symptom. Then decide the single, concrete next action to take.\n\n"
-        "If this is a multi-file build, only mark is_multi_file=True when it genuinely needs "
-        "several distinct files/pages/modules that cannot reasonably live in one runnable file "
-        "— small asks, single components, or single-page tools should stay is_multi_file=False "
-        "so they render as one instant preview. When it is multi-file, target_file must name the "
-        "exact next file to write (e.g. 'index.html', 'dashboard.jsx'), and you must not target a "
-        "file that's already listed under 'Files built so far' unless you're fixing it because of "
-        "review notes. If, having actually looked at what's already built, there's truly nothing "
-        "left to do, set already_done=True instead of inventing more work.\n\n{context}"
+        "Before anything gets planned or written, understand this task the way an "
+        "engineer reads a ticket: what is actually being asked, what (if anything) in "
+        "the existing code is relevant, and — if this is a bug report — what the real "
+        "root cause is, not just the symptom. If, having actually looked at what's "
+        "already built, there's truly nothing left to do, set already_done=True instead "
+        "of inventing more work.\n\n{context}"
     )
 
-    res, err = await execute_code_llm_structured(llm, prompt, CodeAnalysis, {"context": format_code_context(state)})
-
-    iteration = state.get("iteration", 0) + 1
+    res, err = await execute_code_llm_structured(llm, prompt, IdeaAnalysis, {"context": format_code_context(state)})
 
     if not res:
         return {
             "goal": state.get("goal") or "Write the requested code.",
-            "current_step": state.get("current_step") or "Write the code that satisfies the goal.",
-            "iteration": iteration,
+            "needs_fix": False,
             "last_error": err,
         }
 
@@ -2024,26 +2044,58 @@ async def code_analysis_node(state: CodeAgentState) -> dict:
     if res.root_cause:
         notes += f"\n\nRoot cause: {res.root_cause}"
 
+    return {
+        "goal": res.understanding,
+        "analysis_notes": notes,
+        "already_done": bool(res.already_done),
+        "needs_fix": False,
+        "last_error": err,
+    }
+
+async def plan_node(state: CodeAgentState) -> dict:
+    """Stage 2 of the workflow: PLAN. Takes the Idea and turns it into one concrete,
+    actionable next step — inspecting what's already built and, for a multi-file build,
+    naming exactly which file this step targets. This is the 'propose a plan, don't
+    code yet' step: nothing gets written here, only decided."""
+    llm = get_code_llm(state["model_key"], state["temperature"])
+    prompt = (
+        "Based on the idea above, decide the single, concrete next action to take. "
+        "Only mark is_multi_file=True when this genuinely needs several distinct "
+        "files/pages/modules that cannot reasonably live in one runnable file — small "
+        "asks, single components, or single-page tools should stay is_multi_file=False "
+        "so they render as one instant preview. When it is multi-file, target_file must "
+        "name the exact next file to write (e.g. 'index.html', 'dashboard.jsx'), and you "
+        "must not target a file that's already listed under 'Files built so far' unless "
+        "you're fixing it because of test or review notes.\n\n{context}"
+    )
+
+    res, err = await execute_code_llm_structured(llm, prompt, CodePlan, {"context": format_code_context(state)})
+
+    iteration = state.get("iteration", 0) + 1
+
+    if not res:
+        return {
+            "current_step": state.get("current_step") or "Write the code that satisfies the goal.",
+            "iteration": iteration,
+            "last_error": err,
+        }
+
     is_multi_file = bool(res.is_multi_file)
     estimated_file_count = max(1, res.estimated_file_count or 1)
 
-    # A multi-file build genuinely needs one think/act pass per file. The fixed
-    # CODE_REASONING_ITERATIONS ceiling (max 5) was sized for single-file asks — once the
-    # first real estimate exists, raise the ceiling to fit it instead of cutting a big
-    # multi-file app off after a handful of steps.
+    # A multi-file build genuinely needs one plan/code/test/review pass per file. The
+    # fixed CODE_REASONING_ITERATIONS ceiling (max 5) was sized for single-file asks —
+    # once the first real estimate exists, raise the ceiling to fit it instead of
+    # cutting a big multi-file app off after a handful of steps.
     max_iterations = state.get("max_iterations", 3)
     if is_multi_file:
         max_iterations = max(max_iterations, estimated_file_count + 2)
 
     return {
-        "goal": res.understanding,
-        "analysis_notes": notes,
         "current_step": res.next_step,
         "target_file": (res.target_file or "").strip(),
         "is_multi_file": is_multi_file,
         "estimated_file_count": estimated_file_count,
-        "already_done": bool(res.already_done),
-        "needs_fix": False,
         "iteration": iteration,
         "max_iterations": max_iterations,
         "last_error": err,
@@ -2060,7 +2112,7 @@ async def code_analysis_node(state: CodeAgentState) -> dict:
 #
 # On any follow-up turn where a prior draft already exists for the thing
 # this step is about to touch (and the ask isn't an explicit full rewrite),
-# code_executor_node below asks the model for a small SEARCH/REPLACE diff
+# code_node (and fix_node) below asks the model for a small SEARCH/REPLACE diff
 # instead and applies it locally with plain string replacement — the model
 # only pays for the lines that actually change. If the diff can't be parsed
 # or a SEARCH block doesn't match verbatim, this fails closed (returns
@@ -2132,7 +2184,7 @@ def build_edit_prompt(prior_code: str, language: str, goal: str, current_step: s
         f"Existing Code:\n{prior_code}"
     )
 
-# code_executor_node pushes real code tokens onto this per-request queue the instant
+# code_node/fix_node push real code tokens onto this per-request queue the instant
 # they're generated (see stream_code_execution below) — mirrors _current_token_queue /
 # stream_plain_response used by the normal chat's executor_node higher up in this file.
 # A LangGraph node function only ever receives `state`, so the per-request queue has to
@@ -2211,7 +2263,16 @@ async def stream_code_execution(llm: ChatNVIDIA, prompt: str, token_queue: Optio
 
     return language, explanation, code_part
 
-async def code_executor_node(state: CodeAgentState) -> dict:
+async def _write_or_edit_code(state: CodeAgentState, is_fix: bool) -> dict:
+    """Shared core for the CODE and FIX stages: writes a fresh file when there's
+    nothing to build on yet, or applies a targeted SEARCH/REPLACE diff when a prior
+    draft already exists — the same cheap-diff-first approach used throughout Code
+    Mode, so a one-line change costs a few tokens instead of a full-file regenerate.
+
+    When is_fix=True (the FIX stage), the loop is here because Test or Review found a
+    concrete, named problem — the prompt is built around fixing THAT issue rather than
+    re-executing the current step from scratch, and the diff path is preferred even more
+    strongly since a fix should repair the file, not rewrite it."""
     llm = get_code_llm(state["model_key"], state["temperature"])
     is_multi = bool(state.get("is_multi_file"))
     target_file = state.get("target_file", "")
@@ -2228,8 +2289,19 @@ async def code_executor_node(state: CodeAgentState) -> dict:
         prior_code_for_step = state.get("code", "")
         prior_language_for_step = state.get("language", "")
 
-    edit_mode = bool(prior_code_for_step.strip()) and not wants_full_rewrite(
-        state.get("goal", ""), state.get("current_step", "")
+    issue_text = ""
+    if is_fix:
+        parts = []
+        if not state.get("test_passed", True) and state.get("test_notes"):
+            parts.append(f"Test found: {state.get('test_notes')}")
+        if state.get("needs_fix") and state.get("review_notes"):
+            parts.append(f"Review found: {state.get('review_notes')}")
+        issue_text = "\n".join(parts) or "Address the problem noted in the test/review notes above."
+
+    # A FIX always edits the existing code rather than rewriting from scratch, as long
+    # as there IS existing code to edit — a fix should never regenerate the whole file.
+    edit_mode = bool(prior_code_for_step.strip()) and (
+        is_fix or not wants_full_rewrite(state.get("goal", ""), state.get("current_step", ""))
     )
 
     language, explanation, code, err = "", "", "", None
@@ -2245,7 +2317,8 @@ async def code_executor_node(state: CodeAgentState) -> dict:
         try:
             edit_prompt = build_edit_prompt(
                 prior_code_for_step, prior_language_for_step,
-                state.get("goal", ""), state.get("current_step", "")
+                state.get("goal", ""),
+                f"Fix this: {issue_text}" if is_fix else state.get("current_step", "")
             )
             res = await llm.ainvoke([HumanMessage(content=edit_prompt)])
             edit_text = strip_thinking(res.content).strip()
@@ -2253,7 +2326,7 @@ async def code_executor_node(state: CodeAgentState) -> dict:
             if ok:
                 code = new_code
                 language = prior_language_for_step
-                explanation = "Applied a targeted edit to the existing code."
+                explanation = "Applied a targeted fix to the existing code." if is_fix else "Applied a targeted edit to the existing code."
         except Exception as e:
             print(f"[CodeMode] edit-mode generation failed, falling back to full generate: {e}")
         # ok == False (or an exception) falls through to the full-generate path below
@@ -2268,12 +2341,13 @@ async def code_executor_node(state: CodeAgentState) -> dict:
             f"'{target_file}' — write ONLY that file's code, not the whole app."
             if is_multi and target_file else ""
         )
+        step_desc = f"Fix this problem: {issue_text}" if is_fix else "Execute the 'Current Step' to satisfy the coding 'Goal'."
         prompt = (
-            "Execute the 'Current Step' to satisfy the coding 'Goal'. Write complete, runnable "
-            "code. IMPORTANT: you must never leave the code empty for a coding task — even if "
-            "this step is just a review, a small tweak, or you believe the goal is already met, "
-            "write out the full current version of the code (unchanged if nothing needed to "
-            f"change), not just an explanation with no code.{multi_note}\n\n"
+            f"{step_desc} Write complete, runnable code. IMPORTANT: you must never leave "
+            "the code empty for a coding task — even if this step is just a review, a "
+            "small tweak, or you believe the goal is already met, write out the full "
+            "current version of the code (unchanged if nothing needed to change), not "
+            f"just an explanation with no code.{multi_note}\n\n"
             f"{format_code_context(state)}\n\n"
             "Respond in exactly this shape, nothing else:\n"
             "LANGUAGE: <the programming language, e.g. python, javascript, html, jsx>\n"
@@ -2289,7 +2363,7 @@ async def code_executor_node(state: CodeAgentState) -> dict:
             language, explanation, code = await stream_code_execution(llm, prompt, token_queue)
             err = None
         except Exception as e:
-            print(f"[CodeMode] code_executor_node streaming failed: {e}")
+            print(f"[CodeMode] code generation streaming failed: {e}")
             language, explanation, code, err = "", "", "", f"{type(e).__name__}: {e}"
 
     prior_code = state.get("code", "")
@@ -2306,7 +2380,7 @@ async def code_executor_node(state: CodeAgentState) -> dict:
             is_frontend = False
 
         if not explanation.strip():
-            explanation = "Wrote the code for this step."
+            explanation = "Applied the fix." if is_fix else "Wrote the code for this step."
 
         # Guard -1: the model decided no new code was needed and left 'code' blank.
         # That should never happen on a genuine coding task when a working prior file
@@ -2363,31 +2437,113 @@ async def code_executor_node(state: CodeAgentState) -> dict:
         "last_error": err
     }
 
-async def code_review_node(state: CodeAgentState) -> dict:
-    """The 'look over your own diff before calling it done' step — this is where
-    Claude Code's bug-finding actually happens. One honest pass against the goal and the
-    step that was just executed: is it really correct, not just present. No separate
-    0-100 'completion percentage' call — that was a second LLM opinion asked to rate
-    something the review pass had already judged; here the judgment itself (looks_correct)
-    is what drives the loop."""
+async def code_node(state: CodeAgentState) -> dict:
+    """Stage 3 of the workflow: CODE. Writes the code for the step the Plan just
+    decided — a fresh file when there's nothing to build on yet, a targeted diff when
+    a prior draft already exists."""
+    return await _write_or_edit_code(state, is_fix=False)
+
+async def fix_node(state: CodeAgentState) -> dict:
+    """Stage 6 of the workflow: FIX. Only reached when TEST or REVIEW found a concrete,
+    named problem — applies a targeted repair for that specific issue (never a full
+    rewrite) and clears needs_fix so the loop re-verifies via TEST again instead of
+    assuming the fix actually worked."""
+    result = await _write_or_edit_code(state, is_fix=True)
+    result["needs_fix"] = False
+    return result
+
+async def test_node(state: CodeAgentState) -> dict:
+    """Stage 4 of the workflow: TEST. There's no live execution sandbox here, so this
+    stage does two things instead: a real static syntax check for languages that support
+    one cheaply (Python compiles cleanly, JSON parses cleanly), and — for anything that
+    passes that check — an honest LLM pass that reasons through the concrete unit tests,
+    integration paths, and edge cases this code should handle, and reports whether it
+    would actually pass them. A concrete syntax error always wins over the model's
+    opinion; it never even gets asked."""
+    is_multi = bool(state.get("is_multi_file"))
+    target_file = state.get("target_file", "")
+    if is_multi:
+        code = state.get("files", {}).get(target_file, "")
+        language = state.get("file_languages", {}).get(target_file, "")
+    else:
+        code = state.get("code", "")
+        language = state.get("language", "")
+
+    if not (code or "").strip():
+        return {"test_notes": "No code to test yet.", "test_passed": True, "needs_fix": False}
+
+    lang = (language or "").strip().lower()
+    syntax_error = None
+    if lang == "python":
+        try:
+            compile(code, target_file or "<generated>", "exec")
+        except SyntaxError as e:
+            syntax_error = f"Python syntax error: {e.msg} (line {e.lineno})"
+        except Exception:
+            pass  # not a clean syntax failure — let the reasoning pass below judge it instead
+    elif lang == "json":
+        try:
+            json.loads(code)
+        except json.JSONDecodeError as e:
+            syntax_error = f"Invalid JSON: {e}"
+        except Exception:
+            pass
+
+    if syntax_error:
+        return {"test_notes": syntax_error, "test_passed": False, "needs_fix": True}
+
     llm = get_code_llm(state["model_key"], state["temperature"])
     prompt = (
-        "Re-read the code you just wrote (the 'Prior Code Draft') against the goal and the "
-        "step it was supposed to satisfy — the way you'd look over your own diff before "
-        "calling it done. Look specifically for real bugs, missed requirements, and broken "
-        "edge cases, not just style nitpicks. Be honest: if it's genuinely correct, say so "
-        "rather than inventing issues.\n\n{context}"
+        "Test the code you just wrote against the goal and the step it was supposed to "
+        "satisfy, the way you'd actually run it: think through the concrete unit tests, "
+        "integration paths, and edge cases this should handle, and check whether the "
+        "code as written would actually pass them. Be honest — if it would genuinely "
+        "pass, say so rather than inventing problems.\n\n{context}"
+    )
+    res, err = await execute_code_llm_structured(llm, prompt, TestReport, {"context": format_code_context(state)})
+
+    if not res:
+        # Couldn't get a reliable test pass — don't block the loop on it, treat it as
+        # passing rather than looping forever against a backend that's already failing.
+        return {
+            "test_notes": f"Skipped testing — hit an error: {err}" if err else "No issues found.",
+            "test_passed": True,
+            "needs_fix": False,
+            "last_error": err,
+        }
+
+    return {
+        "test_notes": res.test_notes or ("Would pass." if res.passed else "Would fail."),
+        "test_passed": bool(res.passed),
+        "needs_fix": (not res.passed) and bool(res.issues.strip()),
+        "last_error": err,
+    }
+
+async def review_node(state: CodeAgentState) -> dict:
+    """Stage 5 of the workflow: REVIEW. Looks over the diff the way you'd review your
+    own pull request before calling it done — real bugs, missed requirements, and broken
+    edge cases, not style nitpicks. A failing TEST result upstream already means the
+    loop needs a FIX, so a clean review here never silently clears that on its own."""
+    llm = get_code_llm(state["model_key"], state["temperature"])
+    prompt = (
+        "Review the code you just wrote (the 'Prior Code Draft') against the goal and "
+        "the step it was supposed to satisfy — the way you'd look over your own diff "
+        "before calling it done. Look specifically for real bugs, missed requirements, "
+        "and broken edge cases, not just style nitpicks. Take the 'Test Notes From Last "
+        "Pass' into account too. Be honest: if it's genuinely correct, say so rather "
+        "than inventing issues.\n\n{context}"
     )
 
     res, err = await execute_code_llm_structured(llm, prompt, CodeReview, {"context": format_code_context(state)})
+    test_failed = not bool(state.get("test_passed", True))
 
     if not res:
-        # Couldn't get a reliable review — don't block the loop on it, treat it as passing
-        # rather than looping forever against a backend that's already failing.
+        # Couldn't get a reliable review — don't block the loop on it, but a test that
+        # already failed still needs a fix regardless.
         return {
             "review_notes": f"Skipped review — hit an error: {err}" if err else "Looks solid.",
-            "needs_fix": False,
-            "completion_score": 100,
+            "needs_fix": test_failed,
+            "completion_score": 70 if test_failed else 100,
             "last_error": err,
         }
 
@@ -2396,63 +2552,125 @@ async def code_review_node(state: CodeAgentState) -> dict:
     else:
         review_str = f"Found an issue: {res.issues}" if res.issues.strip() else "Found an issue that needs another pass."
 
+    review_needs_fix = (not res.looks_correct) and bool(res.issues.strip())
+    needs_fix = review_needs_fix or test_failed
+
     return {
         "review_notes": review_str,
-        "needs_fix": (not res.looks_correct) and bool(res.issues.strip()),
-        "completion_score": 100 if res.looks_correct else 70,
+        "needs_fix": needs_fix,
+        "completion_score": 100 if (res.looks_correct and not test_failed) else 70,
         "last_error": err,
     }
 
-def code_decision_edge(state: CodeAgentState) -> str:
-    """Decides whether the think -> write -> review loop is done or needs another pass.
+async def commit_node(state: CodeAgentState) -> dict:
+    """Stage 7 of the workflow: COMMIT. Runs once, after Review (and any Fix/Test
+    re-checks) have settled and there's nothing left to fix — writes a short,
+    conventional-commit-style summary of the change and finalizes the chat response.
+    Never blocks the loop: if the summary call fails, a sensible default is used
+    instead. Nothing here touches the code itself."""
+    commit_message = "chore: apply requested change"
+    goal = state.get("goal", "")
+    step = state.get("current_step", "")
+    if goal or step:
+        try:
+            llm = get_code_llm(state["model_key"], state["temperature"])
+            prompt = (
+                f"Goal: {goal}\nWhat changed: {step}\n\n"
+                "Write ONE line, conventional-commit style (e.g. 'feat: add paginated "
+                "user search endpoint', 'fix: correct off-by-one in pagination loop'). "
+                "Reply with only that line, nothing else."
+            )
+            res = await llm.ainvoke([HumanMessage(content=prompt)])
+            candidate = strip_thinking(res.content).strip().splitlines()[0].strip().strip('"')
+            if candidate:
+                commit_message = candidate
+        except Exception as e:
+            print(f"[CodeMode] commit_node message generation failed (using default): {e}")
+
+    response = state.get("response", "")
+    explanation = state.get("explanation", "")
+    code = state.get("code", "")
+    language = state.get("language", "")
+    is_multi = bool(state.get("is_multi_file"))
+
+    if not is_multi and code:
+        response = f"{explanation}\n\nCommit: {commit_message}\n\n```{language}\n{code}\n```".strip()
+
+    return {
+        "commit_message": commit_message,
+        "response": response,
+        "completion_score": 100,
+    }
+
+def post_review_edge(state: CodeAgentState) -> str:
+    """Decides what happens after REVIEW: another pass through FIX if Test or Review
+    found a concrete, real issue; the next file's IDEA if this is a multi-file build
+    with more left to do; otherwise straight on to COMMIT.
 
     No artificial completion-percentage evaluator: for multi-file builds this trusts the
-    analysis step's own judgment on whether more files are actually needed (already_done)
+    idea step's own judgment on whether more files are actually needed (already_done)
     — the same way an engineer decides "anything else left?" by looking at what's built,
-    not by ticking off a plan written before any code existed. For single-file work it
-    loops back only when the review pass found a concrete, real issue.
+    not by ticking off a plan written before any code existed.
 
     Still keeps the original safety net: as long as iterations remain, the loop is never
-    allowed to end having produced zero code.
+    allowed to reach COMMIT having produced zero code.
     """
     out_of_iterations = state.get("iteration", 0) >= state.get("max_iterations", 3)
+
+    if state.get("needs_fix") and not out_of_iterations:
+        return "fix"
 
     if bool(state.get("is_multi_file")):
         files_done = len(state.get("files", {}))
         if out_of_iterations:
-            return END
+            return "commit"
         if state.get("already_done") and files_done > 0:
-            return END
-        return "code_analysis"
+            return "commit"
+        return "idea"
 
     has_code = bool((state.get("code") or "").strip())
     if not has_code and not out_of_iterations:
-        return "code_analysis"
-    if out_of_iterations:
-        return END
-    if state.get("needs_fix"):
-        return "code_analysis"
-    return END
+        return "idea"
+    return "commit"
 
 # ----------------------------------------------------------------------
 # CODE MODE: Workflow Graph (separate compiled graph from the normal app_graph)
 #
-# Three nodes instead of the original five: think about it (code_analysis), do it
-# (code_executor), check it (code_review). That's the actual shape of how Claude Code
-# works a task — read/understand, make the change, look it over — rather than a
-# multi-stage plan-then-verify-percentage pipeline.
+# The Claude AI coding workflow, wired as the actual execution graph:
+#
+#   Idea -> Plan -> Code -> Test -> Review -> Fix -> Commit
+#
+#   1. Idea    — understand what's actually being asked (and the root cause, for bugs)
+#   2. Plan    — inspect what exists, propose the single concrete next step
+#   3. Code    — implement that one step (full write or targeted diff)
+#   4. Test    — static syntax check + reasoned test/edge-case pass
+#   5. Review  — look over the diff for real bugs before calling it done
+#   6. Fix     — only reached when Test or Review found a concrete issue; loops back
+#                through Test to re-verify rather than trusting itself
+#   7. Commit  — runs once, at the very end: short commit-style summary, done
+#
+# A multi-file build sends Review back to Idea for the next file instead of Commit;
+# Commit itself only ever runs once, after everything is actually settled.
 # ----------------------------------------------------------------------
 
 code_workflow = StateGraph(CodeAgentState)
 
-code_workflow.add_node("code_analysis", code_analysis_node)
-code_workflow.add_node("code_executor", code_executor_node)
-code_workflow.add_node("code_review", code_review_node)
+code_workflow.add_node("idea", idea_node)
+code_workflow.add_node("plan", plan_node)
+code_workflow.add_node("code", code_node)
+code_workflow.add_node("test", test_node)
+code_workflow.add_node("review", review_node)
+code_workflow.add_node("fix", fix_node)
+code_workflow.add_node("commit", commit_node)
 
-code_workflow.set_entry_point("code_analysis")
-code_workflow.add_edge("code_analysis", "code_executor")
-code_workflow.add_edge("code_executor", "code_review")
-code_workflow.add_conditional_edges("code_review", code_decision_edge)
+code_workflow.set_entry_point("idea")
+code_workflow.add_edge("idea", "plan")
+code_workflow.add_edge("plan", "code")
+code_workflow.add_edge("code", "test")
+code_workflow.add_edge("test", "review")
+code_workflow.add_conditional_edges("review", post_review_edge)
+code_workflow.add_edge("fix", "test")
+code_workflow.add_edge("commit", END)
 
 code_app_graph = code_workflow.compile()
 
@@ -2527,53 +2745,73 @@ def code_graph_timeout_seconds(model_key: str, max_iterations: int) -> float:
     to a generous absolute limit); the heartbeat pings in run_code_graph_streaming keep the SSE
     connection alive for the platform proxy the whole time, so a longer run is safe to allow."""
     per_call_seconds = 140.0 if (model_key or "").strip().lower() in ("kimi", "kimik2.6") else 90.0
-    worst_case_calls = 1 + (max_iterations * 4)
+    # The workflow now has up to 6 LLM-calling stages per iteration (idea, plan, code,
+    # test, review, fix) instead of the original 3 (analysis, executor, review) — the
+    # per-iteration multiplier below was raised from 4 to 7 to match, so a multi-step
+    # build still gets a realistic time budget instead of being cut off mid-run.
+    worst_case_calls = 1 + (max_iterations * 7)
     return min(worst_case_calls * per_call_seconds, 1500.0)
 
 CODE_NODE_LABELS = {
-    "code_analysis": "Reading the code and thinking it through",
-    "code_executor": "Writing the code",
-    "code_review": "Reviewing the change",
+    "idea": "Understanding the idea",
+    "plan": "Planning the next step",
+    "code": "Writing the code",
+    "test": "Testing the change",
+    "review": "Reviewing the change",
+    "fix": "Fixing the issue",
+    "commit": "Committing the change",
 }
 
 def code_node_detail(node_name: str, state: dict) -> str:
-    if node_name == "code_analysis":
+    if node_name == "idea":
         err = state.get("last_error")
         if err:
             return f"Thinking hit an error: {err}"
+        notes = state.get("analysis_notes", "")
+        return notes if notes else "Reading through the request and the existing code."
+    if node_name == "plan":
         step = state.get("current_step", "")
         target = state.get("target_file", "")
         if state.get("is_multi_file"):
             files_done = len(state.get("files", {}))
             progress = f"({files_done} file{'s' if files_done != 1 else ''} built so far)"
             label = f"{target or 'the next file'} {progress}"
-            return f"Figuring out {label}: {step}" if step else f"Thinking through the build {progress}."
-        return step if step else "Reading through the request and the existing code."
-    if node_name == "code_executor":
+            return f"Planning {label}: {step}" if step else f"Planning the build {progress}."
+        return step if step else "Deciding the next concrete step."
+    if node_name == "code":
         explanation = state.get("explanation", "")
         if state.get("is_multi_file"):
             target = state.get("target_file", "")
             base = f"Writing {target}" if target else "Writing the next file"
             return f"{base} — {explanation}" if explanation else f"{base}."
         return explanation if explanation else "Writing the code."
-    if node_name == "code_review":
+    if node_name == "test":
+        notes = state.get("test_notes", "")
+        return notes if notes else "Checking the code against likely tests and edge cases."
+    if node_name == "review":
         notes = state.get("review_notes", "")
         return notes if notes else "Reviewing the change for bugs and correctness."
+    if node_name == "fix":
+        explanation = state.get("explanation", "")
+        return explanation if explanation else "Applying a fix for the issue that was found."
+    if node_name == "commit":
+        msg = state.get("commit_message", "")
+        return f"Committed: {msg}" if msg else "Finalizing the change."
     return CODE_NODE_LABELS.get(node_name, node_name)
 
 async def run_code_graph_streaming(initial_state: dict, timeout: float, token_queue: asyncio.Queue):
     """
     Runs the Code Mode LangGraph node-by-node AND, concurrently, relays whatever
-    code_executor_node pushes onto token_queue as it writes code — interleaving both into
+    code_node/fix_node push onto token_queue as they write code — interleaving both into
     one chronological stream of events:
       ("status", node_name, state_so_far) — a node just finished (real backend progress)
-      ("code_reset", filename)            — code_executor_node is about to start writing a
+      ("code_reset", filename)            — code_node/fix_node is about to start writing a
                                              file live; filename is None for single-file
       ("token", text)                     — a real, live delta of code being written,
                                              straight from the model, the instant it arrives
       ("heartbeat", None)                 — nothing new yet, just keeping the SSE connection
                                              alive during a long non-streaming node call
-                                             (understand_code_goal / code_planner / etc.)
+                                             (idea / plan / test / review / fix / commit)
     Still enforces the same overall timeout budget, and still emits the same ~12s
     heartbeats as before so a slow non-streaming node (these can take 60-140s) doesn't
     leave the SSE connection silent long enough for a hosting proxy to kill it as idle.
@@ -2750,7 +2988,7 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
                     continue
 
                 if kind == "code_reset":
-                    # code_executor_node is about to start writing a file live — open the
+                    # code_node/fix_node is about to start writing a file live — open the
                     # canvas now so the tokens that follow have somewhere to land.
                     active_filename = evt[1]
                     streamed_live = True
@@ -2783,8 +3021,8 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
             is_multi = bool(final_state.get("is_multi_file"))
             files = final_state.get("files", {}) if is_multi else {}
 
-            # Hard safety net: code_decision_edge now avoids ending the loop before code
-            # exists, but if iterations still ran out with none (e.g. reasoning_level
+            # Hard safety net: post_review_edge now avoids reaching commit/END before
+            # code exists, but if iterations still ran out with none (e.g. reasoning_level
             # "low" giving very few passes), don't hand back an explanation with nothing
             # to show — make one guaranteed direct attempt at real code instead.
             has_any_output = bool(files) if is_multi else bool(code.strip())
@@ -2864,7 +3102,7 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
     session["messages"].append(AIMessage(content=final_response))
 
     # Only stream the prose/explanation into the chat bubble. `final_response` still
-    # has the full fenced code glued on the end (see code_executor_node), but that
+    # has the full fenced code glued on the end (see code_node/commit_node), but that
     # code is delivered once, in full, via the `code_result` event right below and
     # rendered into the dedicated code canvas. Streaming the fenced block word-by-word
     # here is what made the whole file appear to get typed out inside the chat like a
@@ -3021,8 +3259,8 @@ async def _handle_code_chat(request: CodeChatRequest):
             is_multi = bool(final_state.get("is_multi_file"))
             files = final_state.get("files", {}) if is_multi else {}
 
-            # Hard safety net: code_decision_edge now avoids ending the loop before code
-            # exists, but if iterations still ran out with none (e.g. reasoning_level
+            # Hard safety net: post_review_edge now avoids reaching commit/END before
+            # code exists, but if iterations still ran out with none (e.g. reasoning_level
             # "low" giving very few passes), don't hand back an explanation with nothing
             # to show — make one guaranteed direct attempt at real code instead.
             has_any_output = bool(files) if is_multi else bool(code.strip())
@@ -3048,7 +3286,7 @@ async def _handle_code_chat(request: CodeChatRequest):
     if is_multi and files:
         # Big multi-file build: assemble every accumulated file into the final answer as
         # its own fenced block, and hand the raw per-file dict back too (see 'files' below)
-        # instead of only ever returning the single last file that code_executor_node
+        # instead of only ever returning the single last file that code_node
         # happened to run on last — that's what was silently dropping every other file.
         file_languages = final_state.get("file_languages", {})
         intro = final_state.get("goal", "") and f"Built {len(files)} files for: {final_state.get('goal')}"
