@@ -87,21 +87,24 @@
 
         /* Simplified assistant message: no repeated title per bubble, just a small quiet avatar */
         .assistant .message-bubble { background-color:transparent; border-radius:8px; color:var(--text-primary); display:flex; gap:12px; padding-left:0; align-items:flex-start; }
-        .assistant-avatar { flex-shrink:0; width:26px; height:26px; padding:5px; border-radius:50%; border:1px solid var(--border-color); color:var(--text-secondary); margin-top:2px; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+        .assistant-avatar { flex-shrink:0; width:26px; height:26px; padding:5px; border-radius:50%; border:1px solid var(--border-color); color:var(--text-secondary); margin-top:2px; position:relative; overflow:hidden; }
         /* Nexus-spark logo scaled down to sit inside the round avatar slot — same
            technique as .thinking-indicator below: the 280x280 logo is kept at its
            original authored size and shrunk with a CSS transform so nothing about
-           it (blur radii, stroke widths, colors) needed to be re-tuned. */
-        .assistant-avatar .logo-container { position:relative; width:280px; height:280px; display:flex; justify-content:center; align-items:center; transform:scale(0.093); transform-origin:center; }
+           it (blur radii, stroke widths, colors) needed to be re-tuned. Positioned
+           absolutely (not flex-centered) because a flex parent shrinks a fixed-width
+           flex child to fit BEFORE the scale transform applies, compounding the two
+           shrinks and leaving only the core dot visible — absolute positioning keeps
+           the 280px box at its true authored size so the transform is the only thing
+           scaling it. */
+        .assistant-avatar .logo-container { position:absolute; top:50%; left:50%; width:280px; height:280px; display:flex; justify-content:center; align-items:center; transform:translate(-50%,-50%) scale(0.093); transform-origin:center; }
         .assistant-avatar .ai-svg { width:100%; height:100%; overflow:visible; filter:drop-shadow(0 0 30px rgba(139,92,246,0.2)); transition:filter 0.5s ease; }
         .assistant-avatar .spark-group { transform-origin:50px 50px; transition:all 0.5s cubic-bezier(0.4,0,0.2,1); }
         .assistant-avatar .core-dot { transform-origin:50px 50px; transition:all 0.5s cubic-bezier(0.4,0,0.2,1); }
-        .assistant-avatar .state-idle .spark-primary { animation:idle-spin-primary 8s ease-in-out infinite; }
-        .assistant-avatar .state-idle .spark-secondary { animation:idle-spin-secondary 10s ease-in-out infinite; }
-        .assistant-avatar .state-idle .core-dot { animation:idle-core 4s ease-in-out infinite; }
-        @keyframes idle-spin-primary { 0% { transform:rotate(0deg) scale(0.9); } 50% { transform:rotate(45deg) scale(1); } 100% { transform:rotate(90deg) scale(0.9); } }
-        @keyframes idle-spin-secondary { 0% { transform:rotate(45deg) scale(0.85); } 50% { transform:rotate(0deg) scale(0.95); } 100% { transform:rotate(-45deg) scale(0.85); } }
-        @keyframes idle-core { 0%, 100% { transform:scale(0.8); opacity:0.8; } 50% { transform:scale(1.1); opacity:1; } }
+        .assistant-avatar .state-thinking .ai-svg { filter:drop-shadow(0 0 50px rgba(236,72,153,0.4)); }
+        .assistant-avatar .state-thinking .spark-primary { animation:think-spin-primary 3s cubic-bezier(0.68,-0.55,0.265,1.55) infinite; }
+        .assistant-avatar .state-thinking .spark-secondary { animation:think-spin-secondary 4s cubic-bezier(0.68,-0.55,0.265,1.55) infinite; }
+        .assistant-avatar .state-thinking .core-dot { animation:think-core 1.5s ease-in-out infinite; fill:#ec4899; }
         .assistant-body { flex:1; min-width:0; display:flex; flex-direction:column; gap:10px; }
 
         .message-text { word-break:break-word; }
@@ -552,15 +555,16 @@
             return wrapper;
         }
 
-        // Small static (idle, gently breathing) version of the same Nexus-spark
-        // logo, sized to sit inside the round .assistant-avatar slot next to each
+        // Small version of the same Nexus-spark logo, running the "thinking" spin
+        // (exact same keyframes/colors as think-spin-primary/secondary/core below),
+        // sized to sit inside the round .assistant-avatar slot next to each
         // assistant message — replaces the old plain box-outline icon.
         function createAvatarLogo() {
             thinkingIndicatorInstanceCount++;
             const uid = `av${thinkingIndicatorInstanceCount}`;
             const avatar = document.createElement('div');
             avatar.className = 'assistant-avatar';
-            avatar.innerHTML = `<div class="logo-container state-idle">
+            avatar.innerHTML = `<div class="logo-container state-thinking">
         <svg class="ai-svg" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
             <defs>
                 <linearGradient id="grad-primary-${uid}" x1="0%" y1="0%" x2="100%" y2="100%">
