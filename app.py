@@ -1917,6 +1917,29 @@ Icons and symbols:
 - Never fake an icon with an emoji, a random Unicode glyph, or a text
   abbreviation standing in for one.
 
+Images:
+
+- Whenever a design calls for a photo, hero image, avatar, product shot,
+  or any other picture, you MUST emit a real `<img src="...">` element
+  that actually loads — NEVER a bare link/anchor with text like "image"
+  or "photo", NEVER a filename that points at a local asset that was not
+  provided to you (e.g. "images/hero.jpg", "./photo1.png"), and NEVER a
+  placeholder string in place of a working URL.
+- Since you cannot browse for a specific real photo, use a stable
+  image-generation/placeholder service that returns an actual image byte
+  stream at request time, so the `<img>` tag renders something real
+  instead of a broken icon or a link. Good defaults:
+  - `https://picsum.photos/seed/<unique-seed>/<width>/<height>` for
+    generic photographic filler (vary the seed per image so they differ).
+  - `https://source.unsplash.com/<width>x<height>/?<topic-keywords>` when
+    the image should match a topic/theme (e.g. "coffee", "mountains").
+  - For avatars, `https://i.pravatar.cc/<size>?img=<1-70>`.
+- Always set `alt` text describing the image, and always set explicit
+  width/height (or CSS) so the layout doesn't jump while the image loads.
+- Never wrap the only content of a card/section in an `<a>` tag with no
+  `<img>` inside it when the design calls for a picture — the visible
+  element must be the image itself, not a text link standing in for it.
+
 Color and theme:
 
 - Match the look of modern, production AI-assistant interfaces (ChatGPT,
