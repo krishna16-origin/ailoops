@@ -87,7 +87,21 @@
 
         /* Simplified assistant message: no repeated title per bubble, just a small quiet avatar */
         .assistant .message-bubble { background-color:transparent; border-radius:8px; color:var(--text-primary); display:flex; gap:12px; padding-left:0; align-items:flex-start; }
-        .assistant-avatar { flex-shrink:0; width:26px; height:26px; padding:5px; border-radius:50%; border:1px solid var(--border-color); color:var(--text-secondary); margin-top:2px; }
+        .assistant-avatar { flex-shrink:0; width:26px; height:26px; padding:5px; border-radius:50%; border:1px solid var(--border-color); color:var(--text-secondary); margin-top:2px; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+        /* Nexus-spark logo scaled down to sit inside the round avatar slot — same
+           technique as .thinking-indicator below: the 280x280 logo is kept at its
+           original authored size and shrunk with a CSS transform so nothing about
+           it (blur radii, stroke widths, colors) needed to be re-tuned. */
+        .assistant-avatar .logo-container { position:relative; width:280px; height:280px; display:flex; justify-content:center; align-items:center; transform:scale(0.093); transform-origin:center; }
+        .assistant-avatar .ai-svg { width:100%; height:100%; overflow:visible; filter:drop-shadow(0 0 30px rgba(139,92,246,0.2)); transition:filter 0.5s ease; }
+        .assistant-avatar .spark-group { transform-origin:50px 50px; transition:all 0.5s cubic-bezier(0.4,0,0.2,1); }
+        .assistant-avatar .core-dot { transform-origin:50px 50px; transition:all 0.5s cubic-bezier(0.4,0,0.2,1); }
+        .assistant-avatar .state-idle .spark-primary { animation:idle-spin-primary 8s ease-in-out infinite; }
+        .assistant-avatar .state-idle .spark-secondary { animation:idle-spin-secondary 10s ease-in-out infinite; }
+        .assistant-avatar .state-idle .core-dot { animation:idle-core 4s ease-in-out infinite; }
+        @keyframes idle-spin-primary { 0% { transform:rotate(0deg) scale(0.9); } 50% { transform:rotate(45deg) scale(1); } 100% { transform:rotate(90deg) scale(0.9); } }
+        @keyframes idle-spin-secondary { 0% { transform:rotate(45deg) scale(0.85); } 50% { transform:rotate(0deg) scale(0.95); } 100% { transform:rotate(-45deg) scale(0.85); } }
+        @keyframes idle-core { 0%, 100% { transform:scale(0.8); opacity:0.8; } 50% { transform:scale(1.1); opacity:1; } }
         .assistant-body { flex:1; min-width:0; display:flex; flex-direction:column; gap:10px; }
 
         .message-text { word-break:break-word; }
@@ -536,6 +550,51 @@
         </svg>
     </div>`;
             return wrapper;
+        }
+
+        // Small static (idle, gently breathing) version of the same Nexus-spark
+        // logo, sized to sit inside the round .assistant-avatar slot next to each
+        // assistant message — replaces the old plain box-outline icon.
+        function createAvatarLogo() {
+            thinkingIndicatorInstanceCount++;
+            const uid = `av${thinkingIndicatorInstanceCount}`;
+            const avatar = document.createElement('div');
+            avatar.className = 'assistant-avatar';
+            avatar.innerHTML = `<div class="logo-container state-idle">
+        <svg class="ai-svg" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+            <defs>
+                <linearGradient id="grad-primary-${uid}" x1="0%" y1="0%" x2="100%" y2="100%">
+                    <stop offset="0%" stop-color="#8b5cf6" />
+                    <stop offset="50%" stop-color="#6366f1" />
+                    <stop offset="100%" stop-color="#06b6d4" />
+                </linearGradient>
+                <linearGradient id="grad-secondary-${uid}" x1="100%" y1="0%" x2="0%" y2="100%">
+                    <stop offset="0%" stop-color="#ec4899" />
+                    <stop offset="50%" stop-color="#f43f5e" />
+                    <stop offset="100%" stop-color="#f59e0b" />
+                </linearGradient>
+                <filter id="glow-${uid}" x="-20%" y="-20%" width="140%" height="140%">
+                    <feGaussianBlur stdDeviation="3" result="blur" />
+                    <feComposite in="SourceGraphic" in2="blur" operator="over" />
+                </filter>
+            </defs>
+            <circle cx="50" cy="50" r="35" fill="url(#grad-primary-${uid})" opacity="0.1" filter="blur(10px)" class="core-dot"/>
+            <g class="spark-group spark-secondary">
+                <path d="M 50 12 Q 50 50 88 50 Q 50 50 50 88 Q 50 50 12 50 Q 50 50 50 12 Z"
+                      fill="none" stroke="url(#grad-secondary-${uid})" stroke-width="1.5" opacity="0.8" />
+                <path d="M 50 15 Q 50 50 85 50 Q 50 50 50 85 Q 50 50 15 50 Q 50 50 50 15 Z"
+                      fill="url(#grad-secondary-${uid})" opacity="0.3" style="mix-blend-mode: screen;" />
+            </g>
+            <g class="spark-group spark-primary">
+                <path d="M 50 5 Q 50 50 95 50 Q 50 50 50 95 Q 50 50 5 50 Q 50 50 50 5 Z"
+                      fill="url(#grad-primary-${uid})" filter="url(#glow-${uid})" opacity="0.9" />
+                <path d="M 50 15 Q 50 50 85 50 Q 50 50 50 85 Q 50 50 15 50 Q 50 50 50 15 Z"
+                      fill="none" stroke="#ffffff" stroke-width="0.5" opacity="0.5" />
+            </g>
+            <circle cx="50" cy="50" r="4.5" fill="#ffffff" class="core-dot" filter="url(#glow-${uid})" />
+        </svg>
+    </div>`;
+            return avatar;
         }
 
         // Switches an existing indicator node's state in place (rather than
@@ -996,19 +1055,7 @@
             bubble.className = 'message-bubble';
 
             if (role === 'assistant') {
-                const avatar = document.createElement('svg');
-                avatar.setAttribute('class', 'assistant-avatar');
-                avatar.setAttribute('viewBox', '0 0 24 24');
-                avatar.setAttribute('fill', 'none');
-                avatar.setAttribute('stroke', 'currentColor');
-                avatar.setAttribute('stroke-width', '1.5');
-                avatar.setAttribute('stroke-linecap', 'round');
-                avatar.setAttribute('stroke-linejoin', 'round');
-                avatar.innerHTML = `
-                    <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
-                    <polyline points="2 12 12 17 22 12"></polyline>
-                    <polyline points="2 17 12 22 22 17"></polyline>
-                `;
+                const avatar = createAvatarLogo();
 
                 const body = document.createElement('div');
                 body.className = 'assistant-body';
