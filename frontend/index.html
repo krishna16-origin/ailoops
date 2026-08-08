@@ -463,7 +463,15 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.5/purify.min.js"></script>
 
     <script>
-        marked.use(markedKatex({ throwOnError: false }));
+        if (typeof marked !== 'undefined' && typeof markedKatex !== 'undefined') {
+            try {
+                marked.use(markedKatex({ throwOnError: false }));
+            } catch (e) {
+                console.warn('Math rendering extension failed to initialize:', e);
+            }
+        } else {
+            console.warn('marked.js or its KaTeX extension failed to load from the CDN — math rendering will be disabled, but the rest of the app will still work.');
+        }
 
         // marked-katex-extension only recognizes $...$ and $$...$$ delimiters.
         // A lot of model output uses the LaTeX-style \( ... \) and \[ ... \]
