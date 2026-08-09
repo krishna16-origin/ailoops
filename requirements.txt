@@ -5,5 +5,5 @@ langchain
 langchain-core>=1.0
 langchain-nvidia-ai-endpoints
 langgraph
-ddgs
+ddgs>=9.5
 python-dotenv
