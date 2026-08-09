@@ -389,18 +389,44 @@ _WEB_SEARCH_KEYWORDS = (
     "how much does", "search for", "look up", "google ", "duckduckgo",
     "documentation for", "docs for", "official docs", "api for", "library for",
     "package for", "npm package", "pip package",
+    # Model/product-version phrasing — the original list only caught "release"/
+    # "released", which missed extremely common ways people actually ask this
+    # ("new models of X", "newest model", "which version is the latest").
+    "new model", "new models", "newest", "latest model", "latest models",
+    "latest version", "current model", "current models", "current version",
+    "which version", "which model", "model lineup", "what's new", "whats new",
+    "any updates", "update on", "updates on", "as of now", "as of today",
+    "still the latest", "still current", "is there a newer",
 )
 
-_EXPLICIT_SEARCH_PREFIXES = ("search:", "/search", "search for:")
+# Explicit ways a user can force a search regardless of the heuristic above —
+# e.g. typing "search:" before a query, or just saying "websearch"/"search the
+# web" on its own. Checked as a startswith AND as a bare-message match (see
+# _BARE_SEARCH_COMMANDS below), since previously there was no way to force a
+# search at all if a query didn't happen to contain one of the keywords above.
+_EXPLICIT_SEARCH_PREFIXES = ("search:", "/search", "search for:", "websearch:", "web search:")
+
+# Bare commands with no real topic in them — "websearch" typed as its own
+# message forces a search, but searching literally for the word "websearch"
+# is useless. resolve_search_query() below detects this and substitutes the
+# previous user message as the actual query instead.
+_BARE_SEARCH_COMMANDS = {
+    "websearch", "web search", "search", "do a web search", "please websearch",
+    "please web search", "search the web", "search online", "look it up",
+    "look this up", "look this up online", "google it", "can you search",
+    "please search", "search this", "search that",
+}
 
 def needs_web_search(message: str) -> bool:
     """True if the message looks like it needs current/external information a
-    free web search can help with, rather than something already fully knowable
+    web search can help with, rather than something already fully knowable
     from the model's own training."""
     text = (message or "").strip().lower()
     if not text:
         return False
     if text.startswith(_EXPLICIT_SEARCH_PREFIXES):
+        return True
+    if text.rstrip("?!.") in _BARE_SEARCH_COMMANDS:
         return True
     if any(kw in text for kw in _WEB_SEARCH_KEYWORDS):
         return True
@@ -419,6 +445,22 @@ def extract_search_query(message: str) -> str:
         if lowered.startswith(prefix):
             return text[len(prefix):].strip()
     return text
+
+def resolve_search_query(messages: List[BaseMessage], latest_user_message: str) -> str:
+    """Figures out what to actually search for. Handles the case where the
+    latest message IS the search request but carries no topic of its own
+    (e.g. the user just typed "websearch" to force a lookup on whatever was
+    just being discussed) — searching literally for the word "websearch"
+    would return junk, so this walks backward for the last real user message
+    before it and searches for that instead."""
+    query = extract_search_query(latest_user_message)
+    normalized = query.strip().lower().rstrip("?!.")
+    if normalized in _BARE_SEARCH_COMMANDS:
+        for m in reversed(messages[:-1]):
+            content = (m.content or "").strip()
+            if isinstance(m, HumanMessage) and content and content.lower().rstrip("?!.") not in _BARE_SEARCH_COMMANDS:
+                return content
+    return query
 
 # ==================================================
 # REAL TOKEN-BY-TOKEN STREAMING
@@ -1606,7 +1648,7 @@ async def understand_goal_node(state: AgentState) -> dict:
     web_search_raw_links: list = []
     web_search_images: list = []
     if needs_web_search(latest_user_message):
-        web_search_query = extract_search_query(latest_user_message)
+        web_search_query = resolve_search_query(messages, latest_user_message)
         (web_search_results, web_search_raw_links), web_search_images = await asyncio.gather(
             web_search(web_search_query),
             web_image_search(web_search_query),
@@ -2137,7 +2179,7 @@ async def answer_directly(message: str, history: List[BaseMessage], model_type: 
     web_search_results = ""
     sources_md = ""
     if needs_web_search(message):
-        query = extract_search_query(message)
+        query = resolve_search_query(list(history) + [HumanMessage(content=message)], message)
         (web_search_results, links), images = await asyncio.gather(
             web_search(query), web_image_search(query)
         )
@@ -2212,7 +2254,7 @@ async def answer_directly_stream(message: str, history: List[BaseMessage], model
     web_search_results = ""
     sources_md = ""
     if needs_web_search(message):
-        query = extract_search_query(message)
+        query = resolve_search_query(list(history) + [HumanMessage(content=message)], message)
         (web_search_results, links), images = await asyncio.gather(
             web_search(query), web_image_search(query)
         )
@@ -3157,7 +3199,7 @@ async def idea_node(state: CodeAgentState) -> dict:
     web_search_query = ""
     web_search_results = ""
     if needs_web_search(latest_user_message):
-        web_search_query = extract_search_query(latest_user_message)
+        web_search_query = resolve_search_query(messages, latest_user_message)
         web_search_results, _unused_raw_links = await web_search(web_search_query)
 
     llm = get_code_llm(state["model_key"], state["temperature"])
