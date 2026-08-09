@@ -7,6 +7,7 @@ import re
 import random
 import asyncio
 import contextvars
+from datetime import datetime, timezone
 from typing import TypedDict, List, Dict, Any, Optional, Annotated
 
 from dotenv import load_dotenv
@@ -147,6 +148,33 @@ def strip_thinking(text: str) -> str:
     return text.strip()
 
 # ==================================================
+# CURRENT DATE & TIME
+#
+# The model otherwise has no way to know "today" — its own training data has
+# a fixed, long-past cutoff, and nothing in this app told it what day it
+# actually is. That silently broke two separate things:
+#   1. Any date-relative question ("what year is it", "how many days until
+#      X", "is this still current") had no ground truth to reason from.
+#   2. Web Search Results carried no timestamp, so the model had no way to
+#      judge how fresh a given result actually was, or to notice a result
+#      that's dated (e.g. an article from years ago showing up for a
+#      "latest" query).
+#
+# get_current_datetime_str() is the single source of truth for "now" —
+# called fresh on every request (never cached at import time, since the
+# server process can run for days) — and its output is threaded into every
+# system prompt AND stamped onto every web search result below, in both the
+# Chat section and the Code section.
+# ==================================================
+
+def get_current_datetime_str() -> str:
+    """Returns the current UTC date/time, human-readable, e.g.
+    'Sunday, August 09, 2026, 03:45 PM UTC'. Computed fresh on every call —
+    never memoized — so a long-running server process never hands the model
+    a stale 'now'."""
+    return datetime.now(timezone.utc).strftime("%A, %B %d, %Y, %I:%M %p UTC")
+
+# ==================================================
 # WEB SEARCH (free — DuckDuckGo, with automatic fallback to other free
 # engines via ddgs's "auto" backend; no API key required)
 #
@@ -218,7 +246,7 @@ async def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> t
                 timeout=WEB_SEARCH_TIMEOUT,
             )
             if results:
-                lines = [f"Web search results for '{query}':"]
+                lines = [f"Web search results for '{query}' (fetched just now — current date/time is {get_current_datetime_str()}):"]
                 for i, r in enumerate(results, start=1):
                     title = (r.get("title") or "").strip()
                     snippet = (r.get("body") or "").strip()
@@ -455,7 +483,9 @@ async def execute_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic_mode
     format_instructions = parser.get_format_instructions()
     
     system_prompt = (
-        """You are GoalAI — a general-purpose assistant built to reason, research, and communicate at a genuinely top-tier level: as capable, careful, and trustworthy in conversation as the best assistants available today (the bar you are held to is Claude-level quality, in every domain — not just code).
+        f"""Current Date & Time: {get_current_datetime_str()} — this is the real, current date/time; trust it completely for anything date-relative (what year it is, how recent something is, whether Web Search Results below are stale) rather than assuming a date from your own training.
+
+You are GoalAI — a general-purpose assistant built to reason, research, and communicate at a genuinely top-tier level: as capable, careful, and trustworthy in conversation as the best assistants available today (the bar you are held to is Claude-level quality, in every domain — not just code).
 
 Your responsibility is not to produce *a* response, but to actually help the user accomplish what they came for — correctly, completely, and with real understanding of what they're asking, not a shallow pattern-match to the nearest familiar question.
 
@@ -547,7 +577,9 @@ def format_context(state: AgentState) -> str:
     """Formats the current graph state into a readable string for the prompt."""
     msg_str = "\n".join([f"{m.type.capitalize()}: {m.content}" for m in state.get("messages", [])])
     
-    return f"""Conversation History:
+    return f"""Current Date & Time: {get_current_datetime_str()} (this is genuinely "now" — trust it over any date you might otherwise assume, and use it to judge how current the Web Search Results below are)
+
+Conversation History:
 {msg_str}
 
 Current Internal State:
@@ -1124,6 +1156,9 @@ async def answer_directly(message: str, history: List[BaseMessage], model_type: 
         sources_md = build_web_sources_markdown(links, images)
 
     system_content = (
+        f"Current Date & Time: {get_current_datetime_str()} — this is the real, current date/time; "
+        "trust it completely for anything date-relative rather than assuming a date from your own "
+        "training data.\n\n"
         "You are GoalAI, a sharp, honest, genuinely helpful assistant — same quality bar as a "
         "top-tier assistant like Claude, just answering fast for a short message. Be direct and "
         "concise, never robotic or padded. Never invent facts, APIs, or events; if you're not "
@@ -1196,6 +1231,9 @@ async def answer_directly_stream(message: str, history: List[BaseMessage], model
         sources_md = build_web_sources_markdown(links, images)
 
     system_content = (
+        f"Current Date & Time: {get_current_datetime_str()} — this is the real, current date/time; "
+        "trust it completely for anything date-relative rather than assuming a date from your own "
+        "training data.\n\n"
         "You are GoalAI, a sharp, honest, genuinely helpful assistant — same quality bar as a "
         "top-tier assistant like Claude, just answering fast for a short message. Be direct and "
         "concise, never robotic or padded. Never invent facts, APIs, or events; if you're not "
@@ -1977,6 +2015,11 @@ async def execute_code_llm_structured(llm: ChatNVIDIA, prompt_str: str, pydantic
     format_instructions = parser.get_format_instructions()
 
     base_system = CODE_SYSTEM_PROMPT if CODE_SYSTEM_PROMPT.strip() else "You are an elite, Claude-level coding assistant. Research and plan before writing code, ground every claim in what you actually know, never fabricate an API, and return structured, well-formatted, production-quality output."
+    # CODE_SYSTEM_PROMPT is a static module-level constant, so "now" can't be baked
+    # into it at import time — a long-running server would hand the model a date
+    # that's stale by however long it's been up. Stamp the real current date/time
+    # on fresh, per-call, the same way format_code_context() does.
+    base_system = f"Current Date & Time: {get_current_datetime_str()} — this is the real, current date/time; trust it completely (what year it is, how recent a library/framework version is, whether Web Search Results below are stale) rather than assuming a date from your own training.\n\n" + base_system
 
     # format_instructions is raw JSON-schema text full of literal { } characters.
     # It must be handed to ChatPromptTemplate as a template VARIABLE (filled in at
@@ -2082,7 +2125,9 @@ def format_code_context(state: CodeAgentState) -> str:
     files = state.get("files", {})
     files_summary = ", ".join(files.keys()) if files else "None yet"
 
-    return f"""Conversation History:
+    return f"""Current Date & Time: {get_current_datetime_str()} (this is genuinely "now" — trust it over any date you might otherwise assume, and use it to judge how current the Web Search Results below are, e.g. whether a library/framework version is still the latest)
+
+Conversation History:
 {msg_str}
 
 Current Internal State:
@@ -2281,6 +2326,9 @@ def apply_code_edits(original: str, edit_text: str) -> tuple[str, bool]:
 
 def build_edit_prompt(prior_code: str, language: str, goal: str, current_step: str) -> str:
     return (
+        f"Current Date & Time: {get_current_datetime_str()} — trust this as the real, current "
+        "date/time for anything date-relative (e.g. whether an API/library referenced below is "
+        "still current).\n\n"
         "The 'Existing Code' below already satisfies most of the goal. Make ONLY the "
         "change described by the 'Current Step' — do not rewrite anything else.\n\n"
         "Respond with one or more SEARCH/REPLACE blocks in exactly this shape, and "
@@ -2833,6 +2881,9 @@ def extract_code_from_answer(answer: str) -> tuple[str, str]:
 async def answer_code_directly(message: str, history: List[BaseMessage], model_key: str, temperature: float) -> dict:
     """Always returns a real code answer — falls back to the other Code Mode model if the primary one fails."""
     base_system = CODE_SYSTEM_PROMPT if CODE_SYSTEM_PROMPT.strip() else "You are an elite, Claude-level coding assistant. Plan briefly, ground your answer in what you actually know rather than guessing at APIs, then respond with correct, complete code and a concise explanation."
+    # Same reasoning as execute_code_llm_structured above: stamp "now" on fresh,
+    # per-call, since the static CODE_SYSTEM_PROMPT constant can't carry a live date.
+    base_system = f"Current Date & Time: {get_current_datetime_str()} — this is the real, current date/time; trust it completely rather than assuming a date from your own training.\n\n" + base_system
     messages = [SystemMessage(content=base_system)]
     messages.extend(history[-6:])
     messages.append(HumanMessage(content=message))
@@ -3005,6 +3056,7 @@ async def stream_code_thinking(model_key: str, temperature: float, message: str,
     )
     context = "\n".join([f"{m.type.capitalize()}: {m.content}" for m in history[-6:]])
     prompt = (
+        f"Current Date & Time: {get_current_datetime_str()}\n\n"
         f"{context}\n\nUser's new request: {message}\n\n"
         "Think through how you'd build this: what it actually needs, whether it needs one file "
         "or several, the technical approach, and any risks or tricky parts. Reason it through out "
