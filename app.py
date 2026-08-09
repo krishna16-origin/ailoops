@@ -159,70 +159,106 @@ def strip_thinking(text: str) -> str:
 # this feature existed.
 # ==================================================
 
-WEB_SEARCH_TIMEOUT = 12.0
+WEB_SEARCH_TIMEOUT = 9.0          # per-attempt timeout (kept tight since we may retry)
 WEB_SEARCH_MAX_RESULTS = 5
+WEB_SEARCH_RETRIES = 2            # total attempts (1 initial + 1 retry) before giving up
+
+# The bare "duckduckgo" backend alone gets rate-limited hard and often from
+# cloud/datacenter IPs (the free ddgs library is a scraper, not an official API,
+# and DuckDuckGo actively throttles automated traffic). Modern ddgs (the
+# renamed/rebranded "Dux Distributed Global Search" successor to
+# duckduckgo_search) supports multiple real search backends and will query
+# this comma-delimited list in order, automatically falling back to the next
+# one if an earlier backend errors or rate-limits — so a DuckDuckGo 202 no
+# longer means "no search results," it just means "try Bing/Brave next."
+WEB_SEARCH_BACKENDS = "bing,brave,duckduckgo,yahoo,mojeek"
+WEB_IMAGE_SEARCH_BACKENDS = "bing,duckduckgo"  # ddgs only supports these two for images()
+
+# Optional escape hatch: if the deployment's outbound IP keeps getting
+# rate-limited/blocked outright, set WEB_SEARCH_PROXY (e.g. "http://user:pass@host:port"
+# or "socks5h://host:port") and every DDGS call below will route through it.
+# Defaults to None (no proxy) — nothing changes for anyone who doesn't set it.
+WEB_SEARCH_PROXY = os.getenv("WEB_SEARCH_PROXY") or None
 
 def _run_web_search_sync(query: str, max_results: int) -> list:
-    """Blocking DuckDuckGo (auto-backend) text search. Only ever called via asyncio.to_thread."""
-    with DDGS() as ddgs:
-        return ddgs.text(query, max_results=max_results)
+    """Blocking multi-backend text search (Bing/Brave/DuckDuckGo/Yahoo/Mojeek, with
+    automatic fallback between them). Only ever called via asyncio.to_thread."""
+    with DDGS(proxy=WEB_SEARCH_PROXY) as ddgs:
+        return ddgs.text(query, max_results=max_results, backend=WEB_SEARCH_BACKENDS)
 
 async def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> tuple[str, list]:
     """
-    Runs a free web search (DuckDuckGo, falling back to other free engines) and
-    returns (formatted_text, raw_results):
+    Runs a free web search (multi-backend, with automatic fallback) and returns
+    (formatted_text, raw_results):
       - formatted_text: plain text ready to drop straight into an LLM prompt.
       - raw_results: the raw list of {title, href, body} dicts from ddgs, so a
         caller that wants real clickable links (Chat mode — see
         build_web_sources_markdown below) doesn't have to re-parse the text.
-    Never raises — any failure (network issue, rate limit, timeout) becomes a
-    short human-readable formatted_text (with an empty raw_results list)
-    instead of an exception, so callers can always safely use the return value
-    without extra error handling of their own.
+
+    Never raises. Critically: on ANY failure (timeout, rate limit, network error,
+    genuinely zero results) this returns ("", []) — an EMPTY string, not a
+    human-readable "search failed" message. Every caller checks `if web_search_results:`
+    to decide whether real fetched content exists; a truthy "failed"/"timed out"
+    string used to pass that check and get handed to the model as if it were
+    trustworthy fetched data, which is worse than not searching at all. Returning
+    falsy values here means a failed search is indistinguishable from "no search
+    was needed," which is exactly the honest thing for the model to see — it then
+    answers from its own knowledge with an appropriately light caveat instead of
+    being told to "trust" an error message.
     """
     query = (query or "").strip()
     if not query:
-        return "No search query.", []
+        return "", []
 
-    try:
-        results = await asyncio.wait_for(
-            asyncio.to_thread(_run_web_search_sync, query, max_results),
-            timeout=WEB_SEARCH_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        return f"Web search for '{query}' timed out.", []
-    except Exception as e:
-        print(f"Web search failed for '{query}': {e}")
-        return f"Web search for '{query}' failed and returned no results.", []
+    last_error: Optional[Exception] = None
+    for attempt in range(WEB_SEARCH_RETRIES):
+        try:
+            results = await asyncio.wait_for(
+                asyncio.to_thread(_run_web_search_sync, query, max_results),
+                timeout=WEB_SEARCH_TIMEOUT,
+            )
+            if results:
+                lines = [f"Web search results for '{query}':"]
+                for i, r in enumerate(results, start=1):
+                    title = (r.get("title") or "").strip()
+                    snippet = (r.get("body") or "").strip()
+                    url = (r.get("href") or "").strip()
+                    lines.append(f"{i}. {title}\n   {snippet}\n   Source: {url}")
+                return "\n".join(lines), results
+            # Empty-but-not-erroring result — a real "no results for this query"
+            # rather than a transient failure, so no point retrying.
+            print(f"Web search for '{query}' returned zero results (no retry).")
+            return "", []
+        except asyncio.TimeoutError as e:
+            last_error = e
+            print(f"Web search attempt {attempt + 1}/{WEB_SEARCH_RETRIES} for '{query}' timed out.")
+        except Exception as e:
+            last_error = e
+            print(f"Web search attempt {attempt + 1}/{WEB_SEARCH_RETRIES} for '{query}' failed: {e}")
 
-    if not results:
-        return f"No web search results found for '{query}'.", []
+        if attempt < WEB_SEARCH_RETRIES - 1:
+            await asyncio.sleep(1.0 + random.random())  # jittered backoff before retrying
 
-    lines = [f"Web search results for '{query}':"]
-    for i, r in enumerate(results, start=1):
-        title = (r.get("title") or "").strip()
-        snippet = (r.get("body") or "").strip()
-        url = (r.get("href") or "").strip()
-        lines.append(f"{i}. {title}\n   {snippet}\n   Source: {url}")
-    return "\n".join(lines), results
+    print(f"Web search for '{query}' exhausted all retries. Last error: {last_error}")
+    return "", []
 
 # ==================================================
 # CHAT MODE ONLY: image search + Markdown sources/images block.
 #
 # Code Mode intentionally does NOT use these — code answers stay plain
 # text/code, only the Chat graph's executor_node renders sources/images in
-# the response. Images use ddgs's image search (same free, no-API-key
-# DuckDuckGo-backed engine as web_search above); everything here fails
-# closed to an empty list/string on any error so a flaky image search never
+# the response. Images use ddgs's image search (same free, no-API-key,
+# multi-backend engine as web_search above); everything here fails closed
+# to an empty list/string on any error so a flaky image search never
 # breaks or blanks out an otherwise-good chat answer.
 # ==================================================
 
 WEB_IMAGE_SEARCH_MAX_RESULTS = 4
 
 def _run_web_image_search_sync(query: str, max_results: int) -> list:
-    """Blocking DuckDuckGo (auto-backend) image search. Only ever called via asyncio.to_thread."""
-    with DDGS() as ddgs:
-        return ddgs.images(query, max_results=max_results)
+    """Blocking multi-backend (Bing/DuckDuckGo) image search. Only ever called via asyncio.to_thread."""
+    with DDGS(proxy=WEB_SEARCH_PROXY) as ddgs:
+        return ddgs.images(query, max_results=max_results, backend=WEB_IMAGE_SEARCH_BACKENDS)
 
 async def web_image_search(query: str, max_results: int = WEB_IMAGE_SEARCH_MAX_RESULTS) -> list:
     """Chat-mode-only free image search. Returns a list of {title, image, url}
@@ -441,7 +477,7 @@ For anything beyond a trivial exchange, reason through it internally before prod
 - Decide the most useful next action rather than trying to cover everything shallowly.
 - For technical, analytical, or multi-part questions, sketch the structure of a good answer before writing it out.
 - Re-check the drafted answer against the actual question before finalizing it — not against an easier, assumed version of the question.
-- if the request contains words like new,research,find,fetch,search web,internet then use websearch up to date
+
 None of this internal process should leak into the reply. The user should experience a smooth, natural answer, never a visible planning transcript, a list of "steps I'm taking," or meta-commentary about your own reasoning.
 
 ====================================================
