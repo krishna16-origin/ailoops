@@ -4195,63 +4195,6 @@ async def run_code_graph_streaming(initial_state: dict, timeout: float, token_qu
                 pass
         await agen.aclose()
 
-async def stream_code_thinking(model_key: str, temperature: float, message: str, history: List[BaseMessage]):
-    """Streams a genuine reasoning trace token-by-token before the coding loop starts — the
-    Claude.ai-style 'Thinking' panel. This is a plain free-text call (no Pydantic parser), with
-    thinking turned ON, so the entire token budget goes toward real reasoning instead of
-    competing with a JSON schema the way it would inside execute_code_llm_structured (that's the
-    documented reason thinking is forced OFF for every structured call — see CODE_THINKING_OFF_KWARGS
-    above). Kept on its own model instance so it never eats into the 32K budget reserved for the
-    actual code-generating calls.
-
-    The prompt deliberately asks for real structure (candidate interpretations weighed against
-    each other, then a plain-markdown breakdown of what/how/risks) rather than a single flat
-    paragraph — this is what makes the panel read like an engineer actually working through the
-    problem instead of a decorative loading message. The frontend renders this as plain text on
-    purpose (see appendLiveThought), so the markdown markers below (**bold**, numbered/bulleted
-    lists, `code`) show up as literal characters, exactly like Claude's own raw thinking trace —
-    not as a request to prettify the output, just to make the model's actual reasoning legible."""
-    model_name = CODE_MODEL_MAP.get((model_key or "").strip().lower(), CODE_MODEL_MAP["kimi"])
-    thinking_llm = ChatNVIDIA(
-        model=model_name,
-        temperature=temperature,
-        max_tokens=6144,
-        timeout=75,
-        model_kwargs={"chat_template_kwargs": {"thinking": True, "enable_thinking": True}},
-    )
-    context = "\n".join([f"{m.type.capitalize()}: {m.content}" for m in history[-6:]])
-    prompt = (
-        f"Current Date & Time: {get_current_datetime_str()}\n\n"
-        f"{context}\n\nUser's new request: {message}\n\n"
-        "Think this through out loud, in your own words, the way you'd actually reason through a "
-        "real engineering task before touching an editor — don't write final code yet, and don't "
-        "just restate the request in different words.\n\n"
-        "Structure it for real, using plain markdown as you go (not because it needs to look "
-        "pretty, but because that's how you'd actually lay out your own thinking):\n\n"
-        "1. If the request is ambiguous, underspecified, could plausibly mean more than one "
-        "thing, or contains something that looks like a typo — say so directly and name the "
-        "**specific candidates** you're weighing (a short numbered or bulleted list, one bold "
-        "label per candidate), then reason about which is most likely given the context and commit "
-        "to one. If it's already unambiguous, skip straight past this instead of manufacturing "
-        "false uncertainty.\n"
-        "2. Once you've landed on what's actually being built, break the thinking into real "
-        "sections with bold or heading-style labels — e.g. **What it needs:** (the concrete "
-        "requirements, data shape, interactions), **Technical approach:** (single file vs several, "
-        "the concrete implementation plan, key libraries or patterns), and **Risks / tricky "
-        "parts:** (the specific part most likely to go wrong or need the most care, and why).\n"
-        "3. Be concrete and specific — name real fields, functions, edge cases, and trade-offs "
-        "instead of vague filler like 'handle errors properly' or 'make it look nice'.\n\n"
-        "Write it as continuous reasoning, not a formal report — the structure should feel like "
-        "how your own thoughts are actually organized, not a template you're filling in."
-    )
-    try:
-        async for chunk in thinking_llm.astream(prompt):
-            piece = getattr(chunk, "content", "") or ""
-            if piece:
-                yield piece
-    except Exception as e:
-        print(f"[CodeMode] Thinking stream failed (non-fatal, coding loop still runs): {e}")
-
 def iter_code_chunks(text: str, target_chunks: int = 60, min_chunk: int = 24, max_chunk: int = 800):
     """Splits an already-generated code string into pieces for progressive delivery to the
     code canvas — a Claude/Gemini-Canvas-style 'typewriter' fill instead of the whole file
@@ -4283,19 +4226,11 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
         final_response, code, language, is_frontend = result["text"], result["code"], result["language"], result["is_frontend"]
         final_state = {"completion_score": 100, "iteration": 1}
     else:
-        # Real Claude.ai-style thinking: stream the model's actual reasoning token-by-token
-        # BEFORE the structured plan/execute loop starts, as its own SSE event type. The
-        # frontend renders these `thinking` deltas into a collapsible panel and, on
-        # `thinking_done`, headers it "Thought for {elapsed}s" — same shape as Claude.ai.
-        yield f"data: {json.dumps({'type': 'thinking_start'})}\n\n"
-        thinking_start = asyncio.get_event_loop().time()
-        thinking_text = ""
-        async for piece in stream_code_thinking(request.model, request.temperature, request.message, session["messages"]):
-            thinking_text += piece
-            yield f"data: {json.dumps({'type': 'thinking', 'delta': piece})}\n\n"
-        thinking_elapsed = round(asyncio.get_event_loop().time() - thinking_start, 1)
-        yield f"data: {json.dumps({'type': 'thinking_done', 'elapsed': thinking_elapsed})}\n\n"
-
+        # The "Thinking" panel is driven entirely by the real per-node status/activity
+        # events emitted below as the plan/execute loop actually runs (Understanding,
+        # Planning, writing each file, reviewing, etc.) — there's no separate free-text
+        # reasoning pass before it anymore, so the first thing the user sees is genuine
+        # backend progress instead of a preliminary "thinking out loud" essay.
         initial_state = {
             "messages": session["messages"],
             "model_key": request.model,
@@ -4535,7 +4470,7 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
     }
     yield f"data: {json.dumps({'type': 'turn_summary', **summary, 'session_id': session_id})}\n\n"
 
-    yield f"data: {json.dumps({'type': 'code_result', 'code': code, 'language': language, 'files': files, 'show_preview': bool(is_frontend), 'session_id': session_id})}\n\n"
+    yield f"data: {json.dumps({'type': 'code_result', 'code': code, 'language': language, 'files': files, 'file_languages': final_state.get('file_languages', {}), 'show_preview': bool(is_frontend), 'session_id': session_id})}\n\n"
 
 # ----------------------------------------------------------------------
 # CODE MODE: FastAPI request models
@@ -4706,6 +4641,7 @@ async def _handle_code_chat(request: CodeChatRequest):
         "code": code,
         "language": language,
         "files": files,
+        "file_languages": final_state.get("file_languages", {}),
         "show_preview": bool(is_frontend),   # frontend code -> True (render live preview); backend code -> False
         "model": request.model,
         "reasoning_level": request.reasoning_level,
