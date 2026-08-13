@@ -257,11 +257,14 @@
         .activity-content { display:none; margin:6px 0 10px 4px; padding-left:20px; border-left:1px solid var(--border-color); }
         .activity-content.expanded { display:block; }
         .activity-row { display:flex; align-items:center; gap:8px; padding:5px 0; font-size:13px; color:var(--text-secondary); line-height:1.4; }
-        .activity-row-icon { width:15px; height:15px; flex-shrink:0; color:var(--text-secondary); }
+        .activity-row-icon { width:15px; height:15px; flex-shrink:0; color:var(--text-secondary); display:flex; align-items:center; justify-content:center; }
         .activity-row-icon svg { width:100%; height:100%; }
+        .activity-row-icon .thought-bullet { width:6px; height:6px; border-radius:50%; background-color:#555; }
         .activity-row-label { flex-shrink:0; }
-        .activity-file-badge { font-family:'Courier New', Courier, monospace; font-size:12px; background:rgba(255,255,255,0.08); color:var(--text-primary); padding:1px 7px; border-radius:5px; }
-        .activity-diff-stat { font-size:12px; font-family:'Courier New', Courier, monospace; white-space:nowrap; }
+        .activity-row-edit .activity-row-label { color:var(--text-primary); flex:1 1 auto; min-width:0; white-space:normal; }
+        .activity-row-narration { font-style:italic; opacity:0.85; }
+        .activity-file-badge { font-family:'Courier New', Courier, monospace; font-size:12px; background:rgba(255,255,255,0.08); color:var(--text-primary); padding:1px 7px; border-radius:5px; flex-shrink:0; }
+        .activity-diff-stat { font-size:12px; font-family:'Courier New', Courier, monospace; white-space:nowrap; margin-left:auto; flex-shrink:0; }
         .activity-diff-add { color:#3fb950; }
         .activity-diff-del { color:#f85149; margin-left:4px; }
         .activity-row-status { font-style:italic; opacity:0.85; }
@@ -1187,7 +1190,7 @@
                             <svg class="activity-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
                             <span class="activity-toggle-label">Working</span>
                         </button>
-                        <div class="activity-content"></div>
+                        <div class="activity-content expanded"></div>
                     `;
                     activityDiv.querySelector('.activity-toggle').addEventListener('click', () => {
                         activityDiv.querySelector('.activity-content').classList.toggle('expanded');
@@ -1320,8 +1323,8 @@
             };
 
             // Appends one real, already-happened action (file edit/create, command run,
-            // file read, or note) to the activity trace and refreshes the running
-            // "Editing…" header. Called only from real 'activity' SSE events, never
+            // file read, note, or live narration) to the activity trace and refreshes
+            // the running header. Called only from real 'activity' SSE events, never
             // synthesized client-side.
             function addActivity(activity) {
                 if (!activityBlock) return;
@@ -1334,19 +1337,33 @@
                 else if (activity.kind === 'note') activityCounts.notes++;
 
                 const row = document.createElement('div');
-                row.className = 'activity-row';
-                const icon = ACTIVITY_ICONS[activity.kind] || ACTIVITY_ICONS.note;
-                let rowHtml = `<span class="activity-row-icon">${icon}</span>`;
+                let rowHtml;
 
-                if ((activity.kind === 'edit' || activity.kind === 'create') && activity.filename) {
-                    const verb = activity.kind === 'edit' ? 'Edited' : 'Created';
+                if (activity.kind === 'narration') {
+                    // The model's own "now let me do X" narration, right before the command
+                    // that follows it — a plain muted dot + line, same visual language as
+                    // the thinking panel's default bullet, never a boxed icon.
+                    row.className = 'activity-row activity-row-narration';
+                    rowHtml = `<span class="activity-row-icon"><span class="thought-bullet" style="position:static;"></span></span>` +
+                        `<span class="activity-row-label activity-row-status">${escapeHtml(activity.label || '')}</span>`;
+                } else if ((activity.kind === 'edit' || activity.kind === 'create') && activity.filename) {
+                    // Description-first, like a real diff's subject line — the label IS
+                    // what this step actually did (e.g. "Add a default backend URL
+                    // constant…"), with the file it touched and its real +/- line counts
+                    // trailing after it.
+                    row.className = 'activity-row activity-row-edit';
+                    const icon = ACTIVITY_ICONS[activity.kind];
                     const add = Math.max(0, activity.additions || 0);
                     const del = Math.max(0, activity.deletions || 0);
-                    rowHtml += `<span class="activity-row-label">${verb}</span>` +
+                    rowHtml = `<span class="activity-row-icon">${icon}</span>` +
+                        `<span class="activity-row-label">${escapeHtml(activity.label || '')}</span>` +
                         `<span class="activity-file-badge">${escapeHtml(activity.filename)}</span>` +
                         `<span class="activity-diff-stat"><span class="activity-diff-add">+${add}</span><span class="activity-diff-del">-${del}</span></span>`;
                 } else {
-                    rowHtml += `<span class="activity-row-label activity-row-status">${escapeHtml(activity.label || '')}</span>`;
+                    row.className = 'activity-row';
+                    const icon = ACTIVITY_ICONS[activity.kind] || ACTIVITY_ICONS.note;
+                    rowHtml = `<span class="activity-row-icon">${icon}</span>` +
+                        `<span class="activity-row-label activity-row-status">${escapeHtml(activity.label || '')}</span>`;
                 }
                 row.innerHTML = rowHtml;
                 activityContent.appendChild(row);
