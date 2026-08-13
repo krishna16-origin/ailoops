@@ -1,0 +1,529 @@
+diff --git a/app.py b/app.py
+index b01744b..73bf9f7 100644
+--- a/app.py
++++ b/app.py
+@@ -4,6 +4,7 @@
+ import os
+ import json
+ import re
++import difflib
+ import random
+ import asyncio
+ import contextvars
+@@ -2544,6 +2545,7 @@ class CodeAgentState(TypedDict):
+     last_error: Optional[str]
+     web_search_query: str
+     web_search_results: str
++    turn_activities: List[Dict[str, Any]]
+ 
+ # ----------------------------------------------------------------------
+ # CODE MODE: Session Memory (kept separate from the normal chat sessions)
+@@ -2635,7 +2637,7 @@ def is_simple_code_message(message: str) -> bool:
+ # CODE MODE: System Prompt — intentionally left empty, to be filled in separately
+ # ----------------------------------------------------------------------
+ 
+-CODE_SYSTEM_PROMPT = """You are an elite software engineering AI — a dedicated build/plan/execute coding agent held to the same bar as the best coding assistants available today (Claude-level engineering judgment, not a generic code-completion model). Your only job is solving real software engineering tasks end-to-end: understanding what's actually being built, researching what you don't already know for certain, planning the architecture, and then writing code that a senior engineer would approve without a second pass.
++CODE_SYSTEM_PROMPT = """You are a thoughtful, senior software engineer working directly in someone's codebase — the same way Claude approaches a coding task: read first, think honestly about what's actually being asked, then make the smallest correct change that solves it well. You are not chasing a checklist or a completion score; you're solving a real problem the way an engineer you'd trust to touch production code would.
+ 
+ Your domain covers:
+ - Programming, software architecture, algorithms and data structures
+@@ -2645,13 +2647,18 @@ Your domain covers:
+ - Testing, performance optimization, security
+ - Documentation, system design
+ 
+-Never switch into a general, non-technical assistant role. If a request is genuinely unrelated to software engineering, politely refuse and explain that you are a dedicated coding agent.
++Stay in this role. If a request is genuinely unrelated to software engineering, say so plainly and explain that you're set up as a dedicated coding agent here, rather than improvising a generic answer outside that scope.
+ 
+ --------------------------------------------------
+-PRIMARY OBJECTIVE
++HOW TO APPROACH A TASK
+ --------------------------------------------------
+ 
+-Produce correct, maintainable, production-quality software — not a toy sketch that merely resembles an answer. Optimize for correctness, robustness, readability, maintainability, scalability, security, and performance, in that rough order of priority. Quality always beats speed; never trade a correct answer for a shorter one.
++Don't just pattern-match to "write some code that looks like an answer." Work through it the way you actually would:
++
++- Read before you touch anything. Look at what already exists — the request, the prior code, the conversation so far — and form a real, honest understanding of the problem before deciding what to do about it. If something is already correct, say so instead of manufacturing a change to look busy.
++- Think in terms of the actual codebase, not an isolated snippet. Prefer the smallest, most targeted change that genuinely solves the problem over a wholesale rewrite — the same instinct that makes a real diff easy to review. Touch multiple files when the task genuinely spans them; don't force everything into one file just because that's easier to output, and don't touch a file the task didn't ask about.
++- Hold an honest opinion. If a request is ambiguous, underspecified, or would lead somewhere fragile, say so directly and explain the trade-off — don't silently comply with something you can see is a bad idea, and don't pad the answer with hedging you don't mean.
++- There's no artificial score to hit and no reward for declaring victory early. "Good enough to ship" is a real engineering judgment you make by actually checking the work, not a percentage to report.
+ 
+ --------------------------------------------------
+ RESEARCH BEFORE YOU BUILD
+@@ -2718,43 +2725,38 @@ OUTPUT REQUIREMENTS
+ Generated code should compile/run whenever possible, follow language and ecosystem conventions, include all necessary imports and dependencies, and be complete — never omit sections and call it "left as an exercise" unless the user explicitly asked for a partial sketch.
+ 
+ --------------------------------------------------
+-FINAL VALIDATION (DO THIS BEFORE YOU RESPOND)
++BEFORE YOU CALL IT DONE
+ --------------------------------------------------
+ 
+-Before finishing, verify against the actual requirement — not a simplified version of it you found easier to satisfy:
+-✓ Requirements satisfied  ✓ Logic is correct  ✓ Edge cases considered
+-✓ Security reviewed  ✓ Performance acceptable  ✓ Code is maintainable
+-✓ No unnecessary complexity  ✓ Nothing was silently invented or assumed without saying so
+-
+-Only then produce the final answer.
++Before finishing, actually check the work against the real requirement — not a simplified version of it that was easier to satisfy. Think it through honestly: does the logic hold up, including the edge cases nobody mentioned out loud? Would this survive a real code review — security, performance, maintainability? Is there anything you assumed or invented that you haven't said out loud yet? If something's off, fix it now rather than shipping it and hoping it's fine.
+ 
+ --------------------------------------------------
+-OUTPUT FORMAT CONSTRAINT (CRITICAL — READ THIS)
++WORKING ACROSS FILES (READ THIS)
+ --------------------------------------------------
+ 
+-You can only return ONE code block per turn (one 'code' + one 'language' field).
+-There is no mechanism to deliver separate files in the same turn.
+-
+-Because of this:
+-- For any frontend/web task (HTML, CSS, JS, React, Vue, Svelte, a "website",
+-  "app", "page", "component", "UI"), you MUST produce a single self-contained
+-  .html file with ALL CSS inside a <style> tag and ALL JS inside a <script>
+-  tag, in the <head>/<body> of that same file. The 'language' field for
+-  every such task MUST be "html" — never "css", "javascript", "jsx", "tsx",
+-  "vue", or "svelte" on their own. Those languages cannot run standalone in
+-  a browser preview with no build step; only a plain .html file can.
+-  NEVER write <link rel="stylesheet" href="styles.css"> or
+-  <script src="app.js"> — those files will never exist, and the page will
+-  silently render unstyled and non-functional.
+-- If the user explicitly asks for React/Vue/Svelte source code itself (not a
+-  preview of it running), that's fine to return as its own language — but
+-  if the goal is to SHOW or PREVIEW a working UI, always compile it down to
+-  vanilla HTML/CSS/JS (or load the framework from a CDN <script> tag inside
+-  the same HTML file) rather than returning bare framework source.
+-- If a task genuinely requires multiple real files (e.g. a Python package),
+-  pick the single most important file for this step and say in your
+-  explanation which other files still need separate follow-up turns —
+-  do not silently drop files with no mention.
++Each turn generates one file's worth of code at a time, but a task is free to span
++as many files as it genuinely needs across the turns it takes to build — the same
++way a real PR touches exactly the files the change requires, no more and no less.
++
++- For a task that only needs one file, write one file. Don't invent extra files
++  just to look thorough.
++- For a genuinely multi-file build (e.g. separate pages, a backend plus a
++  frontend, a small package with more than one module), say so plainly and work
++  through the files one at a time, each getting a real, complete implementation
++  — not a stub "to be continued" left for later with no substance.
++- For any frontend/web task meant to be PREVIEWED running in a browser (a
++  "website", "app", "page", "component", "UI"), a single self-contained .html
++  file with CSS in a <style> tag and JS in a <script> tag is usually the right
++  shape, since that's what actually renders with no build step — use
++  'language': "html" for that, not "css"/"javascript"/"jsx" on their own, and
++  never write <link href="styles.css"> or <script src="app.js"> pointing at a
++  file that doesn't exist as its own artifact.
++- If the user explicitly asks for the React/Vue/Svelte source itself (not a
++  running preview), return it as its own file and language — that's a real,
++  separate deliverable, not something to silently compile away.
++- When editing a file that already exists, make the targeted change rather than
++  regenerating the whole thing from scratch, exactly like a real diff would —
++  preserve everything that wasn't part of the ask.
+ 
+ --------------------------------------------------
+ UI / VISUAL DESIGN STANDARDS (CRITICAL — APPLIES ANY TIME YOU BUILD, DESIGN,
+@@ -3236,6 +3238,11 @@ async def idea_node(state: CodeAgentState) -> dict:
+     if web_search_query:
+         notes += f"\n\nSearched the web for: '{web_search_query}'"
+ 
++    activities = list(state.get("turn_activities", []))
++    has_prior_code = bool((state.get("code") or "").strip()) or bool(state.get("files"))
++    if has_prior_code and res.relevant_context:
++        activities = add_activity(state, "read", "Read the existing code")
++
+     return {
+         "goal": res.understanding,
+         "analysis_notes": notes,
+@@ -3244,6 +3251,7 @@ async def idea_node(state: CodeAgentState) -> dict:
+         "last_error": err,
+         "web_search_query": web_search_query,
+         "web_search_results": web_search_results,
++        "turn_activities": activities,
+     }
+ 
+ async def plan_node(state: CodeAgentState) -> dict:
+@@ -3354,6 +3362,61 @@ def apply_code_edits(original: str, edit_text: str) -> tuple[str, bool]:
+         code = code.replace(search, replace, 1)
+     return code, True
+ 
++# ----------------------------------------------------------------------
++# CODE MODE: Claude-Code-style activity tracking
++#
++# Every turn accumulates a flat `turn_activities` list on state (same
++# read-copy-append-return pattern as `files`/`file_languages` above, since
++# this graph's nodes don't use LangGraph reducers). Each entry is one line
++# of "what actually happened" — a file edited/created (with real +added/
++# -removed line counts, the way a git diff reports them), a note worth
++# surfacing, or the file read at the start — and the SSE layer replays new
++# entries live as `activity` events, then folds the whole list into one
++# `turn_summary` event ("Edited 2 files, ran 2 commands, read a file · 1
++# note") once the turn settles.
++# ----------------------------------------------------------------------
++
++LANGUAGE_EXTENSIONS = {
++    "python": "py", "javascript": "js", "typescript": "ts", "jsx": "jsx",
++    "tsx": "tsx", "html": "html", "css": "css", "json": "json", "java": "java",
++    "c": "c", "cpp": "cpp", "c++": "cpp", "csharp": "cs", "c#": "cs", "go": "go",
++    "rust": "rs", "ruby": "rb", "php": "php", "swift": "swift", "kotlin": "kt",
++    "sql": "sql", "bash": "sh", "shell": "sh", "yaml": "yml", "markdown": "md",
++    "vue": "vue", "svelte": "svelte",
++}
++
++def filename_for_language(language: str) -> str:
++    """Best-guess display filename for single-file mode, which doesn't track a
++    real path — mirrors what the file would actually be called."""
++    ext = LANGUAGE_EXTENSIONS.get((language or "").strip().lower(), "txt")
++    return f"main.{ext}"
++
++def diff_line_counts(old: str, new: str) -> tuple[int, int]:
++    """Line-level (additions, deletions) between old and new text — the same
++    numbers `git diff --stat` would report for the change, computed with
++    difflib instead of shelling out to git."""
++    old_lines = old.splitlines()
++    new_lines = new.splitlines()
++    additions = deletions = 0
++    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=old_lines, b=new_lines, autojunk=False).get_opcodes():
++        if tag == "replace":
++            deletions += (i2 - i1)
++            additions += (j2 - j1)
++        elif tag == "delete":
++            deletions += (i2 - i1)
++        elif tag == "insert":
++            additions += (j2 - j1)
++    return additions, deletions
++
++def add_activity(state: dict, kind: str, label: str, **extra) -> List[Dict[str, Any]]:
++    """Read-copy-append-return helper: pulls the turn's activity list off
++    `state`, appends one new entry, and returns the full list so the calling
++    node can hand it straight back as part of its update dict."""
++    activities = list(state.get("turn_activities", []))
++    entry = {"kind": kind, "label": label, **extra}
++    activities.append(entry)
++    return activities
++
+ def build_edit_prompt(prior_code: str, language: str, goal: str, current_step: str) -> str:
+     return (
+         f"Current Date & Time: {get_current_datetime_str()} — trust this as the real, current "
+@@ -3623,6 +3686,21 @@ async def _write_or_edit_code(state: CodeAgentState, is_fix: bool) -> dict:
+         # line that shows up after a failed generation.
+         response_text = f"{explanation}\n\n```{language}\n{code}\n```".strip() if code else explanation
+ 
++    # Real +added/-removed line counts for this step, the same numbers a git diff
++    # would report — drives the "filename +N -M" pill in the Claude-Code-style
++    # activity trace. Skipped when nothing actually changed (carry-forward /
++    # error paths above), so a failed step doesn't get logged as a phantom edit.
++    activities = list(state.get("turn_activities", []))
++    if code and code != prior_code_for_step:
++        display_name = target_file if (is_multi and target_file) else filename_for_language(language)
++        additions, deletions = diff_line_counts(prior_code_for_step, code)
++        action = "edit" if prior_code_for_step.strip() else "create"
++        verb = "Edited" if action == "edit" else "Created"
++        activities = add_activity(
++            state, action, f"{verb} {display_name}",
++            filename=display_name, additions=additions, deletions=deletions,
++        )
++
+     return {
+         "code": code,
+         "language": language,
+@@ -3631,7 +3709,8 @@ async def _write_or_edit_code(state: CodeAgentState, is_fix: bool) -> dict:
+         "response": response_text,
+         "files": files,
+         "file_languages": file_languages,
+-        "last_error": err
++        "last_error": err,
++        "turn_activities": activities,
+     }
+ 
+ async def code_node(state: CodeAgentState) -> dict:
+@@ -3671,6 +3750,7 @@ async def test_node(state: CodeAgentState) -> dict:
+ 
+     lang = (language or "").strip().lower()
+     syntax_error = None
++    ran_real_check = lang in ("python", "json")
+     if lang == "python":
+         try:
+             compile(code, target_file or "<generated>", "exec")
+@@ -3686,8 +3766,15 @@ async def test_node(state: CodeAgentState) -> dict:
+         except Exception:
+             pass
+ 
++    # "command" activity: a real syntax check actually ran (compile()/json.loads()),
++    # the closest thing this agent has to executing something in a terminal — the
++    # reasoning-only pass for other languages isn't logged as a "command" since
++    # nothing was actually run.
++    check_label = f"Ran a syntax check on {target_file}" if (target_file and ran_real_check) else "Ran a syntax check"
++    activities = add_activity(state, "command", check_label) if ran_real_check else list(state.get("turn_activities", []))
++
+     if syntax_error:
+-        return {"test_notes": syntax_error, "test_passed": False, "needs_fix": True}
++        return {"test_notes": syntax_error, "test_passed": False, "needs_fix": True, "turn_activities": activities}
+ 
+     llm = get_code_llm(state["model_key"], state["temperature"])
+     prompt = (
+@@ -3707,6 +3794,7 @@ async def test_node(state: CodeAgentState) -> dict:
+             "test_passed": True,
+             "needs_fix": False,
+             "last_error": err,
++            "turn_activities": activities,
+         }
+ 
+     return {
+@@ -3714,6 +3802,7 @@ async def test_node(state: CodeAgentState) -> dict:
+         "test_passed": bool(res.passed),
+         "needs_fix": (not res.passed) and bool(res.issues.strip()),
+         "last_error": err,
++        "turn_activities": activities,
+     }
+ 
+ async def review_node(state: CodeAgentState) -> dict:
+@@ -3752,11 +3841,20 @@ async def review_node(state: CodeAgentState) -> dict:
+     review_needs_fix = (not res.looks_correct) and bool(res.issues.strip())
+     needs_fix = review_needs_fix or test_failed
+ 
++    # Only surface a "note" activity when the review actually said something worth a
++    # human reading — a plain "Looks correct." with no extra remark isn't a note,
++    # it's just the loop passing quietly.
++    activities = list(state.get("turn_activities", []))
++    notable = res.notes.strip() if res.looks_correct else review_str
++    if notable and notable not in ("Looks correct.",):
++        activities = add_activity(state, "note", notable)
++
+     return {
+         "review_notes": review_str,
+         "needs_fix": needs_fix,
+         "completion_score": 100 if (res.looks_correct and not test_failed) else 70,
+         "last_error": err,
++        "turn_activities": activities,
+     }
+ 
+ async def commit_node(state: CodeAgentState) -> dict:
+@@ -3793,10 +3891,15 @@ async def commit_node(state: CodeAgentState) -> dict:
+     if not is_multi and code:
+         response = f"{explanation}\n\nCommit: {commit_message}\n\n```{language}\n{code}\n```".strip()
+ 
++    file_count = len(state.get("files", {})) if is_multi else (1 if code else 0)
++    presented_label = f"Presented {file_count} files" if file_count > 1 else "Presented file"
++    activities = add_activity(state, "done", presented_label) if file_count else list(state.get("turn_activities", []))
++
+     return {
+         "commit_message": commit_message,
+         "response": response,
+         "completion_score": 100,
++        "turn_activities": activities,
+     }
+ 
+ def post_review_edge(state: CodeAgentState) -> str:
+@@ -4053,8 +4156,12 @@ async def run_code_graph_streaming(initial_state: dict, timeout: float, token_qu
+                 except StopAsyncIteration:
+                     break
+                 node_name, node_output = next(iter(chunk.items()))
++                prev_activity_count = len(state_acc.get("turn_activities", []))
+                 state_acc.update(node_output)
++                new_activities = state_acc.get("turn_activities", [])[prev_activity_count:]
+                 yield ("status", node_name, state_acc)
++                for activity in new_activities:
++                    yield ("activity", activity)
+                 graph_next = asyncio.ensure_future(agen.__anext__())
+     except StopAsyncIteration:
+         return
+@@ -4207,6 +4314,15 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
+                         yield f"data: {json.dumps({'type': 'code_delta', 'delta': delta, 'session_id': session_id})}\n\n"
+                     continue
+ 
++                if kind == "activity":
++                    # A real, concrete thing that just happened — a file edited/created
++                    # (with its +added/-removed counts), a syntax check that ran, a note
++                    # worth surfacing, or the file that got read. The frontend appends
++                    # these live into the Claude-Code-style activity trace.
++                    activity = evt[1]
++                    yield f"data: {json.dumps({'type': 'activity', **activity})}\n\n"
++                    continue
++
+                 # kind == "status"
+                 _, node_name, state_so_far = evt
+                 label = CODE_NODE_LABELS.get(node_name, node_name)
+@@ -4359,6 +4475,21 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
+     # a live preview (Gemini-Canvas style) only when the code is frontend code. `files`
+     # is populated (and `code`/`language` left blank) for multi-file builds so the
+     # frontend can render a per-file tree/tab view instead of a single blob.
++    # Consolidated recap of this turn's activity trace — the frontend folds this into
++    # the collapsed "Edited N files, ran M commands, read a file · K notes" header
++    # (mirroring Claude Code's own summary line) while still keeping the live,
++    # step-by-step `activity` events above for the expanded view.
++    turn_activities = final_state.get("turn_activities", [])
++    edited_files = sorted({a["filename"] for a in turn_activities if a.get("kind") in ("edit", "create") and a.get("filename")})
++    summary = {
++        "files_touched": len(edited_files),
++        "commands_run": sum(1 for a in turn_activities if a.get("kind") == "command"),
++        "files_read": sum(1 for a in turn_activities if a.get("kind") == "read"),
++        "notes": sum(1 for a in turn_activities if a.get("kind") == "note"),
++        "activities": turn_activities,
++    }
++    yield f"data: {json.dumps({'type': 'turn_summary', **summary, 'session_id': session_id})}\n\n"
++
+     yield f"data: {json.dumps({'type': 'code_result', 'code': code, 'language': language, 'files': files, 'show_preview': bool(is_frontend), 'session_id': session_id})}\n\n"
+ 
+ # ----------------------------------------------------------------------
+diff --git a/frontend/index.html b/frontend/index.html
+index a37e80f..192e42d 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -240,6 +240,32 @@
+         .spinner { width:14px; height:14px; border:2px solid var(--text-secondary); border-top:2px solid transparent; border-radius:50%; animation:spin 1s linear infinite; }
+         @keyframes spin { 0%{transform:rotate(0deg);} 100%{transform:rotate(360deg);} }
+ 
++        /* ============== CODE MODE: Claude-Code-style activity trace ==============
++           "Edited 2 files, ran 2 commands, read a file · 1 note" summary bar with an
++           expandable list of what actually happened this turn — each file edit shown
++           as its own row with a filename badge and real +added/-removed line counts. */
++        .activity-block { margin-top:2px; margin-bottom:4px; }
++        .activity-toggle { display:flex; align-items:center; gap:6px; background:none; border:none; padding:4px 0; font-size:13px; font-family:inherit; color:var(--text-secondary); cursor:pointer; text-align:left; }
++        .activity-toggle:hover { color:var(--text-primary); }
++        .activity-toggle .activity-chevron { width:12px; height:12px; flex-shrink:0; transition:transform 0.15s ease; color:var(--text-secondary); }
++        .activity-content.expanded .activity-chevron { transform:rotate(90deg); }
++        .activity-toggle.shimmer {
++            background-image: linear-gradient(90deg, var(--text-secondary) 0%, var(--text-secondary) 35%, var(--text-primary) 50%, var(--text-secondary) 65%, var(--text-secondary) 100%);
++            background-size: 200% 100%; background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent;
++            animation: thinkingShimmer 1.6s linear infinite;
++        }
++        .activity-content { display:none; margin:6px 0 10px 4px; padding-left:20px; border-left:1px solid var(--border-color); }
++        .activity-content.expanded { display:block; }
++        .activity-row { display:flex; align-items:center; gap:8px; padding:5px 0; font-size:13px; color:var(--text-secondary); line-height:1.4; }
++        .activity-row-icon { width:15px; height:15px; flex-shrink:0; color:var(--text-secondary); }
++        .activity-row-icon svg { width:100%; height:100%; }
++        .activity-row-label { flex-shrink:0; }
++        .activity-file-badge { font-family:'Courier New', Courier, monospace; font-size:12px; background:rgba(255,255,255,0.08); color:var(--text-primary); padding:1px 7px; border-radius:5px; }
++        .activity-diff-stat { font-size:12px; font-family:'Courier New', Courier, monospace; white-space:nowrap; }
++        .activity-diff-add { color:#3fb950; }
++        .activity-diff-del { color:#f85149; margin-left:4px; }
++        .activity-row-status { font-style:italic; opacity:0.85; }
++
+         /* ============== INPUT ============== */
+         .input-container { position:absolute; bottom:0; left:0; width:100%; padding:22px; background:linear-gradient(180deg, rgba(33,33,33,0) 0%, var(--bg-main) 40%); display:flex; justify-content:center; }
+         .input-box { width:100%; max-width:760px; background-color:var(--bg-input); border-radius:22px; border:1px solid var(--border-color); display:flex; align-items:flex-end; padding:11px 15px; box-shadow:0 4px 20px rgba(0,0,0,0.15); transition:border-color 0.25s ease, box-shadow 0.25s ease; }
+@@ -1100,6 +1126,12 @@
+             historyList.prepend(item);
+         }
+ 
++        function escapeHtml(str) {
++            const div = document.createElement('div');
++            div.textContent = str == null ? '' : String(str);
++            return div.innerHTML;
++        }
++
+         function appendMessage(role, text) {
+             modes[currentMode].hasMessages = true;
+             openingScene.style.display = 'none';
+@@ -1142,6 +1174,27 @@
+                 });
+ 
+                 body.appendChild(statusDiv);
++
++                // Code Mode only: the Claude-Code-style activity trace — starts empty and
++                // hidden, and is only ever populated from real 'activity'/'turn_summary'
++                // SSE events (see sendMessage below), never faked client-side.
++                if (currentMode === 'code') {
++                    const activityDiv = document.createElement('div');
++                    activityDiv.className = 'activity-block';
++                    activityDiv.style.display = 'none';
++                    activityDiv.innerHTML = `
++                        <button type="button" class="activity-toggle">
++                            <svg class="activity-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
++                            <span class="activity-toggle-label">Working</span>
++                        </button>
++                        <div class="activity-content"></div>
++                    `;
++                    activityDiv.querySelector('.activity-toggle').addEventListener('click', () => {
++                        activityDiv.querySelector('.activity-content').classList.toggle('expanded');
++                    });
++                    body.appendChild(activityDiv);
++                }
++
+                 body.appendChild(contentDiv);
+                 bubble.appendChild(avatar);
+                 bubble.appendChild(body);
+@@ -1249,6 +1302,75 @@
+             const thinkingContent = thinkingBlock.querySelector('.thinking-content');
+             const thinkingStartTime = Date.now();
+ 
++            // Code Mode only: the Claude-Code-style "Edited N files, ran M commands,
++            // read a file · K notes" activity trace (null in Chat mode).
++            const activityBlock = assistantBubble.querySelector('.activity-block');
++            const activityToggle = activityBlock ? activityBlock.querySelector('.activity-toggle') : null;
++            const activityLabel = activityBlock ? activityBlock.querySelector('.activity-toggle-label') : null;
++            const activityContent = activityBlock ? activityBlock.querySelector('.activity-content') : null;
++            const activityCounts = { files: 0, commands: 0, reads: 0, notes: 0 };
++
++            const ACTIVITY_ICONS = {
++                edit: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>`,
++                create: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="12" y1="18" x2="12" y2="12"></line><line x1="9" y1="15" x2="15" y2="15"></line></svg>`,
++                command: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>`,
++                read: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"></path><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"></path></svg>`,
++                note: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>`,
++                done: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>`,
++            };
++
++            // Appends one real, already-happened action (file edit/create, command run,
++            // file read, or note) to the activity trace and refreshes the running
++            // "Editing…" header. Called only from real 'activity' SSE events, never
++            // synthesized client-side.
++            function addActivity(activity) {
++                if (!activityBlock) return;
++                activityBlock.style.display = 'block';
++                activityToggle.classList.add('shimmer');
++
++                if (activity.kind === 'edit' || activity.kind === 'create') activityCounts.files++;
++                else if (activity.kind === 'command') activityCounts.commands++;
++                else if (activity.kind === 'read') activityCounts.reads++;
++                else if (activity.kind === 'note') activityCounts.notes++;
++
++                const row = document.createElement('div');
++                row.className = 'activity-row';
++                const icon = ACTIVITY_ICONS[activity.kind] || ACTIVITY_ICONS.note;
++                let rowHtml = `<span class="activity-row-icon">${icon}</span>`;
++
++                if ((activity.kind === 'edit' || activity.kind === 'create') && activity.filename) {
++                    const verb = activity.kind === 'edit' ? 'Edited' : 'Created';
++                    const add = Math.max(0, activity.additions || 0);
++                    const del = Math.max(0, activity.deletions || 0);
++                    rowHtml += `<span class="activity-row-label">${verb}</span>` +
++                        `<span class="activity-file-badge">${escapeHtml(activity.filename)}</span>` +
++                        `<span class="activity-diff-stat"><span class="activity-diff-add">+${add}</span><span class="activity-diff-del">-${del}</span></span>`;
++                } else {
++                    rowHtml += `<span class="activity-row-label activity-row-status">${escapeHtml(activity.label || '')}</span>`;
++                }
++                row.innerHTML = rowHtml;
++                activityContent.appendChild(row);
++
++                activityLabel.textContent = activity.kind === 'done' ? (activity.label || 'Presented file') : 'Working';
++                scrollToBottom();
++            }
++
++            // Called once 'turn_summary' arrives (right before code_result) — replaces the
++            // live "Working" header with the settled Claude-Code-style recap line, e.g.
++            // "Edited 2 files, ran 2 commands, read a file · 1 note".
++            function finalizeActivitySummary(summary) {
++                if (!activityBlock || !activityLabel) return;
++                activityToggle.classList.remove('shimmer');
++                const parts = [];
++                if (summary.files_touched > 0) parts.push(`Edited ${summary.files_touched} file${summary.files_touched === 1 ? '' : 's'}`);
++                if (summary.commands_run > 0) parts.push(`ran ${summary.commands_run} command${summary.commands_run === 1 ? '' : 's'}`);
++                if (summary.files_read > 0) parts.push(summary.files_read === 1 ? 'read a file' : `read ${summary.files_read} files`);
++                let text = parts.join(', ');
++                if (summary.notes > 0) text += `${text ? ' · ' : ''}${summary.notes} note${summary.notes === 1 ? '' : 's'}`;
++                if (text) activityLabel.textContent = text;
++                else if (!activityContent.childElementCount) activityBlock.style.display = 'none';
++            }
++
+             // Show "Thinking" the instant the request goes out — like Claude.ai — rather
+             // than waiting for a real backend status event, which may never arrive for
+             // quick replies that skip the planning loop entirely (e.g. "hi").
+@@ -1458,6 +1580,10 @@
+                                     // follow right after this — nothing else to do here.
+                                 } else if (parsed.type === 'status') {
+                                     addThought(parsed.label, parsed.detail, parsed.step);
++                                } else if (parsed.type === 'activity') {
++                                    addActivity(parsed);
++                                } else if (parsed.type === 'turn_summary') {
++                                    finalizeActivitySummary(parsed);
+                                 } else if (parsed.type === 'code_start') {
+                                     startCodeCanvasStream(parsed.language, '');
+                                     inlineCodeState = startInlineCodeStream(textContainer, parsed.language, '');
