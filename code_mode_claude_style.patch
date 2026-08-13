@@ -1,5 +1,5 @@
 diff --git a/app.py b/app.py
-index b01744b..73bf9f7 100644
+index b01744b..cc8bee5 100644
 --- a/app.py
 +++ b/app.py
 @@ -4,6 +4,7 @@
@@ -201,29 +201,37 @@ index b01744b..73bf9f7 100644
  def build_edit_prompt(prior_code: str, language: str, goal: str, current_step: str) -> str:
      return (
          f"Current Date & Time: {get_current_datetime_str()} — trust this as the real, current "
-@@ -3623,6 +3686,21 @@ async def _write_or_edit_code(state: CodeAgentState, is_fix: bool) -> dict:
+@@ -3623,6 +3686,29 @@ async def _write_or_edit_code(state: CodeAgentState, is_fix: bool) -> dict:
          # line that shows up after a failed generation.
          response_text = f"{explanation}\n\n```{language}\n{code}\n```".strip() if code else explanation
  
-+    # Real +added/-removed line counts for this step, the same numbers a git diff
-+    # would report — drives the "filename +N -M" pill in the Claude-Code-style
-+    # activity trace. Skipped when nothing actually changed (carry-forward /
-+    # error paths above), so a failed step doesn't get logged as a phantom edit.
++    # A commit-message-style description of what this step actually did, not a
++    # generic "Edited X" — mirrors the plan's own concrete next_step for a normal
++    # step (see CodePlan.next_step), or the specific issue being addressed for a
++    # fix, the way a real diff's subject line describes intent rather than just
++    # naming the file it touched.
 +    activities = list(state.get("turn_activities", []))
 +    if code and code != prior_code_for_step:
 +        display_name = target_file if (is_multi and target_file) else filename_for_language(language)
 +        additions, deletions = diff_line_counts(prior_code_for_step, code)
 +        action = "edit" if prior_code_for_step.strip() else "create"
-+        verb = "Edited" if action == "edit" else "Created"
++        if is_fix:
++            short_issue = issue_text.strip().replace("\n", " ")
++            step_label = f"Fix: {short_issue[:120]}" if short_issue else "Fix the issue found in review"
++        else:
++            step_label = (
++                state.get("current_step", "").strip() or explanation.strip()
++                or f"{'Edit' if action == 'edit' else 'Create'} {display_name}"
++            )
 +        activities = add_activity(
-+            state, action, f"{verb} {display_name}",
++            state, action, step_label,
 +            filename=display_name, additions=additions, deletions=deletions,
 +        )
 +
      return {
          "code": code,
          "language": language,
-@@ -3631,7 +3709,8 @@ async def _write_or_edit_code(state: CodeAgentState, is_fix: bool) -> dict:
+@@ -3631,7 +3717,8 @@ async def _write_or_edit_code(state: CodeAgentState, is_fix: bool) -> dict:
          "response": response_text,
          "files": files,
          "file_languages": file_languages,
@@ -233,24 +241,36 @@ index b01744b..73bf9f7 100644
      }
  
  async def code_node(state: CodeAgentState) -> dict:
-@@ -3671,6 +3750,7 @@ async def test_node(state: CodeAgentState) -> dict:
+@@ -3669,8 +3756,19 @@ async def test_node(state: CodeAgentState) -> dict:
+     if not (code or "").strip():
+         return {"test_notes": "No code to test yet.", "test_passed": True, "needs_fix": False}
  
++    # Live narration, pushed the instant verification starts (not after it finishes) —
++    # same token_queue channel code_node/fix_node already use for "about to write a
++    # file" — so the frontend can show "Now let me verify the changes..." as its own
++    # line before the "command" activity below resolves, the same beat as a real
++    # engineer narrating what they're about to do next.
++    token_queue = _current_code_token_queue.get()
++    if token_queue is not None:
++        narration = f"Now let me verify the changes to {target_file}." if (is_multi and target_file) else "Now let me verify the changes."
++        await token_queue.put(("verify_start", narration))
++
      lang = (language or "").strip().lower()
      syntax_error = None
 +    ran_real_check = lang in ("python", "json")
      if lang == "python":
          try:
              compile(code, target_file or "<generated>", "exec")
-@@ -3686,8 +3766,15 @@ async def test_node(state: CodeAgentState) -> dict:
+@@ -3686,8 +3784,15 @@ async def test_node(state: CodeAgentState) -> dict:
          except Exception:
              pass
  
-+    # "command" activity: a real syntax check actually ran (compile()/json.loads()),
-+    # the closest thing this agent has to executing something in a terminal — the
-+    # reasoning-only pass for other languages isn't logged as a "command" since
-+    # nothing was actually run.
-+    check_label = f"Ran a syntax check on {target_file}" if (target_file and ran_real_check) else "Ran a syntax check"
-+    activities = add_activity(state, "command", check_label) if ran_real_check else list(state.get("turn_activities", []))
++    # "command" activity: a real check actually ran against the code — either a
++    # concrete syntax check (compile()/json.loads()) or, for languages without a
++    # cheap static check, the honest reasoning-based test pass below. Either way
++    # this is genuine verification work that happened, not decoration.
++    check_label = f"Verify {target_file}" if (is_multi and target_file) else "Verify the edits"
++    activities = add_activity(state, "command", check_label)
 +
      if syntax_error:
 -        return {"test_notes": syntax_error, "test_passed": False, "needs_fix": True}
@@ -258,7 +278,7 @@ index b01744b..73bf9f7 100644
  
      llm = get_code_llm(state["model_key"], state["temperature"])
      prompt = (
-@@ -3707,6 +3794,7 @@ async def test_node(state: CodeAgentState) -> dict:
+@@ -3707,6 +3812,7 @@ async def test_node(state: CodeAgentState) -> dict:
              "test_passed": True,
              "needs_fix": False,
              "last_error": err,
@@ -266,7 +286,7 @@ index b01744b..73bf9f7 100644
          }
  
      return {
-@@ -3714,6 +3802,7 @@ async def test_node(state: CodeAgentState) -> dict:
+@@ -3714,6 +3820,7 @@ async def test_node(state: CodeAgentState) -> dict:
          "test_passed": bool(res.passed),
          "needs_fix": (not res.passed) and bool(res.issues.strip()),
          "last_error": err,
@@ -274,7 +294,7 @@ index b01744b..73bf9f7 100644
      }
  
  async def review_node(state: CodeAgentState) -> dict:
-@@ -3752,11 +3841,20 @@ async def review_node(state: CodeAgentState) -> dict:
+@@ -3752,11 +3859,20 @@ async def review_node(state: CodeAgentState) -> dict:
      review_needs_fix = (not res.looks_correct) and bool(res.issues.strip())
      needs_fix = review_needs_fix or test_failed
  
@@ -295,7 +315,7 @@ index b01744b..73bf9f7 100644
      }
  
  async def commit_node(state: CodeAgentState) -> dict:
-@@ -3793,10 +3891,15 @@ async def commit_node(state: CodeAgentState) -> dict:
+@@ -3793,10 +3909,15 @@ async def commit_node(state: CodeAgentState) -> dict:
      if not is_multi and code:
          response = f"{explanation}\n\nCommit: {commit_message}\n\n```{language}\n{code}\n```".strip()
  
@@ -311,7 +331,16 @@ index b01744b..73bf9f7 100644
      }
  
  def post_review_edge(state: CodeAgentState) -> str:
-@@ -4053,8 +4156,12 @@ async def run_code_graph_streaming(initial_state: dict, timeout: float, token_qu
+@@ -4043,6 +4164,8 @@ async def run_code_graph_streaming(initial_state: dict, timeout: float, token_qu
+                 kind, payload = queue_next.result()
+                 if kind == "code_executor_start":
+                     yield ("code_reset", payload)
++                elif kind == "verify_start":
++                    yield ("activity", {"kind": "narration", "label": payload})
+                 else:
+                     yield ("token", payload)
+                 queue_next = asyncio.ensure_future(token_queue.get())
+@@ -4053,8 +4176,12 @@ async def run_code_graph_streaming(initial_state: dict, timeout: float, token_qu
                  except StopAsyncIteration:
                      break
                  node_name, node_output = next(iter(chunk.items()))
@@ -324,7 +353,63 @@ index b01744b..73bf9f7 100644
                  graph_next = asyncio.ensure_future(agen.__anext__())
      except StopAsyncIteration:
          return
-@@ -4207,6 +4314,15 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
+@@ -4074,23 +4201,48 @@ async def stream_code_thinking(model_key: str, temperature: float, message: str,
+     thinking turned ON, so the entire token budget goes toward real reasoning instead of
+     competing with a JSON schema the way it would inside execute_code_llm_structured (that's the
+     documented reason thinking is forced OFF for every structured call — see CODE_THINKING_OFF_KWARGS
+-    above). Kept short (max_tokens=4096) and on its own model instance so it never eats into the
+-    32K budget reserved for the actual code-generating calls."""
++    above). Kept on its own model instance so it never eats into the 32K budget reserved for the
++    actual code-generating calls.
++
++    The prompt deliberately asks for real structure (candidate interpretations weighed against
++    each other, then a plain-markdown breakdown of what/how/risks) rather than a single flat
++    paragraph — this is what makes the panel read like an engineer actually working through the
++    problem instead of a decorative loading message. The frontend renders this as plain text on
++    purpose (see appendLiveThought), so the markdown markers below (**bold**, numbered/bulleted
++    lists, `code`) show up as literal characters, exactly like Claude's own raw thinking trace —
++    not as a request to prettify the output, just to make the model's actual reasoning legible."""
+     model_name = CODE_MODEL_MAP.get((model_key or "").strip().lower(), CODE_MODEL_MAP["kimi"])
+     thinking_llm = ChatNVIDIA(
+         model=model_name,
+         temperature=temperature,
+-        max_tokens=4096,
+-        timeout=60,
++        max_tokens=6144,
++        timeout=75,
+         model_kwargs={"chat_template_kwargs": {"thinking": True, "enable_thinking": True}},
+     )
+     context = "\n".join([f"{m.type.capitalize()}: {m.content}" for m in history[-6:]])
+     prompt = (
+         f"Current Date & Time: {get_current_datetime_str()}\n\n"
+         f"{context}\n\nUser's new request: {message}\n\n"
+-        "Think through how you'd build this: what it actually needs, whether it needs one file "
+-        "or several, the technical approach, and any risks or tricky parts. Reason it through out "
+-        "loud, in your own words — don't write final code yet."
++        "Think this through out loud, in your own words, the way you'd actually reason through a "
++        "real engineering task before touching an editor — don't write final code yet, and don't "
++        "just restate the request in different words.\n\n"
++        "Structure it for real, using plain markdown as you go (not because it needs to look "
++        "pretty, but because that's how you'd actually lay out your own thinking):\n\n"
++        "1. If the request is ambiguous, underspecified, could plausibly mean more than one "
++        "thing, or contains something that looks like a typo — say so directly and name the "
++        "**specific candidates** you're weighing (a short numbered or bulleted list, one bold "
++        "label per candidate), then reason about which is most likely given the context and commit "
++        "to one. If it's already unambiguous, skip straight past this instead of manufacturing "
++        "false uncertainty.\n"
++        "2. Once you've landed on what's actually being built, break the thinking into real "
++        "sections with bold or heading-style labels — e.g. **What it needs:** (the concrete "
++        "requirements, data shape, interactions), **Technical approach:** (single file vs several, "
++        "the concrete implementation plan, key libraries or patterns), and **Risks / tricky "
++        "parts:** (the specific part most likely to go wrong or need the most care, and why).\n"
++        "3. Be concrete and specific — name real fields, functions, edge cases, and trade-offs "
++        "instead of vague filler like 'handle errors properly' or 'make it look nice'.\n\n"
++        "Write it as continuous reasoning, not a formal report — the structure should feel like "
++        "how your own thoughts are actually organized, not a template you're filling in."
+     )
+     try:
+         async for chunk in thinking_llm.astream(prompt):
+@@ -4207,6 +4359,15 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
                          yield f"data: {json.dumps({'type': 'code_delta', 'delta': delta, 'session_id': session_id})}\n\n"
                      continue
  
@@ -340,7 +425,7 @@ index b01744b..73bf9f7 100644
                  # kind == "status"
                  _, node_name, state_so_far = evt
                  label = CODE_NODE_LABELS.get(node_name, node_name)
-@@ -4359,6 +4475,21 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
+@@ -4359,6 +4520,21 @@ async def generate_code_stream(request: "CodeChatRequest", session: dict, sessio
      # a live preview (Gemini-Canvas style) only when the code is frontend code. `files`
      # is populated (and `code`/`language` left blank) for multi-file builds so the
      # frontend can render a per-file tree/tab view instead of a single blob.
@@ -363,10 +448,10 @@ index b01744b..73bf9f7 100644
  
  # ----------------------------------------------------------------------
 diff --git a/frontend/index.html b/frontend/index.html
-index a37e80f..192e42d 100644
+index a37e80f..1d894f7 100644
 --- a/frontend/index.html
 +++ b/frontend/index.html
-@@ -240,6 +240,32 @@
+@@ -240,6 +240,35 @@
          .spinner { width:14px; height:14px; border:2px solid var(--text-secondary); border-top:2px solid transparent; border-radius:50%; animation:spin 1s linear infinite; }
          @keyframes spin { 0%{transform:rotate(0deg);} 100%{transform:rotate(360deg);} }
  
@@ -387,11 +472,14 @@ index a37e80f..192e42d 100644
 +        .activity-content { display:none; margin:6px 0 10px 4px; padding-left:20px; border-left:1px solid var(--border-color); }
 +        .activity-content.expanded { display:block; }
 +        .activity-row { display:flex; align-items:center; gap:8px; padding:5px 0; font-size:13px; color:var(--text-secondary); line-height:1.4; }
-+        .activity-row-icon { width:15px; height:15px; flex-shrink:0; color:var(--text-secondary); }
++        .activity-row-icon { width:15px; height:15px; flex-shrink:0; color:var(--text-secondary); display:flex; align-items:center; justify-content:center; }
 +        .activity-row-icon svg { width:100%; height:100%; }
++        .activity-row-icon .thought-bullet { width:6px; height:6px; border-radius:50%; background-color:#555; }
 +        .activity-row-label { flex-shrink:0; }
-+        .activity-file-badge { font-family:'Courier New', Courier, monospace; font-size:12px; background:rgba(255,255,255,0.08); color:var(--text-primary); padding:1px 7px; border-radius:5px; }
-+        .activity-diff-stat { font-size:12px; font-family:'Courier New', Courier, monospace; white-space:nowrap; }
++        .activity-row-edit .activity-row-label { color:var(--text-primary); flex:1 1 auto; min-width:0; white-space:normal; }
++        .activity-row-narration { font-style:italic; opacity:0.85; }
++        .activity-file-badge { font-family:'Courier New', Courier, monospace; font-size:12px; background:rgba(255,255,255,0.08); color:var(--text-primary); padding:1px 7px; border-radius:5px; flex-shrink:0; }
++        .activity-diff-stat { font-size:12px; font-family:'Courier New', Courier, monospace; white-space:nowrap; margin-left:auto; flex-shrink:0; }
 +        .activity-diff-add { color:#3fb950; }
 +        .activity-diff-del { color:#f85149; margin-left:4px; }
 +        .activity-row-status { font-style:italic; opacity:0.85; }
@@ -399,7 +487,7 @@ index a37e80f..192e42d 100644
          /* ============== INPUT ============== */
          .input-container { position:absolute; bottom:0; left:0; width:100%; padding:22px; background:linear-gradient(180deg, rgba(33,33,33,0) 0%, var(--bg-main) 40%); display:flex; justify-content:center; }
          .input-box { width:100%; max-width:760px; background-color:var(--bg-input); border-radius:22px; border:1px solid var(--border-color); display:flex; align-items:flex-end; padding:11px 15px; box-shadow:0 4px 20px rgba(0,0,0,0.15); transition:border-color 0.25s ease, box-shadow 0.25s ease; }
-@@ -1100,6 +1126,12 @@
+@@ -1100,6 +1129,12 @@
              historyList.prepend(item);
          }
  
@@ -412,7 +500,7 @@ index a37e80f..192e42d 100644
          function appendMessage(role, text) {
              modes[currentMode].hasMessages = true;
              openingScene.style.display = 'none';
-@@ -1142,6 +1174,27 @@
+@@ -1142,6 +1177,27 @@
                  });
  
                  body.appendChild(statusDiv);
@@ -429,7 +517,7 @@ index a37e80f..192e42d 100644
 +                            <svg class="activity-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
 +                            <span class="activity-toggle-label">Working</span>
 +                        </button>
-+                        <div class="activity-content"></div>
++                        <div class="activity-content expanded"></div>
 +                    `;
 +                    activityDiv.querySelector('.activity-toggle').addEventListener('click', () => {
 +                        activityDiv.querySelector('.activity-content').classList.toggle('expanded');
@@ -440,7 +528,7 @@ index a37e80f..192e42d 100644
                  body.appendChild(contentDiv);
                  bubble.appendChild(avatar);
                  bubble.appendChild(body);
-@@ -1249,6 +1302,75 @@
+@@ -1249,6 +1305,89 @@
              const thinkingContent = thinkingBlock.querySelector('.thinking-content');
              const thinkingStartTime = Date.now();
  
@@ -462,8 +550,8 @@ index a37e80f..192e42d 100644
 +            };
 +
 +            // Appends one real, already-happened action (file edit/create, command run,
-+            // file read, or note) to the activity trace and refreshes the running
-+            // "Editing…" header. Called only from real 'activity' SSE events, never
++            // file read, note, or live narration) to the activity trace and refreshes
++            // the running header. Called only from real 'activity' SSE events, never
 +            // synthesized client-side.
 +            function addActivity(activity) {
 +                if (!activityBlock) return;
@@ -476,19 +564,33 @@ index a37e80f..192e42d 100644
 +                else if (activity.kind === 'note') activityCounts.notes++;
 +
 +                const row = document.createElement('div');
-+                row.className = 'activity-row';
-+                const icon = ACTIVITY_ICONS[activity.kind] || ACTIVITY_ICONS.note;
-+                let rowHtml = `<span class="activity-row-icon">${icon}</span>`;
++                let rowHtml;
 +
-+                if ((activity.kind === 'edit' || activity.kind === 'create') && activity.filename) {
-+                    const verb = activity.kind === 'edit' ? 'Edited' : 'Created';
++                if (activity.kind === 'narration') {
++                    // The model's own "now let me do X" narration, right before the command
++                    // that follows it — a plain muted dot + line, same visual language as
++                    // the thinking panel's default bullet, never a boxed icon.
++                    row.className = 'activity-row activity-row-narration';
++                    rowHtml = `<span class="activity-row-icon"><span class="thought-bullet" style="position:static;"></span></span>` +
++                        `<span class="activity-row-label activity-row-status">${escapeHtml(activity.label || '')}</span>`;
++                } else if ((activity.kind === 'edit' || activity.kind === 'create') && activity.filename) {
++                    // Description-first, like a real diff's subject line — the label IS
++                    // what this step actually did (e.g. "Add a default backend URL
++                    // constant…"), with the file it touched and its real +/- line counts
++                    // trailing after it.
++                    row.className = 'activity-row activity-row-edit';
++                    const icon = ACTIVITY_ICONS[activity.kind];
 +                    const add = Math.max(0, activity.additions || 0);
 +                    const del = Math.max(0, activity.deletions || 0);
-+                    rowHtml += `<span class="activity-row-label">${verb}</span>` +
++                    rowHtml = `<span class="activity-row-icon">${icon}</span>` +
++                        `<span class="activity-row-label">${escapeHtml(activity.label || '')}</span>` +
 +                        `<span class="activity-file-badge">${escapeHtml(activity.filename)}</span>` +
 +                        `<span class="activity-diff-stat"><span class="activity-diff-add">+${add}</span><span class="activity-diff-del">-${del}</span></span>`;
 +                } else {
-+                    rowHtml += `<span class="activity-row-label activity-row-status">${escapeHtml(activity.label || '')}</span>`;
++                    row.className = 'activity-row';
++                    const icon = ACTIVITY_ICONS[activity.kind] || ACTIVITY_ICONS.note;
++                    rowHtml = `<span class="activity-row-icon">${icon}</span>` +
++                        `<span class="activity-row-label activity-row-status">${escapeHtml(activity.label || '')}</span>`;
 +                }
 +                row.innerHTML = rowHtml;
 +                activityContent.appendChild(row);
@@ -516,7 +618,7 @@ index a37e80f..192e42d 100644
              // Show "Thinking" the instant the request goes out — like Claude.ai — rather
              // than waiting for a real backend status event, which may never arrive for
              // quick replies that skip the planning loop entirely (e.g. "hi").
-@@ -1458,6 +1580,10 @@
+@@ -1458,6 +1597,10 @@
                                      // follow right after this — nothing else to do here.
                                  } else if (parsed.type === 'status') {
                                      addThought(parsed.label, parsed.detail, parsed.step);
