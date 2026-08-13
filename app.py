@@ -3686,18 +3686,26 @@ async def _write_or_edit_code(state: CodeAgentState, is_fix: bool) -> dict:
         # line that shows up after a failed generation.
         response_text = f"{explanation}\n\n```{language}\n{code}\n```".strip() if code else explanation
 
-    # Real +added/-removed line counts for this step, the same numbers a git diff
-    # would report — drives the "filename +N -M" pill in the Claude-Code-style
-    # activity trace. Skipped when nothing actually changed (carry-forward /
-    # error paths above), so a failed step doesn't get logged as a phantom edit.
+    # A commit-message-style description of what this step actually did, not a
+    # generic "Edited X" — mirrors the plan's own concrete next_step for a normal
+    # step (see CodePlan.next_step), or the specific issue being addressed for a
+    # fix, the way a real diff's subject line describes intent rather than just
+    # naming the file it touched.
     activities = list(state.get("turn_activities", []))
     if code and code != prior_code_for_step:
         display_name = target_file if (is_multi and target_file) else filename_for_language(language)
         additions, deletions = diff_line_counts(prior_code_for_step, code)
         action = "edit" if prior_code_for_step.strip() else "create"
-        verb = "Edited" if action == "edit" else "Created"
+        if is_fix:
+            short_issue = issue_text.strip().replace("\n", " ")
+            step_label = f"Fix: {short_issue[:120]}" if short_issue else "Fix the issue found in review"
+        else:
+            step_label = (
+                state.get("current_step", "").strip() or explanation.strip()
+                or f"{'Edit' if action == 'edit' else 'Create'} {display_name}"
+            )
         activities = add_activity(
-            state, action, f"{verb} {display_name}",
+            state, action, step_label,
             filename=display_name, additions=additions, deletions=deletions,
         )
 
@@ -3748,6 +3756,16 @@ async def test_node(state: CodeAgentState) -> dict:
     if not (code or "").strip():
         return {"test_notes": "No code to test yet.", "test_passed": True, "needs_fix": False}
 
+    # Live narration, pushed the instant verification starts (not after it finishes) —
+    # same token_queue channel code_node/fix_node already use for "about to write a
+    # file" — so the frontend can show "Now let me verify the changes..." as its own
+    # line before the "command" activity below resolves, the same beat as a real
+    # engineer narrating what they're about to do next.
+    token_queue = _current_code_token_queue.get()
+    if token_queue is not None:
+        narration = f"Now let me verify the changes to {target_file}." if (is_multi and target_file) else "Now let me verify the changes."
+        await token_queue.put(("verify_start", narration))
+
     lang = (language or "").strip().lower()
     syntax_error = None
     ran_real_check = lang in ("python", "json")
@@ -3766,12 +3784,12 @@ async def test_node(state: CodeAgentState) -> dict:
         except Exception:
             pass
 
-    # "command" activity: a real syntax check actually ran (compile()/json.loads()),
-    # the closest thing this agent has to executing something in a terminal — the
-    # reasoning-only pass for other languages isn't logged as a "command" since
-    # nothing was actually run.
-    check_label = f"Ran a syntax check on {target_file}" if (target_file and ran_real_check) else "Ran a syntax check"
-    activities = add_activity(state, "command", check_label) if ran_real_check else list(state.get("turn_activities", []))
+    # "command" activity: a real check actually ran against the code — either a
+    # concrete syntax check (compile()/json.loads()) or, for languages without a
+    # cheap static check, the honest reasoning-based test pass below. Either way
+    # this is genuine verification work that happened, not decoration.
+    check_label = f"Verify {target_file}" if (is_multi and target_file) else "Verify the edits"
+    activities = add_activity(state, "command", check_label)
 
     if syntax_error:
         return {"test_notes": syntax_error, "test_passed": False, "needs_fix": True, "turn_activities": activities}
@@ -4146,6 +4164,8 @@ async def run_code_graph_streaming(initial_state: dict, timeout: float, token_qu
                 kind, payload = queue_next.result()
                 if kind == "code_executor_start":
                     yield ("code_reset", payload)
+                elif kind == "verify_start":
+                    yield ("activity", {"kind": "narration", "label": payload})
                 else:
                     yield ("token", payload)
                 queue_next = asyncio.ensure_future(token_queue.get())
@@ -4181,23 +4201,48 @@ async def stream_code_thinking(model_key: str, temperature: float, message: str,
     thinking turned ON, so the entire token budget goes toward real reasoning instead of
     competing with a JSON schema the way it would inside execute_code_llm_structured (that's the
     documented reason thinking is forced OFF for every structured call — see CODE_THINKING_OFF_KWARGS
-    above). Kept short (max_tokens=4096) and on its own model instance so it never eats into the
-    32K budget reserved for the actual code-generating calls."""
+    above). Kept on its own model instance so it never eats into the 32K budget reserved for the
+    actual code-generating calls.
+
+    The prompt deliberately asks for real structure (candidate interpretations weighed against
+    each other, then a plain-markdown breakdown of what/how/risks) rather than a single flat
+    paragraph — this is what makes the panel read like an engineer actually working through the
+    problem instead of a decorative loading message. The frontend renders this as plain text on
+    purpose (see appendLiveThought), so the markdown markers below (**bold**, numbered/bulleted
+    lists, `code`) show up as literal characters, exactly like Claude's own raw thinking trace —
+    not as a request to prettify the output, just to make the model's actual reasoning legible."""
     model_name = CODE_MODEL_MAP.get((model_key or "").strip().lower(), CODE_MODEL_MAP["kimi"])
     thinking_llm = ChatNVIDIA(
         model=model_name,
         temperature=temperature,
-        max_tokens=4096,
-        timeout=60,
+        max_tokens=6144,
+        timeout=75,
         model_kwargs={"chat_template_kwargs": {"thinking": True, "enable_thinking": True}},
     )
     context = "\n".join([f"{m.type.capitalize()}: {m.content}" for m in history[-6:]])
     prompt = (
         f"Current Date & Time: {get_current_datetime_str()}\n\n"
         f"{context}\n\nUser's new request: {message}\n\n"
-        "Think through how you'd build this: what it actually needs, whether it needs one file "
-        "or several, the technical approach, and any risks or tricky parts. Reason it through out "
-        "loud, in your own words — don't write final code yet."
+        "Think this through out loud, in your own words, the way you'd actually reason through a "
+        "real engineering task before touching an editor — don't write final code yet, and don't "
+        "just restate the request in different words.\n\n"
+        "Structure it for real, using plain markdown as you go (not because it needs to look "
+        "pretty, but because that's how you'd actually lay out your own thinking):\n\n"
+        "1. If the request is ambiguous, underspecified, could plausibly mean more than one "
+        "thing, or contains something that looks like a typo — say so directly and name the "
+        "**specific candidates** you're weighing (a short numbered or bulleted list, one bold "
+        "label per candidate), then reason about which is most likely given the context and commit "
+        "to one. If it's already unambiguous, skip straight past this instead of manufacturing "
+        "false uncertainty.\n"
+        "2. Once you've landed on what's actually being built, break the thinking into real "
+        "sections with bold or heading-style labels — e.g. **What it needs:** (the concrete "
+        "requirements, data shape, interactions), **Technical approach:** (single file vs several, "
+        "the concrete implementation plan, key libraries or patterns), and **Risks / tricky "
+        "parts:** (the specific part most likely to go wrong or need the most care, and why).\n"
+        "3. Be concrete and specific — name real fields, functions, edge cases, and trade-offs "
+        "instead of vague filler like 'handle errors properly' or 'make it look nice'.\n\n"
+        "Write it as continuous reasoning, not a formal report — the structure should feel like "
+        "how your own thoughts are actually organized, not a template you're filling in."
     )
     try:
         async for chunk in thinking_llm.astream(prompt):
