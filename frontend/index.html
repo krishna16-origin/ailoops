@@ -240,6 +240,32 @@
         .spinner { width:14px; height:14px; border:2px solid var(--text-secondary); border-top:2px solid transparent; border-radius:50%; animation:spin 1s linear infinite; }
         @keyframes spin { 0%{transform:rotate(0deg);} 100%{transform:rotate(360deg);} }
 
+        /* ============== CODE MODE: Claude-Code-style activity trace ==============
+           "Edited 2 files, ran 2 commands, read a file · 1 note" summary bar with an
+           expandable list of what actually happened this turn — each file edit shown
+           as its own row with a filename badge and real +added/-removed line counts. */
+        .activity-block { margin-top:2px; margin-bottom:4px; }
+        .activity-toggle { display:flex; align-items:center; gap:6px; background:none; border:none; padding:4px 0; font-size:13px; font-family:inherit; color:var(--text-secondary); cursor:pointer; text-align:left; }
+        .activity-toggle:hover { color:var(--text-primary); }
+        .activity-toggle .activity-chevron { width:12px; height:12px; flex-shrink:0; transition:transform 0.15s ease; color:var(--text-secondary); }
+        .activity-content.expanded .activity-chevron { transform:rotate(90deg); }
+        .activity-toggle.shimmer {
+            background-image: linear-gradient(90deg, var(--text-secondary) 0%, var(--text-secondary) 35%, var(--text-primary) 50%, var(--text-secondary) 65%, var(--text-secondary) 100%);
+            background-size: 200% 100%; background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            animation: thinkingShimmer 1.6s linear infinite;
+        }
+        .activity-content { display:none; margin:6px 0 10px 4px; padding-left:20px; border-left:1px solid var(--border-color); }
+        .activity-content.expanded { display:block; }
+        .activity-row { display:flex; align-items:center; gap:8px; padding:5px 0; font-size:13px; color:var(--text-secondary); line-height:1.4; }
+        .activity-row-icon { width:15px; height:15px; flex-shrink:0; color:var(--text-secondary); }
+        .activity-row-icon svg { width:100%; height:100%; }
+        .activity-row-label { flex-shrink:0; }
+        .activity-file-badge { font-family:'Courier New', Courier, monospace; font-size:12px; background:rgba(255,255,255,0.08); color:var(--text-primary); padding:1px 7px; border-radius:5px; }
+        .activity-diff-stat { font-size:12px; font-family:'Courier New', Courier, monospace; white-space:nowrap; }
+        .activity-diff-add { color:#3fb950; }
+        .activity-diff-del { color:#f85149; margin-left:4px; }
+        .activity-row-status { font-style:italic; opacity:0.85; }
+
         /* ============== INPUT ============== */
         .input-container { position:absolute; bottom:0; left:0; width:100%; padding:22px; background:linear-gradient(180deg, rgba(33,33,33,0) 0%, var(--bg-main) 40%); display:flex; justify-content:center; }
         .input-box { width:100%; max-width:760px; background-color:var(--bg-input); border-radius:22px; border:1px solid var(--border-color); display:flex; align-items:flex-end; padding:11px 15px; box-shadow:0 4px 20px rgba(0,0,0,0.15); transition:border-color 0.25s ease, box-shadow 0.25s ease; }
@@ -1100,6 +1126,12 @@
             historyList.prepend(item);
         }
 
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str == null ? '' : String(str);
+            return div.innerHTML;
+        }
+
         function appendMessage(role, text) {
             modes[currentMode].hasMessages = true;
             openingScene.style.display = 'none';
@@ -1142,6 +1174,27 @@
                 });
 
                 body.appendChild(statusDiv);
+
+                // Code Mode only: the Claude-Code-style activity trace — starts empty and
+                // hidden, and is only ever populated from real 'activity'/'turn_summary'
+                // SSE events (see sendMessage below), never faked client-side.
+                if (currentMode === 'code') {
+                    const activityDiv = document.createElement('div');
+                    activityDiv.className = 'activity-block';
+                    activityDiv.style.display = 'none';
+                    activityDiv.innerHTML = `
+                        <button type="button" class="activity-toggle">
+                            <svg class="activity-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                            <span class="activity-toggle-label">Working</span>
+                        </button>
+                        <div class="activity-content"></div>
+                    `;
+                    activityDiv.querySelector('.activity-toggle').addEventListener('click', () => {
+                        activityDiv.querySelector('.activity-content').classList.toggle('expanded');
+                    });
+                    body.appendChild(activityDiv);
+                }
+
                 body.appendChild(contentDiv);
                 bubble.appendChild(avatar);
                 bubble.appendChild(body);
@@ -1248,6 +1301,75 @@
             const thinkingToggle = thinkingBlock.querySelector('.thinking-toggle');
             const thinkingContent = thinkingBlock.querySelector('.thinking-content');
             const thinkingStartTime = Date.now();
+
+            // Code Mode only: the Claude-Code-style "Edited N files, ran M commands,
+            // read a file · K notes" activity trace (null in Chat mode).
+            const activityBlock = assistantBubble.querySelector('.activity-block');
+            const activityToggle = activityBlock ? activityBlock.querySelector('.activity-toggle') : null;
+            const activityLabel = activityBlock ? activityBlock.querySelector('.activity-toggle-label') : null;
+            const activityContent = activityBlock ? activityBlock.querySelector('.activity-content') : null;
+            const activityCounts = { files: 0, commands: 0, reads: 0, notes: 0 };
+
+            const ACTIVITY_ICONS = {
+                edit: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>`,
+                create: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="12" y1="18" x2="12" y2="12"></line><line x1="9" y1="15" x2="15" y2="15"></line></svg>`,
+                command: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>`,
+                read: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"></path><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"></path></svg>`,
+                note: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>`,
+                done: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>`,
+            };
+
+            // Appends one real, already-happened action (file edit/create, command run,
+            // file read, or note) to the activity trace and refreshes the running
+            // "Editing…" header. Called only from real 'activity' SSE events, never
+            // synthesized client-side.
+            function addActivity(activity) {
+                if (!activityBlock) return;
+                activityBlock.style.display = 'block';
+                activityToggle.classList.add('shimmer');
+
+                if (activity.kind === 'edit' || activity.kind === 'create') activityCounts.files++;
+                else if (activity.kind === 'command') activityCounts.commands++;
+                else if (activity.kind === 'read') activityCounts.reads++;
+                else if (activity.kind === 'note') activityCounts.notes++;
+
+                const row = document.createElement('div');
+                row.className = 'activity-row';
+                const icon = ACTIVITY_ICONS[activity.kind] || ACTIVITY_ICONS.note;
+                let rowHtml = `<span class="activity-row-icon">${icon}</span>`;
+
+                if ((activity.kind === 'edit' || activity.kind === 'create') && activity.filename) {
+                    const verb = activity.kind === 'edit' ? 'Edited' : 'Created';
+                    const add = Math.max(0, activity.additions || 0);
+                    const del = Math.max(0, activity.deletions || 0);
+                    rowHtml += `<span class="activity-row-label">${verb}</span>` +
+                        `<span class="activity-file-badge">${escapeHtml(activity.filename)}</span>` +
+                        `<span class="activity-diff-stat"><span class="activity-diff-add">+${add}</span><span class="activity-diff-del">-${del}</span></span>`;
+                } else {
+                    rowHtml += `<span class="activity-row-label activity-row-status">${escapeHtml(activity.label || '')}</span>`;
+                }
+                row.innerHTML = rowHtml;
+                activityContent.appendChild(row);
+
+                activityLabel.textContent = activity.kind === 'done' ? (activity.label || 'Presented file') : 'Working';
+                scrollToBottom();
+            }
+
+            // Called once 'turn_summary' arrives (right before code_result) — replaces the
+            // live "Working" header with the settled Claude-Code-style recap line, e.g.
+            // "Edited 2 files, ran 2 commands, read a file · 1 note".
+            function finalizeActivitySummary(summary) {
+                if (!activityBlock || !activityLabel) return;
+                activityToggle.classList.remove('shimmer');
+                const parts = [];
+                if (summary.files_touched > 0) parts.push(`Edited ${summary.files_touched} file${summary.files_touched === 1 ? '' : 's'}`);
+                if (summary.commands_run > 0) parts.push(`ran ${summary.commands_run} command${summary.commands_run === 1 ? '' : 's'}`);
+                if (summary.files_read > 0) parts.push(summary.files_read === 1 ? 'read a file' : `read ${summary.files_read} files`);
+                let text = parts.join(', ');
+                if (summary.notes > 0) text += `${text ? ' · ' : ''}${summary.notes} note${summary.notes === 1 ? '' : 's'}`;
+                if (text) activityLabel.textContent = text;
+                else if (!activityContent.childElementCount) activityBlock.style.display = 'none';
+            }
 
             // Show "Thinking" the instant the request goes out — like Claude.ai — rather
             // than waiting for a real backend status event, which may never arrive for
@@ -1458,6 +1580,10 @@
                                     // follow right after this — nothing else to do here.
                                 } else if (parsed.type === 'status') {
                                     addThought(parsed.label, parsed.detail, parsed.step);
+                                } else if (parsed.type === 'activity') {
+                                    addActivity(parsed);
+                                } else if (parsed.type === 'turn_summary') {
+                                    finalizeActivitySummary(parsed);
                                 } else if (parsed.type === 'code_start') {
                                     startCodeCanvasStream(parsed.language, '');
                                     inlineCodeState = startInlineCodeStream(textContainer, parsed.language, '');
