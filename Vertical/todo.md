@@ -1,0 +1,21 @@
+# Vertical Unity TODO
+
+- [x] Set Unity 2022.3 LTS and Android as the project target
+- [x] Add URP, Input System, TextMesh Pro, and Unity UI project dependencies
+- [x] Create the storm-noir visual reference and custom game icon assets
+- [x] Configure portrait gameplay, Android 7.0+ support, ARMv7, and ARM64 build intent
+- [x] Create a runtime-built vertical-slice tower and objective route
+- [x] Implement forgiving target selection and cyan target feedback
+- [x] Implement rope rendering, swing conservation, release launch, and glide state
+- [x] Implement one-thumb tap, hold, swipe, and double-tap touch controls
+- [x] Implement title, briefing, HUD, pause, checkpoint, restart, completion, and return flows
+- [x] Implement mobile graphics profiles for performance, balanced, and cinematic modes
+- [x] Add Unity menu actions for Android player configuration and source validation
+- [x] Add persistent haptic, audio, and swipe-sensitivity controls
+- [x] Run source integrity checks for the Unity scripts
+- [ ] Open the project in Unity 2022.3 LTS and allow package resolution
+- [ ] Assign the URP asset in Graphics settings if Unity does not auto-configure it
+- [ ] Run the Editor validation command and play through the full route
+- [ ] Set Android signing credentials in Unity Player Settings
+- [ ] Build and install the Android APK on at least one physical phone
+- [ ] Profile the physical device and tune the default graphics tier if required

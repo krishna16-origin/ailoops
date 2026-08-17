@@ -1,0 +1,14 @@
+{
+  "dependencies": {
+    "com.unity.render-pipelines.universal": {
+      "version": "14.0.11",
+      "depth": 0,
+      "source": "registry",
+      "dependencies": {
+        "com.unity.render-pipelines.core": "14.0.11",
+        "com.unity.shadergraph": "14.0.11"
+      },
+      "url": "https://packages.unity.com"
+    }
+  }
+}
