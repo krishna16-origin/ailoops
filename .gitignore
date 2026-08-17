@@ -20,3 +20,6 @@ Vertical/.vs/
 Vertical/.idea/
 Vertical/*.csproj
 Vertical/*.sln
+
+# Godot editor cache
+Vertical/.godot/

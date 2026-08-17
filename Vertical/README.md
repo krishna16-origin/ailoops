@@ -1,27 +1,17 @@
-# Vertical — Unity Android Vertical Slice
+# Vertical
 
-This repository contains a Unity 2022.3 LTS project targeting Android portrait devices. It implements the playable core of **Vertical**: a one-thumb third-person grapple, swing, launch, glide, checkpoint, and objective ascent through a storm-noir tower facade.
+**Vertical** is a playable 3D mobile traversal game built entirely with the free and open-source Godot Engine. The Android game is portrait-first and uses a one-thumb grammar: tap cyan grappling nodes, release to launch, and hold during a fall to glide.
 
-## Open and run
-
-Install the free **Unity Hub**, Unity **2022.3 LTS**, and the **Android Build Support** module with SDK, NDK, and OpenJDK. In Unity Hub, select **Open** and choose this `Vertical` folder. Unity resolves the URP dependency on first open. Open `Assets/Scenes/Vertical.unity` and press Play.
-
-The game creates its playable scene at runtime, so its tower, player, targets, UI, lighting, rain, and camera do not require drag-and-drop setup. The first screen has a functional title, briefing, quality selector, and start action. Gameplay uses touch input on Android and mouse input in the Unity editor.
+The project uses the GLES3-compatible mobile renderer and targets `armeabi-v7a` and `arm64-v8a`. The tower, targets, lighting, effects, HUD, and menu flows are generated at runtime from GDScript, so no proprietary game engine or licensed editor is required.
 
 ## Android build
 
-Switch platform to Android in **File → Build Settings**, set a release signing key in **Project Settings → Player → Publishing Settings**, then use **Build** to create an APK. The configuration targets Android 7.0+ and ARMv7 plus ARM64. A Unity editor with Android support is required to produce the APK; the current automation workspace contains the project source but does not have a Unity editor installed.
+The bundled `export_presets.cfg` contains a debug Android preset. In this workspace, build with the command below.
 
-## Controls
+```bash
+export ANDROID_SDK_ROOT=/home/ubuntu/Android/Sdk
+export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+/home/ubuntu/tools/godot/Godot_v4.7.1-stable_linux.x86_64 --headless --path /home/ubuntu/ailoops/Vertical --export-debug Android build/Vertical-debug.apk
+```
 
-| Input | Gameplay action |
-|---|---|
-| Tap near a cyan target | Grapple to a forgiving in-range anchor. |
-| Release while attached | Launch along swing velocity. |
-| Hold while airborne | Glide while holding the gesture surface. |
-| Double-tap | Detach from the rope, or attempt an emergency recovery. |
-| Keyboard in editor | `A`/`D` steer; `Space` taps the centre; `R` restarts. |
-
-## Mobile graphics
-
-The default is **Balanced**. Cinematic quality is intended for stronger devices; Performance reduces post-effects and rain. The project favors a high-end noir art direction with mobile-safe URP choices: a single shadowed directional light, static geometry, emissive neon, depth fog, local particles, and conservative dynamic lights.
+The debug APK is suitable for direct device testing. A separate private signing key is only necessary for a release APK or app-store distribution.
