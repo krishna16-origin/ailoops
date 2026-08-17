@@ -23,3 +23,6 @@ Vertical/*.sln
 
 # Godot editor cache
 Vertical/.godot/
+
+# User requested that the complete game project remain local only.
+Vertical/
