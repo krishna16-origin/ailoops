@@ -3,6 +3,7 @@ import os
 import json
 import re
 import asyncio
+import difflib
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
@@ -576,6 +577,135 @@ def extract_code_artifact(text: str) -> tuple[str, str, str, dict, dict]:
     return explanation, "", "", files, file_languages
 
 
+# ----------------------------------------------------------------------
+# CODE MODE: session memory + incremental (diff-based) edits
+#
+# Root cause of "it rewrites the whole file for every tiny change": session
+# history only ever kept the one-line explanation ("I generated the requested
+# code.") in the AIMessage — the actual file contents were never persisted
+# anywhere, so every follow-up turn started from zero knowledge of what had
+# already been built. code_understand_node below now also loads the session's
+# real file map, and code_compose_node uses it to ask for a targeted
+# SEARCH/REPLACE patch instead of a full regenerate whenever a prior version
+# of the file already exists. This entire mechanism is Code-mode-only — plain
+# /chat never touches code_files.
+# ----------------------------------------------------------------------
+
+_EXTENSION_MAP = {
+    "python": "py", "py": "py", "javascript": "js", "js": "js", "typescript": "ts",
+    "ts": "ts", "jsx": "jsx", "tsx": "tsx", "html": "html", "htm": "html", "css": "css",
+    "json": "json", "bash": "sh", "sh": "sh", "shell": "sh", "java": "java", "c": "c",
+    "cpp": "cpp", "c++": "cpp", "go": "go", "rust": "rs", "rs": "rs", "ruby": "rb",
+    "rb": "rb", "php": "php", "sql": "sql", "yaml": "yaml", "yml": "yaml",
+    "markdown": "md", "md": "md", "text": "txt", "plaintext": "txt", "": "txt",
+}
+
+
+def implied_filename(language: str) -> str:
+    """A stable filename for a single unnamed code block, so a follow-up turn
+    has something real to target with a SEARCH/REPLACE edit instead of the
+    file identity being lost the moment the response leaves the model."""
+    lang = (language or "").strip().lower()
+    ext = _EXTENSION_MAP.get(lang, lang if re.fullmatch(r"[a-z0-9]+", lang) else "txt")
+    return f"main.{ext}"
+
+
+def diff_stats(old: str, new: str) -> tuple[int, int]:
+    """Real added/removed line counts between two versions of a file — the same
+    classification `git diff --stat` uses — for the activity trace's +/- badges.
+    Never a token-count heuristic or a guess."""
+    sm = difflib.SequenceMatcher(a=(old or "").splitlines(), b=(new or "").splitlines())
+    additions = deletions = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "replace":
+            deletions += i2 - i1
+            additions += j2 - j1
+        elif tag == "delete":
+            deletions += i2 - i1
+        elif tag == "insert":
+            additions += j2 - j1
+    return additions, deletions
+
+
+_REWRITE_KEYWORDS = (
+    "rewrite everything", "rewrite the whole", "start over", "start from scratch",
+    "from scratch", "redo the whole", "redesign completely", "throw away",
+    "completely different", "scrap it", "rebuild it", "new version of the whole",
+    "build a new website", "build a new site", "create a new website", "create a new site",
+    "make a new website", "make a new site",
+)
+
+
+def wants_full_rewrite(message: str) -> bool:
+    """Heuristic: does the request explicitly call for replacing the whole
+    project rather than a targeted change? Deliberately biased toward False
+    (the cheaper diff path) — a false negative just costs one harmless
+    SEARCH/REPLACE attempt that fails closed and falls back to a full
+    regenerate anyway; a false positive pays for a full regenerate when a
+    small patch would have done."""
+    text = (message or "").lower()
+    return any(kw in text for kw in _REWRITE_KEYWORDS)
+
+
+_BUILD_SCOPE_KEYWORDS = (
+    "website", "web site", "webpage", "web page", "landing page", "app",
+    "application", "project", "dashboard", "portfolio", "game", "platform",
+    "system", "tool", "site",
+)
+
+
+def looks_like_a_build(message: str) -> bool:
+    """Whether a brand-new request looks substantial enough to warrant a short
+    plan before writing code — vs. a quick one-off snippet where a plan step
+    would just add latency without helping anyone."""
+    text = (message or "").lower()
+    if any(kw in text for kw in _BUILD_SCOPE_KEYWORDS):
+        return True
+    return len(text.split()) >= 18
+
+
+EDIT_BLOCK_RE = re.compile(
+    r"(?:FILE\s*:\s*(?P<filename>[^\n`]+)\n)?"
+    r"<{3,}\s*SEARCH\s*\n(?P<search>.*?)\n={3,}\s*\n(?P<replace>.*?)\n>{3,}\s*REPLACE",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def parse_edit_blocks(text: str) -> list[tuple[str, str, str]]:
+    """Parses SEARCH/REPLACE blocks out of model output into
+    (filename_or_'', search, replace) tuples. filename is '' when the block
+    has no leading `FILE:` header — used for single-file edits/reviews where
+    the target is already known some other way."""
+    return [
+        ((m.group("filename") or "").strip().strip("`"), m.group("search"), m.group("replace"))
+        for m in EDIT_BLOCK_RE.finditer(text or "")
+    ]
+
+
+def apply_edit_blocks(files: dict, blocks: list, default_filename: str) -> tuple[dict, list, bool]:
+    """Applies parsed SEARCH/REPLACE blocks to a {filename: content} map.
+    Fails closed: if a block names an unknown file, has an empty (ambiguous)
+    SEARCH, or its SEARCH text isn't found verbatim, the WHOLE apply is
+    rejected (ok=False) rather than landing a partial or garbled edit — the
+    caller then falls back to a full regenerate instead of guessing."""
+    if not blocks:
+        return files, [], False
+    working = dict(files)
+    touched = []
+    for filename, search, replace in blocks:
+        target = filename or default_filename
+        if not target or target not in working:
+            return files, [], False
+        if search == "":
+            return files, [], False
+        if search not in working[target]:
+            return files, [], False
+        working[target] = working[target].replace(search, replace, 1)
+        if target not in touched:
+            touched.append(target)
+    return working, touched, True
+
+
 _FENCE_OPEN_RE = re.compile(r"^```([A-Za-z0-9_+#.-]*)\s*$")
 _FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _FILE_HEADER_RE = re.compile(r"^\s*FILE\s*:\s*(.+?)\s*$", re.IGNORECASE)
@@ -640,16 +770,204 @@ async def flush_code_answer_stream(progress, code_state: dict) -> None:
 
 async def code_understand_node(request: CodeChatRequest, session: dict, progress=None) -> dict:
     config = get_thinking_config(request.reasoning_level)
-    excerpt = request_excerpt(session["messages"][-1].content if session["messages"] else "")
-    await publish_progress(progress, "code_understand_node", "code_understand_node", f"Read the build request and identified the requested result: “{excerpt}”")
-    return {"config": config, "history": session["messages"]}
+    latest_message = session["messages"][-1].content if session["messages"] else request.message
+    excerpt = request_excerpt(latest_message)
+    # The real project state from every prior turn in this session — empty on
+    # the very first Code-mode message, populated from here on by
+    # generate_code_once's session persistence at the end of every turn.
+    existing_files = dict(session.get("code_files", {}))
+    existing_file_languages = dict(session.get("code_file_languages", {}))
+    if existing_files:
+        await publish_progress(progress, "code_understand_node", "code_understand_node", f"Read the request against the existing project ({', '.join(existing_files)}): “{excerpt}”")
+    else:
+        await publish_progress(progress, "code_understand_node", "code_understand_node", f"Read the build request and identified the requested result: “{excerpt}”")
+    return {
+        "config": config,
+        "history": session["messages"],
+        "latest_message": latest_message,
+        "existing_files": existing_files,
+        "existing_file_languages": existing_file_languages,
+    }
+
+
+async def _swallow_answer_piece(_text: str) -> None:
+    """Used as invoke_model's on_answer_piece for internal sub-calls (plan,
+    edit-diff, review) whose visible output must never leak into the chat
+    bubble as ordinary answer tokens — only their live reasoning trace (real
+    'thought' events) should reach the user while they run."""
+    return None
+
+
+async def code_plan_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
+    """Runs ONLY on a brand-new build in this session (no existing files yet)
+    for a request that looks substantial — mirrors "think, then plan the
+    files, then write code" instead of jumping straight to code with no
+    stated intent. One short real LLM call: its own reasoning streams live
+    into the Thinking pane exactly like every other call here, never a
+    canned status line. Published as a 'plan' event so the frontend can show
+    the manifest before any code starts streaming. Silently skipped (falls
+    through to code_compose_node as before) for edits, tiny one-off asks, or
+    if anything about the call goes wrong — a missing plan should never block
+    the actual build."""
+    if state["existing_files"] or not looks_like_a_build(state["latest_message"]):
+        return state
+    config = state["config"]
+    llm = get_llm("fast", 0.2, min(1200, config["max_tokens"]))
+    prompt = (
+        "A user just asked a coding assistant to build something. Before any code is "
+        "written, decide what you'll build and which file(s) it needs. Think inside a "
+        "single <think>...</think> block about the approach, briefly. Then, after the "
+        "closing </think> tag, write 1-2 short sentences describing what you'll build, "
+        "then on a new line write exactly 'FILES:' followed by one bare filename per "
+        "line (e.g. index.html) for every file the build will need — no paths, no "
+        "commentary, nothing else.\n\n"
+        f"Request: {state['latest_message']}"
+    )
+    messages = [SystemMessage(content="You plan briefly before you build."), HumanMessage(content=prompt)]
+    try:
+        raw = await invoke_model(messages, llm, progress, on_answer_piece=_swallow_answer_piece)
+    except Exception as e:
+        print(f"[CodeMode] code_plan_node failed, skipping plan: {e}")
+        return state
+    if not raw:
+        return state
+    marker = re.search(r"FILES\s*:\s*\n", raw, re.IGNORECASE)
+    summary = (raw[: marker.start()] if marker else raw).strip()
+    files: list[str] = []
+    if marker:
+        for line in raw[marker.end():].splitlines():
+            name = line.strip().strip("-*•").strip().strip("`")
+            if name and re.match(r"^[\w.\-]+\.[A-Za-z0-9]+$", name):
+                files.append(name)
+    if not summary and not files:
+        return state
+    await publish_event(progress, {"type": "plan", "summary": summary, "files": files[:8]})
+    state["planned_files"] = files[:8]
+    return state
+
+
+async def run_code_edit_pass(request: CodeChatRequest, state: dict, llm, progress=None) -> Optional[dict]:
+    """The heart of "edit the same file instead of rewriting all the code":
+    asks the model for one or more small SEARCH/REPLACE blocks against the
+    project's CURRENT file contents (loaded from session), applies them
+    locally with plain string replacement, and only pays output tokens for
+    the lines that actually changed. Also lets the model add a brand-new file
+    via a `FILE:`+fenced block in the same response (e.g. adding a
+    requirements.txt to an existing build). Returns None (never a partial or
+    guessed result) if the model didn't produce anything usable — the caller
+    then falls back to code_compose_node's original full-generate path."""
+    existing_files = state["existing_files"]
+    existing_file_languages = state["existing_file_languages"]
+    default_filename = next(iter(existing_files)) if len(existing_files) == 1 else ""
+    file_list = "\n\n".join(
+        f"--- FILE: {name} ({existing_file_languages.get(name, 'text')}) ---\n{content}"
+        for name, content in existing_files.items()
+    )
+    filename_note = (
+        f"There is exactly one existing file, '{default_filename}' — SEARCH/REPLACE blocks for it don't need a FILE: header."
+        if default_filename else
+        "There are multiple existing files — put a `FILE: <name>` line immediately before every SEARCH/REPLACE block, naming which file it targets."
+    )
+    prompt = (
+        "The project below already exists. Make ONLY the change described by the user's "
+        "latest message below — do not rewrite files that don't need to change, and do "
+        "not regenerate anything beyond the specific lines that actually need to change.\n\n"
+        f"{filename_note}\n\n"
+        "Respond with one or more blocks in exactly this shape, and nothing else — no "
+        "commentary outside the blocks:\n\n"
+        "<<<<<<< SEARCH\n<exact existing lines, copied character-for-character>\n=======\n"
+        "<the new lines that replace them>\n>>>>>>> REPLACE\n\n"
+        "Rules:\n"
+        "- Every SEARCH block must match the existing file EXACTLY, including whitespace.\n"
+        "- Keep each SEARCH block as short as possible while still being unique in its file.\n"
+        "- Use several blocks for several separate changes, even across different files.\n"
+        "- To insert code, include a short unique anchor line in SEARCH and put that anchor "
+        "plus the new lines in REPLACE.\n"
+        "- To delete code, put it in SEARCH and leave REPLACE empty.\n"
+        "- If (and only if) the request needs a brand-new file that doesn't exist yet, "
+        "instead write a line `FILE: path/to/new_file.ext` followed by a fenced code "
+        "block containing that file's full contents.\n\n"
+        f"Existing project:\n{file_list}\n\n"
+        f"User's latest request: {state['latest_message']}"
+    )
+    messages = [
+        SystemMessage(content="You make precise, minimal, targeted code edits to an existing project — never a full rewrite when a small patch will do."),
+        HumanMessage(content=prompt),
+    ]
+    try:
+        raw = await invoke_model(messages, llm, progress, on_answer_piece=_swallow_answer_piece)
+    except Exception as e:
+        print(f"[CodeMode] run_code_edit_pass failed, falling back to full generate: {e}")
+        return None
+    if not raw:
+        return None
+
+    edit_blocks = parse_edit_blocks(raw)
+    remaining_text = EDIT_BLOCK_RE.sub("", raw)
+    _, _, _, new_files, new_file_languages = extract_code_artifact(remaining_text)
+
+    updated_files = dict(existing_files)
+    updated_languages = dict(existing_file_languages)
+    touched: list[str] = []
+
+    if edit_blocks:
+        merged, edited_names, ok = apply_edit_blocks(existing_files, edit_blocks, default_filename)
+        if not ok:
+            return None  # fail closed — an edit that doesn't apply cleanly is never guessed at
+        updated_files.update(merged)
+        touched.extend(edited_names)
+
+    for filename, content in new_files.items():
+        updated_files[filename] = content
+        updated_languages[filename] = new_file_languages.get(filename, "text")
+        if filename not in touched:
+            touched.append(filename)
+
+    if not touched:
+        return None  # nothing usable came back — let the caller fall back to a full generate
+
+    for filename in touched:
+        old_content = existing_files.get(filename, "")
+        new_content = updated_files[filename]
+        additions, deletions = diff_stats(old_content, new_content)
+        if filename in existing_files:
+            await publish_activity(progress, "edit", f"Edited {filename}", filename=filename, additions=additions, deletions=deletions)
+        else:
+            await publish_activity(progress, "create", f"Added {filename}", filename=filename, additions=additions, deletions=0)
+
+    explanation = (
+        f"Applied a targeted edit to {touched[0]} without rewriting the rest of the code."
+        if len(touched) == 1 else
+        f"Applied targeted edits to {', '.join(touched)} without rewriting the rest of the code."
+    )
+    return {
+        "files": updated_files,
+        "file_languages": updated_languages,
+        "code": "",
+        "language": "",
+        "explanation": explanation,
+        "touched_files": touched,
+    }
 
 
 async def code_compose_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
     config = state["config"]
     model_type = "reasoning" if request.model in {"glm", "kimik2.6"} else "balanced"
-    await publish_progress(progress, "code_compose_node", "code_compose_node", f"Invoking the code model with {config['label']} effort and a {config['max_tokens']}-token budget.")
     llm = get_llm(model_type, 0.2, config["max_tokens"])
+
+    existing_files = state["existing_files"]
+    edit_eligible = bool(existing_files) and not wants_full_rewrite(state["latest_message"])
+
+    if edit_eligible:
+        await publish_progress(progress, "code_compose_node", "code_compose_node", f"Existing project found ({', '.join(existing_files)}); editing in place instead of rewriting.")
+        edit_result = await run_code_edit_pass(request, state, llm, progress)
+        if edit_result is not None:
+            state.update(edit_result)
+            state["edit_mode"] = True
+            return state
+        await publish_progress(progress, "code_compose_node", "code_compose_node", "The targeted edit didn't apply cleanly; regenerating the file(s) in full instead.")
+
+    await publish_progress(progress, "code_compose_node", "code_compose_node", f"Invoking the code model with {config['label']} effort and a {config['max_tokens']}-token budget.")
 
     code_state = _new_code_stream_state()
 
@@ -661,30 +979,137 @@ async def code_compose_node(request: CodeChatRequest, state: dict, progress=None
         on_answer_piece=on_answer_piece,
     )
     await flush_code_answer_stream(progress, code_state)
+    state["edit_mode"] = False
     return state
 
 
 async def code_extract_artifact_node(state: dict, progress=None) -> dict:
+    if state.get("edit_mode"):
+        # Already parsed and applied as targeted SEARCH/REPLACE edits inside
+        # run_code_edit_pass (including that pass's own activity events) —
+        # nothing left to extract here.
+        return state
+
     explanation, code, language, files, file_languages = extract_code_artifact(state["raw"])
     state.update({"explanation": explanation, "code": code, "language": language, "files": files, "file_languages": file_languages})
+    existing_files = state.get("existing_files", {})
+
     if files:
         await publish_progress(progress, "code_extract_artifact_node", "code_extract_artifact_node", f"Separated {len(files)} named files for the canvas: {', '.join(files)}")
         for filename, content in files.items():
-            line_count = len(content.splitlines()) if content else 0
-            await publish_activity(
-                progress, "create", f"Created {filename}",
-                filename=filename, additions=line_count, deletions=0,
-            )
+            if filename in existing_files:
+                # A full-generate that landed on a filename that already existed
+                # (e.g. the edit-pass above failed and this is the fallback) — show
+                # it as a real edit with real diff stats, not a fake "create".
+                additions, deletions = diff_stats(existing_files[filename], content)
+                await publish_activity(progress, "edit", f"Rewrote {filename}", filename=filename, additions=additions, deletions=deletions)
+            else:
+                line_count = len(content.splitlines()) if content else 0
+                await publish_activity(progress, "create", f"Created {filename}", filename=filename, additions=line_count, deletions=0)
     elif code:
         await publish_progress(progress, "code_extract_artifact_node", "code_extract_artifact_node", f"Extracted the {language or 'text'} implementation block for the canvas.")
-        line_count = len(code.splitlines()) if code else 0
-        implied_name = f"main.{language}" if language else "main"
-        await publish_activity(
-            progress, "create", f"Created {implied_name}",
-            filename=implied_name, additions=line_count, deletions=0,
-        )
+        implied_name = implied_filename(language)
+        if implied_name in existing_files:
+            additions, deletions = diff_stats(existing_files[implied_name], code)
+            await publish_activity(progress, "edit", f"Rewrote {implied_name}", filename=implied_name, additions=additions, deletions=deletions)
+        else:
+            line_count = len(code.splitlines()) if code else 0
+            await publish_activity(progress, "create", f"Created {implied_name}", filename=implied_name, additions=line_count, deletions=0)
     else:
         await publish_progress(progress, "code_extract_artifact_node", "code_extract_artifact_node", "No fenced artifact was returned, so the explanation remains the visible result.")
+    return state
+
+
+async def code_merge_node(state: dict, progress=None) -> dict:
+    """Reconciles this turn's file(s) against the rest of the project so a
+    turn that only touches index.html never silently drops requirements.txt
+    (or any other file) from the response — the canvas is always reconciled
+    against the FULL current project, not just what changed this turn. Also
+    normalizes a single unnamed code block into the same {filename: content}
+    shape as a named build, using a stable implied filename, so every turn
+    from here on (including this one, if edited again later) has a real name
+    to target."""
+    existing_files = state.get("existing_files", {})
+    existing_langs = state.get("existing_file_languages", {})
+
+    if state.get("edit_mode"):
+        # run_code_edit_pass already merged its changes into the full existing
+        # file map — state["files"]/["file_languages"] are already complete.
+        merged_files = dict(state.get("files") or {})
+        merged_langs = dict(state.get("file_languages") or {})
+    else:
+        this_turn_files = dict(state.get("files") or {})
+        this_turn_langs = dict(state.get("file_languages") or {})
+        if not this_turn_files and state.get("code"):
+            name = implied_filename(state.get("language", ""))
+            this_turn_files = {name: state["code"]}
+            this_turn_langs = {name: state.get("language", "")}
+        state["touched_files"] = list(this_turn_files.keys())
+        merged_files = {**existing_files, **this_turn_files}
+        merged_langs = {**existing_langs, **this_turn_langs}
+
+    state["files"] = merged_files
+    state["file_languages"] = merged_langs
+    # Keep the top-level code/language fields populated for a single-file
+    # result too, so anything that only looks at those two fields still works.
+    if len(merged_files) == 1:
+        only_name = next(iter(merged_files))
+        state["code"] = merged_files[only_name]
+        state["language"] = merged_langs.get(only_name, "")
+    return state
+
+
+async def code_review_node(state: dict, progress=None) -> dict:
+    """One lightweight, real self-review pass over the file(s) this turn
+    actually touched — a second small LLM call reads the finished code back
+    and is asked to point out one concrete bug worth flagging, if there is
+    one. If it finds one, the fix is applied the exact same way as any other
+    Code-mode edit: a targeted SEARCH/REPLACE, never a full rewrite. Skipped
+    when there's nothing to review, or at the 'Low' thinking level, to keep
+    quick asks quick."""
+    files = state.get("files") or {}
+    touched = state.get("touched_files") or []
+    if not files or not touched or state["config"]["label"] == "Low":
+        return state
+    target = touched[0]
+    code = files.get(target, "")
+    if not code.strip():
+        return state
+
+    await publish_activity(progress, "note", f"Checking {target} for errors…")
+    language = state.get("file_languages", {}).get(target, "")
+    prompt = (
+        f"Review the following{f' {language}' if language else ''} file for ONE concrete, "
+        "obvious bug — a syntax error, a broken reference, a mismatched tag, an "
+        "off-by-one, something that would actually break. Don't nitpick style or "
+        "suggest improvements.\n\n"
+        "If you find a real bug, respond with EXACTLY one block fixing it, in this "
+        "shape and nothing else:\n"
+        "<<<<<<< SEARCH\n<exact existing lines>\n=======\n<the fixed lines>\n>>>>>>> REPLACE\n\n"
+        "If the file looks correct, respond with exactly: NONE\n\n"
+        f"File: {target}\n\n{code}"
+    )
+    llm = get_llm("fast", 0.1, 1200)
+    try:
+        raw = await invoke_model([HumanMessage(content=prompt)], llm, progress, on_answer_piece=_swallow_answer_piece)
+    except Exception as e:
+        print(f"[CodeMode] code_review_node failed, skipping review: {e}")
+        return state
+    if not raw or raw.strip().upper().startswith("NONE"):
+        return state
+
+    blocks = parse_edit_blocks(raw)
+    updated, touched_by_fix, ok = apply_edit_blocks({target: code}, blocks, target)
+    if not ok or updated[target] == code:
+        return state
+
+    new_code = updated[target]
+    additions, deletions = diff_stats(code, new_code)
+    files[target] = new_code
+    state["files"] = files
+    if len(files) == 1:
+        state["code"] = new_code
+    await publish_activity(progress, "edit", f"Found and fixed a bug in {target}", filename=target, additions=additions, deletions=deletions)
     return state
 
 
@@ -695,7 +1120,8 @@ async def code_finalize_node(state: dict, progress=None) -> dict:
     previewable = {"html", "htm", "css", "js", "javascript", "jsx", "tsx"}
     show_preview = state["language"] in previewable or any(language in previewable for language in file_languages.values())
     await publish_progress(progress, "code_finalize_node", "code_finalize_node", f"Prepared {len(files) if files else 1} separate artifact file(s) and preview metadata for the frontend.")
-    files_touched = len(files) if files else (1 if state.get("code") else 0)
+    touched = state.get("touched_files") or list(files.keys())
+    files_touched = len(touched) if touched else (1 if state.get("code") else 0)
     await publish_turn_summary(progress, files_touched=files_touched, commands_run=0, files_read=0, notes=0)
     return {
         "response": state["explanation"] or "I generated the requested code.",
@@ -712,9 +1138,19 @@ async def code_finalize_node(state: dict, progress=None) -> dict:
 
 async def generate_code_once(request: CodeChatRequest, session: dict, progress=None) -> dict:
     state = await code_understand_node(request, session, progress)
+    state = await code_plan_node(request, state, progress)
     state = await code_compose_node(request, state, progress)
     state = await code_extract_artifact_node(state, progress)
-    return await code_finalize_node(state, progress)
+    state = await code_merge_node(state, progress)
+    state = await code_review_node(state, progress)
+    result = await code_finalize_node(state, progress)
+    # Persist the full, current project back onto the session so the NEXT turn
+    # can edit these exact files in place instead of starting from nothing —
+    # this is the piece that makes "editing the same file, like Claude.ai"
+    # possible across turns at all.
+    session["code_files"] = dict(state.get("files") or {})
+    session["code_file_languages"] = dict(state.get("file_languages") or {})
+    return result
 
 
 @app.get("/health")
@@ -769,7 +1205,7 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
     streamed_text = ""
     try:
         async for event in forward_live_events(task, progress_queue, session_id):
-            if event["type"] in ("status", "thought", "activity", "turn_summary", "code_start", "code_file_start", "code_delta"):
+            if event["type"] in ("status", "thought", "activity", "turn_summary", "code_start", "code_file_start", "code_delta", "plan"):
                 yield f"data: {json.dumps(event)}\n\n"
             elif event["type"] == "token":
                 streamed_text += event["text"]
