@@ -381,7 +381,9 @@ def build_code_messages(history: List[BaseMessage], reasoning_level: str) -> Lis
     config = get_thinking_config(reasoning_level)
     system_text = (
         "You are a practical coding assistant. Produce the requested implementation directly in one pass. "
-        "Give a concise explanation and put the implementation in a fenced code block with its language. "
+        "Give a concise explanation and put the implementation in fenced code blocks. "
+        "If the request needs multiple files, write a separate line `FILE: path/to/file.ext` immediately before each fenced block. "
+        "Use the correct language tag for every block. If one file is enough, return one block without a FILE header. "
         "Do not reveal private chain-of-thought or hidden internal deliberation; provide only a brief, user-facing rationale.\n"
         f"Effort: {config['label']}. Maximum completion budget: {config['max_tokens']} tokens.\n"
         f"Current date and time: {get_current_datetime_str()}"
@@ -389,14 +391,46 @@ def build_code_messages(history: List[BaseMessage], reasoning_level: str) -> Lis
     return [SystemMessage(content=system_text), *history[-6:]]
 
 
-def extract_code_artifact(text: str) -> tuple[str, str, str]:
-    """Extract one fenced artifact while retaining the user-facing explanation."""
-    matches = re.findall(r"```([A-Za-z0-9_+#.-]*)\s*\n([\s\S]*?)```", text or "")
+def extract_code_artifact(text: str) -> tuple[str, str, str, dict, dict]:
+    """Extract one file or multiple named files from Code-mode output."""
+    source = text or ""
+    named_pattern = re.compile(
+        r"(?:^|\n)\s*FILE\s*:\s*(?P<filename>[^\n]+)\n\s*```(?P<language>[A-Za-z0-9_+#.-]*)\s*\n(?P<code>[\s\S]*?)```",
+        re.IGNORECASE,
+    )
+    named_matches = list(named_pattern.finditer(source))
+    if named_matches:
+        files = {}
+        file_languages = {}
+        for match in named_matches:
+            filename = match.group("filename").strip().strip('`')
+            if not filename:
+                continue
+            files[filename] = match.group("code").strip()
+            file_languages[filename] = (match.group("language") or "text").lower()
+        explanation = named_pattern.sub("", source).strip()
+        return explanation, "", "", files, file_languages
+
+    matches = list(re.finditer(r"```([A-Za-z0-9_+#.-]*)\s*\n([\s\S]*?)```", source))
     if not matches:
-        return (text or "").strip(), "", ""
-    language, code = matches[0]
-    explanation = re.sub(r"```[A-Za-z0-9_+#.-]*\s*\n[\s\S]*?```", "", text or "").strip()
-    return explanation, code.strip(), (language or "text").lower()
+        return source.strip(), "", "", {}, {}
+    if len(matches) == 1:
+        language = (matches[0].group(1) or "text").lower()
+        code = matches[0].group(2).strip()
+        explanation = re.sub(r"```[A-Za-z0-9_+#.-]*\s*\n[\s\S]*?```", "", source).strip()
+        return explanation, code, language, {}, {}
+
+    extension_map = {"python": "py", "py": "py", "javascript": "js", "js": "js", "typescript": "ts", "html": "html", "css": "css", "json": "json"}
+    files = {}
+    file_languages = {}
+    for index, match in enumerate(matches, start=1):
+        language = (match.group(1) or "text").lower()
+        extension = extension_map.get(language, "txt")
+        filename = f"file_{index}.{extension}"
+        files[filename] = match.group(2).strip()
+        file_languages[filename] = language
+    explanation = re.sub(r"```[A-Za-z0-9_+#.-]*\s*\n[\s\S]*?```", "", source).strip()
+    return explanation, "", "", files, file_languages
 
 
 async def code_understand_node(request: CodeChatRequest, session: dict, progress=None) -> dict:
@@ -416,9 +450,11 @@ async def code_compose_node(request: CodeChatRequest, state: dict, progress=None
 
 
 async def code_extract_artifact_node(state: dict, progress=None) -> dict:
-    explanation, code, language = extract_code_artifact(state["raw"])
-    state.update({"explanation": explanation, "code": code, "language": language})
-    if code:
+    explanation, code, language, files, file_languages = extract_code_artifact(state["raw"])
+    state.update({"explanation": explanation, "code": code, "language": language, "files": files, "file_languages": file_languages})
+    if files:
+        await publish_progress(progress, "code_extract_artifact_node", "code_extract_artifact_node", f"Separated {len(files)} named files for the canvas: {', '.join(files)}")
+    elif code:
         await publish_progress(progress, "code_extract_artifact_node", "code_extract_artifact_node", f"Extracted the {language or 'text'} implementation block for the canvas.")
     else:
         await publish_progress(progress, "code_extract_artifact_node", "code_extract_artifact_node", "No fenced artifact was returned, so the explanation remains the visible result.")
@@ -426,15 +462,19 @@ async def code_extract_artifact_node(state: dict, progress=None) -> dict:
 
 
 async def code_finalize_node(state: dict, progress=None) -> dict:
-    await publish_progress(progress, "code_finalize_node", "code_finalize_node", "Prepared the explanation, artifact metadata, and preview flag for the frontend.")
     config = state["config"]
+    files = state.get("files", {})
+    file_languages = state.get("file_languages", {})
+    previewable = {"html", "htm", "css", "js", "javascript", "jsx", "tsx"}
+    show_preview = state["language"] in previewable or any(language in previewable for language in file_languages.values())
+    await publish_progress(progress, "code_finalize_node", "code_finalize_node", f"Prepared {len(files) if files else 1} separate artifact file(s) and preview metadata for the frontend.")
     return {
         "response": state["explanation"] or "I generated the requested code.",
         "code": state["code"],
         "language": state["language"],
-        "files": {},
-        "file_languages": {},
-        "show_preview": state["language"] in {"html", "htm", "css", "js", "javascript", "jsx", "tsx"},
+        "files": files,
+        "file_languages": file_languages,
+        "show_preview": show_preview,
         "thinking_summary": f"Generated the implementation with explicit backend nodes using {config['label']} effort.",
         "thinking_level": config["label"],
         "max_tokens": config["max_tokens"],
@@ -516,7 +556,7 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
             "file_languages": {},
             "show_preview": False,
         }
-    if result.get("code"):
+    if result.get("code") or result.get("files"):
         yield f"data: {json.dumps({'type': 'code_result', **result, 'session_id': session_id})}\n\n"
     if not streamed_text:
         yield f"data: {json.dumps({'type': 'message', 'assistant_message': result['response'], 'conversation_id': session_id, 'session_id': session_id})}\n\n"
