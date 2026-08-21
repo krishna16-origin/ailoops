@@ -578,17 +578,15 @@ def extract_code_artifact(text: str) -> tuple[str, str, str, dict, dict]:
 
 
 # ----------------------------------------------------------------------
-# CODE MODE: session memory + incremental (diff-based) edits
+# ----------------------------------------------------------------------
+# CODE MODE: Idea -> Plan -> Code -> Test -> Review -> Fix -> Commit
 #
-# Root cause of "it rewrites the whole file for every tiny change": session
-# history only ever kept the one-line explanation ("I generated the requested
-# code.") in the AIMessage — the actual file contents were never persisted
-# anywhere, so every follow-up turn started from zero knowledge of what had
-# already been built. code_understand_node below now also loads the session's
-# real file map, and code_compose_node uses it to ask for a targeted
-# SEARCH/REPLACE patch instead of a full regenerate whenever a prior version
-# of the file already exists. This entire mechanism is Code-mode-only — plain
-# /chat never touches code_files.
+# This pipeline deliberately keeps the existing frontend event contract. The
+# backend owns the workflow and emits real model reasoning through `thought`
+# events plus concrete `plan`, `activity`, and canvas events. There is no
+# legacy "edit pass then silently regenerate" branch: every turn is an
+# explicit action against the session workspace, followed by test/review and,
+# only when necessary, a targeted fix.
 # ----------------------------------------------------------------------
 
 _EXTENSION_MAP = {
@@ -602,18 +600,12 @@ _EXTENSION_MAP = {
 
 
 def implied_filename(language: str) -> str:
-    """A stable filename for a single unnamed code block, so a follow-up turn
-    has something real to target with a SEARCH/REPLACE edit instead of the
-    file identity being lost the moment the response leaves the model."""
     lang = (language or "").strip().lower()
     ext = _EXTENSION_MAP.get(lang, lang if re.fullmatch(r"[a-z0-9]+", lang) else "txt")
     return f"main.{ext}"
 
 
 def diff_stats(old: str, new: str) -> tuple[int, int]:
-    """Real added/removed line counts between two versions of a file — the same
-    classification `git diff --stat` uses — for the activity trace's +/- badges.
-    Never a token-count heuristic or a guess."""
     sm = difflib.SequenceMatcher(a=(old or "").splitlines(), b=(new or "").splitlines())
     additions = deletions = 0
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -627,79 +619,67 @@ def diff_stats(old: str, new: str) -> tuple[int, int]:
     return additions, deletions
 
 
-_REWRITE_KEYWORDS = (
-    "rewrite everything", "rewrite the whole", "start over", "start from scratch",
-    "from scratch", "redo the whole", "redesign completely", "throw away",
-    "completely different", "scrap it", "rebuild it", "new version of the whole",
-    "build a new website", "build a new site", "create a new website", "create a new site",
-    "make a new website", "make a new site",
+_FILE_FENCE_RE = re.compile(
+    r"(?:^|\n)\s*FILE\s*:\s*(?P<filename>[^\n]+)\r?\n\s*```(?P<language>[A-Za-z0-9_+#.-]*)\s*\r?\n(?P<code>[\s\S]*?)```",
+    re.IGNORECASE,
 )
-
-
-def wants_full_rewrite(message: str) -> bool:
-    """Heuristic: does the request explicitly call for replacing the whole
-    project rather than a targeted change? Deliberately biased toward False
-    (the cheaper diff path) — a false negative just costs one harmless
-    SEARCH/REPLACE attempt that fails closed and falls back to a full
-    regenerate anyway; a false positive pays for a full regenerate when a
-    small patch would have done."""
-    text = (message or "").lower()
-    return any(kw in text for kw in _REWRITE_KEYWORDS)
-
-
-_BUILD_SCOPE_KEYWORDS = (
-    "website", "web site", "webpage", "web page", "landing page", "app",
-    "application", "project", "dashboard", "portfolio", "game", "platform",
-    "system", "tool", "site",
-)
-
-
-def looks_like_a_build(message: str) -> bool:
-    """Whether a brand-new request looks substantial enough to warrant a short
-    plan before writing code — vs. a quick one-off snippet where a plan step
-    would just add latency without helping anyone."""
-    text = (message or "").lower()
-    if any(kw in text for kw in _BUILD_SCOPE_KEYWORDS):
-        return True
-    return len(text.split()) >= 18
-
-
-EDIT_BLOCK_RE = re.compile(
-    r"(?:FILE\s*:\s*(?P<filename>[^\n`]+)\n)?"
-    r"<{3,}\s*SEARCH\s*\n(?P<search>.*?)\n={3,}\s*\n(?P<replace>.*?)\n>{3,}\s*REPLACE",
+_UNNAMED_FENCE_RE = re.compile(r"```([A-Za-z0-9_+#.-]*)\s*\r?\n([\s\S]*?)```")
+_ACTION_BLOCK_RE = re.compile(
+    r"(?:^|\n)\s*(?:FILE\s*:\s*(?P<filename>[^\n`]+)\r?\n)?"
+    r"<{3,}\s*SEARCH\s*\r?\n(?P<search>.*?)\r?\n={3,}\s*\r?\n"
+    r"(?P<replace>.*?)\r?\n>{3,}\s*REPLACE",
     re.DOTALL | re.IGNORECASE,
 )
 
 
-def parse_edit_blocks(text: str) -> list[tuple[str, str, str]]:
-    """Parses SEARCH/REPLACE blocks out of model output into
-    (filename_or_'', search, replace) tuples. filename is '' when the block
-    has no leading `FILE:` header — used for single-file edits/reviews where
-    the target is already known some other way."""
+def parse_code_files(text: str) -> tuple[str, str, str, dict, dict]:
+    """Parse explicit FILE/fence artifacts, with a stable fallback for one block."""
+    source = text or ""
+    named = list(_FILE_FENCE_RE.finditer(source))
+    if named:
+        files, languages = {}, {}
+        for match in named:
+            filename = match.group("filename").strip().strip("`")
+            if filename:
+                files[filename] = match.group("code").strip()
+                languages[filename] = (match.group("language") or "text").lower()
+        return _FILE_FENCE_RE.sub("", source).strip(), "", "", files, languages
+
+    matches = list(_UNNAMED_FENCE_RE.finditer(source))
+    if not matches:
+        return source.strip(), "", "", {}, {}
+    if len(matches) == 1:
+        language = (matches[0].group(1) or "text").lower()
+        code = matches[0].group(2).strip()
+        explanation = _UNNAMED_FENCE_RE.sub("", source).strip()
+        return explanation, code, language, {}, {}
+
+    extension_map = {"python": "py", "py": "py", "javascript": "js", "js": "js", "typescript": "ts", "html": "html", "css": "css", "json": "json"}
+    files, languages = {}, {}
+    for index, match in enumerate(matches, start=1):
+        language = (match.group(1) or "text").lower()
+        files[f"file_{index}.{extension_map.get(language, 'txt')}"] = match.group(2).strip()
+        languages[f"file_{index}.{extension_map.get(language, 'txt')}"] = language
+    return _UNNAMED_FENCE_RE.sub("", source).strip(), "", "", files, languages
+
+
+def parse_action_blocks(text: str) -> list[tuple[str, str, str]]:
     return [
-        ((m.group("filename") or "").strip().strip("`"), m.group("search"), m.group("replace"))
-        for m in EDIT_BLOCK_RE.finditer(text or "")
+        ((match.group("filename") or "").strip().strip("`"), match.group("search"), match.group("replace"))
+        for match in _ACTION_BLOCK_RE.finditer(text or "")
     ]
 
 
-def apply_edit_blocks(files: dict, blocks: list, default_filename: str) -> tuple[dict, list, bool]:
-    """Applies parsed SEARCH/REPLACE blocks to a {filename: content} map.
-    Fails closed: if a block names an unknown file, has an empty (ambiguous)
-    SEARCH, or its SEARCH text isn't found verbatim, the WHOLE apply is
-    rejected (ok=False) rather than landing a partial or garbled edit — the
-    caller then falls back to a full regenerate instead of guessing."""
+def apply_action_blocks(files: dict, blocks: list, default_filename: str) -> tuple[dict, list, bool]:
+    """Apply an entire action atomically; invalid actions never partially mutate a workspace."""
     if not blocks:
-        return files, [], False
+        return dict(files), [], False
     working = dict(files)
     touched = []
     for filename, search, replace in blocks:
         target = filename or default_filename
-        if not target or target not in working:
-            return files, [], False
-        if search == "":
-            return files, [], False
-        if search not in working[target]:
-            return files, [], False
+        if not target or target not in working or not search or search not in working[target]:
+            return dict(files), [], False
         working[target] = working[target].replace(search, replace, 1)
         if target not in touched:
             touched.append(target)
@@ -716,14 +696,6 @@ def _new_code_stream_state() -> dict:
 
 
 async def _stream_code_line(progress, line: str, code_state: dict) -> None:
-    """Consume one complete line of the model's (post-thinking) answer text and
-    turn it into the right live event. A `FILE: name` header is swallowed and
-    remembered; a fenced-code open/close line flips between prose and code; prose
-    lines stream to the chat bubble as plain 'token' events exactly as before,
-    while code lines now stream straight into the canvas as 'code_delta' events —
-    the event type the frontend's code canvas already knew how to render live,
-    that the backend was simply never sending, so the canvas only ever filled in
-    all at once at the very end instead of live as the model wrote it."""
     if not code_state["in_code"]:
         file_match = _FILE_HEADER_RE.match(line)
         if file_match:
@@ -736,23 +708,17 @@ async def _stream_code_line(progress, line: str, code_state: dict) -> None:
             code_state["pending_filename"] = None
             code_state["in_code"] = True
             code_state["current_file"] = filename
-            if filename:
-                await publish_event(progress, {"type": "code_file_start", "language": language, "filename": filename})
-            else:
-                await publish_event(progress, {"type": "code_start", "language": language})
+            event = {"type": "code_file_start", "language": language, "filename": filename} if filename else {"type": "code_start", "language": language}
+            await publish_event(progress, event)
             return
         await publish_token(progress, line + "\n")
+    elif _FENCE_CLOSE_RE.match(line):
+        code_state["in_code"] = False
     else:
-        if _FENCE_CLOSE_RE.match(line):
-            code_state["in_code"] = False
-            return
         await publish_event(progress, {"type": "code_delta", "delta": line + "\n", "filename": code_state["current_file"]})
 
 
 async def stream_code_answer_piece(progress, code_state: dict, text: str) -> None:
-    """Feed a live slice of raw answer text into the line-buffered code parser
-    above. Model output doesn't arrive aligned to line boundaries, so this holds
-    onto whatever's left of the current line between calls."""
     code_state["line_buf"] += text
     while "\n" in code_state["line_buf"]:
         line, code_state["line_buf"] = code_state["line_buf"].split("\n", 1)
@@ -760,394 +726,268 @@ async def stream_code_answer_piece(progress, code_state: dict, text: str) -> Non
 
 
 async def flush_code_answer_stream(progress, code_state: dict) -> None:
-    """Called once the model's turn is fully done — the last line of a response
-    usually has no trailing newline, so it never gets processed inside the loop
-    above and has to be flushed explicitly."""
     if code_state["line_buf"]:
         await _stream_code_line(progress, code_state["line_buf"], code_state)
         code_state["line_buf"] = ""
 
 
-async def code_understand_node(request: CodeChatRequest, session: dict, progress=None) -> dict:
+async def code_idea_node(request: CodeChatRequest, session: dict, progress=None) -> dict:
     config = get_thinking_config(request.reasoning_level)
-    latest_message = session["messages"][-1].content if session["messages"] else request.message
-    excerpt = request_excerpt(latest_message)
-    # The real project state from every prior turn in this session — empty on
-    # the very first Code-mode message, populated from here on by
-    # generate_code_once's session persistence at the end of every turn.
     existing_files = dict(session.get("code_files", {}))
-    existing_file_languages = dict(session.get("code_file_languages", {}))
-    if existing_files:
-        await publish_progress(progress, "code_understand_node", "code_understand_node", f"Read the request against the existing project ({', '.join(existing_files)}): “{excerpt}”")
-    else:
-        await publish_progress(progress, "code_understand_node", "code_understand_node", f"Read the build request and identified the requested result: “{excerpt}”")
-    return {
-        "config": config,
-        "history": session["messages"],
-        "latest_message": latest_message,
-        "existing_files": existing_files,
-        "existing_file_languages": existing_file_languages,
-    }
+    manifest = "\n".join(existing_files) or "(empty workspace)"
+    await publish_progress(progress, "idea", "idea", "Understanding the request and the current workspace before making changes.")
+    prompt = (
+        "You are in the IDEA stage of a coding workflow. Understand the user's request, inspect the existing workspace "
+        "context, and identify the real next goal. Do not write code, do not output a plan marker, and do not output "
+        "fences. Think naturally inside one <think>...</think> block, then give one concise sentence summarizing the "
+        "understanding.\n\nWorkspace files:\n" + manifest + "\n\nUser request:\n" + request.message
+    )
+    llm = get_llm("reasoning" if request.model in {"glm", "kimik2.6"} else "balanced", 0.2, min(1800, config["max_tokens"]))
+    try:
+        raw = await invoke_model([SystemMessage(content="You are the idea stage."), HumanMessage(content=prompt)], llm, progress, on_answer_piece=_swallow_answer_piece)
+    except Exception as exc:
+        print(f"[CodeMode] idea stage failed: {exc}")
+        raw = ""
+    return {"config": config, "history": session["messages"], "latest_message": request.message, "existing_files": existing_files, "existing_file_languages": dict(session.get("code_file_languages", {})), "idea": raw.strip()}
 
 
 async def _swallow_answer_piece(_text: str) -> None:
-    """Used as invoke_model's on_answer_piece for internal sub-calls (plan,
-    edit-diff, review) whose visible output must never leak into the chat
-    bubble as ordinary answer tokens — only their live reasoning trace (real
-    'thought' events) should reach the user while they run."""
     return None
 
 
 async def code_plan_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
-    """Runs ONLY on a brand-new build in this session (no existing files yet)
-    for a request that looks substantial — mirrors "think, then plan the
-    files, then write code" instead of jumping straight to code with no
-    stated intent. One short real LLM call: its own reasoning streams live
-    into the Thinking pane exactly like every other call here, never a
-    canned status line. Published as a 'plan' event so the frontend can show
-    the manifest before any code starts streaming. Silently skipped (falls
-    through to code_compose_node as before) for edits, tiny one-off asks, or
-    if anything about the call goes wrong — a missing plan should never block
-    the actual build."""
-    if state["existing_files"] or not looks_like_a_build(state["latest_message"]):
-        return state
-    config = state["config"]
-    llm = get_llm("fast", 0.2, min(1200, config["max_tokens"]))
+    existing = state["existing_files"]
+    manifest = "\n".join(f"- {name}" for name in existing) or "- (none)"
     prompt = (
-        "A user just asked a coding assistant to build something. Before any code is "
-        "written, decide what you'll build and which file(s) it needs. Think inside a "
-        "single <think>...</think> block about the approach, briefly. Then, after the "
-        "closing </think> tag, write 1-2 short sentences describing what you'll build, "
-        "then on a new line write exactly 'FILES:' followed by one bare filename per "
-        "line (e.g. index.html) for every file the build will need — no paths, no "
-        "commentary, nothing else.\n\n"
-        f"Request: {state['latest_message']}"
+        "You are in the PLAN stage. Decide the single next implementation action for the user's request. "
+        "Do not write code. After thinking, respond with a short plan sentence, then exactly:\n"
+        "FILES:\n<one filename per line>\n\n"
+        "For a new build, list the files you will create. For an edit, list the file(s) you will touch. "
+        "Never invent unrelated files.\n\nExisting files:\n" + manifest + "\n\nRequest:\n" + state["latest_message"]
     )
-    messages = [SystemMessage(content="You plan briefly before you build."), HumanMessage(content=prompt)]
+    llm = get_llm("fast", 0.2, min(1800, state["config"]["max_tokens"]))
     try:
-        raw = await invoke_model(messages, llm, progress, on_answer_piece=_swallow_answer_piece)
-    except Exception as e:
-        print(f"[CodeMode] code_plan_node failed, skipping plan: {e}")
-        return state
-    if not raw:
-        return state
-    marker = re.search(r"FILES\s*:\s*\n", raw, re.IGNORECASE)
-    summary = (raw[: marker.start()] if marker else raw).strip()
-    files: list[str] = []
+        raw = await invoke_model([SystemMessage(content="You are the plan stage."), HumanMessage(content=prompt)], llm, progress, on_answer_piece=_swallow_answer_piece)
+    except Exception as exc:
+        print(f"[CodeMode] plan stage failed: {exc}")
+        raw = ""
+    marker = re.search(r"FILES\s*:\s*\n", raw or "", re.IGNORECASE)
+    summary = (raw[:marker.start()] if marker else (raw or "")).strip()
+    planned = []
     if marker:
         for line in raw[marker.end():].splitlines():
-            name = line.strip().strip("-*•").strip().strip("`")
-            if name and re.match(r"^[\w.\-]+\.[A-Za-z0-9]+$", name):
-                files.append(name)
-    if not summary and not files:
-        return state
-    await publish_event(progress, {"type": "plan", "summary": summary, "files": files[:8]})
-    state["planned_files"] = files[:8]
+            name = line.strip().strip("-*• ").strip("`")
+            if name and re.fullmatch(r"[\w./-]+\.[A-Za-z0-9]+", name):
+                planned.append(name)
+    if not planned and existing:
+        planned = list(existing)[:8]
+    await publish_event(progress, {"type": "plan", "summary": summary or "Plan the requested implementation and validate it before presenting the result.", "files": planned[:8]})
+    state.update({"plan_summary": summary, "planned_files": planned[:8]})
     return state
 
 
-async def run_code_edit_pass(request: CodeChatRequest, state: dict, llm, progress=None) -> Optional[dict]:
-    """The heart of "edit the same file instead of rewriting all the code":
-    asks the model for one or more small SEARCH/REPLACE blocks against the
-    project's CURRENT file contents (loaded from session), applies them
-    locally with plain string replacement, and only pays output tokens for
-    the lines that actually changed. Also lets the model add a brand-new file
-    via a `FILE:`+fenced block in the same response (e.g. adding a
-    requirements.txt to an existing build). Returns None (never a partial or
-    guessed result) if the model didn't produce anything usable — the caller
-    then falls back to code_compose_node's original full-generate path."""
-    existing_files = state["existing_files"]
-    existing_file_languages = state["existing_file_languages"]
-    default_filename = next(iter(existing_files)) if len(existing_files) == 1 else ""
-    file_list = "\n\n".join(
-        f"--- FILE: {name} ({existing_file_languages.get(name, 'text')}) ---\n{content}"
-        for name, content in existing_files.items()
-    )
-    filename_note = (
-        f"There is exactly one existing file, '{default_filename}' — SEARCH/REPLACE blocks for it don't need a FILE: header."
-        if default_filename else
-        "There are multiple existing files — put a `FILE: <name>` line immediately before every SEARCH/REPLACE block, naming which file it targets."
-    )
+async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=None, fix_issue: str = "") -> dict:
+    existing = state["existing_files"]
+    languages = state["existing_file_languages"]
+    workspace = "\n\n".join(f"--- FILE: {name} ({languages.get(name, 'text')}) ---\n{content}" for name, content in existing.items()) or "(empty workspace)"
+    default_filename = next(iter(existing)) if len(existing) == 1 else ""
+    issue = f"\nConcrete issue to fix:\n{fix_issue}\n" if fix_issue else ""
+    if existing:
+        format_rules = (
+            "For an existing file, return one or more exact SEARCH/REPLACE blocks. Use `FILE: name` before each "
+            "block when there is more than one file. For a new file, return `FILE: name` followed by a fenced block. "
+            "Do not return a full rewrite for an existing file."
+        )
+    else:
+        format_rules = "Create the requested file(s) using `FILE: name` immediately before each fenced code block."
     prompt = (
-        "The project below already exists. Make ONLY the change described by the user's "
-        "latest message below — do not rewrite files that don't need to change, and do "
-        "not regenerate anything beyond the specific lines that actually need to change.\n\n"
-        f"{filename_note}\n\n"
-        "Respond with one or more blocks in exactly this shape, and nothing else — no "
-        "commentary outside the blocks:\n\n"
-        "<<<<<<< SEARCH\n<exact existing lines, copied character-for-character>\n=======\n"
-        "<the new lines that replace them>\n>>>>>>> REPLACE\n\n"
-        "Rules:\n"
-        "- Every SEARCH block must match the existing file EXACTLY, including whitespace.\n"
-        "- Keep each SEARCH block as short as possible while still being unique in its file.\n"
-        "- Use several blocks for several separate changes, even across different files.\n"
-        "- To insert code, include a short unique anchor line in SEARCH and put that anchor "
-        "plus the new lines in REPLACE.\n"
-        "- To delete code, put it in SEARCH and leave REPLACE empty.\n"
-        "- If (and only if) the request needs a brand-new file that doesn't exist yet, "
-        "instead write a line `FILE: path/to/new_file.ext` followed by a fenced code "
-        "block containing that file's full contents.\n\n"
-        f"Existing project:\n{file_list}\n\n"
-        f"User's latest request: {state['latest_message']}"
+        "You are in the CODE stage. Apply only the planned request to the workspace. " + format_rules + issue + "\n"
+        "Exact SEARCH/REPLACE format:\n<<<<<<< SEARCH\n<existing lines exactly>\n=======\n<replacement lines>\n>>>>>>> REPLACE\n\n"
+        "Nothing outside the action blocks or FILE/fenced blocks.\n\nWorkspace:\n" + workspace + "\n\nPlan:\n" + state.get("plan_summary", "") + "\n\nUser request:\n" + state["latest_message"]
     )
-    messages = [
-        SystemMessage(content="You make precise, minimal, targeted code edits to an existing project — never a full rewrite when a small patch will do."),
-        HumanMessage(content=prompt),
-    ]
-    try:
-        raw = await invoke_model(messages, llm, progress, on_answer_piece=_swallow_answer_piece)
-    except Exception as e:
-        print(f"[CodeMode] run_code_edit_pass failed, falling back to full generate: {e}")
-        return None
-    if not raw:
-        return None
-
-    edit_blocks = parse_edit_blocks(raw)
-    remaining_text = EDIT_BLOCK_RE.sub("", raw)
-    _, _, _, new_files, new_file_languages = extract_code_artifact(remaining_text)
-
-    updated_files = dict(existing_files)
-    updated_languages = dict(existing_file_languages)
-    touched: list[str] = []
-
-    if edit_blocks:
-        merged, edited_names, ok = apply_edit_blocks(existing_files, edit_blocks, default_filename)
-        if not ok:
-            return None  # fail closed — an edit that doesn't apply cleanly is never guessed at
-        updated_files.update(merged)
-        touched.extend(edited_names)
-
-    for filename, content in new_files.items():
-        updated_files[filename] = content
-        updated_languages[filename] = new_file_languages.get(filename, "text")
-        if filename not in touched:
-            touched.append(filename)
-
-    if not touched:
-        return None  # nothing usable came back — let the caller fall back to a full generate
-
-    for filename in touched:
-        old_content = existing_files.get(filename, "")
-        new_content = updated_files[filename]
-        additions, deletions = diff_stats(old_content, new_content)
-        if filename in existing_files:
-            await publish_activity(progress, "edit", f"Edited {filename}", filename=filename, additions=additions, deletions=deletions)
-        else:
-            await publish_activity(progress, "create", f"Added {filename}", filename=filename, additions=additions, deletions=0)
-
-    explanation = (
-        f"Applied a targeted edit to {touched[0]} without rewriting the rest of the code."
-        if len(touched) == 1 else
-        f"Applied targeted edits to {', '.join(touched)} without rewriting the rest of the code."
-    )
-    return {
-        "files": updated_files,
-        "file_languages": updated_languages,
-        "code": "",
-        "language": "",
-        "explanation": explanation,
-        "touched_files": touched,
-    }
-
-
-async def code_compose_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
-    config = state["config"]
     model_type = "reasoning" if request.model in {"glm", "kimik2.6"} else "balanced"
-    llm = get_llm(model_type, 0.2, config["max_tokens"])
-
-    existing_files = state["existing_files"]
-    edit_eligible = bool(existing_files) and not wants_full_rewrite(state["latest_message"])
-
-    if edit_eligible:
-        await publish_progress(progress, "code_compose_node", "code_compose_node", f"Existing project found ({', '.join(existing_files)}); editing in place instead of rewriting.")
-        edit_result = await run_code_edit_pass(request, state, llm, progress)
-        if edit_result is not None:
-            state.update(edit_result)
-            state["edit_mode"] = True
-            return state
-        await publish_progress(progress, "code_compose_node", "code_compose_node", "The targeted edit didn't apply cleanly; regenerating the file(s) in full instead.")
-
-    await publish_progress(progress, "code_compose_node", "code_compose_node", f"Invoking the code model with {config['label']} effort and a {config['max_tokens']}-token budget.")
-
+    llm = get_llm(model_type, 0.2, state["config"]["max_tokens"])
     code_state = _new_code_stream_state()
 
     async def on_answer_piece(text: str) -> None:
         await stream_code_answer_piece(progress, code_state, text)
 
-    state["raw"] = await invoke_model(
-        build_code_messages(state["history"], request.reasoning_level), llm, progress,
-        on_answer_piece=on_answer_piece,
-    )
-    await flush_code_answer_stream(progress, code_state)
-    state["edit_mode"] = False
-    return state
-
-
-async def code_extract_artifact_node(state: dict, progress=None) -> dict:
-    if state.get("edit_mode"):
-        # Already parsed and applied as targeted SEARCH/REPLACE edits inside
-        # run_code_edit_pass (including that pass's own activity events) —
-        # nothing left to extract here.
-        return state
-
-    explanation, code, language, files, file_languages = extract_code_artifact(state["raw"])
-    state.update({"explanation": explanation, "code": code, "language": language, "files": files, "file_languages": file_languages})
-    existing_files = state.get("existing_files", {})
-
-    if files:
-        await publish_progress(progress, "code_extract_artifact_node", "code_extract_artifact_node", f"Separated {len(files)} named files for the canvas: {', '.join(files)}")
-        for filename, content in files.items():
-            if filename in existing_files:
-                # A full-generate that landed on a filename that already existed
-                # (e.g. the edit-pass above failed and this is the fallback) — show
-                # it as a real edit with real diff stats, not a fake "create".
-                additions, deletions = diff_stats(existing_files[filename], content)
-                await publish_activity(progress, "edit", f"Rewrote {filename}", filename=filename, additions=additions, deletions=deletions)
-            else:
-                line_count = len(content.splitlines()) if content else 0
-                await publish_activity(progress, "create", f"Created {filename}", filename=filename, additions=line_count, deletions=0)
-    elif code:
-        await publish_progress(progress, "code_extract_artifact_node", "code_extract_artifact_node", f"Extracted the {language or 'text'} implementation block for the canvas.")
-        implied_name = implied_filename(language)
-        if implied_name in existing_files:
-            additions, deletions = diff_stats(existing_files[implied_name], code)
-            await publish_activity(progress, "edit", f"Rewrote {implied_name}", filename=implied_name, additions=additions, deletions=deletions)
-        else:
-            line_count = len(code.splitlines()) if code else 0
-            await publish_activity(progress, "create", f"Created {implied_name}", filename=implied_name, additions=line_count, deletions=0)
-    else:
-        await publish_progress(progress, "code_extract_artifact_node", "code_extract_artifact_node", "No fenced artifact was returned, so the explanation remains the visible result.")
-    return state
-
-
-async def code_merge_node(state: dict, progress=None) -> dict:
-    """Reconciles this turn's file(s) against the rest of the project so a
-    turn that only touches index.html never silently drops requirements.txt
-    (or any other file) from the response — the canvas is always reconciled
-    against the FULL current project, not just what changed this turn. Also
-    normalizes a single unnamed code block into the same {filename: content}
-    shape as a named build, using a stable implied filename, so every turn
-    from here on (including this one, if edited again later) has a real name
-    to target."""
-    existing_files = state.get("existing_files", {})
-    existing_langs = state.get("existing_file_languages", {})
-
-    if state.get("edit_mode"):
-        # run_code_edit_pass already merged its changes into the full existing
-        # file map — state["files"]/["file_languages"] are already complete.
-        merged_files = dict(state.get("files") or {})
-        merged_langs = dict(state.get("file_languages") or {})
-    else:
-        this_turn_files = dict(state.get("files") or {})
-        this_turn_langs = dict(state.get("file_languages") or {})
-        if not this_turn_files and state.get("code"):
-            name = implied_filename(state.get("language", ""))
-            this_turn_files = {name: state["code"]}
-            this_turn_langs = {name: state.get("language", "")}
-        state["touched_files"] = list(this_turn_files.keys())
-        merged_files = {**existing_files, **this_turn_files}
-        merged_langs = {**existing_langs, **this_turn_langs}
-
-    state["files"] = merged_files
-    state["file_languages"] = merged_langs
-    # Keep the top-level code/language fields populated for a single-file
-    # result too, so anything that only looks at those two fields still works.
-    if len(merged_files) == 1:
-        only_name = next(iter(merged_files))
-        state["code"] = merged_files[only_name]
-        state["language"] = merged_langs.get(only_name, "")
-    return state
-
-
-async def code_review_node(state: dict, progress=None) -> dict:
-    """One lightweight, real self-review pass over the file(s) this turn
-    actually touched — a second small LLM call reads the finished code back
-    and is asked to point out one concrete bug worth flagging, if there is
-    one. If it finds one, the fix is applied the exact same way as any other
-    Code-mode edit: a targeted SEARCH/REPLACE, never a full rewrite. Skipped
-    when there's nothing to review, or at the 'Low' thinking level, to keep
-    quick asks quick."""
-    files = state.get("files") or {}
-    touched = state.get("touched_files") or []
-    if not files or not touched or state["config"]["label"] == "Low":
-        return state
-    target = touched[0]
-    code = files.get(target, "")
-    if not code.strip():
-        return state
-
-    await publish_activity(progress, "note", f"Checking {target} for errors…")
-    language = state.get("file_languages", {}).get(target, "")
-    prompt = (
-        f"Review the following{f' {language}' if language else ''} file for ONE concrete, "
-        "obvious bug — a syntax error, a broken reference, a mismatched tag, an "
-        "off-by-one, something that would actually break. Don't nitpick style or "
-        "suggest improvements.\n\n"
-        "If you find a real bug, respond with EXACTLY one block fixing it, in this "
-        "shape and nothing else:\n"
-        "<<<<<<< SEARCH\n<exact existing lines>\n=======\n<the fixed lines>\n>>>>>>> REPLACE\n\n"
-        "If the file looks correct, respond with exactly: NONE\n\n"
-        f"File: {target}\n\n{code}"
-    )
-    llm = get_llm("fast", 0.1, 1200)
     try:
-        raw = await invoke_model([HumanMessage(content=prompt)], llm, progress, on_answer_piece=_swallow_answer_piece)
-    except Exception as e:
-        print(f"[CodeMode] code_review_node failed, skipping review: {e}")
-        return state
-    if not raw or raw.strip().upper().startswith("NONE"):
-        return state
+        raw = await invoke_model([SystemMessage(content="You are the code action stage."), HumanMessage(content=prompt)], llm, progress, on_answer_piece=on_answer_piece)
+        await flush_code_answer_stream(progress, code_state)
+    except Exception as exc:
+        print(f"[CodeMode] code action failed: {exc}")
+        return {"raw": "", "files": dict(existing), "file_languages": dict(languages), "touched_files": [], "explanation": "The code action could not be completed."}
 
-    blocks = parse_edit_blocks(raw)
-    updated, touched_by_fix, ok = apply_edit_blocks({target: code}, blocks, target)
-    if not ok or updated[target] == code:
-        return state
+    action_blocks = parse_action_blocks(raw)
+    remaining = _ACTION_BLOCK_RE.sub("", raw)
+    _, single_code, single_language, created_files, created_languages = parse_code_files(remaining)
+    if single_code and not created_files:
+        fallback_name = default_filename or implied_filename(single_language)
+        created_files = {fallback_name: single_code}
+        created_languages = {fallback_name: single_language or "text"}
+    updated = dict(existing)
+    updated_languages = dict(languages)
+    touched = []
 
-    new_code = updated[target]
-    additions, deletions = diff_stats(code, new_code)
-    files[target] = new_code
-    state["files"] = files
-    if len(files) == 1:
-        state["code"] = new_code
-    await publish_activity(progress, "edit", f"Found and fixed a bug in {target}", filename=target, additions=additions, deletions=deletions)
+    if action_blocks:
+        updated, edited, ok = apply_action_blocks(existing, action_blocks, default_filename)
+        if not ok:
+            await publish_activity(progress, "note", "The proposed edit did not match the current file exactly; no partial change was applied.")
+            return {"raw": raw, "files": dict(existing), "file_languages": dict(languages), "touched_files": [], "explanation": "No change was applied because the exact edit could not be verified."}
+        touched.extend(edited)
+    for filename, content in created_files.items():
+        updated[filename] = content
+        updated_languages[filename] = created_languages.get(filename, "text")
+        if filename not in touched:
+            touched.append(filename)
+
+    for filename in touched:
+        old = existing.get(filename, "")
+        additions, deletions = diff_stats(old, updated[filename])
+        if filename in existing:
+            await publish_activity(progress, "edit", f"Edited {filename}", filename=filename, additions=additions, deletions=deletions)
+        else:
+            await publish_activity(progress, "create", f"Created {filename}", filename=filename, additions=additions, deletions=0)
+
+    if not touched and existing:
+        return {"raw": raw, "files": updated, "file_languages": updated_languages, "touched_files": [], "explanation": "The workspace already matches the requested change."}
+    return {"raw": raw, "files": updated, "file_languages": updated_languages, "touched_files": touched, "explanation": f"Applied the planned change to {', '.join(touched)}." if touched else "Generated the requested implementation."}
+
+
+async def code_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
+    await publish_progress(progress, "code", "code", "Writing the planned implementation in the workspace.")
+    result = await _invoke_code_action(request, state, progress)
+    state.update(result)
+    return state
+
+
+async def code_test_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
+    files = state.get("files") or {}
+    touched = state.get("touched_files") or list(files)
+    target = touched[0] if touched else (next(iter(files)) if files else "")
+    code = files.get(target, "")
+    language = state.get("file_languages", {}).get(target, "")
+    notes = "No file changed, so there was nothing new to test."
+    passed = True
+    if code.strip() and language.lower() in {"python", "py"}:
+        try:
+            compile(code, target or "<generated>", "exec")
+            notes = f"Python syntax check passed for {target}."
+        except SyntaxError as exc:
+            passed = False
+            notes = f"Python syntax error in {target}: {exc.msg} on line {exc.lineno}."
+    elif code.strip() and language.lower() == "json":
+        try:
+            json.loads(code)
+            notes = f"JSON parse check passed for {target}."
+        except json.JSONDecodeError as exc:
+            passed = False
+            notes = f"Invalid JSON in {target}: {exc.msg} on line {exc.lineno}."
+    elif code.strip():
+        llm = get_llm("fast", 0.1, min(1400, state["config"]["max_tokens"]))
+        prompt = (
+            "You are in the TEST stage. Check the changed file for one concrete breaking issue, syntax problem, "
+            "or missed requirement. Think inside <think> tags. After that respond with exactly PASS or FAIL: <short reason>. "
+            f"\n\nFile: {target}\nLanguage: {language}\n\n{code}"
+        )
+        try:
+            raw = await invoke_model([SystemMessage(content="You are the test stage."), HumanMessage(content=prompt)], llm, progress, on_answer_piece=_swallow_answer_piece)
+            line = (raw or "").strip().splitlines()[-1] if raw else "PASS: no issue reported"
+            passed = not line.upper().startswith("FAIL")
+            notes = line
+        except Exception as exc:
+            notes = f"Test reasoning unavailable; no static failure was found ({type(exc).__name__})."
+    if target:
+        await publish_activity(progress, "note", f"Checked {target}: {notes}")
+    state.update({"test_passed": passed, "test_notes": notes, "test_target": target, "needs_fix": not passed, "review_notes": ""})
+    return state
+
+
+async def code_review_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
+    files = state.get("files") or {}
+    touched = state.get("touched_files") or list(files)
+    target = touched[0] if touched else (next(iter(files)) if files else "")
+    if not target or state.get("config", {}).get("label") == "Low":
+        return state
+    code = files.get(target, "")
+    language = state.get("file_languages", {}).get(target, "")
+    llm = get_llm("fast", 0.1, min(1400, state["config"]["max_tokens"]))
+    prompt = (
+        "You are in the REVIEW stage. Review the changed file against the user request and test notes. "
+        "Think inside <think> tags. Then respond exactly PASS or FAIL: <one concrete issue>. Do not suggest style changes.\n\n"
+        f"Request: {state['latest_message']}\nTest notes: {state.get('test_notes', '')}\nFile: {target} ({language})\n\n{code}"
+    )
+    try:
+        raw = await invoke_model([SystemMessage(content="You are the review stage."), HumanMessage(content=prompt)], llm, progress, on_answer_piece=_swallow_answer_piece)
+        line = (raw or "").strip().splitlines()[-1] if raw else "PASS: review unavailable"
+    except Exception as exc:
+        line = f"PASS: review unavailable ({type(exc).__name__})"
+    review_failed = line.upper().startswith("FAIL")
+    await publish_activity(progress, "note", f"Reviewed {target}: {line}")
+    state.update({"review_notes": line, "needs_fix": bool(state.get("needs_fix")) or review_failed, "review_target": target})
+    return state
+
+
+async def code_fix_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
+    if not state.get("needs_fix"):
+        return state
+    target = state.get("test_target") or state.get("review_target") or next(iter(state.get("files", {})), "")
+    issue = f"{state.get('test_notes', '')}\n{state.get('review_notes', '')}"
+    await publish_progress(progress, "fix", "fix", f"Fixing the verified issue in {target} without rewriting the file.")
+    fixed = await _invoke_code_action(request, {**state, "existing_files": state.get("files", {}), "existing_file_languages": state.get("file_languages", {})}, progress, fix_issue=issue)
+    state.update(fixed)
+    state["needs_fix"] = False
+    return state
+
+
+async def code_commit_node(state: dict, progress=None) -> dict:
+    files = state.get("files") or {}
+    touched = state.get("touched_files") or list(files)
+    summary = state.get("explanation") or "Completed the requested Code-mode change."
+    await publish_activity(progress, "done", "Finished the requested change.")
+    state["explanation"] = summary
+    state["commit_message"] = f"Applied Code-mode change to {', '.join(touched) if touched else 'the workspace'}"
     return state
 
 
 async def code_finalize_node(state: dict, progress=None) -> dict:
-    config = state["config"]
     files = state.get("files", {})
     file_languages = state.get("file_languages", {})
     previewable = {"html", "htm", "css", "js", "javascript", "jsx", "tsx"}
-    show_preview = state["language"] in previewable or any(language in previewable for language in file_languages.values())
-    await publish_progress(progress, "code_finalize_node", "code_finalize_node", f"Prepared {len(files) if files else 1} separate artifact file(s) and preview metadata for the frontend.")
-    touched = state.get("touched_files") or list(files.keys())
-    files_touched = len(touched) if touched else (1 if state.get("code") else 0)
-    await publish_turn_summary(progress, files_touched=files_touched, commands_run=0, files_read=0, notes=0)
+    language = state.get("language", "")
+    show_preview = language.lower() in previewable or any((item or "").lower() in previewable for item in file_languages.values())
+    if len(files) == 1:
+        only_name = next(iter(files))
+        state["code"] = files[only_name]
+        state["language"] = file_languages.get(only_name, state.get("language", ""))
+    await publish_progress(progress, "commit", "commit", f"Prepared {len(files)} workspace file(s) for the existing canvas.")
+    await publish_turn_summary(progress, files_touched=len(state.get("touched_files") or []), commands_run=0, files_read=len(state.get("existing_files") or {}), notes=1)
     return {
-        "response": state["explanation"] or "I generated the requested code.",
-        "code": state["code"],
-        "language": state["language"],
+        "response": state.get("explanation") or "Completed the requested Code-mode change.",
+        "code": state.get("code", ""),
+        "language": state.get("language", ""),
         "files": files,
         "file_languages": file_languages,
         "show_preview": show_preview,
-        "thinking_summary": f"Generated the implementation with explicit backend nodes using {config['label']} effort.",
-        "thinking_level": config["label"],
-        "max_tokens": config["max_tokens"],
+        "thinking_summary": "Completed Idea, Plan, Code, Test, Review, Fix, and Commit stages.",
+        "thinking_level": state["config"]["label"],
+        "max_tokens": state["config"]["max_tokens"],
     }
 
 
 async def generate_code_once(request: CodeChatRequest, session: dict, progress=None) -> dict:
-    state = await code_understand_node(request, session, progress)
+    state = await code_idea_node(request, session, progress)
     state = await code_plan_node(request, state, progress)
-    state = await code_compose_node(request, state, progress)
-    state = await code_extract_artifact_node(state, progress)
-    state = await code_merge_node(state, progress)
-    state = await code_review_node(state, progress)
+    state = await code_node(request, state, progress)
+    for _ in range(2):
+        state = await code_test_node(request, state, progress)
+        state = await code_review_node(request, state, progress)
+        if not state.get("needs_fix"):
+            break
+        state = await code_fix_node(request, state, progress)
+    state = await code_commit_node(state, progress)
     result = await code_finalize_node(state, progress)
-    # Persist the full, current project back onto the session so the NEXT turn
-    # can edit these exact files in place instead of starting from nothing —
-    # this is the piece that makes "editing the same file, like Claude.ai"
-    # possible across turns at all.
     session["code_files"] = dict(state.get("files") or {})
     session["code_file_languages"] = dict(state.get("file_languages") or {})
     return result
