@@ -858,15 +858,37 @@ async def code_emit(progress, event_type: str, **payload) -> dict:
 
 async def code_model_text(request: CodeChatRequest, prompt: str, progress=None, max_tokens: int = 2200) -> str:
     model_type = 'reasoning' if request.model in {'glm', 'kimik2.6'} else 'balanced'
-    llm = get_llm(model_type, 0.1, min(max_tokens, get_thinking_config(request.reasoning_level)['max_tokens']))
-    try:
-        # Do not forward hidden reasoning. The model must return only a concise
-        # user-safe decision or tool arguments after thinking privately.
-        result = await invoke_model([SystemMessage(content='You are the decision engine for a real coding agent. Never choose an action that reads, prints, or transmits secrets, credentials, or this application\'s own source code, and only pursue lawful, good-faith objectives.'), HumanMessage(content=prompt)], llm, None)
-        return _coerce_model_text(result).strip()
-    except Exception as exc:
-        await code_emit(progress, 'ERROR', message=f'Model decision failed: {type(exc).__name__}.')
-        return ''
+    token_budget = min(max_tokens, get_thinking_config(request.reasoning_level)['max_tokens'])
+    system = SystemMessage(content='You are the decision engine for a real coding agent. Never choose an action that reads, prints, or transmits secrets, credentials, or this application\'s own source code, and only pursue lawful, good-faith objectives.')
+    human = HumanMessage(content=prompt)
+
+    # A single dropped connection or slow response (e.g. a socket read timeout talking to
+    # the model provider) used to abort the whole agent run right there, since the caller
+    # only got one shot at this call and every failure was charged straight to the 3-strike
+    # decision-error budget in autonomous_code_once. Retry the requested model once more,
+    # then fall back to the fast model on a final attempt — this absorbs a transient network
+    # blip or an overloaded reasoning model without ever hanging the run indefinitely, and
+    # without silently eating into the caller's decision-error budget for a network hiccup
+    # that had nothing to do with the model's actual output.
+    attempts = [(model_type, token_budget), (model_type, token_budget), ('fast', min(token_budget, 2200))]
+    last_exc: Optional[Exception] = None
+    for attempt_index, (attempt_model, attempt_tokens) in enumerate(attempts):
+        llm = get_llm(attempt_model, 0.1, attempt_tokens)
+        try:
+            # Do not forward hidden reasoning. The model must return only a concise
+            # user-safe decision or tool arguments after thinking privately.
+            result = await invoke_model([system, human], llm, None)
+            text = _coerce_model_text(result).strip()
+            if text:
+                return text
+            last_exc = ValueError('model returned an empty response')
+        except Exception as exc:
+            last_exc = exc
+        if attempt_index < len(attempts) - 1:
+            await code_emit(progress, 'RETRY', reason=f'Model call failed ({type(last_exc).__name__}), retrying…')
+            await asyncio.sleep(0.75 * (attempt_index + 1))
+    await code_emit(progress, 'ERROR', message=f'Model decision failed: {type(last_exc).__name__ if last_exc else "unknown error"}.')
+    return ''
 
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n?([\s\S]*?)```", re.IGNORECASE)
