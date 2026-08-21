@@ -34,11 +34,34 @@ THINKING_LEVELS = {
 }
 DEFAULT_THINKING_LEVEL = "medium"
 
+# How hard the model is asked to actually reason inside its own <think> block at
+# each level — this is what makes "Max" genuinely think longer and deeper than
+# "Low", not just a bigger token ceiling with the same shallow pass.
+THINKING_DEPTH_INSTRUCTIONS = {
+    "low": "Think briefly — a couple of sentences on your approach is enough before answering.",
+    "medium": "Think through the key considerations in a short, organized way before answering.",
+    "high": "Reason carefully and thoroughly: consider multiple angles, check your logic, and catch mistakes before answering.",
+    "extra": "Reason extensively and rigorously: break the problem into parts, explore alternative approaches, weigh trade-offs, and verify your conclusion step by step before answering.",
+    "max": "Reason exhaustively, like a world-class expert working through a hard problem: decompose it fully, question your own assumptions, consider edge cases and counter-arguments, verify each step, and only then commit to a final answer.",
+}
+CODE_THINKING_DEPTH_INSTRUCTIONS = {
+    "low": "Briefly plan your approach in a couple of sentences before writing code.",
+    "medium": "Plan your approach — data structures, edge cases, file layout — before writing code.",
+    "high": "Plan thoroughly: consider the architecture, data flow, error handling, and edge cases before writing code.",
+    "extra": "Plan extensively: weigh alternative designs, consider performance and maintainability, and enumerate edge cases and failure modes before committing to an approach and writing code.",
+    "max": "Plan like a principal engineer: weigh multiple architectures and their trade-offs, edge cases, error handling, performance, and testability; decide on the strongest approach and justify it to yourself, then write the implementation.",
+}
+
+
+def normalize_thinking_level(level: str) -> str:
+    """Fold any input onto one of the five valid thinking-level keys."""
+    normalized = (level or DEFAULT_THINKING_LEVEL).strip().lower()
+    return normalized if normalized in THINKING_LEVELS else DEFAULT_THINKING_LEVEL
+
 
 def get_thinking_config(level: str) -> dict:
     """Return a valid thinking level and its token budget."""
-    normalized = (level or DEFAULT_THINKING_LEVEL).strip().lower()
-    return THINKING_LEVELS.get(normalized, THINKING_LEVELS[DEFAULT_THINKING_LEVEL])
+    return THINKING_LEVELS[normalize_thinking_level(level)]
 
 
 def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
@@ -237,11 +260,42 @@ async def publish_token(progress, text: str) -> None:
         await progress.put({"type": "token", "text": text})
 
 
+async def publish_thought(progress, text: str) -> None:
+    """Publish a live slice of the model's OWN reasoning trace — whatever it wrote
+    inside <think>/<thinking> tags — as it streams in, token by token. This is real
+    chain-of-thought from the model, not synthesized narration."""
+    if not text:
+        return
+    if isinstance(progress, asyncio.Queue):
+        await progress.put({"type": "thought", "text": text})
+
+
+async def publish_activity(progress, kind: str, label: str, **extra) -> None:
+    """Publish one concrete, already-happened Code Mode action (a file actually
+    generated, with its real line count) for the activity trace."""
+    if isinstance(progress, asyncio.Queue):
+        event = {"type": "activity", "kind": kind, "label": label}
+        event.update(extra)
+        await progress.put(event)
+
+
+async def publish_turn_summary(progress, **counts) -> None:
+    """Publish the final real tally (files touched, etc.) for the turn's recap line."""
+    if isinstance(progress, asyncio.Queue):
+        await progress.put({"type": "turn_summary", **counts})
+
+
 def build_messages(history: List[BaseMessage], thinking_level: str, search_text: str = "") -> List[BaseMessage]:
-    config = get_thinking_config(thinking_level)
+    level_key = normalize_thinking_level(thinking_level)
+    config = THINKING_LEVELS[level_key]
+    depth = THINKING_DEPTH_INSTRUCTIONS[level_key]
     system_text = (
-        "You are a sharp, honest, genuinely helpful assistant. Answer the user's latest message directly. "
-        "Answer directly without exposing private internal workflow narration.\n"
+        "You are a sharp, genuinely helpful assistant with real step-by-step reasoning ability.\n"
+        f"Before answering, think inside a single <think>...</think> block. {depth}\n"
+        "Write that block as your own natural reasoning as you work through the problem — not a "
+        "restatement of these instructions and not a performance for an audience.\n"
+        "After the closing </think> tag, give the user a direct, clean final answer with no meta-commentary "
+        "about your process.\n"
         f"Thinking level: {config['label']} — {config['description']}.\n"
         f"Maximum completion budget: {config['max_tokens']} tokens.\n"
         f"Current date and time: {get_current_datetime_str()}"
@@ -252,36 +306,65 @@ def build_messages(history: List[BaseMessage], thinking_level: str, search_text:
 
 
 async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None) -> str:
-    """Invoke once; stream visible answer chunks when a live queue is provided."""
+    """Invoke once. When a live queue is provided, stream BOTH the visible answer
+    ('token' events) and the model's own live reasoning trace ('thought' events) in
+    real time, exactly as the model produces them — mirroring Claude.ai's extended
+    thinking pane instead of a canned status message."""
     if not isinstance(progress, asyncio.Queue):
         result = await llm.ainvoke(messages)
         return strip_thinking(getattr(result, "content", "") or "").strip()
 
+    OPEN_TAGS = ("<think>", "<thinking>")
+    CLOSE_TAGS = ("</think>", "</thinking>")
+    max_tag_len = max(len(t) for t in OPEN_TAGS + CLOSE_TAGS)
+
     full = ""
-    pending = ""
-    hidden_open = False
+    buffer = ""
+    in_thought = False
+
+    async def drain(flush_all: bool) -> None:
+        nonlocal buffer, in_thought
+        while True:
+            if not in_thought:
+                positions = [buffer.find(t) for t in OPEN_TAGS if t in buffer]
+                idx = min(positions) if positions else -1
+                if idx == -1:
+                    hold_back = 0 if flush_all else min(len(buffer), max_tag_len - 1)
+                    send_len = len(buffer) - hold_back
+                    if send_len > 0:
+                        await publish_token(progress, buffer[:send_len])
+                        buffer = buffer[send_len:]
+                    return
+                if idx:
+                    await publish_token(progress, buffer[:idx])
+                tag = next(t for t in OPEN_TAGS if buffer[idx:].startswith(t))
+                buffer = buffer[idx + len(tag):]
+                in_thought = True
+            else:
+                positions = [buffer.find(t) for t in CLOSE_TAGS if t in buffer]
+                idx = min(positions) if positions else -1
+                if idx == -1:
+                    hold_back = 0 if flush_all else min(len(buffer), max_tag_len - 1)
+                    send_len = len(buffer) - hold_back
+                    if send_len > 0:
+                        await publish_thought(progress, buffer[:send_len])
+                        buffer = buffer[send_len:]
+                    return
+                if idx:
+                    await publish_thought(progress, buffer[:idx])
+                tag = next(t for t in CLOSE_TAGS if buffer[idx:].startswith(t))
+                buffer = buffer[idx + len(tag):]
+                in_thought = False
+
     async for chunk in llm.astream(messages):
         piece = getattr(chunk, "content", "") or ""
         if not piece:
             continue
         full += piece
-        pending += piece
+        buffer += piece
+        await drain(flush_all=False)
 
-        if not hidden_open and ("<think>" in pending or "<thinking>" in pending):
-            hidden_open = True
-        if hidden_open:
-            close_positions = [p for p in (pending.find("</think>"), pending.find("</thinking>")) if p >= 0]
-            if not close_positions:
-                continue
-            close_at = min(close_positions)
-            close_tag = "</thinking>" if pending.find("</thinking>") == close_at else "</think>"
-            pending = pending[close_at + len(close_tag):]
-            hidden_open = False
-        await publish_token(progress, pending)
-        pending = ""
-
-    if pending and not hidden_open:
-        await publish_token(progress, pending)
+    await drain(flush_all=True)
     return strip_thinking(full).strip()
 
 
@@ -378,13 +461,17 @@ class CodeChatRequest(BaseModel):
 
 
 def build_code_messages(history: List[BaseMessage], reasoning_level: str) -> List[BaseMessage]:
-    config = get_thinking_config(reasoning_level)
+    level_key = normalize_thinking_level(reasoning_level)
+    config = THINKING_LEVELS[level_key]
+    depth = CODE_THINKING_DEPTH_INSTRUCTIONS[level_key]
     system_text = (
-        "You are a practical coding assistant. Produce the requested implementation directly in one pass. "
-        "Give a concise explanation and put the implementation in fenced code blocks. "
-        "If the request needs multiple files, write a separate line `FILE: path/to/file.ext` immediately before each fenced block. "
-        "Use the correct language tag for every block. If one file is enough, return one block without a FILE header. "
-        "Do not reveal private chain-of-thought or hidden internal deliberation; provide only a brief, user-facing rationale.\n"
+        "You are a practical coding assistant. Produce the requested implementation directly in one pass.\n"
+        f"Before writing code, think inside a single <think>...</think> block. {depth}\n"
+        "Write that block as your own natural engineering reasoning — not a restatement of these instructions.\n"
+        "After the closing </think> tag, give a concise user-facing explanation and put the implementation in "
+        "fenced code blocks. If the request needs multiple files, write a separate line `FILE: path/to/file.ext` "
+        "immediately before each fenced block. Use the correct language tag for every block. If one file is "
+        "enough, return one block without a FILE header.\n"
         f"Effort: {config['label']}. Maximum completion budget: {config['max_tokens']} tokens.\n"
         f"Current date and time: {get_current_datetime_str()}"
     )
@@ -454,8 +541,20 @@ async def code_extract_artifact_node(state: dict, progress=None) -> dict:
     state.update({"explanation": explanation, "code": code, "language": language, "files": files, "file_languages": file_languages})
     if files:
         await publish_progress(progress, "code_extract_artifact_node", "code_extract_artifact_node", f"Separated {len(files)} named files for the canvas: {', '.join(files)}")
+        for filename, content in files.items():
+            line_count = len(content.splitlines()) if content else 0
+            await publish_activity(
+                progress, "create", f"Created {filename}",
+                filename=filename, additions=line_count, deletions=0,
+            )
     elif code:
         await publish_progress(progress, "code_extract_artifact_node", "code_extract_artifact_node", f"Extracted the {language or 'text'} implementation block for the canvas.")
+        line_count = len(code.splitlines()) if code else 0
+        implied_name = f"main.{language}" if language else "main"
+        await publish_activity(
+            progress, "create", f"Created {implied_name}",
+            filename=implied_name, additions=line_count, deletions=0,
+        )
     else:
         await publish_progress(progress, "code_extract_artifact_node", "code_extract_artifact_node", "No fenced artifact was returned, so the explanation remains the visible result.")
     return state
@@ -468,6 +567,8 @@ async def code_finalize_node(state: dict, progress=None) -> dict:
     previewable = {"html", "htm", "css", "js", "javascript", "jsx", "tsx"}
     show_preview = state["language"] in previewable or any(language in previewable for language in file_languages.values())
     await publish_progress(progress, "code_finalize_node", "code_finalize_node", f"Prepared {len(files) if files else 1} separate artifact file(s) and preview metadata for the frontend.")
+    files_touched = len(files) if files else (1 if state.get("code") else 0)
+    await publish_turn_summary(progress, files_touched=files_touched, commands_run=0, files_read=0, notes=0)
     return {
         "response": state["explanation"] or "I generated the requested code.",
         "code": state["code"],
@@ -516,7 +617,7 @@ async def generate_stream(request: ChatRequest, session: dict, session_id: str):
     emitted_content = False
     try:
         async for event in forward_live_events(task, progress_queue, session_id):
-            if event["type"] == "status":
+            if event["type"] in ("status", "thought"):
                 yield f"data: {json.dumps(event)}\n\n"
             elif event["type"] == "token":
                 emitted_content = True
@@ -540,7 +641,7 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
     streamed_text = ""
     try:
         async for event in forward_live_events(task, progress_queue, session_id):
-            if event["type"] == "status":
+            if event["type"] in ("status", "thought", "activity", "turn_summary"):
                 yield f"data: {json.dumps(event)}\n\n"
             elif event["type"] == "token":
                 streamed_text += event["text"]
