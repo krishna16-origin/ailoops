@@ -765,7 +765,8 @@ async def code_idea_node(request: CodeChatRequest, session: dict, progress=None)
         "fences. Think naturally inside one <think>...</think> block, then give one concise sentence summarizing the "
         "understanding.\n\nWorkspace files:\n" + manifest + "\n\nUser request:\n" + request.message
     )
-    llm = get_llm(request.model, 0.2, min(1800, config["max_tokens"]))
+    model_type = "reasoning" if request.model in {"glm", "kimik2.6"} else "balanced"
+    llm = get_llm(model_type, 0.2, min(1800, config["max_tokens"]))
     try:
         raw = await invoke_model([SystemMessage(content="You are the idea stage."), HumanMessage(content=prompt)], llm, progress, on_answer_piece=_swallow_answer_piece)
     except Exception as exc:
@@ -845,7 +846,8 @@ async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=No
         "Exact SEARCH/REPLACE format:\n<<<<<<< SEARCH\n<existing lines exactly>\n=======\n<replacement lines>\n>>>>>>> REPLACE\n\n"
         "Nothing outside the action blocks or FILE/fenced blocks.\n\nWorkspace:\n" + workspace + "\n\nPlan:\n" + state.get("plan_summary", "") + "\n\nUser request:\n" + state["latest_message"]
     )
-    llm = get_llm(request.model, 0.2, min(2400, state["config"]["max_tokens"]))
+    model_type = "reasoning" if request.model in {"glm", "kimik2.6"} else "balanced"
+    llm = get_llm(model_type, 0.2, min(2400, state["config"]["max_tokens"]))
     if existing:
         for filename in list(existing)[:8]:
             await publish_activity(progress, "read", f"Reading {filename}", filename=filename)
