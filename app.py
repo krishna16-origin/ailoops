@@ -285,34 +285,56 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
     return strip_thinking(full).strip()
 
 
-async def generate_response_once(request: "ChatRequest", session: dict, progress=None) -> str:
+async def chat_understand_node(request: "ChatRequest", session: dict, progress=None) -> dict:
     history = session["messages"]
     latest = history[-1].content if history else ""
     config = get_thinking_config(request.thinking_level)
     excerpt = request_excerpt(latest)
-    await publish_progress(progress, "understand", "Understanding the request", f"I’m focusing on: “{excerpt}”")
+    await publish_progress(progress, "chat_understand_node", "chat_understand_node", f"Read the latest user request and isolated the topic: “{excerpt}”")
+    return {"history": history, "latest": latest, "config": config}
+
+
+async def chat_context_node(state: dict, progress=None) -> dict:
+    latest = state["latest"]
+    history = state["history"]
     search_text = ""
     links = []
     images = []
     if needs_web_search(latest):
         query = resolve_search_query(history, latest)
-        await publish_progress(progress, "search_start", "Checking current context", f"The request may depend on up-to-date information, so I’m checking: {query}")
+        await publish_progress(progress, "chat_context_node", "chat_context_node", f"Detected a current-information request and searched for: {query}")
         (search_text, links), images = await asyncio.gather(web_search(query), web_image_search(query))
-        result_count = len(links)
-        await publish_progress(progress, "search_done", "Using the retrieved context", f"I found {result_count} result(s) and will use only the relevant evidence in the answer.")
+        await publish_progress(progress, "chat_context_result", "chat_context_result", f"Collected {len(links)} source result(s) for the response context.")
     else:
-        await publish_progress(progress, "context", "Choosing the response approach", "This request can be handled from the conversation context without a web lookup.")
-    await publish_progress(progress, "compose", "Working through the answer", f"I’m applying {config['label']} thinking to select the clearest direct response, using a {config['max_tokens']}-token budget.")
+        await publish_progress(progress, "chat_context_node", "chat_context_node", "No web lookup was required; continuing with the conversation context.")
+    state.update({"search_text": search_text, "links": links, "images": images})
+    return state
+
+
+async def chat_compose_node(request: "ChatRequest", state: dict, progress=None) -> dict:
+    config = state["config"]
+    await publish_progress(progress, "chat_compose_node", "chat_compose_node", f"Invoking the model with {config['label']} thinking and a {config['max_tokens']}-token budget.")
     llm = get_llm(request.model_type, request.temperature, config["max_tokens"])
-    response = await invoke_model(build_messages(history, request.thinking_level, search_text), llm, progress)
-    if not response:
-        response = "I apologize, I encountered an issue formulating my answer."
-    sources = build_web_sources_markdown(links, images)
+    response = await invoke_model(build_messages(state["history"], request.thinking_level, state["search_text"]), llm, progress)
+    state["response"] = response or "I apologize, I encountered an issue formulating my answer."
+    return state
+
+
+async def chat_finalize_node(state: dict, progress=None) -> str:
+    response = state["response"]
+    sources = build_web_sources_markdown(state["links"], state["images"])
     if sources:
         response += sources
         await publish_token(progress, sources)
-    await publish_progress(progress, "complete", "Answer checked", "I finished the response and kept the visible rationale separate from private internal reasoning.")
+    await publish_progress(progress, "chat_finalize_node", "chat_finalize_node", "Validated the response format and prepared the final answer for display.")
     return response
+
+
+async def generate_response_once(request: "ChatRequest", session: dict, progress=None) -> str:
+    state = await chat_understand_node(request, session, progress)
+    state = await chat_context_node(state, progress)
+    state = await chat_compose_node(request, state, progress)
+    return await chat_finalize_node(state, progress)
 
 
 app = FastAPI(title="AI Assistant")
@@ -377,32 +399,53 @@ def extract_code_artifact(text: str) -> tuple[str, str, str]:
     return explanation, code.strip(), (language or "text").lower()
 
 
-async def generate_code_once(request: CodeChatRequest, session: dict, progress=None) -> dict:
+async def code_understand_node(request: CodeChatRequest, session: dict, progress=None) -> dict:
     config = get_thinking_config(request.reasoning_level)
     excerpt = request_excerpt(session["messages"][-1].content if session["messages"] else "")
-    await publish_progress(progress, "understand", "Understanding the build request", f"I’m identifying the requested result from: “{excerpt}”")
+    await publish_progress(progress, "code_understand_node", "code_understand_node", f"Read the build request and identified the requested result: “{excerpt}”")
+    return {"config": config, "history": session["messages"]}
+
+
+async def code_compose_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
+    config = state["config"]
     model_type = "reasoning" if request.model in {"glm", "kimik2.6"} else "balanced"
-    await publish_progress(progress, "compose", "Choosing the implementation shape", f"I’m using one focused code-generation pass with {config['label']} effort and a {config['max_tokens']}-token budget.")
+    await publish_progress(progress, "code_compose_node", "code_compose_node", f"Invoking the code model with {config['label']} effort and a {config['max_tokens']}-token budget.")
     llm = get_llm(model_type, 0.2, config["max_tokens"])
-    result_text = await invoke_model(build_code_messages(session["messages"], request.reasoning_level), llm, progress)
-    raw = result_text
-    explanation, code, language = extract_code_artifact(raw)
+    state["raw"] = await invoke_model(build_code_messages(state["history"], request.reasoning_level), llm, progress)
+    return state
+
+
+async def code_extract_artifact_node(state: dict, progress=None) -> dict:
+    explanation, code, language = extract_code_artifact(state["raw"])
+    state.update({"explanation": explanation, "code": code, "language": language})
     if code:
-        await publish_progress(progress, "artifact", "Separating explanation from code", f"I identified a {language or 'text'} code block and will place it in the canvas for inspection.")
+        await publish_progress(progress, "code_extract_artifact_node", "code_extract_artifact_node", f"Extracted the {language or 'text'} implementation block for the canvas.")
     else:
-        await publish_progress(progress, "artifact_missing", "Checking the generated format", "The response did not contain a fenced code block, so I’m keeping the explanation visible instead of inventing an artifact.")
-    await publish_progress(progress, "complete", "Code response checked", "I separated the explanation from the generated code and prepared the result for the canvas.")
+        await publish_progress(progress, "code_extract_artifact_node", "code_extract_artifact_node", "No fenced artifact was returned, so the explanation remains the visible result.")
+    return state
+
+
+async def code_finalize_node(state: dict, progress=None) -> dict:
+    await publish_progress(progress, "code_finalize_node", "code_finalize_node", "Prepared the explanation, artifact metadata, and preview flag for the frontend.")
+    config = state["config"]
     return {
-        "response": explanation or "I generated the requested code.",
-        "code": code,
-        "language": language,
+        "response": state["explanation"] or "I generated the requested code.",
+        "code": state["code"],
+        "language": state["language"],
         "files": {},
         "file_languages": {},
-        "show_preview": language in {"html", "htm", "css", "js", "javascript", "jsx", "tsx"},
-        "thinking_summary": f"Generated the implementation directly with {config['label']} effort; no planning or revision pass was run.",
+        "show_preview": state["language"] in {"html", "htm", "css", "js", "javascript", "jsx", "tsx"},
+        "thinking_summary": f"Generated the implementation with explicit backend nodes using {config['label']} effort.",
         "thinking_level": config["label"],
         "max_tokens": config["max_tokens"],
     }
+
+
+async def generate_code_once(request: CodeChatRequest, session: dict, progress=None) -> dict:
+    state = await code_understand_node(request, session, progress)
+    state = await code_compose_node(request, state, progress)
+    state = await code_extract_artifact_node(state, progress)
+    return await code_finalize_node(state, progress)
 
 
 @app.get("/health")

@@ -229,6 +229,7 @@
         .thought-bullet { position: absolute; left: -26.5px; top: 8px; width: 8px; height: 8px; background-color: #555; border-radius: 50%; z-index: 1; }
         .thought-icon-wrapper { position: absolute; left: -34px; top: 0px; width: 24px; height: 24px; background-color: var(--bg-main); display: flex; align-items: center; justify-content: center; z-index: 2; }
         .thought-icon-wrapper svg { width: 20px; height: 20px; color: var(--text-secondary); }
+        .thought-node { display:block; margin-bottom:3px; color:var(--text-primary); font-family:'Courier New', Courier, monospace; font-size:11px; letter-spacing:0.02em; opacity:0.78; }
         .thought-content { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
         .thought-content.expanded { -webkit-line-clamp: unset; }
         .show-more-btn { background: none; border: none; color: var(--text-primary); cursor: pointer; font-size: 12px; padding: 4px 0; margin-top: 2px; display: none; opacity: 0.7; }
@@ -1749,6 +1750,11 @@
                 } else {
                     item.innerHTML = icon; // bullet
                 }
+
+                const node = document.createElement('span');
+                node.className = 'thought-node';
+                node.textContent = step || 'backend_node';
+                item.appendChild(node);
 
                 const content = document.createElement('div');
                 content.className = 'thought-content';
