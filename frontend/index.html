@@ -1752,6 +1752,19 @@
                 done: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>`,
             };
 
+            // Builds the live "Working · 2 files, 1 command" header text straight from
+            // activityCounts as events stream in — these counts were previously tracked
+            // but never actually rendered anywhere, so the header just sat on a static
+            // "Working" label the whole time the agent was running.
+            function liveActivityCountsText() {
+                const parts = [];
+                if (activityCounts.files > 0) parts.push(`${activityCounts.files} file${activityCounts.files === 1 ? '' : 's'}`);
+                if (activityCounts.commands > 0) parts.push(`${activityCounts.commands} command${activityCounts.commands === 1 ? '' : 's'}`);
+                if (activityCounts.reads > 0) parts.push(`${activityCounts.reads} read${activityCounts.reads === 1 ? '' : 's'}`);
+                if (activityCounts.notes > 0) parts.push(`${activityCounts.notes} note${activityCounts.notes === 1 ? '' : 's'}`);
+                return parts.length ? `Working · ${parts.join(', ')}` : 'Working';
+            }
+
             // Appends one real, already-happened action (file edit/create, command run,
             // file read, note, or live narration) to the activity trace and refreshes
             // the running header. Called only from real 'activity' SSE events, never
