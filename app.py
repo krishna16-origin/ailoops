@@ -317,6 +317,25 @@ def build_messages(history: List[BaseMessage], thinking_level: str, search_text:
     return [SystemMessage(content=system_text), *history[-6:]]
 
 
+def _coerce_model_text(value: Any) -> str:
+    """Normalize NVIDIA/LangChain text blocks into plain text for event parsing."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                parts.append(_coerce_model_text(item.get("text") or item.get("content") or ""))
+            else:
+                parts.append(_coerce_model_text(item))
+        return "".join(parts)
+    if isinstance(value, dict):
+        return _coerce_model_text(value.get("text") or value.get("content") or "")
+    return str(value)
+
+
 def _extract_reasoning(obj) -> str:
     """Pull live reasoning text out of langchain_nvidia_ai_endpoints' normalized
     channel. Per the library's own docs, additional_kwargs['reasoning_content'] is
@@ -325,7 +344,7 @@ def _extract_reasoning(obj) -> str:
     reasoning_content field, or a reasoning field) — so this is the one reliable
     place to read a model's real chain-of-thought from, chunk by chunk."""
     kwargs = getattr(obj, "additional_kwargs", None) or {}
-    return kwargs.get("reasoning_content") or kwargs.get("reasoning") or ""
+    return _coerce_model_text(kwargs.get("reasoning_content") or kwargs.get("reasoning") or "")
 
 
 async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None) -> str:
@@ -351,7 +370,7 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
         reasoning = _extract_reasoning(result)
         if reasoning and isinstance(progress, list):
             progress.append({"step": "reasoning", "label": "Thinking", "detail": reasoning.strip()})
-        content = getattr(result, "content", "") or ""
+        content = _coerce_model_text(getattr(result, "content", "") or "")
         return strip_thinking(content).strip()
 
     async def emit_answer(text: str) -> None:
@@ -418,7 +437,7 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
             reasoning_seen = True
             await publish_thought(progress, reasoning_piece)
 
-        piece = getattr(chunk, "content", "") or ""
+        piece = _coerce_model_text(getattr(chunk, "content", "") or "")
         if not piece:
             continue
         full += piece
