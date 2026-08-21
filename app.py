@@ -826,7 +826,7 @@ async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=No
         "Exact SEARCH/REPLACE format:\n<<<<<<< SEARCH\n<existing lines exactly>\n=======\n<replacement lines>\n>>>>>>> REPLACE\n\n"
         "Nothing outside the action blocks or FILE/fenced blocks.\n\nWorkspace:\n" + workspace + "\n\nPlan:\n" + state.get("plan_summary", "") + "\n\nUser request:\n" + state["latest_message"]
     )
-    llm = get_llm(request.model, 0.2, min(6000, state["config"]["max_tokens"]))
+    llm = get_llm(request.model, 0.2, min(2400, state["config"]["max_tokens"]))
     if existing:
         for filename in list(existing)[:8]:
             await publish_activity(progress, "read", f"Reading {filename}", filename=filename)
@@ -854,7 +854,7 @@ async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=No
     if not raw.strip():
         await publish_activity(progress, "note", "The selected code model did not complete; retrying the same edit with the fast code model.")
         try:
-            raw = await run_action(get_llm("fast", 0.2, min(6000, state["config"]["max_tokens"])))
+            raw = await run_action(get_llm("fast", 0.2, min(2400, state["config"]["max_tokens"])))
         except Exception as exc:
             print(f"[CodeMode] fast code fallback failed: {exc}")
             return {"raw": "", "files": dict(existing), "file_languages": dict(languages), "touched_files": [], "explanation": "The code action could not be completed."}
