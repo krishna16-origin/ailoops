@@ -810,9 +810,9 @@ async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=No
     if existing:
         for filename in list(existing)[:8]:
             await publish_activity(progress, "read", f"Reading {filename}", filename=filename)
-        await publish_activity(progress, "narration", f"Preparing a targeted edit in {default_filename or 'the existing workspace'}.")
+        await publish_activity(progress, "narration", f"Now let me edit {default_filename or 'the existing files'}.")
     else:
-        await publish_activity(progress, "narration", "Preparing the requested files for the live workspace.")
+        await publish_activity(progress, "narration", "Now let me create the requested files.")
     code_state = _new_code_stream_state()
 
     async def on_answer_piece(text: str) -> None:
@@ -852,9 +852,11 @@ async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=No
         old = existing.get(filename, "")
         additions, deletions = diff_stats(old, updated[filename])
         if filename in existing:
-            await publish_activity(progress, "edit", f"Edited {filename}", filename=filename, additions=additions, deletions=deletions)
+            await publish_activity(progress, "edit", "Editing file", filename=filename, additions=additions, deletions=deletions)
+            await publish_activity(progress, "done", f"Edited {filename}")
         else:
-            await publish_activity(progress, "create", f"Created {filename}", filename=filename, additions=additions, deletions=0)
+            await publish_activity(progress, "create", "Creating file", filename=filename, additions=additions, deletions=0)
+            await publish_activity(progress, "done", f"Created {filename}")
 
     if not touched and existing:
         return {"raw": raw, "files": updated, "file_languages": updated_languages, "touched_files": [], "explanation": "The workspace already matches the requested change."}
@@ -876,6 +878,9 @@ async def code_test_node(request: CodeChatRequest, state: dict, progress=None) -
     language = state.get("file_languages", {}).get(target, "")
     notes = "No file changed, so there was nothing new to test."
     passed = True
+    if target:
+        await publish_activity(progress, "narration", "Let me check this correctly working.")
+        await publish_activity(progress, "narration", "Running command")
     if code.strip() and language.lower() in {"python", "py"}:
         try:
             compile(code, target or "<generated>", "exec")
@@ -905,7 +910,11 @@ async def code_test_node(request: CodeChatRequest, state: dict, progress=None) -
         except Exception as exc:
             notes = f"Test reasoning unavailable; no static failure was found ({type(exc).__name__})."
     if target:
-        await publish_activity(progress, "note", f"Checked {target}: {notes}")
+        await publish_activity(progress, "command", "Ran a command")
+        if passed:
+            await publish_activity(progress, "note", "I checked here—no bugs or issues.")
+        else:
+            await publish_activity(progress, "note", f"I found an issue in {target}: {notes}")
     state.update({"test_passed": passed, "test_notes": notes, "test_target": target, "needs_fix": not passed, "review_notes": ""})
     return state
 
@@ -930,7 +939,8 @@ async def code_review_node(request: CodeChatRequest, state: dict, progress=None)
     except Exception as exc:
         line = f"PASS: review unavailable ({type(exc).__name__})"
     review_failed = line.upper().startswith("FAIL")
-    await publish_activity(progress, "note", f"Reviewed {target}: {line}")
+    if review_failed:
+        await publish_activity(progress, "note", f"I found an issue in {target}: {line}")
     state.update({"review_notes": line, "needs_fix": bool(state.get("needs_fix")) or review_failed, "review_target": target})
     return state
 
@@ -951,7 +961,7 @@ async def code_commit_node(state: dict, progress=None) -> dict:
     files = state.get("files") or {}
     touched = state.get("touched_files") or list(files)
     summary = state.get("explanation") or "Completed the requested Code-mode change."
-    await publish_activity(progress, "done", "Finished the requested change.")
+    await publish_activity(progress, "done", "Presenting files")
     state["explanation"] = summary
     state["commit_message"] = f"Applied Code-mode change to {', '.join(touched) if touched else 'the workspace'}"
     return state
