@@ -267,15 +267,42 @@
 
         /* ============== INPUT ============== */
         .input-container { position:absolute; bottom:0; left:0; width:100%; padding:22px; background:linear-gradient(180deg, rgba(33,33,33,0) 0%, var(--bg-main) 40%); display:flex; justify-content:center; }
-        .input-box { width:100%; max-width:760px; background-color:var(--bg-input); border-radius:22px; border:1px solid var(--border-color); display:flex; align-items:flex-end; padding:11px 15px; box-shadow:0 4px 20px rgba(0,0,0,0.15); transition:border-color 0.25s ease, box-shadow 0.25s ease; }
+        .input-box { width:100%; max-width:760px; background-color:var(--bg-input); border-radius:22px; border:1px solid var(--border-color); display:flex; flex-direction:column; align-items:stretch; padding:11px 15px; box-shadow:0 4px 20px rgba(0,0,0,0.15); transition:border-color 0.25s ease, box-shadow 0.25s ease; }
         .input-box:focus-within { border-color:rgba(255,255,255,0.3); box-shadow:0 4px 24px rgba(0,0,0,0.22); }
         .input-box textarea { flex:1; background:transparent; border:none; color:var(--text-primary); font-size:15.5px; resize:none; outline:none; max-height:200px; padding:8px 4px; line-height:1.5; }
         .input-box textarea::placeholder { color:var(--text-secondary); }
-        .send-btn { background:var(--text-primary); color:var(--bg-main); border:none; border-radius:50%; width:34px; height:34px; display:flex; align-items:center; justify-content:center; cursor:pointer; transition:opacity 0.2s, transform 0.2s var(--transition-bezier); margin-left:10px; margin-bottom:3px; }
+        .send-btn { background:var(--text-primary); color:var(--bg-main); border:none; border-radius:50%; width:34px; height:34px; display:flex; align-items:center; justify-content:center; cursor:pointer; transition:opacity 0.2s, transform 0.2s var(--transition-bezier); flex-shrink:0; }
         .send-btn:hover:not(:disabled) { transform:scale(1.06); }
         .send-btn:active:not(:disabled) { transform:scale(0.94); }
         .send-btn:disabled { opacity:0.3; cursor:not-allowed; }
         .send-btn svg { width:17px; height:17px; }
+
+        /* ============== MODEL / EFFORT PICKER (input-attached, ChatGPT/Claude-style) ============== */
+        .composer-toolbar { display:flex; align-items:center; justify-content:space-between; margin-top:6px; padding-top:2px; }
+        .model-picker { position:relative; }
+        .model-picker-btn { display:flex; align-items:center; gap:6px; background:transparent; border:1px solid var(--border-color); color:var(--text-primary); font-size:13px; font-weight:500; padding:6px 10px 6px 12px; border-radius:999px; cursor:pointer; transition:background 0.2s ease, border-color 0.2s ease; }
+        .model-picker-btn:hover { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); }
+        .model-picker-btn svg { color:var(--text-secondary); flex-shrink:0; }
+        .model-picker-sep { color:var(--text-secondary); }
+        #modelPickerLevel { color:var(--text-secondary); }
+        .model-picker-panel { position:absolute; left:0; bottom:calc(100% + 10px); width:280px; background-color:#262626; border:1px solid var(--border-color); border-radius:14px; box-shadow:0 10px 38px rgba(0,0,0,0.45); padding:6px; z-index:30; animation:pickerPopIn 0.16s var(--transition-bezier); }
+        @keyframes pickerPopIn { from { opacity:0; transform:translateY(6px) scale(0.98); } to { opacity:1; transform:translateY(0) scale(1); } }
+        .model-picker-panel[hidden] { display:none; }
+        .picker-screen[hidden] { display:none; }
+        .picker-row { display:flex; align-items:center; justify-content:space-between; width:100%; background:transparent; border:none; text-align:left; padding:9px 10px; border-radius:9px; cursor:pointer; color:var(--text-primary); transition:background 0.15s ease; }
+        .picker-row:hover { background-color:var(--bg-hover); }
+        .picker-row-nav { font-size:13.5px; }
+        .picker-row-right { display:flex; align-items:center; gap:6px; color:var(--text-secondary); font-size:13px; }
+        .picker-divider { height:1px; background-color:var(--border-color); margin:6px 6px; }
+        .picker-model-row .picker-row-text { display:flex; flex-direction:column; gap:2px; }
+        .picker-model-row .picker-row-name { font-size:14px; font-weight:500; color:var(--text-primary); }
+        .picker-model-row .picker-row-desc { font-size:12px; color:var(--text-secondary); }
+        .picker-check { color:var(--accent); flex-shrink:0; margin-left:8px; }
+        .picker-back { display:flex; align-items:center; gap:6px; background:transparent; border:none; color:var(--text-secondary); font-size:12.5px; font-weight:500; padding:6px 8px 10px; cursor:pointer; }
+        .picker-back:hover { color:var(--text-primary); }
+        .picker-level-desc { font-size:12px; color:var(--text-secondary); line-height:1.5; padding:0 8px 8px; }
+        .picker-level-row { font-size:14px; }
+        .picker-badge { font-size:10px; color:var(--text-secondary); background-color:rgba(255,255,255,0.08); padding:2px 6px; border-radius:5px; margin-left:8px; }
 
         /* Floating "jump to latest" button — only shown once the user has scrolled
            up away from the bottom during a response, exactly like ChatGPT. Clicking
@@ -412,20 +439,9 @@
         </div>
         <div class="history-list" id="historyList"></div>
         <div class="sidebar-settings">
-            <!-- Chat mode settings -->
+            <!-- Chat mode settings — Model, Temperature and Effort moved to the
+                 picker attached to the message composer (see input-container below). -->
             <div class="settings-panel" id="chatSettings">
-                <div class="sidebar-setting-item">
-                    <label title="Model">Model</label>
-                    <select id="modelType">
-                        <option value="fast">Horus</option>
-                        <option value="balanced" selected>Osiris</option>
-                        <option value="reasoning">Amun-Ra</option>
-                    </select>
-                </div>
-                <div class="sidebar-setting-item">
-                    <label title="Model Temperature">Temperature</label>
-                    <input type="number" id="tempSetting" value="0.7" step="0.1" min="0" max="1">
-                </div>
                 <div class="sidebar-setting-item">
                     <label title="Maximum Goal Iterations">Max Iterations</label>
                     <input type="number" id="iterSetting" value="2" min="1" max="10">
@@ -436,25 +452,8 @@
                 </div>
             </div>
 
-            <!-- Code mode settings (no temperature) -->
+            <!-- Code mode settings — Model and Effort moved to the composer picker too. -->
             <div class="settings-panel" id="codeSettings" hidden>
-                <div class="sidebar-setting-item">
-                    <label title="Model">Model</label>
-                    <select id="codeModel">
-                        <option value="kimi" selected>Kimi K2.6</option>
-                        <option value="glm">GLM 5.2</option>
-                        <option value="kimik2.6">Kimi K2.6 (Thinking)</option>
-                    </select>
-                </div>
-                <div class="sidebar-setting-item">
-                    <label title="Reasoning Depth">Reasoning</label>
-                    <select id="codeReasoningLevel">
-                        <option value="low">Low</option>
-                        <option value="medium" selected>Medium</option>
-                        <option value="high">High</option>
-                        <option value="max">Max</option>
-                    </select>
-                </div>
                 <div class="sidebar-setting-item">
                     <label title="Stream Response Tokens">Stream Response</label>
                     <input type="checkbox" id="codeStreamSetting" checked>
@@ -509,13 +508,68 @@
         <div class="input-container">
             <div class="input-box">
                 <textarea id="userInput" rows="1" placeholder="Describe your objective..." oninput="autoResize(this)" onkeydown="handleEnter(event)"></textarea>
-                <button class="send-btn" id="sendBtn" onclick="sendMessage()">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                        <line x1="12" y1="19" x2="12" y2="5"></line>
-                        <polyline points="5 12 12 5 19 12"></polyline>
-                    </svg>
-                </button>
+                <div class="composer-toolbar">
+                    <div class="model-picker" id="modelPicker">
+                        <button type="button" class="model-picker-btn" id="modelPickerBtn" onclick="toggleModelPicker(event)">
+                            <span id="modelPickerLabel">Osiris</span>
+                            <span class="model-picker-sep">&middot;</span>
+                            <span id="modelPickerLevel">Medium</span>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                        </button>
+                        <div class="model-picker-panel" id="modelPickerPanel" hidden>
+                            <div class="picker-screen" id="pickerScreenMain">
+                                <div id="pickerModelList"></div>
+                                <div class="picker-divider"></div>
+                                <button type="button" class="picker-row picker-row-nav" onclick="showLevelScreen()">
+                                    <span id="pickerLevelLabel">Temperature</span>
+                                    <span class="picker-row-right">
+                                        <span id="pickerLevelValue">Medium</span>
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="9 6 15 12 9 18"></polyline></svg>
+                                    </span>
+                                </button>
+                            </div>
+                            <div class="picker-screen" id="pickerScreenLevel" hidden>
+                                <button type="button" class="picker-back" onclick="showMainScreen()">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="15 18 9 12 15 6"></polyline></svg>
+                                    <span id="pickerLevelBackLabel">Temperature</span>
+                                </button>
+                                <p class="picker-level-desc" id="pickerLevelDesc"></p>
+                                <div id="pickerLevelList"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="12" y1="19" x2="12" y2="5"></line>
+                            <polyline points="5 12 12 5 19 12"></polyline>
+                        </svg>
+                    </button>
+                </div>
             </div>
+        </div>
+
+        <!-- Model / Temperature / Reasoning source-of-truth fields. These are the
+             exact same elements sendMessage() has always read by id — only their
+             location changed (out of the sidebar, into the composer) and they're
+             now driven by the picker above instead of being shown directly. -->
+        <div id="hiddenModelInputs" style="display:none" aria-hidden="true">
+            <select id="modelType">
+                <option value="fast">Horus</option>
+                <option value="balanced" selected>Osiris</option>
+                <option value="reasoning">Amun-Ra</option>
+            </select>
+            <input type="number" id="tempSetting" value="0.7" step="0.1" min="0" max="1">
+            <select id="codeModel">
+                <option value="kimi" selected>Kimi K2.6</option>
+                <option value="glm">GLM 5.2</option>
+                <option value="kimik2.6">Kimi K2.6 (Thinking)</option>
+            </select>
+            <select id="codeReasoningLevel">
+                <option value="low">Low</option>
+                <option value="medium" selected>Medium</option>
+                <option value="high">High</option>
+                <option value="max">Max</option>
+            </select>
         </div>
     </div>
 
@@ -1129,6 +1183,152 @@
 
         function toggleSidebar() { sidebar.classList.toggle('collapsed'); }
 
+        // ============== MODEL / EFFORT PICKER ==============
+        // #modelType / #tempSetting / #codeModel / #codeReasoningLevel (down in the
+        // composer, hidden) remain the single source of truth sendMessage() reads —
+        // this picker only renders their current state and writes back to them.
+        const MODEL_OPTIONS = {
+            chat: [
+                { value: 'fast', name: 'Horus', desc: 'Fastest for quick answers' },
+                { value: 'balanced', name: 'Osiris', desc: 'Most efficient for everyday tasks' },
+                { value: 'reasoning', name: 'Amun-Ra', desc: 'For complex, multi-step objectives' }
+            ],
+            code: [
+                { value: 'kimi', name: 'Kimi K2.6', desc: 'Balanced everyday coding' },
+                { value: 'glm', name: 'GLM 5.2', desc: 'Alternative model for code tasks' },
+                { value: 'kimik2.6', name: 'Kimi K2.6 (Thinking)', desc: 'Extended reasoning before it codes' }
+            ]
+        };
+
+        const LEVEL_OPTIONS = {
+            chat: {
+                label: 'Temperature',
+                desc: 'Higher temperature makes responses more varied and creative, but less predictable.',
+                options: [
+                    { value: '0.3', label: 'Low' },
+                    { value: '0.7', label: 'Medium', isDefault: true },
+                    { value: '0.9', label: 'High' },
+                    { value: '1', label: 'Max' }
+                ]
+            },
+            code: {
+                label: 'Effort',
+                desc: 'Higher effort runs more reasoning passes \u2014 more thorough, but slower.',
+                options: [
+                    { value: 'low', label: 'Low' },
+                    { value: 'medium', label: 'Medium', isDefault: true },
+                    { value: 'high', label: 'High' },
+                    { value: 'max', label: 'Max' }
+                ]
+            }
+        };
+
+        const CHECK_ICON = '<svg class="picker-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+
+        const modelPicker = document.getElementById('modelPicker');
+        const modelPickerPanel = document.getElementById('modelPickerPanel');
+        const pickerScreenMain = document.getElementById('pickerScreenMain');
+        const pickerScreenLevel = document.getElementById('pickerScreenLevel');
+        const pickerModelList = document.getElementById('pickerModelList');
+        const pickerLevelList = document.getElementById('pickerLevelList');
+        const modelPickerLabel = document.getElementById('modelPickerLabel');
+        const modelPickerLevel = document.getElementById('modelPickerLevel');
+
+        function activeModelField() { return currentMode === 'code' ? document.getElementById('codeModel') : document.getElementById('modelType'); }
+        function activeLevelField() { return currentMode === 'code' ? document.getElementById('codeReasoningLevel') : document.getElementById('tempSetting'); }
+
+        function currentLevelLabel() {
+            const cfg = LEVEL_OPTIONS[currentMode];
+            const field = activeLevelField();
+            const match = cfg.options.find(o => o.value === String(field.value));
+            return match ? match.label : cfg.options.find(o => o.isDefault).label;
+        }
+
+        function updateModelPickerLabel() {
+            const models = MODEL_OPTIONS[currentMode];
+            const field = activeModelField();
+            const match = models.find(m => m.value === field.value);
+            modelPickerLabel.textContent = match ? match.name : models[0].name;
+            modelPickerLevel.textContent = currentLevelLabel();
+        }
+
+        function renderModelList() {
+            const models = MODEL_OPTIONS[currentMode];
+            const field = activeModelField();
+            pickerModelList.innerHTML = models.map(m => `
+                <button type="button" class="picker-row picker-model-row" onclick="selectModel('${m.value}')">
+                    <span class="picker-row-text">
+                        <span class="picker-row-name">${escapeHtml(m.name)}</span>
+                        <span class="picker-row-desc">${escapeHtml(m.desc)}</span>
+                    </span>
+                    ${field.value === m.value ? CHECK_ICON : ''}
+                </button>
+            `).join('');
+        }
+
+        function renderLevelRowSummary() {
+            document.getElementById('pickerLevelLabel').textContent = LEVEL_OPTIONS[currentMode].label;
+            document.getElementById('pickerLevelValue').textContent = currentLevelLabel();
+        }
+
+        function renderLevelList() {
+            const cfg = LEVEL_OPTIONS[currentMode];
+            const field = activeLevelField();
+            document.getElementById('pickerLevelBackLabel').textContent = cfg.label;
+            document.getElementById('pickerLevelDesc').textContent = cfg.desc;
+            pickerLevelList.innerHTML = cfg.options.map(o => `
+                <button type="button" class="picker-row picker-level-row" onclick="selectLevel('${o.value}')">
+                    <span>${escapeHtml(o.label)}${o.isDefault ? '<span class="picker-badge">Default</span>' : ''}</span>
+                    ${String(field.value) === o.value ? CHECK_ICON : ''}
+                </button>
+            `).join('');
+        }
+
+        function showMainScreen() {
+            pickerScreenLevel.hidden = true;
+            pickerScreenMain.hidden = false;
+            renderModelList();
+            renderLevelRowSummary();
+        }
+
+        function showLevelScreen() {
+            pickerScreenMain.hidden = true;
+            pickerScreenLevel.hidden = false;
+            renderLevelList();
+        }
+
+        function openModelPicker() {
+            modelPickerPanel.hidden = false;
+            showMainScreen();
+            document.addEventListener('click', handleOutsidePickerClick);
+        }
+
+        function closeModelPicker() {
+            modelPickerPanel.hidden = true;
+            document.removeEventListener('click', handleOutsidePickerClick);
+        }
+
+        function handleOutsidePickerClick(e) {
+            if (!modelPicker.contains(e.target)) closeModelPicker();
+        }
+
+        function toggleModelPicker(e) {
+            e.stopPropagation();
+            if (modelPickerPanel.hidden) openModelPicker(); else closeModelPicker();
+        }
+
+        function selectModel(value) {
+            activeModelField().value = value;
+            updateModelPickerLabel();
+            closeModelPicker();
+        }
+
+        function selectLevel(value) {
+            activeLevelField().value = value;
+            updateModelPickerLabel();
+            closeModelPicker();
+        }
+
         function autoResize(textarea) {
             textarea.style.height = 'auto';
             textarea.style.height = (textarea.scrollHeight) + 'px';
@@ -1167,6 +1367,8 @@
 
             chatSettings.hidden = mode !== 'chat';
             codeSettings.hidden = mode !== 'code';
+            closeModelPicker();
+            updateModelPickerLabel();
 
             // Canvas only ever exists in Code mode: show it if a result is
             // already sitting there (and the user hasn't closed it), otherwise
@@ -1756,6 +1958,7 @@
                 }
                 document.getElementById('userInput').focus();
             }, 2100);
+            updateModelPickerLabel();
         };
     </script>
 </body>
