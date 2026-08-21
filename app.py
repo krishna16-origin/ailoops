@@ -213,6 +213,14 @@ def trim_memory(messages: List[BaseMessage], limit: int = 10) -> List[BaseMessag
     return messages[-limit:]
 
 
+def request_excerpt(text: str, limit: int = 180) -> str:
+    """Create a compact, user-facing excerpt for the visible rationale panel."""
+    clean = " ".join((text or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 1].rstrip() + "…"
+
+
 async def publish_progress(progress, step: str, label: str, detail: str) -> None:
     """Publish a concrete backend event to a queue or collect it for non-streaming replies."""
     event = {"type": "status", "step": step, "label": label, "detail": detail}
@@ -281,19 +289,20 @@ async def generate_response_once(request: "ChatRequest", session: dict, progress
     history = session["messages"]
     latest = history[-1].content if history else ""
     config = get_thinking_config(request.thinking_level)
-    await publish_progress(progress, "received", "Request received", "The backend accepted the chat request.")
+    excerpt = request_excerpt(latest)
+    await publish_progress(progress, "understand", "Understanding the request", f"I’m focusing on: “{excerpt}”")
     search_text = ""
     links = []
     images = []
     if needs_web_search(latest):
         query = resolve_search_query(history, latest)
-        await publish_progress(progress, "search_start", "Looking up information", f"Searching for current context: {query}")
+        await publish_progress(progress, "search_start", "Checking current context", f"The request may depend on up-to-date information, so I’m checking: {query}")
         (search_text, links), images = await asyncio.gather(web_search(query), web_image_search(query))
         result_count = len(links)
-        await publish_progress(progress, "search_done", "Context ready", f"The backend received {result_count} web result(s).")
+        await publish_progress(progress, "search_done", "Using the retrieved context", f"I found {result_count} result(s) and will use only the relevant evidence in the answer.")
     else:
-        await publish_progress(progress, "search_skip", "No web lookup needed", "The request can be answered from the conversation context.")
-    await publish_progress(progress, "model_start", "Composing the answer", f"Invoking the selected model with {config['label']} thinking and a {config['max_tokens']}-token budget.")
+        await publish_progress(progress, "context", "Choosing the response approach", "This request can be handled from the conversation context without a web lookup.")
+    await publish_progress(progress, "compose", "Working through the answer", f"I’m applying {config['label']} thinking to select the clearest direct response, using a {config['max_tokens']}-token budget.")
     llm = get_llm(request.model_type, request.temperature, config["max_tokens"])
     response = await invoke_model(build_messages(history, request.thinking_level, search_text), llm, progress)
     if not response:
@@ -302,7 +311,7 @@ async def generate_response_once(request: "ChatRequest", session: dict, progress
     if sources:
         response += sources
         await publish_token(progress, sources)
-    await publish_progress(progress, "complete", "Answer ready", "The backend completed the direct response.")
+    await publish_progress(progress, "complete", "Answer checked", "I finished the response and kept the visible rationale separate from private internal reasoning.")
     return response
 
 
@@ -370,18 +379,19 @@ def extract_code_artifact(text: str) -> tuple[str, str, str]:
 
 async def generate_code_once(request: CodeChatRequest, session: dict, progress=None) -> dict:
     config = get_thinking_config(request.reasoning_level)
-    await publish_progress(progress, "received", "Request received", "The backend accepted the code request.")
+    excerpt = request_excerpt(session["messages"][-1].content if session["messages"] else "")
+    await publish_progress(progress, "understand", "Understanding the build request", f"I’m identifying the requested result from: “{excerpt}”")
     model_type = "reasoning" if request.model in {"glm", "kimik2.6"} else "balanced"
-    await publish_progress(progress, "model_start", "Generating code", f"Invoking the selected code model with {config['label']} effort and a {config['max_tokens']}-token budget.")
+    await publish_progress(progress, "compose", "Choosing the implementation shape", f"I’m using one focused code-generation pass with {config['label']} effort and a {config['max_tokens']}-token budget.")
     llm = get_llm(model_type, 0.2, config["max_tokens"])
     result_text = await invoke_model(build_code_messages(session["messages"], request.reasoning_level), llm, progress)
     raw = result_text
     explanation, code, language = extract_code_artifact(raw)
     if code:
-        await publish_progress(progress, "artifact", "Artifact extracted", f"The backend extracted a {language or 'text'} code artifact for the canvas.")
+        await publish_progress(progress, "artifact", "Separating explanation from code", f"I identified a {language or 'text'} code block and will place it in the canvas for inspection.")
     else:
-        await publish_progress(progress, "artifact_missing", "No artifact block found", "The backend received text without a fenced code artifact.")
-    await publish_progress(progress, "complete", "Code response ready", "The backend completed the direct code response.")
+        await publish_progress(progress, "artifact_missing", "Checking the generated format", "The response did not contain a fenced code block, so I’m keeping the explanation visible instead of inventing an artifact.")
+    await publish_progress(progress, "complete", "Code response checked", "I separated the explanation from the generated code and prepared the result for the canvas.")
     return {
         "response": explanation or "I generated the requested code.",
         "code": code,
