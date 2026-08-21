@@ -833,17 +833,31 @@ async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=No
         await publish_activity(progress, "narration", f"Now let me edit {default_filename or 'the existing files'}.")
     else:
         await publish_activity(progress, "narration", "Now let me create the requested files.")
-    code_state = _new_code_stream_state()
+    messages = [SystemMessage(content="You are the code action stage."), HumanMessage(content=prompt)]
 
-    async def on_answer_piece(text: str) -> None:
-        await stream_code_answer_piece(progress, code_state, text)
+    async def run_action(action_llm) -> str:
+        code_state = _new_code_stream_state()
+
+        async def on_answer_piece(text: str) -> None:
+            await stream_code_answer_piece(progress, code_state, text)
+
+        raw_text = await invoke_model(messages, action_llm, progress, on_answer_piece=on_answer_piece)
+        await flush_code_answer_stream(progress, code_state)
+        return raw_text or ""
 
     try:
-        raw = await invoke_model([SystemMessage(content="You are the code action stage."), HumanMessage(content=prompt)], llm, progress, on_answer_piece=on_answer_piece)
-        await flush_code_answer_stream(progress, code_state)
+        raw = await run_action(llm)
     except Exception as exc:
-        print(f"[CodeMode] code action failed: {exc}")
-        return {"raw": "", "files": dict(existing), "file_languages": dict(languages), "touched_files": [], "explanation": "The code action could not be completed."}
+        print(f"[CodeMode] selected code model failed: {exc}")
+        raw = ""
+
+    if not raw.strip():
+        await publish_activity(progress, "note", "The selected code model did not complete; retrying the same edit with the fast code model.")
+        try:
+            raw = await run_action(get_llm("fast", 0.2, min(6000, state["config"]["max_tokens"])))
+        except Exception as exc:
+            print(f"[CodeMode] fast code fallback failed: {exc}")
+            return {"raw": "", "files": dict(existing), "file_languages": dict(languages), "touched_files": [], "explanation": "The code action could not be completed."}
 
     action_blocks = parse_action_blocks(raw)
     remaining = _ACTION_BLOCK_RE.sub("", raw)
