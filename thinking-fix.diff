@@ -1,0 +1,105 @@
+diff --git a/app.py b/app.py
+index e9f91b6..0cc033a 100644
+--- a/app.py
++++ b/app.py
+@@ -305,14 +305,37 @@ def build_messages(history: List[BaseMessage], thinking_level: str, search_text:
+     return [SystemMessage(content=system_text), *history[-6:]]
+ 
+ 
++def _extract_reasoning(obj) -> str:
++    """Pull live reasoning text out of langchain_nvidia_ai_endpoints' normalized
++    channel. Per the library's own docs, additional_kwargs['reasoning_content'] is
++    ALWAYS populated as a unified reasoning channel no matter which raw format the
++    underlying NIM actually used (inline <think> tags in content, a dedicated
++    reasoning_content field, or a reasoning field) — so this is the one reliable
++    place to read a model's real chain-of-thought from, chunk by chunk."""
++    kwargs = getattr(obj, "additional_kwargs", None) or {}
++    return kwargs.get("reasoning_content") or kwargs.get("reasoning") or ""
++
++
+ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None) -> str:
+     """Invoke once. When a live queue is provided, stream BOTH the visible answer
+     ('token' events) and the model's own live reasoning trace ('thought' events) in
+     real time, exactly as the model produces them — mirroring Claude.ai's extended
+-    thinking pane instead of a canned status message."""
++    thinking pane instead of a canned status message.
++
++    Nemotron and other NVIDIA reasoning models generally return their reasoning via
++    the dedicated additional_kwargs['reasoning_content'] channel rather than inline
++    <think> tags in `content` — so that channel is the primary, authoritative source
++    of live thinking text here. Inline <think>/<thinking> tags inside `content` are
++    still parsed out as a fallback for models that only do it that way, and are
++    never re-published once the reasoning_content channel has already surfaced the
++    same text, so the thinking pane never shows anything twice."""
+     if not isinstance(progress, asyncio.Queue):
+         result = await llm.ainvoke(messages)
+-        return strip_thinking(getattr(result, "content", "") or "").strip()
++        reasoning = _extract_reasoning(result)
++        if reasoning and isinstance(progress, list):
++            progress.append({"step": "reasoning", "label": "Thinking", "detail": reasoning.strip()})
++        content = getattr(result, "content", "") or ""
++        return strip_thinking(content).strip()
+ 
+     OPEN_TAGS = ("<think>", "<thinking>")
+     CLOSE_TAGS = ("</think>", "</thinking>")
+@@ -321,6 +344,12 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
+     full = ""
+     buffer = ""
+     in_thought = False
++    reasoning_seen = False  # True once the model's own reasoning_content channel has
++                             # produced real text this turn. Once true, any <think>
++                             # tags spotted inside `content` are known to be a mirror
++                             # of what was already streamed live, so they're stripped
++                             # from the visible answer but never re-emitted as a
++                             # duplicate thought bubble.
+ 
+     async def drain(flush_all: bool) -> None:
+         nonlocal buffer, in_thought
+@@ -347,16 +376,23 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
+                     hold_back = 0 if flush_all else min(len(buffer), max_tag_len - 1)
+                     send_len = len(buffer) - hold_back
+                     if send_len > 0:
+-                        await publish_thought(progress, buffer[:send_len])
++                        if not reasoning_seen:
++                            await publish_thought(progress, buffer[:send_len])
+                         buffer = buffer[send_len:]
+                     return
+                 if idx:
+-                    await publish_thought(progress, buffer[:idx])
++                    if not reasoning_seen:
++                        await publish_thought(progress, buffer[:idx])
+                 tag = next(t for t in CLOSE_TAGS if buffer[idx:].startswith(t))
+                 buffer = buffer[idx + len(tag):]
+                 in_thought = False
+ 
+     async for chunk in llm.astream(messages):
++        reasoning_piece = _extract_reasoning(chunk)
++        if reasoning_piece:
++            reasoning_seen = True
++            await publish_thought(progress, reasoning_piece)
++
+         piece = getattr(chunk, "content", "") or ""
+         if not piece:
+             continue
+diff --git a/frontend/index.html b/frontend/index.html
+index 8243312..76b1bb5 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -255,12 +255,12 @@
+         .thought-live-content {
+             white-space: pre-wrap;
+             word-break: break-word;
+-            font-family: 'Courier New', Courier, monospace;
+-            font-size: 12.5px;
+-            line-height: 1.65;
++            font-family: 'Inter', sans-serif;
++            font-size: 14px;
++            line-height: 1.6;
+             color: var(--text-secondary);
+-            opacity: 0.9;
+-            max-height: 230px;
++            opacity: 0.95;
++            max-height: 260px;
+             overflow-y: auto;
+             padding-right: 6px;
+             scroll-behavior: smooth;
