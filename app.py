@@ -807,6 +807,12 @@ async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=No
     )
     model_type = "reasoning" if request.model in {"glm", "kimik2.6"} else "balanced"
     llm = get_llm(model_type, 0.2, state["config"]["max_tokens"])
+    if existing:
+        for filename in list(existing)[:8]:
+            await publish_activity(progress, "read", f"Reading {filename}", filename=filename)
+        await publish_activity(progress, "narration", f"Preparing a targeted edit in {default_filename or 'the existing workspace'}.")
+    else:
+        await publish_activity(progress, "narration", "Preparing the requested files for the live workspace.")
     code_state = _new_code_stream_state()
 
     async def on_answer_piece(text: str) -> None:
@@ -1045,7 +1051,7 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
     streamed_text = ""
     try:
         async for event in forward_live_events(task, progress_queue, session_id):
-            if event["type"] in ("status", "thought", "activity", "turn_summary", "code_start", "code_file_start", "code_delta", "plan"):
+            if event["type"] in ("status", "thought", "activity", "turn_summary", "plan"):
                 yield f"data: {json.dumps(event)}\n\n"
             elif event["type"] == "token":
                 streamed_text += event["text"]

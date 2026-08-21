@@ -2041,18 +2041,10 @@
                                     renderPlanCard(textContainer, parsed);
                                 } else if (parsed.type === 'turn_summary') {
                                     finalizeActivitySummary(parsed);
-                                } else if (parsed.type === 'code_start') {
-                                    startCodeCanvasStream(parsed.language, '');
-                                    inlineCodeStatus = startInlineCodeStatus(textContainer, parsed.language, '');
-                                } else if (parsed.type === 'code_file_start') {
-                                    // Multi-file builds: the canvas keeps every earlier file's
-                                    // content (see startCodeCanvasStream) — only the chat status
-                                    // chip's label needs to move onto the new filename.
-                                    startCodeCanvasStream(parsed.language, parsed.filename);
-                                    if (!inlineCodeStatus) inlineCodeStatus = startInlineCodeStatus(textContainer, parsed.language, parsed.filename);
-                                    else updateInlineCodeStatus(inlineCodeStatus, parsed.language, parsed.filename);
-                                } else if (parsed.type === 'code_delta') {
-                                    appendCodeCanvasStream(parsed.delta, parsed.filename);
+                                } else if (parsed.type === 'code_start' || parsed.type === 'code_file_start' || parsed.type === 'code_delta') {
+                                    // Deliberately hidden during generation. Code Mode shows only
+                                    // real backend thoughts and workspace activity; the final
+                                    // code/preview is reconciled from code_result after the turn.
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
                                 } else if (parsed.type === 'message_reset') {
