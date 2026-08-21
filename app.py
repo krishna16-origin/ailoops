@@ -900,8 +900,13 @@ async def code_decide(request: CodeChatRequest, state: dict, observations: list[
 async def code_list_files(root: pathlib.Path, progress) -> dict:
     files = []
     for item in sorted(root.rglob('*')):
-        rel = code_relpath(root, item)
-        if not item.is_file() or any(part in CODE_EXCLUDED_DIRS for part in item.relative_to(root).parts) or is_sensitive_path(rel):
+        if not item.is_file() or any(part in CODE_EXCLUDED_DIRS for part in item.relative_to(root).parts):
+            continue
+        try:
+            rel = code_relpath(root, item)
+        except ValueError:
+            continue  # symlink resolves outside the workspace root (e.g. a venv interpreter); skip it
+        if is_sensitive_path(rel):
             continue
         files.append(rel)
         if len(files) >= 500:
@@ -935,8 +940,13 @@ async def code_search_files(root: pathlib.Path, args: dict, progress) -> dict:
         regex = re.compile(re.escape(pattern), re.IGNORECASE)
     matches = []
     for item in sorted(root.rglob('*')):
-        rel = code_relpath(root, item)
-        if not item.is_file() or any(part in CODE_EXCLUDED_DIRS for part in item.relative_to(root).parts) or is_sensitive_path(rel):
+        if not item.is_file() or any(part in CODE_EXCLUDED_DIRS for part in item.relative_to(root).parts):
+            continue
+        try:
+            rel = code_relpath(root, item)
+        except ValueError:
+            continue  # symlink resolves outside the workspace root; skip it
+        if is_sensitive_path(rel):
             continue
         try:
             lines = item.read_text(errors='replace').splitlines()
@@ -944,7 +954,7 @@ async def code_search_files(root: pathlib.Path, args: dict, progress) -> dict:
             continue
         for number, line in enumerate(lines, 1):
             if regex.search(line):
-                matches.append({'path': code_relpath(root, item), 'line': number, 'text': line[:300]})
+                matches.append({'path': rel, 'line': number, 'text': line[:300]})
                 if len(matches) >= 100:
                     break
         if len(matches) >= 100:
