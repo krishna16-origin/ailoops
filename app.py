@@ -846,8 +846,9 @@ async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=No
         "Exact SEARCH/REPLACE format:\n<<<<<<< SEARCH\n<existing lines exactly>\n=======\n<replacement lines>\n>>>>>>> REPLACE\n\n"
         "Nothing outside the action blocks or FILE/fenced blocks.\n\nWorkspace:\n" + workspace + "\n\nPlan:\n" + state.get("plan_summary", "") + "\n\nUser request:\n" + state["latest_message"]
     )
-    model_type = "reasoning" if request.model in {"glm", "kimik2.6"} else "balanced"
-    llm = get_llm(model_type, 0.2, min(2400, state["config"]["max_tokens"]))
+    # Keep the selected model for the IDEA stage, but use the fast reasoning-capable
+    # writer for the concrete action so the live thought -> edit handoff does not stall.
+    llm = get_llm("fast", 0.2, min(2400, state["config"]["max_tokens"]))
     if existing:
         for filename in list(existing)[:8]:
             await publish_activity(progress, "read", f"Reading {filename}", filename=filename)
