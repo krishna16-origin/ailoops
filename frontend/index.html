@@ -302,6 +302,22 @@
         .activity-diff-del { color:#f85149; margin-left:4px; }
         .activity-row-status { font-style:italic; opacity:0.85; }
 
+        /* ============== CODE MODE: build plan card ==============
+           Shown once, right before the very first build in a session — a short
+           real plan (its own LLM call, its own live reasoning trace) naming
+           what will be built and which file(s) it needs, so the manifest
+           appears before any code starts streaming. Never shown again once a
+           project exists in the session — later turns edit in place instead. */
+        .plan-card { display:block; margin:14px 0; padding:12px 14px; border:1px solid var(--border-color); border-radius:12px; background-color:#1c1c1c; max-width:440px; }
+        .plan-card-header { display:flex; align-items:center; gap:8px; margin-bottom:8px; color:var(--text-primary); font-size:13px; font-weight:600; }
+        .plan-card-header svg { width:15px; height:15px; color:var(--accent); flex-shrink:0; }
+        .plan-card-summary { font-size:13.5px; line-height:1.5; color:var(--text-secondary); margin-bottom:10px; }
+        .plan-card-files { display:flex; flex-wrap:wrap; gap:6px; }
+        .plan-file-chip { display:inline-flex; align-items:center; gap:5px; font-family:'Courier New', Courier, monospace; font-size:12px; background:rgba(255,255,255,0.08); color:var(--text-primary); padding:3px 9px; border-radius:999px; }
+        .plan-suggestions { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
+        .plan-suggestion-btn { font-size:12.5px; color:var(--text-primary); background:transparent; border:1px solid var(--border-color); border-radius:999px; padding:5px 12px; cursor:pointer; transition:background 0.2s ease, border-color 0.2s ease; }
+        .plan-suggestion-btn:hover { background-color:rgba(255,255,255,0.08); border-color:rgba(255,255,255,0.25); }
+
         /* ============== INPUT ============== */
         .input-container { position:absolute; bottom:0; left:0; width:100%; padding:22px; background:linear-gradient(180deg, rgba(33,33,33,0) 0%, var(--bg-main) 40%); display:flex; justify-content:center; }
         .input-box { width:100%; max-width:760px; background-color:var(--bg-input); border-radius:22px; border:1px solid var(--border-color); display:flex; flex-direction:column; align-items:stretch; padding:11px 15px; box-shadow:0 4px 20px rgba(0,0,0,0.15); transition:border-color 0.25s ease, box-shadow 0.25s ease; }
@@ -1186,6 +1202,59 @@
             container.appendChild(chip);
         }
 
+        // Rendered once, right before Code mode's very first build in a session — a
+        // real short plan (its own backend LLM call, streaming its own live
+        // reasoning into the Thinking pane just like everything else) naming what
+        // will be built and which file(s) it needs, so the manifest appears before
+        // any code starts streaming into the canvas. Lives outside .message-prose,
+        // like the inline code status chip and artifact chip, so it survives every
+        // re-render of the streamed answer text. A couple of generic follow-up
+        // suggestions are offered underneath — e.g. asking to add another image —
+        // which just prefill the input and send, the same as typing them.
+        function renderPlanCard(container, plan) {
+            if (!plan || (!plan.summary && (!plan.files || !plan.files.length))) return;
+            const card = document.createElement('div');
+            card.className = 'plan-card';
+            const filesHtml = (plan.files || []).map(name =>
+                `<span class="plan-file-chip">${escapeHtml(name)}</span>`
+            ).join('');
+            card.innerHTML = `
+                <div class="plan-card-header">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
+                    <span>Plan</span>
+                </div>
+                ${plan.summary ? `<div class="plan-card-summary">${escapeHtml(plan.summary)}</div>` : ''}
+                ${filesHtml ? `<div class="plan-card-files">${filesHtml}</div>` : ''}
+            `;
+            if (plan.files && plan.files.length) {
+                const suggestions = document.createElement('div');
+                suggestions.className = 'plan-suggestions';
+                const mainFile = plan.files[0];
+                const quickAsks = [
+                    `Add another image to ${mainFile}`,
+                    'Adjust the design',
+                ];
+                quickAsks.forEach(ask => {
+                    const btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.className = 'plan-suggestion-btn';
+                    btn.textContent = ask;
+                    btn.addEventListener('click', () => {
+                        if (isWaitingForResponse) return;
+                        userInput.value = ask;
+                        autoResize(userInput);
+                        sendMessage();
+                    });
+                    suggestions.appendChild(btn);
+                });
+                card.appendChild(suggestions);
+            }
+            const prose = container.querySelector('.message-prose');
+            if (prose) container.insertBefore(card, prose);
+            else container.appendChild(card);
+            scrollToBottom();
+        }
+
         const API_BASE = 'https://ailoops.onrender.com';
 
         function generateUUID() {
@@ -1968,6 +2037,8 @@
                                     appendLiveThought(parsed.text);
                                 } else if (parsed.type === 'activity') {
                                     addActivity(parsed);
+                                } else if (parsed.type === 'plan') {
+                                    renderPlanCard(textContainer, parsed);
                                 } else if (parsed.type === 'turn_summary') {
                                     finalizeActivitySummary(parsed);
                                 } else if (parsed.type === 'code_start') {
