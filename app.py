@@ -4658,5 +4658,4 @@ async def clear_code_session(request: ClearCodeSessionRequest):
     return {"status": "success", "message": f"Code session {request.session_id} cleared."}
 
 if __name__ == "__main__":
-    # Ensure uvicorn runs the correct file 'main' instead of 'app'
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
