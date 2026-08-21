@@ -3,10 +3,6 @@ import os
 import json
 import re
 import asyncio
-import difflib
-import pathlib
-import shutil
-import time
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
@@ -278,26 +274,55 @@ async def publish_thought(progress, text: str) -> None:
         await progress.put({"type": "thought", "text": text})
 
 
-async def publish_activity(progress, kind: str, label: str, **extra) -> None:
-    """Publish one concrete, already-happened Code Mode action (a file actually
-    generated, with its real line count) for the activity trace."""
-    if isinstance(progress, asyncio.Queue):
-        event = {"type": "activity", "kind": kind, "label": label}
-        event.update(extra)
-        await progress.put(event)
-
-
-async def publish_turn_summary(progress, **counts) -> None:
-    """Publish the final real tally (files touched, etc.) for the turn's recap line."""
-    if isinstance(progress, asyncio.Queue):
-        await progress.put({"type": "turn_summary", **counts})
-
-
 async def publish_event(progress, event: dict) -> None:
-    """Publish an arbitrary already-shaped SSE event (used for code_start /
-    code_file_start / code_delta, whose payloads vary by call site)."""
+    """Publish an arbitrary already-shaped SSE event for the response diff box."""
     if isinstance(progress, asyncio.Queue):
         await progress.put(event)
+
+
+_FENCE_OPEN_RE = re.compile(r"^```([A-Za-z0-9_+#.-]*)\s*$")
+_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
+_FILE_HEADER_RE = re.compile(r"^\s*FILE\s*:\s*(.+?)\s*$", re.IGNORECASE)
+
+
+def _new_code_stream_state() -> dict:
+    return {"in_code": False, "pending_filename": None, "current_file": "", "line_buf": ""}
+
+
+async def _stream_code_line(progress, line: str, code_state: dict) -> None:
+    if not code_state["in_code"]:
+        file_match = _FILE_HEADER_RE.match(line)
+        if file_match:
+            code_state["pending_filename"] = file_match.group(1).strip().strip("`")
+            return
+        fence_match = _FENCE_OPEN_RE.match(line)
+        if fence_match:
+            language = fence_match.group(1) or ""
+            filename = code_state["pending_filename"] or ""
+            code_state["pending_filename"] = None
+            code_state["in_code"] = True
+            code_state["current_file"] = filename
+            event = {"type": "code_file_start", "language": language, "filename": filename} if filename else {"type": "code_start", "language": language}
+            await publish_event(progress, event)
+            return
+        await publish_token(progress, line + "\n")
+    elif _FENCE_CLOSE_RE.match(line):
+        code_state["in_code"] = False
+    else:
+        await publish_event(progress, {"type": "code_delta", "delta": line + "\n", "filename": code_state["current_file"]})
+
+
+async def stream_code_answer_piece(progress, code_state: dict, text: str) -> None:
+    code_state["line_buf"] += text
+    while "\n" in code_state["line_buf"]:
+        line, code_state["line_buf"] = code_state["line_buf"].split("\n", 1)
+        await _stream_code_line(progress, line, code_state)
+
+
+async def flush_code_answer_stream(progress, code_state: dict) -> None:
+    if code_state["line_buf"]:
+        await _stream_code_line(progress, code_state["line_buf"], code_state)
+        code_state["line_buf"] = ""
 
 
 def build_messages(history: List[BaseMessage], thinking_level: str, search_text: str = "") -> List[BaseMessage]:
@@ -372,7 +397,8 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
     `on_answer_piece`, if given, receives each live slice of answer text instead of
     it being published as a plain 'token' event — Code mode uses this to re-parse
     the stream for FILE:/fenced-code boundaries and emit code_start/code_file_start/
-    code_delta events into the canvas instead."""
+    code_delta events into the response diff box instead.
+"""
     if not isinstance(progress, asyncio.Queue):
         result = await llm.ainvoke(messages)
         reasoning = _extract_reasoning(result)
@@ -613,641 +639,88 @@ def extract_code_artifact(text: str) -> tuple[str, str, str, dict, dict]:
     return explanation, "", "", files, file_languages
 
 
-# ----------------------------------------------------------------------
-# ----------------------------------------------------------------------
-# CODE MODE: Idea -> Plan -> Code -> Test -> Review -> Fix -> Commit
-#
-# This pipeline deliberately keeps the existing frontend event contract. The
-# backend owns the workflow and emits real model reasoning through `thought`
-# events plus concrete `plan`, `activity`, and canvas events. There is no
-# legacy "edit pass then silently regenerate" branch: every turn is an
-# explicit action against the session workspace, followed by test/review and,
-# only when necessary, a targeted fix.
-# ----------------------------------------------------------------------
-
-_EXTENSION_MAP = {
-    "python": "py", "py": "py", "javascript": "js", "js": "js", "typescript": "ts",
-    "ts": "ts", "jsx": "jsx", "tsx": "tsx", "html": "html", "htm": "html", "css": "css",
-    "json": "json", "bash": "sh", "sh": "sh", "shell": "sh", "java": "java", "c": "c",
-    "cpp": "cpp", "c++": "cpp", "go": "go", "rust": "rs", "rs": "rs", "ruby": "rb",
-    "rb": "rb", "php": "php", "sql": "sql", "yaml": "yaml", "yml": "yaml",
-    "markdown": "md", "md": "md", "text": "txt", "plaintext": "txt", "": "txt",
-}
-
-
-def implied_filename(language: str) -> str:
-    lang = (language or "").strip().lower()
-    ext = _EXTENSION_MAP.get(lang, lang if re.fullmatch(r"[a-z0-9]+", lang) else "txt")
-    return f"main.{ext}"
-
-
-def diff_stats(old: str, new: str) -> tuple[int, int]:
-    sm = difflib.SequenceMatcher(a=(old or "").splitlines(), b=(new or "").splitlines())
-    additions = deletions = 0
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "replace":
-            deletions += i2 - i1
-            additions += j2 - j1
-        elif tag == "delete":
-            deletions += i2 - i1
-        elif tag == "insert":
-            additions += j2 - j1
-    return additions, deletions
-
-
-_FILE_FENCE_RE = re.compile(
-    r"(?:^|\n)\s*FILE\s*:\s*(?P<filename>[^\n]+)\r?\n\s*```(?P<language>[A-Za-z0-9_+#.-]*)\s*\r?\n(?P<code>[\s\S]*?)```",
-    re.IGNORECASE,
-)
-_UNNAMED_FENCE_RE = re.compile(r"```([A-Za-z0-9_+#.-]*)\s*\r?\n([\s\S]*?)```")
-_ACTION_BLOCK_RE = re.compile(
-    r"(?:^|\n)\s*(?:FILE\s*:\s*(?P<filename>[^\n`]+)\r?\n)?"
-    r"<{3,}\s*SEARCH\s*\r?\n(?P<search>.*?)\r?\n={3,}\s*\r?\n"
-    r"(?P<replace>.*?)\r?\n>{3,}\s*REPLACE",
-    re.DOTALL | re.IGNORECASE,
-)
-
-
-def parse_code_files(text: str) -> tuple[str, str, str, dict, dict]:
-    """Parse explicit FILE/fence artifacts, with a stable fallback for one block."""
-    source = text or ""
-    named = list(_FILE_FENCE_RE.finditer(source))
-    if named:
-        files, languages = {}, {}
-        for match in named:
-            filename = match.group("filename").strip().strip("`")
-            if filename:
-                files[filename] = match.group("code").strip()
-                languages[filename] = (match.group("language") or "text").lower()
-        return _FILE_FENCE_RE.sub("", source).strip(), "", "", files, languages
-
-    matches = list(_UNNAMED_FENCE_RE.finditer(source))
-    if not matches:
-        return source.strip(), "", "", {}, {}
-    if len(matches) == 1:
-        language = (matches[0].group(1) or "text").lower()
-        code = matches[0].group(2).strip()
-        explanation = _UNNAMED_FENCE_RE.sub("", source).strip()
-        return explanation, code, language, {}, {}
-
-    extension_map = {"python": "py", "py": "py", "javascript": "js", "js": "js", "typescript": "ts", "html": "html", "css": "css", "json": "json"}
-    files, languages = {}, {}
-    for index, match in enumerate(matches, start=1):
-        language = (match.group(1) or "text").lower()
-        files[f"file_{index}.{extension_map.get(language, 'txt')}"] = match.group(2).strip()
-        languages[f"file_{index}.{extension_map.get(language, 'txt')}"] = language
-    return _UNNAMED_FENCE_RE.sub("", source).strip(), "", "", files, languages
-
-
-def parse_action_blocks(text: str) -> list[tuple[str, str, str]]:
-    return [
-        ((match.group("filename") or "").strip().strip("`"), match.group("search"), match.group("replace"))
-        for match in _ACTION_BLOCK_RE.finditer(text or "")
-    ]
-
-
-def apply_action_blocks(files: dict, blocks: list, default_filename: str) -> tuple[dict, list, bool]:
-    """Apply an entire action atomically; invalid actions never partially mutate a workspace."""
-    if not blocks:
-        return dict(files), [], False
-    working = dict(files)
-    touched = []
-    for filename, search, replace in blocks:
-        target = filename or default_filename
-        if not target or target not in working or not search or search not in working[target]:
-            return dict(files), [], False
-        working[target] = working[target].replace(search, replace, 1)
-        if target not in touched:
-            touched.append(target)
-    return working, touched, True
-
-
-_FENCE_OPEN_RE = re.compile(r"^```([A-Za-z0-9_+#.-]*)\s*$")
-_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
-_FILE_HEADER_RE = re.compile(r"^\s*FILE\s*:\s*(.+?)\s*$", re.IGNORECASE)
-
-
-def _new_code_stream_state() -> dict:
-    return {"in_code": False, "pending_filename": None, "current_file": "", "line_buf": ""}
-
-
-async def _stream_code_line(progress, line: str, code_state: dict) -> None:
-    if not code_state["in_code"]:
-        file_match = _FILE_HEADER_RE.match(line)
-        if file_match:
-            code_state["pending_filename"] = file_match.group(1).strip().strip("`")
-            return
-        fence_match = _FENCE_OPEN_RE.match(line)
-        if fence_match:
-            language = fence_match.group(1) or ""
-            filename = code_state["pending_filename"] or ""
-            code_state["pending_filename"] = None
-            code_state["in_code"] = True
-            code_state["current_file"] = filename
-            event = {"type": "code_file_start", "language": language, "filename": filename} if filename else {"type": "code_start", "language": language}
-            await publish_event(progress, event)
-            return
-        await publish_token(progress, line + "\n")
-    elif _FENCE_CLOSE_RE.match(line):
-        code_state["in_code"] = False
-    else:
-        await publish_event(progress, {"type": "code_delta", "delta": line + "\n", "filename": code_state["current_file"]})
-
-
-async def stream_code_answer_piece(progress, code_state: dict, text: str) -> None:
-    code_state["line_buf"] += text
-    while "\n" in code_state["line_buf"]:
-        line, code_state["line_buf"] = code_state["line_buf"].split("\n", 1)
-        await _stream_code_line(progress, line, code_state)
-
-
-async def flush_code_answer_stream(progress, code_state: dict) -> None:
-    if code_state["line_buf"]:
-        await _stream_code_line(progress, code_state["line_buf"], code_state)
-        code_state["line_buf"] = ""
-
-
-
 # ---------------------------------------------------------------------------
-# Code mode: autonomous, event-driven workspace agent
+# Code mode: direct response generation with HTTP SSE code streaming.
+# Generated code is returned only through the response stream. The frontend
+# receives the explanation as message events and the code body as
+# code_start/code_delta events for one live diff box inside the assistant response.
 # ---------------------------------------------------------------------------
 
-CODE_MAX_STEPS = 18
 CODE_MAX_OUTPUT = 12000
-CODE_EXCLUDED_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', '.next', 'dist', 'build'}
-
-# Filenames/paths the agent is never allowed to read, search, or print the contents of.
-# This is enforced in code (not just via prompt instructions) so it can't be talked around.
-CODE_SENSITIVE_PATTERN = re.compile(
-    r'(^|/)('
-    r'\.env(\..*)?'          # .env, .env.local, .env.production ...
-    r'|.*secret.*'
-    r'|.*credential.*'
-    r'|.*\bcreds\b.*'
-    r'|.*password.*'
-    r'|.*token.*'
-    r'|.*\.pem$'
-    r'|.*\.key$'
-    r'|.*\.pfx$'
-    r'|.*\.p12$'
-    r'|id_rsa.*'
-    r'|.*service.?account.*\.json$'
-    r'|app\.py'              # this application's own source file
-    r')$',
-    re.IGNORECASE,
-)
-
-# Rough heuristic to stop shell commands from being used to dump secrets even though
-# run_command is already sandboxed to the workspace directory.
-CODE_SENSITIVE_COMMAND_PATTERN = re.compile(r'\.env\b|secret|credential|password|\.pem\b|\.key\b|id_rsa|service.?account', re.IGNORECASE)
 
 
-def is_sensitive_path(relative: str) -> bool:
-    return bool(CODE_SENSITIVE_PATTERN.search((relative or '').replace('\\', '/')))
-
-
-def code_workspace_root() -> pathlib.Path:
-    configured = os.getenv('CODE_WORKSPACE_ROOT') or os.getcwd()
-    return pathlib.Path(configured).resolve()
-
-
-def safe_code_path(root: pathlib.Path, relative: str) -> pathlib.Path:
-    if not relative or pathlib.Path(relative).is_absolute():
-        raise ValueError('A relative workspace path is required.')
-    candidate = (root / relative).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError as exc:
-        raise ValueError('The path is outside the allowed workspace.') from exc
-    return candidate
-
-
-def code_relpath(root: pathlib.Path, path: pathlib.Path) -> str:
-    return path.resolve().relative_to(root).as_posix()
-
-
-def code_language(path: str) -> str:
-    ext = pathlib.Path(path).suffix.lower().lstrip('.')
-    return {'js': 'javascript', 'ts': 'typescript', 'jsx': 'javascript', 'tsx': 'typescript', 'py': 'python', 'yml': 'yaml', 'md': 'markdown'}.get(ext, ext or 'text')
-
-
-def code_diff(old: str, new: str, path: str) -> str:
-    return '\n'.join(difflib.unified_diff(old.splitlines(), new.splitlines(), fromfile=f'a/{path}', tofile=f'b/{path}', lineterm=''))
-
-
-def code_diff_stats(old: str, new: str) -> tuple[int, int]:
-    diff = list(difflib.ndiff(old.splitlines(), new.splitlines()))
-    additions = sum(1 for line in diff if line.startswith('+ '))
-    deletions = sum(1 for line in diff if line.startswith('- '))
-    return additions, deletions
-
-
-def code_truncate(value: str, limit: int = CODE_MAX_OUTPUT) -> str:
-    value = value or ''
-    return value if len(value) <= limit else value[:limit] + '\n… output truncated …'
-
-
-async def code_emit(progress, event_type: str, **payload) -> dict:
-    event = {'type': event_type, **payload}
-    if isinstance(progress, asyncio.Queue):
-        await progress.put(event)
-    elif isinstance(progress, list):
-        progress.append(event)
-    return event
-
-
-async def code_model_text(request: CodeChatRequest, prompt: str, progress=None, max_tokens: int = 2200) -> str:
+async def generate_code_once(request: CodeChatRequest, session: dict, progress=None, on_answer_piece=None) -> dict:
+    config = get_thinking_config(request.reasoning_level)
     model_type = 'reasoning' if request.model in {'glm', 'kimik2.6'} else 'balanced'
-    token_budget = min(max_tokens, get_thinking_config(request.reasoning_level)['max_tokens'])
-    system = SystemMessage(content='You are the decision engine for a real coding agent. Never choose an action that reads, prints, or transmits secrets, credentials, or this application\'s own source code, and only pursue lawful, good-faith objectives.')
-    human = HumanMessage(content=prompt)
-
-    # A single dropped connection or slow response (e.g. a socket read timeout talking to
-    # the model provider) used to abort the whole agent run right there, since the caller
-    # only got one shot at this call and every failure was charged straight to the 3-strike
-    # decision-error budget in autonomous_code_once. Retry the requested model once more,
-    # then fall back to the fast model on a final attempt — this absorbs a transient network
-    # blip or an overloaded reasoning model without ever hanging the run indefinitely, and
-    # without silently eating into the caller's decision-error budget for a network hiccup
-    # that had nothing to do with the model's actual output.
-    attempts = [(model_type, token_budget), (model_type, token_budget), ('fast', min(token_budget, 2200))]
-    last_exc: Optional[Exception] = None
-    for attempt_index, (attempt_model, attempt_tokens) in enumerate(attempts):
-        llm = get_llm(attempt_model, 0.1, attempt_tokens)
-        try:
-            # Do not forward hidden reasoning. The model must return only a concise
-            # user-safe decision or tool arguments after thinking privately.
-            result = await invoke_model([system, human], llm, None)
-            text = _coerce_model_text(result).strip()
-            if text:
-                return text
-            last_exc = ValueError('model returned an empty response')
-        except Exception as exc:
-            last_exc = exc
-        if attempt_index < len(attempts) - 1:
-            await code_emit(progress, 'RETRY', reason=f'Model call failed ({type(last_exc).__name__}), retrying…')
-            await asyncio.sleep(0.75 * (attempt_index + 1))
-    await code_emit(progress, 'ERROR', message=f'Model decision failed: {type(last_exc).__name__ if last_exc else "unknown error"}.')
-    return ''
-
-
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n?([\s\S]*?)```", re.IGNORECASE)
-
-
-def _extract_json_object(text: str) -> str:
-    """Best-effort extraction of a JSON object from a model's raw text output.
-
-    Chat/reasoning models very commonly wrap a requested JSON payload in
-    ```json ... ``` fences, or add a stray sentence of commentary before or
-    after it, even when explicitly told not to. A plain json.loads(raw) on
-    that output fails every time, which previously made the whole Code mode
-    agent abort on step one any time the model didn't return perfectly bare
-    JSON. This pulls the {...} payload out first so parsing gets a fair shot.
-    """
-    if not text:
-        return text
-    cleaned = text.strip()
-    fence_match = _JSON_FENCE_RE.search(cleaned)
-    if fence_match:
-        cleaned = fence_match.group(1).strip()
-    start = cleaned.find('{')
-    end = cleaned.rfind('}')
-    if start != -1 and end != -1 and end > start:
-        return cleaned[start:end + 1]
-    return cleaned
-
-
-async def code_decide(request: CodeChatRequest, state: dict, observations: list[dict], progress=None) -> dict:
-    workspace = state['workspace']
-    recent = json.dumps(observations[-8:], ensure_ascii=False)
-    prompt = (
-        'Choose exactly one real workspace tool for the next action. Never invent a result and never describe a '
-        'tool call that you did not choose. Return JSON only with keys: summary, tool, args. The summary must be a '
-        'short user-safe sentence, not private reasoning. Valid tools: list_files, read_file, search_files, create_file, '
-        'edit_file, delete_file, move_file, run_command, run_tests, git_status, git_diff, finish. '
-        'Inspect before editing. Read only relevant files. Use edit_file with new_content or exact search/replace. '
-        'Call finish once the requested code has been written. Arguments must contain relative paths only. '
-        'For create_file use {path, content}; for edit_file use {path, '
-        'new_content} or {path, search, replace}; for search_files use {pattern}; for run_command use {command}; '
-        'for run_tests optionally use {command}. Respond with the raw JSON object only — no markdown code fences, '
-        'no ```json wrapper, and no explanatory text before or after it.\n\n'
-        f'Workspace root: {workspace}\nUser task: {request.message}\nState: {json.dumps(state["public_state"], ensure_ascii=False)}\n'
-        f'Recent real observations: {recent}'
+    await publish_progress(
+        progress,
+        'code_generation_started',
+        'code_generation_started',
+        f"Generating code with {config['label']} effort and a {config['max_tokens']}-token budget.",
     )
-    raw = await code_model_text(request, prompt, progress)
-    try:
-        parsed = json.loads(_extract_json_object(raw))
-        if not isinstance(parsed, dict) or not isinstance(parsed.get('tool'), str):
-            raise ValueError('invalid decision shape')
-        args = parsed.get('args')
-        if isinstance(args, str):
-            # Some models double-encode args as a JSON string instead of an
-            # object; try to recover it instead of silently discarding it.
-            try:
-                args = json.loads(args)
-            except Exception:
-                args = {}
-        if not isinstance(args, dict):
-            args = {}
-        return {'summary': str(parsed.get('summary') or 'Continuing with the next workspace action.'), 'tool': parsed['tool'], 'args': args}
-    except Exception:
-        await code_emit(progress, 'ERROR', message='The agent returned an invalid tool decision.')
-        return {'summary': '', 'tool': '__decision_error__', 'args': {}, 'raw': code_truncate(raw, 500)}
-
-
-async def code_list_files(root: pathlib.Path, progress) -> dict:
-    files = []
-    for item in sorted(root.rglob('*')):
-        if not item.is_file() or any(part in CODE_EXCLUDED_DIRS for part in item.relative_to(root).parts):
-            continue
-        try:
-            rel = code_relpath(root, item)
-        except ValueError:
-            continue  # symlink resolves outside the workspace root (e.g. a venv interpreter); skip it
-        if is_sensitive_path(rel):
-            continue
-        files.append(rel)
-        if len(files) >= 500:
-            break
-    await code_emit(progress, 'WORKSPACE_LISTED', files=files, count=len(files))
-    return {'files': files, 'count': len(files)}
-
-
-async def code_read_file(root: pathlib.Path, args: dict, state: dict, progress) -> dict:
-    path = str(args.get('path') or '')
-    if is_sensitive_path(path):
-        await code_emit(progress, 'ERROR', message=f'Blocked: "{path}" looks like a secrets/credentials file and cannot be read.')
-        raise PermissionError(f'Reading "{path}" is blocked: it looks like a secrets, credentials, or application source file.')
-    target = safe_code_path(root, path)
-    if not target.is_file():
-        raise FileNotFoundError(path)
-    content = target.read_text(errors='replace')
-    state['read_files'].add(path)
-    await code_emit(progress, 'FILE_READ', path=path, lines=len(content.splitlines()), bytes=len(content.encode('utf-8', errors='ignore')))
-    return {'path': path, 'content': code_truncate(content, 24000)}
-
-
-async def code_search_files(root: pathlib.Path, args: dict, progress) -> dict:
-    pattern = str(args.get('pattern') or '')
-    if not pattern:
-        raise ValueError('A search pattern is required.')
-    await code_emit(progress, 'SEARCH_STARTED', pattern=pattern)
-    try:
-        regex = re.compile(pattern, re.IGNORECASE)
-    except re.error:
-        regex = re.compile(re.escape(pattern), re.IGNORECASE)
-    matches = []
-    for item in sorted(root.rglob('*')):
-        if not item.is_file() or any(part in CODE_EXCLUDED_DIRS for part in item.relative_to(root).parts):
-            continue
-        try:
-            rel = code_relpath(root, item)
-        except ValueError:
-            continue  # symlink resolves outside the workspace root; skip it
-        if is_sensitive_path(rel):
-            continue
-        try:
-            lines = item.read_text(errors='replace').splitlines()
-        except OSError:
-            continue
-        for number, line in enumerate(lines, 1):
-            if regex.search(line):
-                matches.append({'path': rel, 'line': number, 'text': line[:300]})
-                if len(matches) >= 100:
-                    break
-        if len(matches) >= 100:
-            break
-    await code_emit(progress, 'SEARCH_RESULT', pattern=pattern, matches=matches, count=len(matches))
-    return {'pattern': pattern, 'matches': matches, 'count': len(matches)}
-
-
-async def code_apply_file_change(root: pathlib.Path, path: str, old: str, new: str, progress, created: bool = False) -> dict:
-    target = safe_code_path(root, path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    diff = code_diff(old, new, path)
-    additions, deletions = code_diff_stats(old, new)
-    await code_emit(progress, 'FILE_EDIT_STARTED', path=path, created=created, old_lines=len(old.splitlines()), new_lines=len(new.splitlines()), additions=additions, deletions=deletions)
-    target.write_text(new)
-    event = {'path': path, 'old_content': old, 'new_content': new, 'diff': diff, 'additions': additions, 'deletions': deletions, 'status': 'completed'}
-    await code_emit(progress, 'FILE_DIFF', **event)
-    if created:
-        await code_emit(progress, 'FILE_CREATED', path=path, additions=additions, deletions=deletions)
-    await code_emit(progress, 'FILE_EDIT_COMPLETED', path=path, created=created, additions=additions, deletions=deletions)
-    return {'path': path, 'additions': additions, 'deletions': deletions, 'diff': diff}
-
-
-async def code_create_file(root: pathlib.Path, args: dict, state: dict, progress) -> dict:
-    path = str(args.get('path') or '')
-    target = safe_code_path(root, path)
-    if target.exists():
-        raise FileExistsError(path)
-    content = _coerce_model_text(args.get('content') or '')
-    result = await code_apply_file_change(root, path, '', content, progress, created=True)
-    state['modified_files'].add(path)
-    return result
-
-
-async def code_edit_file(root: pathlib.Path, args: dict, state: dict, progress) -> dict:
-    path = str(args.get('path') or '')
-    target = safe_code_path(root, path)
-    old = target.read_text(errors='replace') if target.exists() else ''
-    if 'new_content' in args:
-        new = _coerce_model_text(args.get('new_content'))
-    else:
-        search = _coerce_model_text(args.get('search') or '')
-        replace = _coerce_model_text(args.get('replace') or '')
-        if not search or search not in old:
-            raise ValueError(f'Exact search text was not found in {path}.')
-        new = old.replace(search, replace, 1)
-    result = await code_apply_file_change(root, path, old, new, progress, created=not target.exists())
-    state['modified_files'].add(path)
-    return result
-
-
-async def code_delete_file(root: pathlib.Path, args: dict, state: dict, progress) -> dict:
-    path = str(args.get('path') or '')
-    target = safe_code_path(root, path)
-    if not target.is_file():
-        raise FileNotFoundError(path)
-    target.unlink()
-    state['modified_files'].add(path)
-    await code_emit(progress, 'FILE_DELETED', path=path)
-    return {'path': path, 'deleted': True}
-
-
-async def code_move_file(root: pathlib.Path, args: dict, state: dict, progress) -> dict:
-    source = str(args.get('source') or '')
-    destination = str(args.get('destination') or '')
-    src = safe_code_path(root, source)
-    dst = safe_code_path(root, destination)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(src), str(dst))
-    state['modified_files'].update({source, destination})
-    await code_emit(progress, 'FILE_MOVED', source=source, destination=destination)
-    return {'source': source, 'destination': destination}
-
-
-async def code_run_command(root: pathlib.Path, command: str, progress, event_prefix: str = 'COMMAND') -> dict:
-    command = command.strip()
-    if not command:
-        raise ValueError('A command is required.')
-    if len(command) > 500:
-        raise ValueError('Command is too long.')
-    lowered = command.lower()
-    if any(token in lowered for token in ('sudo ', 'shutdown', 'mkfs', ':(){', ' rm -rf /', ' rm -fr /')):
-        raise PermissionError('Destructive or privileged commands are not allowed.')
-    if re.search(r'(^|\s)(/etc|/usr|/var|/home/[^\s]+|\.\./)', command):
-        raise PermissionError('The command references a path outside the workspace.')
-    if CODE_SENSITIVE_COMMAND_PATTERN.search(command):
-        raise PermissionError('Commands that reference secrets, credentials, or key files are not allowed.')
-    await code_emit(progress, f'{event_prefix}_STARTED', command=command)
-    started = time.monotonic()
-    process = await asyncio.create_subprocess_shell(command, cwd=str(root), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-    output = []
-    timed_out = False
-    while True:
-        remaining = 60 - (time.monotonic() - started)
-        if remaining <= 0:
-            timed_out = True
-            process.kill()
-            break
-        try:
-            line = await asyncio.wait_for(process.stdout.readline(), timeout=min(1.0, remaining))
-        except asyncio.TimeoutError:
-            continue
-        if not line:
-            break
-        text = line.decode(errors='replace')
-        output.append(text)
-        await code_emit(progress, 'COMMAND_OUTPUT', command=command, output=text)
-    return_code = await process.wait()
-    if timed_out:
-        return_code = 124
-        output.append('Command timed out after 60 seconds.\n')
-        await code_emit(progress, 'ERROR', message=f'Command timed out: {command}')
-    result = {'command': command, 'return_code': return_code, 'output': code_truncate(''.join(output))}
-    await code_emit(progress, f'{event_prefix}_COMPLETED', **result)
-    return result
-
-
-async def code_run_tests(root: pathlib.Path, args: dict, state: dict, progress) -> dict:
-    command = str(args.get('command') or '').strip()
-    if not command:
-        if (root / 'package.json').is_file():
-            command = 'npm test -- --runInBand'
-        elif (root / 'pytest.ini').is_file() or (root / 'pyproject.toml').is_file() or (root / 'setup.cfg').is_file():
-            command = 'pytest -q'
-        else:
-            command = 'git diff --check'
-    await code_emit(progress, 'TEST_STARTED', command=command)
-    result = await code_run_command(root, command, progress, event_prefix='COMMAND')
-    passed = result['return_code'] == 0
-    await code_emit(progress, 'TEST_RESULT', command=command, passed=passed, return_code=result['return_code'], output=result['output'])
-    state['verification_done'] = True
-    state['last_test_passed'] = passed
-    return {'command': command, 'passed': passed, **result}
-
-
-async def code_git(root: pathlib.Path, args: dict, progress, diff: bool = False) -> dict:
-    command = 'git diff -- ' + str(args.get('path') or '') if diff and args.get('path') else ('git diff' if diff else 'git status --short')
-    result = await code_run_command(root, command, progress, event_prefix='COMMAND')
-    await code_emit(progress, 'GIT_DIFF' if diff else 'GIT_STATUS', output=result['output'], return_code=result['return_code'])
-    return result
-
-
-async def code_execute_tool(root: pathlib.Path, name: str, args: dict, state: dict, progress) -> dict:
-    if name == 'list_files':
-        return await code_list_files(root, progress)
-    if name == 'read_file':
-        return await code_read_file(root, args, state, progress)
-    if name == 'search_files':
-        return await code_search_files(root, args, progress)
-    if name == 'create_file':
-        return await code_create_file(root, args, state, progress)
-    if name == 'edit_file':
-        return await code_edit_file(root, args, state, progress)
-    if name == 'delete_file':
-        return await code_delete_file(root, args, state, progress)
-    if name == 'move_file':
-        return await code_move_file(root, args, state, progress)
-    if name == 'run_command':
-        return await code_run_command(root, str(args.get('command') or ''), progress)
-    if name == 'run_tests':
-        return await code_run_tests(root, args, state, progress)
-    if name == 'git_status':
-        return await code_git(root, args, progress, diff=False)
-    if name == 'git_diff':
-        return await code_git(root, args, progress, diff=True)
-    raise ValueError(f'Unknown workspace tool: {name}')
-
-
-async def autonomous_code_once(request: CodeChatRequest, session: dict, progress=None) -> dict:
-    root = code_workspace_root()
-    state = {
-        'workspace': str(root),
-        'modified_files': set(),
-        'read_files': set(),
-        'verification_done': False,
-        'last_test_passed': None,
-        'public_state': {'workspace': str(root), 'modified_files': [], 'read_files': [], 'commands': [], 'errors': [], 'verification_done': False},
+    llm = get_llm(model_type, 0.2, config['max_tokens'])
+    raw_response = await invoke_model(
+        build_code_messages(session['messages'], request.reasoning_level),
+        llm,
+        progress,
+        on_answer_piece=on_answer_piece,
+    )
+    explanation, code, language, files, file_languages = extract_code_artifact(raw_response)
+    if not explanation:
+        explanation = 'Generated the requested code.'
+    if len(code) > CODE_MAX_OUTPUT:
+        code = code[:CODE_MAX_OUTPUT] + '\n… output truncated …'
+    files = {
+        filename: (content[:CODE_MAX_OUTPUT] + '\n… output truncated …' if len(content) > CODE_MAX_OUTPUT else content)
+        for filename, content in files.items()
     }
-    observations = []
-    decision_errors = 0
-    await code_emit(progress, 'AGENT_STARTED', task=request.message, workspace=str(root))
-    for step in range(CODE_MAX_STEPS):
-        state['public_state']['modified_files'] = sorted(state['modified_files'])
-        state['public_state']['read_files'] = sorted(state['read_files'])
-        decision = await code_decide(request, state, observations, progress)
-        if decision['summary']:
-            await code_emit(progress, 'TASK_ANALYSIS', summary=decision['summary'], tool=decision['tool'])
-        tool = decision['tool']
-        args = decision['args']
-        if tool == '__decision_error__':
-            # A single malformed response (e.g. JSON wrapped in markdown fences,
-            # or a stray sentence of commentary) used to abort the whole agent
-            # on step one. Give the model a few chances to self-correct instead,
-            # feeding the bad output back so it can see what went wrong.
-            decision_errors += 1
-            observations.append({
-                'summary': 'Previous response could not be parsed.',
-                'tool': '__decision_error__',
-                'error': 'Reply with the raw JSON object only — no markdown fences, no extra text.',
-                'raw_output': decision.get('raw', ''),
-            })
-            if decision_errors >= 3:
-                await code_emit(progress, 'ERROR', message='The agent could not produce a valid tool decision after several attempts.')
-                break
-            continue
-        decision_errors = 0
-        if tool == 'finish':
-            await code_emit(progress, 'AGENT_COMPLETED', files=sorted(state['modified_files']), steps=step + 1)
-            break
-        try:
-            result = await code_execute_tool(root, tool, args, state, progress)
-            observations.append({'summary': decision['summary'], 'tool': tool, 'args': args, 'result': code_truncate(json.dumps(result, ensure_ascii=False), 5000)})
-            state['public_state']['commands'].append(tool) if tool in {'run_command', 'run_tests', 'git_status', 'git_diff'} else None
-        except Exception as exc:
-            message = f'{type(exc).__name__}: {exc}'
-            state['public_state']['errors'].append(message)
-            await code_emit(progress, 'ERROR', tool=tool, message=message)
-            await code_emit(progress, 'RETRY', reason='The agent will inspect the real error and choose the next corrective action.')
-            observations.append({'summary': decision['summary'], 'tool': tool, 'args': args, 'error': message})
-    else:
-        await code_emit(progress, 'ERROR', message='The agent reached its safe action limit before finishing.')
+    return {
+        'response': explanation,
+        'code': code,
+        'language': language,
+        'files': files,
+        'file_languages': file_languages,
+        'show_preview': bool(code or files),
+        'thinking_summary': 'Generated directly in the response stream; no file-system actions were run.',
+        'thinking_level': config['label'],
+        'max_tokens': config['max_tokens'],
+    }
 
-    changed = {}
-    languages = {}
-    for relative in sorted(state['modified_files']):
-        target = safe_code_path(root, relative)
-        if target.is_file():
-            changed[relative] = target.read_text(errors='replace')
-            languages[relative] = code_language(relative)
-    files = changed
-    code = next(iter(files.values())) if len(files) == 1 else ''
-    language = next(iter(languages.values())) if len(languages) == 1 else ''
-    summary = 'Completed the task.' if state['modified_files'] else 'The task needs another run after the reported error.'
-    await code_emit(progress, 'turn_summary', files_touched=len(state['modified_files']), commands_run=len(state['public_state']['commands']), files_read=len(state['read_files']), notes=len(state['public_state']['errors']))
-    return {'response': summary, 'code': code, 'language': language, 'files': files, 'file_languages': languages, 'show_preview': bool(files), 'thinking_summary': 'Real workspace actions and tool results were streamed; private reasoning was not exposed.', 'thinking_level': get_thinking_config(request.reasoning_level)['label'], 'max_tokens': get_thinking_config(request.reasoning_level)['max_tokens'], 'workspace': str(root), 'modified_files': sorted(state['modified_files'])}
+
+async def generate_code_stream(request: CodeChatRequest, session: dict, session_id: str):
+    progress_queue: asyncio.Queue = asyncio.Queue()
+    code_state = _new_code_stream_state()
+    emitted_content = False
+
+    async def on_answer_piece(text: str) -> None:
+        await stream_code_answer_piece(progress_queue, code_state, text)
+
+    task = asyncio.create_task(generate_code_once(request, session, progress_queue, on_answer_piece))
+    result = None
+    try:
+        async for event in forward_live_events(task, progress_queue, session_id):
+            event_type = event.get('type')
+            if event_type in {'status', 'thought', 'code_start', 'code_file_start', 'code_delta', 'AGENT_HEARTBEAT', 'RETRY', 'ERROR'}:
+                yield f'data: {json.dumps(event, ensure_ascii=False)}\n\n'
+            elif event_type == 'token':
+                emitted_content = True
+                yield f"data: {json.dumps({'type': 'message', 'assistant_message': event['text'], 'conversation_id': session_id, 'session_id': session_id}, ensure_ascii=False)}\n\n"
+        await flush_code_answer_stream(progress_queue, code_state)
+        while not progress_queue.empty():
+            event = progress_queue.get_nowait()
+            event_type = event.get('type')
+            if event_type in {'status', 'thought', 'code_start', 'code_file_start', 'code_delta', 'AGENT_HEARTBEAT', 'RETRY', 'ERROR'}:
+                yield f'data: {json.dumps(event, ensure_ascii=False)}\n\n'
+        result = await task
+    except Exception as exc:
+        print(f'[{session_id}] Code generation failed: {exc}')
+        result = {'response': 'I could not generate code right now. Please try again.', 'code': '', 'language': '', 'files': {}, 'file_languages': {}, 'show_preview': False}
+        yield f'data: {json.dumps({"type": "ERROR", "message": str(exc)}, ensure_ascii=False)}\n\n'
+    if result.get('code') or result.get('files'):
+        yield f'data: {json.dumps({"type": "code_result", **result, "session_id": session_id}, ensure_ascii=False)}\n\n'
+    if not emitted_content:
+        yield f'data: {json.dumps({"type": "message", "assistant_message": result["response"], "conversation_id": session_id, "session_id": session_id}, ensure_ascii=False)}\n\n'
+    session['messages'].append(AIMessage(content=result['response']))
 
 
 async def forward_live_events(task: asyncio.Task, progress_queue: asyncio.Queue, session_id: str):
@@ -1256,25 +729,6 @@ async def forward_live_events(task: asyncio.Task, progress_queue: asyncio.Queue,
             yield await asyncio.wait_for(progress_queue.get(), timeout=2.5)
         except asyncio.TimeoutError:
             yield {'type': 'AGENT_HEARTBEAT', 'label': 'Working'}
-
-
-async def generate_code_stream(request: CodeChatRequest, session: dict, session_id: str):
-    progress_queue: asyncio.Queue = asyncio.Queue()
-    task = asyncio.create_task(autonomous_code_once(request, session, progress_queue))
-    result = None
-    try:
-        async for event in forward_live_events(task, progress_queue, session_id):
-            yield f'data: {json.dumps(event, ensure_ascii=False)}\n\n'
-        result = await task
-    except Exception as exc:
-        print(f'[{session_id}] Autonomous Code mode failed: {exc}')
-        result = {'response': 'The autonomous workspace agent failed before completing the task.', 'code': '', 'language': '', 'files': {}, 'file_languages': {}, 'show_preview': False}
-        yield f'data: {json.dumps({"type": "ERROR", "message": str(exc)}, ensure_ascii=False)}\n\n'
-    if result.get('files'):
-        yield f'data: {json.dumps({"type": "code_result", **result, "session_id": session_id}, ensure_ascii=False)}\n\n'
-    yield f'data: {json.dumps({"type": "message", "assistant_message": result["response"], "conversation_id": session_id, "session_id": session_id}, ensure_ascii=False)}\n\n'
-    session['messages'].append(AIMessage(content=result['response']))
-    session['code_workspace'] = result.get('workspace', str(code_workspace_root()))
 
 
 @app.get("/health")
@@ -1324,7 +778,7 @@ async def code_chat(request: CodeChatRequest):
         )
     thinking_steps = []
     try:
-        result = await autonomous_code_once(request, session, thinking_steps)
+        result = await generate_code_once(request, session, thinking_steps)
     except Exception as exc:
         print(f"[{request.session_id}] Code generation failed: {exc}")
         result = {

@@ -174,31 +174,6 @@
         .message-text .artifact-preview.code-preview-frame { padding:0; display:block; }
         .message-text .code-preview-frame iframe { width:100%; min-height:360px; border:none; display:block; background:#fff; }
         .message-text .code-card [hidden] { display:none !important; }
-        .message-text .artifact-chip { display:block; margin:14px 0; padding:10px; border:1px solid var(--border-color); border-radius:12px; background-color:#262626; cursor:pointer; transition:background 0.2s ease, border-color 0.2s ease; max-width:440px; }
-        .message-text .artifact-chip:hover { background-color:#2d2d2d; border-color:rgba(255,255,255,0.18); }
-        .message-text .artifact-chip-header { display:flex; align-items:center; gap:10px; padding:2px 3px 9px; }
-        .message-text .artifact-chip-icon { flex-shrink:0; width:30px; height:30px; border-radius:8px; background-color:rgba(16,163,127,0.15); color:var(--accent); display:flex; align-items:center; justify-content:center; }
-        .message-text .artifact-chip-icon svg { width:17px; height:17px; }
-        .message-text .artifact-chip-info { flex:1; min-width:0; }
-        .message-text .artifact-chip-title { font-size:13.5px; font-weight:500; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        .message-text .artifact-chip-meta { font-size:12px; color:var(--text-secondary); margin-top:2px; }
-        .message-text .artifact-chip-btn { flex-shrink:0; background-color:var(--text-primary); color:var(--bg-main); border:none; border-radius:999px; font-size:12.5px; font-weight:600; padding:6px 14px; cursor:pointer; }
-        .message-text .artifact-file-list { display:flex; flex-direction:column; gap:4px; border-top:1px solid var(--border-color); padding-top:7px; }
-        .message-text .artifact-file-row { display:flex; align-items:center; gap:9px; width:100%; border:0; border-radius:8px; background:transparent; color:var(--text-primary); padding:8px 7px; text-align:left; cursor:pointer; }
-        .message-text .artifact-file-row:hover { background:rgba(255,255,255,0.07); }
-        .message-text .artifact-file-icon { width:18px; height:18px; color:var(--text-secondary); flex-shrink:0; }
-        .message-text .artifact-file-name { flex:1; min-width:0; font-family:'Courier New', Courier, monospace; font-size:12.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        .message-text .artifact-file-language { color:var(--text-secondary); font-size:11.5px; }
-        /* Small status-only chip shown INSIDE the chat message while a file is being
-           generated — names the file and shows a pulsing "writing" dot, but never renders
-           the code itself in the chat; the live code only ever appears in the canvas panel.
-           Replaced by .artifact-chip once the file (or the whole multi-file build) is
-           complete (see the code_result handler). */
-        .message-text .inline-code-status { display:flex; align-items:center; gap:8px; margin:14px 0; padding:8px 12px; border:1px solid var(--border-color); border-radius:10px; background-color:#1c1c1c; max-width:320px; }
-        .message-text .inline-code-status svg { width:14px; height:14px; color:var(--accent); flex-shrink:0; }
-        .message-text .inline-code-status-filename { font-size:12.5px; font-weight:500; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        .message-text .inline-code-status-dot { width:6px; height:6px; border-radius:50%; background-color:var(--accent); margin-left:auto; flex-shrink:0; animation:inlineStreamPulse 1s ease-in-out infinite; }
-        @keyframes inlineStreamPulse { 0%,100% { opacity:0.3; } 50% { opacity:1; } }
         .message-text .copy-btn { display:flex; align-items:center; gap:6px; background:transparent; border:none; color:var(--text-secondary); font-size:12px; cursor:pointer; padding:4px 8px; border-radius:6px; transition:background 0.2s, color 0.2s; }
         .message-text .copy-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
         .message-text .copy-btn svg { width:14px; height:14px; }
@@ -206,6 +181,25 @@
         .message-text code { font-family:'Courier New', Courier, monospace; background-color:rgba(255,255,255,0.1); padding:2px 6px; border-radius:4px; font-size:0.9em; }
         .message-text pre code { background-color:transparent; padding:0; font-size:0.9em; border:none; }
         .message-text blockquote { border-left:4px solid var(--accent); padding-left:12px; color:var(--text-secondary); margin:12px 0; }
+
+        /* ============== CODE MODE: in-response live diff box ============== */
+        .response-code-diff { margin-top:14px; border:1px solid var(--border-color); border-radius:10px; background:#151719; overflow:hidden; }
+        .response-code-diff[hidden] { display:none; }
+        .response-code-diff-header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 12px; border-bottom:1px solid var(--border-color); color:var(--text-secondary); font-size:12px; }
+        .response-code-diff-status { display:flex; align-items:center; gap:8px; min-width:0; }
+        .response-code-diff-dot { width:7px; height:7px; border-radius:50%; background:var(--accent); flex-shrink:0; animation:inlineStreamPulse 1s ease-in-out infinite; }
+        .response-code-diff-dot.done { animation:none; background:#3fb950; }
+        @keyframes inlineStreamPulse { 0%,100% { opacity:0.3; } 50% { opacity:1; } }
+        .response-code-diff-title { color:var(--text-primary); font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .response-code-diff-count { font:11.5px 'Courier New', Courier, monospace; color:#a9b1bb; white-space:nowrap; }
+        .response-diff-box { max-height:360px; overflow:auto; background:#0d0f10; }
+        .response-diff-empty { padding:14px; color:#7d8590; font:12px/1.5 'Courier New', Courier, monospace; }
+        .response-diff-file + .response-diff-file { border-top:1px solid rgba(255,255,255,0.09); }
+        .response-diff-file-header { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:7px 10px; color:var(--text-primary); background:rgba(255,255,255,0.045); font:11.5px 'Courier New', Courier, monospace; }
+        .response-diff-file-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .response-diff-file-stat { color:#aff5b4; white-space:nowrap; }
+        .response-diff-code { margin:0; padding:7px 0; color:#aff5b4; font:12px/1.55 'Courier New', Courier, monospace; white-space:pre; }
+        .response-diff-line { display:block; min-width:max-content; padding:0 10px; color:#aff5b4; background:rgba(46,160,67,.12); }
 
         .thinking-block { margin-top:2px; }
         .thinking-toggle { background:none; border:none; padding:0; font-size:13px; font-family:inherit; color:var(--text-secondary); cursor:pointer; }
@@ -272,46 +266,6 @@
         .thought-live-content::-webkit-scrollbar-thumb { background-color:rgba(255,255,255,0.15); border-radius:4px; }
         .thought-live-cursor { display:inline-block; width:6px; height:12px; margin-left:1px; vertical-align:-1px; background-color:var(--text-secondary); animation:liveCursorBlink 0.9s step-end infinite; }
         @keyframes liveCursorBlink { 0%,49% { opacity:1; } 50%,100% { opacity:0; } }
-
-        /* ============== CODE MODE: Claude-Code-style activity trace ==============
-           "Edited 2 files, ran 2 commands, read a file · 1 note" summary bar with an
-           expandable list of what actually happened this turn — each file edit shown
-           as its own row with a filename badge and real +added/-removed line counts. */
-        .activity-block { margin-top:2px; margin-bottom:4px; }
-        .activity-toggle { display:flex; align-items:center; gap:6px; background:none; border:none; padding:4px 0; font-size:13px; font-family:inherit; color:var(--text-secondary); cursor:pointer; text-align:left; }
-        .activity-toggle:hover { color:var(--text-primary); }
-        .activity-toggle .activity-chevron { width:12px; height:12px; flex-shrink:0; transition:transform 0.15s ease; color:var(--text-secondary); }
-        .activity-content.expanded .activity-chevron { transform:rotate(90deg); }
-        .activity-toggle.shimmer {
-            background-image: linear-gradient(90deg, var(--text-secondary) 0%, var(--text-secondary) 35%, var(--text-primary) 50%, var(--text-secondary) 65%, var(--text-secondary) 100%);
-            background-size: 200% 100%; background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-            animation: thinkingShimmer 1.6s linear infinite;
-        }
-        .activity-content { display:none; margin:6px 0 10px 4px; padding-left:20px; border-left:1px solid var(--border-color); }
-        .activity-content.expanded { display:block; }
-        .activity-row { display:flex; align-items:center; gap:8px; padding:5px 0; font-size:13px; color:var(--text-secondary); line-height:1.4; }
-        .activity-row-icon { width:15px; height:15px; flex-shrink:0; color:var(--text-secondary); display:flex; align-items:center; justify-content:center; }
-        .activity-row-icon svg { width:100%; height:100%; }
-        .activity-row-icon .thought-bullet { width:6px; height:6px; border-radius:50%; background-color:#555; }
-        .activity-row-label { flex-shrink:0; }
-        .activity-row-edit .activity-row-label { color:var(--text-primary); flex:1 1 auto; min-width:0; white-space:normal; }
-        .activity-row-narration { font-style:italic; opacity:0.85; }
-        .activity-file-badge { font-family:'Courier New', Courier, monospace; font-size:12px; background:rgba(255,255,255,0.08); color:var(--text-primary); padding:1px 7px; border-radius:5px; flex-shrink:0; }
-        .activity-diff-stat { font-size:12px; font-family:'Courier New', Courier, monospace; white-space:nowrap; margin-left:auto; flex-shrink:0; }
-        .activity-diff-add { color:#3fb950; }
-        .activity-diff-del { color:#f85149; margin-left:4px; }
-        .activity-row-status { font-style:italic; opacity:0.85; }
-        .activity-row-error { color:#f85149; }
-        .activity-diff-block { margin:6px 0 10px 0; border:1px solid var(--border-color); border-radius:8px; background:#101214; overflow:hidden; }
-        .activity-diff-block summary { cursor:pointer; padding:7px 10px; color:var(--text-primary); font-size:12px; font-family:'Courier New', Courier, monospace; list-style:none; }
-        .activity-diff-block summary::-webkit-details-marker { display:none; }
-        .activity-diff-code { margin:0; padding:8px 0; max-height:360px; overflow:auto; font:12px/1.55 'Courier New', Courier, monospace; white-space:pre; }
-        .activity-diff-line { display:block; padding:0 10px; min-width:max-content; }
-        .activity-diff-line-context { color:#a9b1bb; }
-        .activity-diff-line-added { color:#aff5b4; background:rgba(46,160,67,.16); }
-        .activity-diff-line-removed { color:#ffb4b0; background:rgba(248,81,73,.14); }
-        .activity-diff-line-meta { color:#79c0ff; background:rgba(56,139,253,.10); }
-        .activity-command-output { margin:4px 0 8px 23px; padding:8px 10px; max-height:180px; overflow:auto; border-left:2px solid var(--border-color); background:#101214; color:#a9b1bb; font:12px/1.5 'Courier New', Courier, monospace; white-space:pre-wrap; }
 
         /* ============== CODE MODE: build plan card ==============
            Shown once, right before the very first build in a session — a short
@@ -406,62 +360,6 @@
         @keyframes modeFadeOut { to { opacity:0; transform:translateY(4px); } }
         @keyframes modeFadeIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
 
-        /* ============== CODE CANVAS ==============
-           A dedicated split-panel that appears next to the chat column, only
-           ever used in Code mode. It is a plain flex sibling of .main-content,
-           so it never touches Chat mode's markup, state, or event handlers. */
-        .canvas-panel { flex:1 1 0; min-width:0; display:flex; flex-direction:column; background-color:#181818; border-left:1px solid var(--border-color); animation:canvasSlideIn 0.25s var(--transition-bezier); }
-        .canvas-panel[hidden] { display:none; }
-        @keyframes canvasSlideIn { from { opacity:0; transform:translateX(14px); } to { opacity:1; transform:translateX(0); } }
-        .canvas-header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border-bottom:1px solid var(--border-color); flex-shrink:0; }
-        .canvas-header-left { display:flex; align-items:center; gap:8px; min-width:0; }
-        .canvas-header-left svg { width:16px; height:16px; color:var(--text-secondary); flex-shrink:0; }
-        .canvas-title { font-size:13px; font-weight:500; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        .canvas-header-right { display:flex; align-items:center; gap:4px; flex-shrink:0; }
-        .canvas-tabs { display:flex; align-items:center; background-color:var(--bg-input); border-radius:999px; padding:3px; margin-right:6px; }
-        .canvas-tabs button { border:none; background:transparent; color:var(--text-secondary); font-size:12.5px; font-weight:500; padding:6px 14px; border-radius:999px; cursor:pointer; transition:background 0.2s ease, color 0.2s ease; }
-        .canvas-tabs button.active { background-color:var(--text-primary); color:var(--bg-main); }
-        .canvas-icon-btn { background:transparent; border:none; color:var(--text-secondary); cursor:pointer; padding:6px; border-radius:6px; display:flex; align-items:center; justify-content:center; transition:background 0.2s ease, color 0.2s ease; }
-        .canvas-icon-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
-        .canvas-icon-btn svg { width:16px; height:16px; }
-        /* File-switcher strip along the top of the canvas — only shown once a build has
-           produced more than one file, so a single-file result looks exactly as before. */
-        .canvas-file-tabs { display:flex; align-items:center; gap:2px; padding:6px 10px; border-bottom:1px solid var(--border-color); overflow-x:auto; flex-shrink:0; }
-        .canvas-file-tabs[hidden] { display:none; }
-        .canvas-file-tab { display:flex; align-items:center; gap:6px; border:none; background:transparent; color:var(--text-secondary); font-size:12.5px; font-family:'Courier New', Courier, monospace; padding:6px 10px; border-radius:8px; cursor:pointer; white-space:nowrap; flex-shrink:0; transition:background 0.2s ease, color 0.2s ease; }
-        .canvas-file-tab:hover { background-color:var(--bg-hover); color:var(--text-primary); }
-        .canvas-file-tab.active { background-color:var(--bg-input); color:var(--text-primary); }
-        .canvas-file-tab .canvas-file-tab-dot { width:6px; height:6px; border-radius:50%; background-color:var(--accent); flex-shrink:0; animation:inlineStreamPulse 1s ease-in-out infinite; }
-        /* Live Code mode diff box: stays visible while the agent is writing, and
-           settles into a compact generated-code diff once the turn completes. */
-        .canvas-live-diff { flex-shrink:0; border-bottom:1px solid var(--border-color); background:#151719; }
-        .canvas-live-diff[hidden] { display:none; }
-        .canvas-live-diff-header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 14px; color:var(--text-secondary); font-size:12px; }
-        .canvas-live-diff-status { display:flex; align-items:center; gap:8px; min-width:0; }
-        .canvas-live-diff-dot { width:7px; height:7px; border-radius:50%; background:var(--accent); flex-shrink:0; animation:inlineStreamPulse 1s ease-in-out infinite; }
-        .canvas-live-diff-dot.done { animation:none; background:#3fb950; }
-        .canvas-live-diff-title { color:var(--text-primary); font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        .canvas-live-diff-count { font:11.5px 'Courier New', Courier, monospace; color:#a9b1bb; white-space:nowrap; }
-        .canvas-diff-box { margin:0 12px 12px; border:1px solid rgba(255,255,255,0.12); border-radius:9px; background:#0d0f10; overflow:hidden; box-shadow:inset 0 1px 0 rgba(255,255,255,0.03); }
-        .canvas-diff-box-empty { padding:14px; color:#7d8590; font:12px/1.5 'Courier New', Courier, monospace; }
-        .canvas-live-file + .canvas-live-file { border-top:1px solid rgba(255,255,255,0.09); }
-        .canvas-live-file-header { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:7px 10px; color:var(--text-primary); background:rgba(255,255,255,0.045); font:11.5px 'Courier New', Courier, monospace; }
-        .canvas-live-file-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-        .canvas-live-file-stat { color:#a9b1bb; white-space:nowrap; }
-        .canvas-live-file-stat .add { color:#aff5b4; }
-        .canvas-live-file-stat .del { color:#ffb4b0; margin-left:6px; }
-        .canvas-live-code { max-height:300px; overflow:auto; margin:0; padding:7px 0; color:#a9b1bb; font:12px/1.55 'Courier New', Courier, monospace; white-space:pre; }
-        .canvas-live-line { display:block; min-width:max-content; padding:0 10px; }
-        .canvas-live-line.added { color:#aff5b4; background:rgba(46,160,67,.16); }
-        .canvas-live-line.removed { color:#ffb4b0; background:rgba(248,81,73,.14); }
-        .canvas-live-line.meta { color:#79c0ff; background:rgba(56,139,253,.10); }
-        .canvas-live-line.generated { color:#d5f5d7; background:rgba(46,160,67,.12); }
-        .canvas-body { flex:1; min-height:0; position:relative; }
-        .canvas-view { width:100%; height:100%; overflow:auto; }
-        .canvas-view[hidden] { display:none; }
-        .canvas-view iframe { width:100%; height:100%; border:none; display:block; background:#fff; }
-        #canvasCodeView pre { margin:0; padding:20px; min-height:100%; background-color:#111; }
-        #canvasCodeView code { font-size:13px; line-height:1.65; font-family:'Courier New', Courier, monospace; }
     </style>
 </head>
 <body>
@@ -661,58 +559,6 @@
                 <option value="extra">Extra</option>
                 <option value="max">Max</option>
             </select>
-        </div>
-    </div>
-
-    <!-- ================= CODE CANVAS =================
-         Split panel that opens next to the chat only while in Code mode,
-         showing the generated file with a Code/Preview toggle — same
-         pattern as Gemini/ChatGPT Canvas. Chat mode never touches this. -->
-    <div class="canvas-panel" id="codeCanvas" hidden>
-        <div class="canvas-header">
-            <div class="canvas-header-left">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
-                <span class="canvas-title" id="canvasTitle">Code</span>
-            </div>
-            <div class="canvas-header-right">
-                <div class="canvas-tabs" id="canvasTabs">
-                    <button type="button" data-tab="preview" id="canvasPreviewTabBtn">Preview</button>
-                    <button type="button" data-tab="code">Code</button>
-                </div>
-                <button class="canvas-icon-btn" id="canvasOpenNewTabBtn" title="Open preview in new tab">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
-                </button>
-                <button class="canvas-icon-btn" id="canvasDownloadBtn" title="Download">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-                </button>
-                <button class="canvas-icon-btn" id="canvasCopyBtn" title="Copy code">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-                </button>
-                <button class="canvas-icon-btn" id="canvasCloseBtn" title="Close">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-                </button>
-            </div>
-        </div>
-        <div class="canvas-file-tabs" id="canvasFileTabs" hidden></div>
-        <section class="canvas-live-diff" id="canvasLiveDiff" hidden aria-live="polite">
-            <div class="canvas-live-diff-header">
-                <div class="canvas-live-diff-status">
-                    <span class="canvas-live-diff-dot" id="canvasLiveDiffDot"></span>
-                    <span class="canvas-live-diff-title" id="canvasLiveDiffTitle">Generating code</span>
-                </div>
-                <span class="canvas-live-diff-count" id="canvasLiveDiffCount">0 lines</span>
-            </div>
-            <div class="canvas-diff-box" id="canvasLiveDiffBox">
-                <div class="canvas-diff-box-empty">Waiting for the first generated file…</div>
-            </div>
-        </section>
-        <div class="canvas-body">
-            <div class="canvas-view" id="canvasPreviewView">
-                <iframe id="canvasPreviewFrame" sandbox="allow-scripts allow-same-origin allow-forms allow-modals"></iframe>
-            </div>
-            <div class="canvas-view" id="canvasCodeView" hidden>
-                <pre><code id="canvasCode"></code></pre>
-            </div>
         </div>
     </div>
 
@@ -954,310 +800,13 @@
             });
         }
 
-        // ================= INLINE CODE STATUS (chat-visible, status only — never shows code) =================
-        // Renders directly inside the assistant's message bubble, as a sibling of .message-prose,
-        // so re-rendering the prose on every streamed token never wipes it out. Names whichever
-        // file is currently being written, with a pulsing dot — the actual code is never shown
-        // here, only in the canvas panel. Replaced by the artifact chip once generation finishes.
-        function startInlineCodeStatus(container, language, filename) {
-            const chip = document.createElement('div');
-            chip.className = 'inline-code-status';
-            chip.innerHTML = `
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
-                <span class="inline-code-status-filename">Writing ${escapeHtml(filename || friendlyLangLabel(language) || 'code')}…</span>
-                <span class="inline-code-status-dot"></span>
-            `;
-            container.appendChild(chip);
-            return chip;
-        }
-
-        // Called on code_file_start for every file after the first, in a multi-file build —
-        // updates which filename the status line names, without ever creating a second chip.
-        function updateInlineCodeStatus(chip, language, filename) {
-            if (!chip) return;
-            const label = chip.querySelector('.inline-code-status-filename');
-            if (label) label.textContent = `Writing ${filename || friendlyLangLabel(language) || 'code'}…`;
-        }
-
-        // Called once the whole response is done — just removes the live status chip. Nothing
-        // about the finished code is rendered here; appendArtifactChip() takes over.
-        function removeInlineCodeStatus(chip) {
-            if (chip) chip.remove();
-        }
-
-        // ================= CODE CANVAS =================
-        // Everything below only runs when Code mode calls updateCodeCanvas(). Tracks every file
-        // a build produces in modes.code.canvas.files (keyed by filename, ordered via .order),
-        // not just the last one written, with a tab strip to switch between them — this is what
-        // makes a multi-file build behave like Claude's own multi-file artifacts instead of each
-        // new file silently overwriting the last.
-
-        function friendlyLangLabel(language) {
-            const lang = (language || '').trim();
-            if (!lang) return 'Code';
-            const known = { html: 'HTML', css: 'CSS', javascript: 'JavaScript', js: 'JavaScript', jsx: 'JSX', tsx: 'TSX', json: 'JSON', python: 'Python', py: 'Python' };
-            return known[lang.toLowerCase()] || (lang.charAt(0).toUpperCase() + lang.slice(1));
-        }
-
-        function fileExtensionFor(language) {
-            const map = { html: 'html', css: 'css', javascript: 'js', js: 'js', jsx: 'jsx', tsx: 'tsx', typescript: 'ts', python: 'py', py: 'py', json: 'json' };
-            return map[(language || '').trim().toLowerCase()] || 'txt';
-        }
-
-        // Whether a given file can be rendered live in the preview iframe (buildPreviewDoc
-        // supports html/css/jsx/tsx/plain-js) — checked per file, so in a multi-file build a
-        // stylesheet or script tab simply has no Preview button while the HTML tab does.
-        function fileCanPreview(filename, language) {
-            const previewable = ['html', 'htm', 'css', 'jsx', 'tsx', 'js', 'javascript', 'react'];
-            const lang = (language || '').trim().toLowerCase();
-            const ext = (filename || '').split('.').pop().trim().toLowerCase();
-            return previewable.includes(lang) || previewable.includes(ext);
-        }
-
-        function renderCanvasFileTabs() {
-            const state = modes.code.canvas;
-            const bar = document.getElementById('canvasFileTabs');
-            if (!state || state.order.length <= 1) { bar.hidden = true; bar.innerHTML = ''; return; }
-            bar.hidden = false;
-            bar.innerHTML = state.order.map(key => {
-                const file = state.files[key];
-                const label = file.filename || friendlyLangLabel(file.language);
-                const isBeingWritten = streamingActive && key === state.liveFile;
-                return `<button type="button" class="canvas-file-tab${key === state.activeFile ? ' active' : ''}" data-file="${escapeHtml(key)}">` +
-                    `${escapeHtml(label)}${isBeingWritten ? '<span class="canvas-file-tab-dot"></span>' : ''}</button>`;
-            }).join('');
-            bar.querySelectorAll('.canvas-file-tab').forEach(btn => {
-                btn.addEventListener('click', () => setActiveCanvasFile(btn.dataset.file));
-            });
-        }
-
-        function setActiveCanvasFile(key) {
-            const state = modes.code.canvas;
-            if (!state || !state.files[key]) return;
-            state.activeFile = key;
-            state.tab = 'code';
-            renderCodeCanvas();
-        }
-
-        // Live-fills the code canvas as code_delta events arrive, the same way the thinking
-        // panel fills token-by-token — never touches the chat bubble. Called once per file, the
-        // moment code_start/code_file_start arrives for it; keeps every earlier file's content
-        // in state.files instead of discarding it, and auto-follows the tab strip onto whichever
-        // file is currently being written, exactly like watching a multi-file artifact get built.
-        function startCodeCanvasStream(language, filename) {
-            streamingActive = true;
-            let state = modes.code.canvas;
-            if (!state || !state.files) {
-                state = { open: true, files: {}, order: [], activeFile: null, liveFile: null, tab: 'code' };
-                modes.code.canvas = state;
-            }
-            const key = filename || '__single__';
-            if (!(key in state.files)) state.order.push(key);
-            state.files[key] = { language: language || '', code: '', filename: filename || '' };
-            state.activeFile = key;
-            state.liveFile = key;
-
-            renderCanvasFileTabs();
-            canvasTitle.textContent = filename || friendlyLangLabel(language) || 'Code';
-            canvasCodeEl.textContent = '';
-            canvasCodeEl.className = `language-${(language || 'plaintext').toLowerCase()}`;
-            canvasCodeEl.removeAttribute('data-highlighted');
-            document.getElementById('canvasPreviewTabBtn').style.display = 'none'; // no preview until the file is complete
-            setCanvasTab('code');
-            codeCanvas.hidden = false;
-        }
-
-        function appendCodeCanvasStream(delta, filename) {
-            if (!delta) return;
-            const state = modes.code.canvas;
-            if (!state) return;
-            const key = filename || '__single__';
-            const file = state.files[key];
-            if (!file) return;
-            file.code += delta;
-            if (state.activeFile === key) {
-                canvasCodeEl.textContent += delta;
-                const view = document.getElementById('canvasCodeView');
-                view.scrollTop = view.scrollHeight; // keep the "typewriter" pinned to the latest line
-            }
-        }
-
-        // Called from Code mode's sendMessage() once the final code_result arrives (streaming)
-        // or a non-streaming response with code comes back. `files`/`fileLanguages` are
-        // {filename: value} maps for multi-file builds; a single-file result just has
-        // language/code instead. Always reconciles the canvas against this authoritative
-        // payload, so a dropped or out-of-order delta can never leave it showing something
-        // wrong or partial. Stores the result on modes.code and renders it only if Code mode is
-        // currently visible.
-        function updateCodeCanvas({ language, code, files, fileLanguages, showPreview } = {}) {
-            const hasFiles = files && Object.keys(files).length > 0;
-            if (!hasFiles && !code) return;
-            streamingActive = false;
-
-            const state = { open: true, files: {}, order: [], activeFile: null, liveFile: null, tab: 'code' };
-            if (hasFiles) {
-                for (const [fname, fcode] of Object.entries(files)) {
-                    const flang = (fileLanguages && fileLanguages[fname]) || '';
-                    state.files[fname] = { language: flang, code: fcode, filename: fname };
-                    state.order.push(fname);
-                }
-                state.activeFile = state.order[0];
-            } else {
-                state.files['__single__'] = { language: language || '', code, filename: '', forcePreview: !!showPreview };
-                state.order.push('__single__');
-                state.activeFile = '__single__';
-            }
-            modes.code.canvas = state;
-            if (currentMode === 'code') renderCodeCanvas();
-        }
-
-        function renderCodeCanvas() {
-            const state = modes.code.canvas;
-            if (!state || !state.open || !state.activeFile) { codeCanvas.hidden = true; return; }
-            const file = state.files[state.activeFile];
-            if (!file) { codeCanvas.hidden = true; return; }
-
-            renderCanvasFileTabs();
-
-            const canPreview = fileCanPreview(file.filename, file.language) || file.forcePreview;
-            canvasTitle.textContent = file.filename || `${friendlyLangLabel(file.language)}${canPreview ? ' Preview' : ''}`;
-            canvasCodeEl.textContent = file.code;
-            canvasCodeEl.className = `language-${(file.language || 'plaintext').toLowerCase()}`;
-            canvasCodeEl.removeAttribute('data-highlighted');
-            hljs.highlightElement(canvasCodeEl);
-
-            document.getElementById('canvasPreviewTabBtn').style.display = canPreview ? '' : 'none';
-            if (canPreview) {
-                canvasPreviewFrame.srcdoc = buildPreviewDoc(file.language, file.code);
-            }
-
-            setCanvasTab(canPreview ? state.tab : 'code');
-            codeCanvas.hidden = false;
-        }
-
-        function setCanvasTab(tab) {
-            if (modes.code.canvas) modes.code.canvas.tab = tab;
-            document.querySelectorAll('#canvasTabs button').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === tab));
-            document.getElementById('canvasPreviewView').hidden = tab !== 'preview';
-            document.getElementById('canvasCodeView').hidden = tab !== 'code';
-        }
-
-        document.querySelectorAll('#canvasTabs button').forEach(btn => {
-            btn.addEventListener('click', () => setCanvasTab(btn.dataset.tab));
-        });
-
-        document.getElementById('canvasCloseBtn').addEventListener('click', () => {
-            if (modes.code.canvas) modes.code.canvas.open = false;
-            codeCanvas.hidden = true;
-        });
-
-        function activeCanvasFile() {
-            const state = modes.code.canvas;
-            return state && state.activeFile ? state.files[state.activeFile] : null;
-        }
-
-        document.getElementById('canvasDownloadBtn').addEventListener('click', () => {
-            const file = activeCanvasFile();
-            if (!file || !file.code) return;
-            const blob = new Blob([file.code], { type: 'text/plain' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = file.filename || `code.${fileExtensionFor(file.language)}`;
-            a.click();
-            URL.revokeObjectURL(url);
-        });
-
-        document.getElementById('canvasCopyBtn').addEventListener('click', () => {
-            const file = activeCanvasFile();
-            if (!file || !file.code) return;
-            navigator.clipboard.writeText(file.code);
-            const btn = document.getElementById('canvasCopyBtn');
-            const original = btn.title;
-            btn.title = 'Copied!';
-            setTimeout(() => { btn.title = original; }, 1200);
-        });
-
-        document.getElementById('canvasOpenNewTabBtn').addEventListener('click', () => {
-            const file = activeCanvasFile();
-            if (!file) return;
-            const win = window.open('', '_blank');
-            if (!win) return;
-            win.document.open();
-            win.document.write(buildPreviewDoc(file.language, file.code));
-            win.document.close();
-        });
-
-        // Removes every fenced code block from Code mode's answer text before it's shown in the
-        // chat bubble — the code itself only ever lives in the Canvas panel, the chat bubble just
-        // gets the explanation plus a small chip to open it. Multi-file responses assemble one
-        // fenced block per file (see app.py's final_response for is_multi builds), so this has
-        // to strip ALL of them, not just the first, or every file after the first would still
-        // show up as a raw code block in chat.
+        // Remove fenced code blocks from the prose stream; code is rendered in the
+        // in-response diff box instead.
         function stripCodeFence(text) {
             if (!text) return text;
             return text.replace(/```[\w+#.-]*\n[\s\S]*?```/g, '').trim();
         }
 
-        // Small "open the artifact" chip, shown in place of the removed code block(s). Clicking
-        // it (re)opens the Canvas panel — this is the ONLY other way besides auto-open to bring
-        // the panel back after the user has closed it with X. Pass either `files` (a
-        // {filename: code} map, for multi-file builds) or `language`/`code` for a single file.
-        function appendArtifactChip(container, { language, code, files, fileLanguages } = {}) {
-            const hasFiles = files && Object.keys(files).length > 0;
-            if (!hasFiles && !code) return;
-            const chip = document.createElement('div');
-            chip.className = 'artifact-chip';
-            const entries = hasFiles ? Object.entries(files) : [['__single__', code]];
-            const fileCount = entries.length;
-            const title = hasFiles ? (fileCount === 1 ? entries[0][0] : 'Generated files') : `code.${fileExtensionFor(language)}`;
-            const meta = fileCount === 1 ? '1 file' : `${fileCount} files`;
-            chip.innerHTML = `
-                <div class="artifact-chip-header">
-                    <div class="artifact-chip-icon">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
-                    </div>
-                    <div class="artifact-chip-info">
-                        <div class="artifact-chip-title">${escapeHtml(title)}</div>
-                        <div class="artifact-chip-meta">${escapeHtml(meta)}</div>
-                    </div>
-                    <button type="button" class="artifact-chip-btn">Open</button>
-                </div>
-                <div class="artifact-file-list"></div>
-            `;
-            const list = chip.querySelector('.artifact-file-list');
-            entries.forEach(([filename]) => {
-                const row = document.createElement('button');
-                row.type = 'button';
-                row.className = 'artifact-file-row';
-                const fileLanguage = hasFiles ? ((fileLanguages && fileLanguages[filename]) || '') : (language || '');
-                row.innerHTML = `<svg class="artifact-file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg><span class="artifact-file-name">${escapeHtml(filename === '__single__' ? title : filename)}</span><span class="artifact-file-language">${escapeHtml(friendlyLangLabel(fileLanguage))}</span>`;
-                row.addEventListener('click', (event) => {
-                    event.stopPropagation();
-                    if (modes.code.canvas) {
-                        modes.code.canvas.open = true;
-                        if (hasFiles && modes.code.canvas.files[filename]) modes.code.canvas.activeFile = filename;
-                    }
-                    renderCodeCanvas();
-                });
-                list.appendChild(row);
-            });
-            chip.addEventListener('click', () => {
-                if (modes.code.canvas) modes.code.canvas.open = true;
-                renderCodeCanvas();
-            });
-            container.appendChild(chip);
-        }
-
-        // Rendered once, right before Code mode's very first build in a session — a
-        // real short plan (its own backend LLM call, streaming its own live
-        // reasoning into the Thinking pane just like everything else) naming what
-        // will be built and which file(s) it needs, so the manifest appears before
-        // any code starts streaming into the canvas. Lives outside .message-prose,
-        // like the inline code status chip and artifact chip, so it survives every
-        // re-render of the streamed answer text. A couple of generic follow-up
-        // suggestions are offered underneath — e.g. asking to add another image —
-        // which just prefill the input and send, the same as typing them.
         function renderPlanCard(container, plan) {
             if (!plan || (!plan.summary && (!plan.files || !plan.files.length))) return;
             const card = document.createElement('div');
@@ -1320,13 +869,7 @@
         };
         const modes = {
             chat: { sessionId: generateUUID(), html: '', hasMessages: false },
-            code: { sessionId: generateUUID(), html: '', hasMessages: false,
-                // Canvas is Code-mode-only state: every file the last build produced (keyed
-                // by filename, in build order), which one is active/live, which tab is
-                // showing, and whether the user has closed the panel. Chat mode has no
-                // equivalent and never reads this.
-                canvas: { open: false, files: {}, order: [], activeFile: null, liveFile: null, tab: 'code' }
-            }
+            code: { sessionId: generateUUID(), html: '', hasMessages: false }
         };
         let currentMode = 'chat';
         let isWaitingForResponse = false;
@@ -1348,167 +891,6 @@
         const modeToggle = document.getElementById('modeToggle');
         const chatSettings = document.getElementById('chatSettings');
         const codeSettings = document.getElementById('codeSettings');
-        const codeCanvas = document.getElementById('codeCanvas');
-        const canvasTitle = document.getElementById('canvasTitle');
-        const canvasCodeEl = document.getElementById('canvasCode');
-        let streamingActive = false; // true while code_delta events are live-filling the canvas
-        const canvasPreviewFrame = document.getElementById('canvasPreviewFrame');
-        const canvasLiveDiff = document.getElementById('canvasLiveDiff');
-        const canvasLiveDiffDot = document.getElementById('canvasLiveDiffDot');
-        const canvasLiveDiffTitle = document.getElementById('canvasLiveDiffTitle');
-        const canvasLiveDiffCount = document.getElementById('canvasLiveDiffCount');
-        const canvasLiveDiffBox = document.getElementById('canvasLiveDiffBox');
-        let liveDiffState = { active: false, status: 'Generating code', files: {}, order: [], additions: 0, deletions: 0, lines: 0 };
-
-        function liveDiffLineClass(line, generated = false) {
-            if (generated) return 'generated';
-            if (line.startsWith('+') && !line.startsWith('+++')) return 'added';
-            if (line.startsWith('-') && !line.startsWith('---')) return 'removed';
-            if (line.startsWith('@@')) return 'meta';
-            return '';
-        }
-
-        function liveDiffCountText() {
-            const fileCount = liveDiffState.order.length;
-            const files = `${fileCount} file${fileCount === 1 ? '' : 's'}`;
-            const lines = `${liveDiffState.lines} line${liveDiffState.lines === 1 ? '' : 's'}`;
-            return `${files} · ${lines} · +${liveDiffState.additions} / −${liveDiffState.deletions}`;
-        }
-
-        function renderLiveDiffBox() {
-            if (!liveDiffState.active) return;
-            canvasLiveDiff.hidden = false;
-            canvasLiveDiffTitle.textContent = liveDiffState.status;
-            canvasLiveDiffCount.textContent = liveDiffCountText();
-            canvasLiveDiffDot.classList.toggle('done', liveDiffState.status === 'Generated code');
-            canvasLiveDiffBox.replaceChildren();
-
-            if (!liveDiffState.order.length) {
-                const empty = document.createElement('div');
-                empty.className = 'canvas-diff-box-empty';
-                empty.textContent = 'Waiting for the first generated file…';
-                canvasLiveDiffBox.appendChild(empty);
-                return;
-            }
-
-            liveDiffState.order.forEach((key) => {
-                const file = liveDiffState.files[key];
-                if (!file) return;
-                const wrapper = document.createElement('div');
-                wrapper.className = 'canvas-live-file';
-                const header = document.createElement('div');
-                header.className = 'canvas-live-file-header';
-                const name = document.createElement('span');
-                name.className = 'canvas-live-file-name';
-                name.textContent = file.filename || 'generated code';
-                const stat = document.createElement('span');
-                stat.className = 'canvas-live-file-stat';
-                stat.innerHTML = `<span class="add">+${file.additions || 0}</span><span class="del">−${file.deletions || 0}</span>`;
-                header.append(name, stat);
-                wrapper.appendChild(header);
-
-                const pre = document.createElement('pre');
-                pre.className = 'canvas-live-code';
-                const source = file.diff || file.code || '';
-                if (!source) {
-                    const waiting = document.createElement('span');
-                    waiting.className = 'canvas-live-line';
-                    waiting.textContent = 'Writing…';
-                    pre.appendChild(waiting);
-                } else {
-                    source.split('\\n').forEach((line) => {
-                        const row = document.createElement('span');
-                        row.className = `canvas-live-line ${liveDiffLineClass(line, !!file.generated)}`.trim();
-                        row.textContent = line;
-                        pre.appendChild(row);
-                    });
-                }
-                wrapper.appendChild(pre);
-                canvasLiveDiffBox.appendChild(wrapper);
-            });
-        }
-
-        function resetLiveDiffBox() {
-            liveDiffState = { active: false, status: 'Generating code', files: {}, order: [], additions: 0, deletions: 0, lines: 0 };
-            canvasLiveDiff.hidden = true;
-            canvasLiveDiffBox.replaceChildren();
-        }
-
-        function startLiveDiffFile(event = {}) {
-            const key = event.path || '__single__';
-            if (!liveDiffState.files[key]) {
-                liveDiffState.order.push(key);
-                liveDiffState.files[key] = { filename: event.path || '', code: '', diff: '', additions: 0, deletions: 0, generated: false };
-            }
-            const file = liveDiffState.files[key];
-            file.additions = Number(event.additions || 0);
-            file.deletions = Number(event.deletions || 0);
-            liveDiffState.additions = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].additions || 0), 0);
-            liveDiffState.deletions = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].deletions || 0), 0);
-            liveDiffState.lines = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].newLines || 0), 0);
-            liveDiffState.active = true;
-            liveDiffState.status = 'Generating code';
-            if (currentMode === 'code') {
-                modes.code.canvas.open = true;
-                codeCanvas.hidden = false;
-                setCanvasTab('code');
-            }
-            renderLiveDiffBox();
-        }
-
-        function appendLiveDiffFile(event = {}) {
-            startLiveDiffFile(event);
-            const key = event.path || '__single__';
-            const file = liveDiffState.files[key];
-            file.diff = String(event.diff || '');
-            file.newLines = Number(event.new_lines || (event.new_content ? String(event.new_content).split('\\n').length : 0));
-            file.additions = Number(event.additions || file.additions || 0);
-            file.deletions = Number(event.deletions || file.deletions || 0);
-            liveDiffState.additions = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].additions || 0), 0);
-            liveDiffState.deletions = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].deletions || 0), 0);
-            liveDiffState.lines = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].newLines || 0), 0);
-            renderLiveDiffBox();
-        }
-
-        function appendLiveGeneratedCode(delta, filename = '') {
-            if (!delta) return;
-            startLiveDiffFile({ path: filename });
-            const key = filename || '__single__';
-            const file = liveDiffState.files[key];
-            file.generated = true;
-            file.code = (file.code || '') + delta;
-            file.newLines = file.code.split('\\n').length;
-            file.additions = file.newLines;
-            liveDiffState.additions = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].additions || 0), 0);
-            liveDiffState.lines = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].newLines || 0), 0);
-            renderLiveDiffBox();
-        }
-
-        function finalizeLiveDiffBox(result = {}) {
-            const hasFiles = result.files && Object.keys(result.files).length > 0;
-            const entries = hasFiles ? Object.entries(result.files) : (result.code ? [['__single__', result.code]] : []);
-            if (!entries.length && !liveDiffState.order.length) return;
-            entries.forEach(([filename, code]) => {
-                if (!liveDiffState.files[filename]) {
-                    liveDiffState.order.push(filename);
-                    liveDiffState.files[filename] = { filename: filename === '__single__' ? '' : filename, code: '', diff: '', additions: 0, deletions: 0, generated: true };
-                }
-                const file = liveDiffState.files[filename];
-                file.code = String(code || '');
-                file.newLines = file.code ? file.code.split('\\n').length : 0;
-                if (!file.diff) {
-                    file.generated = true;
-                    if (!file.additions) file.additions = file.newLines;
-                }
-            });
-            liveDiffState.additions = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].additions || 0), 0);
-            liveDiffState.deletions = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].deletions || 0), 0);
-            liveDiffState.lines = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].newLines || 0), 0);
-            liveDiffState.active = true;
-            liveDiffState.status = 'Generated code';
-            renderLiveDiffBox();
-        }
-
         function toggleSidebar() { sidebar.classList.toggle('collapsed'); }
 
         // ============== MODEL / EFFORT PICKER ==============
@@ -1700,11 +1082,6 @@
             closeModelPicker();
             updateModelPickerLabel();
 
-            // Canvas only ever exists in Code mode: show it if a result is
-            // already sitting there (and the user hasn't closed it), otherwise
-            // make sure it's hidden. Chat mode always takes this "else" branch.
-            if (mode === 'code') { renderCodeCanvas(); } else { codeCanvas.hidden = true; }
-
             const copy = MODE_COPY[mode];
             openingTitle.style.opacity = 0;
             openingSubtitle.style.opacity = 0;
@@ -1731,11 +1108,6 @@
             modes[currentMode].sessionId = generateUUID();
             modes[currentMode].html = '';
             modes[currentMode].hasMessages = false;
-
-            if (currentMode === 'code') {
-                modes.code.canvas = { open: false, files: {}, order: [], activeFile: null, liveFile: null, tab: 'code' };
-                codeCanvas.hidden = true;
-            }
 
             chatContent.innerHTML = '';
             refreshOpeningSceneVisibility();
@@ -1775,10 +1147,8 @@
 
                 const contentDiv = document.createElement('div');
                 contentDiv.className = 'message-text';
-                // Prose lives in its own child so re-rendering it (every streamed token
-                // re-runs marked.parse on the whole thing) never wipes out sibling
-                // elements appended directly to .message-text — the inline code-stream
-                // box and the artifact chip both rely on surviving those re-renders.
+                // Prose is kept in its own child so streamed updates do not replace
+                // the Code mode diff box or the thinking panel.
                 contentDiv.innerHTML = `<div class="message-prose">${text ? marked.parse(normalizeMathDelimiters(text)) : ''}</div>`;
                 if (text) highlightCode(contentDiv.querySelector('.message-prose'));
 
@@ -1800,24 +1170,19 @@
 
                 body.appendChild(statusDiv);
 
-                // Code Mode only: the Claude-Code-style activity trace — starts empty and
-                // hidden, and is only ever populated from real 'activity'/'turn_summary'
-                // SSE events (see sendMessage below), never faked client-side.
                 if (currentMode === 'code') {
-                    const activityDiv = document.createElement('div');
-                    activityDiv.className = 'activity-block';
-                    activityDiv.style.display = 'none';
-                    activityDiv.innerHTML = `
-                        <button type="button" class="activity-toggle">
-                            <svg class="activity-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
-                            <span class="activity-toggle-label">Working</span>
-                        </button>
-                        <div class="activity-content expanded"></div>
+                    const diffBox = document.createElement('section');
+                    diffBox.className = 'response-code-diff';
+                    diffBox.hidden = true;
+                    diffBox.setAttribute('aria-live', 'polite');
+                    diffBox.innerHTML = `
+                        <div class="response-code-diff-header">
+                            <div class="response-code-diff-status"><span class="response-code-diff-dot"></span><span class="response-code-diff-title">Generating code</span></div>
+                            <span class="response-code-diff-count">0 lines</span>
+                        </div>
+                        <div class="response-diff-box"><div class="response-diff-empty">Waiting for generated code…</div></div>
                     `;
-                    activityDiv.querySelector('.activity-toggle').addEventListener('click', () => {
-                        activityDiv.querySelector('.activity-content').classList.toggle('expanded');
-                    });
-                    body.appendChild(activityDiv);
+                    contentDiv.appendChild(diffBox);
                 }
 
                 body.appendChild(contentDiv);
@@ -1926,184 +1291,6 @@
             const thinkingContent = thinkingBlock.querySelector('.thinking-content');
             const thinkingStartTime = Date.now();
 
-            // Code Mode only: the Claude-Code-style "Edited N files, ran M commands,
-            // read a file · K notes" activity trace (null in Chat mode).
-            const activityBlock = assistantBubble.querySelector('.activity-block');
-            const activityToggle = activityBlock ? activityBlock.querySelector('.activity-toggle') : null;
-            const activityLabel = activityBlock ? activityBlock.querySelector('.activity-toggle-label') : null;
-            const activityContent = activityBlock ? activityBlock.querySelector('.activity-content') : null;
-            const activityCounts = { files: 0, commands: 0, reads: 0, notes: 0 };
-
-            const ACTIVITY_ICONS = {
-                edit: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>`,
-                create: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="12" y1="18" x2="12" y2="12"></line><line x1="9" y1="15" x2="15" y2="15"></line></svg>`,
-                command: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>`,
-                read: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"></path><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"></path></svg>`,
-                note: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>`,
-                done: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>`,
-            };
-
-            // Builds the live "Working · 2 files, 1 command" header text straight from
-            // activityCounts as events stream in — these counts were previously tracked
-            // but never actually rendered anywhere, so the header just sat on a static
-            // "Working" label the whole time the agent was running.
-            function liveActivityCountsText() {
-                const parts = [];
-                if (activityCounts.files > 0) parts.push(`${activityCounts.files} file${activityCounts.files === 1 ? '' : 's'}`);
-                if (activityCounts.commands > 0) parts.push(`${activityCounts.commands} command${activityCounts.commands === 1 ? '' : 's'}`);
-                if (activityCounts.reads > 0) parts.push(`${activityCounts.reads} read${activityCounts.reads === 1 ? '' : 's'}`);
-                if (activityCounts.notes > 0) parts.push(`${activityCounts.notes} note${activityCounts.notes === 1 ? '' : 's'}`);
-                return parts.length ? `Working · ${parts.join(', ')}` : 'Working';
-            }
-
-            // Appends one real, already-happened action (file edit/create, command run,
-            // file read, note, or live narration) to the activity trace and refreshes
-            // the running header. Called only from real 'activity' SSE events, never
-            // synthesized client-side.
-            function addActivity(activity) {
-                if (!activityBlock) return;
-                activityBlock.style.display = 'block';
-                activityToggle.classList.add('shimmer');
-
-                if (activity.kind === 'edit' || activity.kind === 'create') activityCounts.files++;
-                else if (activity.kind === 'command') activityCounts.commands++;
-                else if (activity.kind === 'read') activityCounts.reads++;
-                else if (activity.kind === 'note') activityCounts.notes++;
-
-                const row = document.createElement('div');
-                let rowHtml;
-
-                if (activity.kind === 'narration') {
-                    // The model's own "now let me do X" narration, right before the command
-                    // that follows it — a plain muted dot + line, same visual language as
-                    // the thinking panel's default bullet, never a boxed icon.
-                    row.className = 'activity-row activity-row-narration';
-                    rowHtml = `<span class="activity-row-icon"><span class="thought-bullet" style="position:static;"></span></span>` +
-                        `<span class="activity-row-label activity-row-status">${escapeHtml(activity.label || '')}</span>`;
-                } else if ((activity.kind === 'edit' || activity.kind === 'create') && activity.filename) {
-                    // Description-first, like a real diff's subject line — the label IS
-                    // what this step actually did (e.g. "Add a default backend URL
-                    // constant…"), with the file it touched and its real +/- line counts
-                    // trailing after it.
-                    row.className = 'activity-row activity-row-edit';
-                    const icon = ACTIVITY_ICONS[activity.kind];
-                    const add = Math.max(0, activity.additions || 0);
-                    const del = Math.max(0, activity.deletions || 0);
-                    rowHtml = `<span class="activity-row-icon">${icon}</span>` +
-                        `<span class="activity-row-label">${escapeHtml(activity.label || '')}</span>` +
-                        `<span class="activity-file-badge">${escapeHtml(activity.filename)}</span>` +
-                        `<span class="activity-diff-stat"><span class="activity-diff-add">+${add}</span><span class="activity-diff-del">-${del}</span></span>`;
-                } else {
-                    row.className = 'activity-row';
-                    const icon = ACTIVITY_ICONS[activity.kind] || ACTIVITY_ICONS.note;
-                    rowHtml = `<span class="activity-row-icon">${icon}</span>` +
-                        `<span class="activity-row-label activity-row-status">${escapeHtml(activity.label || '')}</span>`;
-                }
-                row.innerHTML = rowHtml;
-                activityContent.appendChild(row);
-
-                activityLabel.textContent = activity.kind === 'done' ? (activity.label || 'Presented file') : 'Working';
-                scrollToBottom();
-            }
-
-            // Called once 'turn_summary' arrives (right before code_result) — replaces the
-            // live "Working" header with the settled Claude-Code-style recap line, e.g.
-            // "Edited 2 files, ran 2 commands, read a file · 1 note".
-            function finalizeActivitySummary(summary) {
-                if (!activityBlock || !activityLabel) return;
-                activityToggle.classList.remove('shimmer');
-                const parts = [];
-                if (summary.files_touched > 0) parts.push(`Edited ${summary.files_touched} file${summary.files_touched === 1 ? '' : 's'}`);
-                if (summary.commands_run > 0) parts.push(`ran ${summary.commands_run} command${summary.commands_run === 1 ? '' : 's'}`);
-                if (summary.files_read > 0) parts.push(summary.files_read === 1 ? 'read a file' : `read ${summary.files_read} files`);
-                let text = parts.join(', ');
-                if (summary.notes > 0) text += `${text ? ' · ' : ''}${summary.notes} note${summary.notes === 1 ? '' : 's'}`;
-                if (text) activityLabel.textContent = text;
-                else if (!activityContent.childElementCount) activityBlock.style.display = 'none';
-            }
-
-            function appendAgentDiff(event) {
-                if (!activityContent) return;
-                const details = document.createElement('details');
-                details.className = 'activity-diff-block';
-                details.open = true;
-                const summary = document.createElement('summary');
-                summary.textContent = `${event.path || 'file'}  +${event.additions || 0} -${event.deletions || 0}`;
-                const pre = document.createElement('pre');
-                pre.className = 'activity-diff-code';
-                const diff = String(event.diff || '');
-                for (const line of diff.split('\n')) {
-                    const row = document.createElement('span');
-                    row.className = 'activity-diff-line ' + (line.startsWith('+') && !line.startsWith('+++') ? 'activity-diff-line-added' : line.startsWith('-') && !line.startsWith('---') ? 'activity-diff-line-removed' : line.startsWith('@@') ? 'activity-diff-line-meta' : 'activity-diff-line-context');
-                    row.textContent = line;
-                    pre.appendChild(row);
-                }
-                details.appendChild(summary);
-                details.appendChild(pre);
-                activityContent.appendChild(details);
-                scrollToBottom();
-            }
-
-            function appendAgentCommandOutput(event) {
-                if (!activityContent || !event.output) return;
-                const output = document.createElement('pre');
-                output.className = 'activity-command-output';
-                output.textContent = String(event.output);
-                activityContent.appendChild(output);
-                scrollToBottom();
-            }
-
-            function renderCodeAgentEvent(event) {
-                const type = event.type;
-                if (type === 'AGENT_STARTED') {
-                    addActivity({ kind: 'narration', label: 'Inspecting project' });
-                } else if (type === 'TASK_ANALYSIS') {
-                    addActivity({ kind: 'narration', label: event.summary || 'Determining the next workspace action.' });
-                } else if (type === 'WORKSPACE_LISTED') {
-                    addActivity({ kind: 'read', label: `${event.count || 0} workspace files found` });
-                } else if (type === 'SEARCH_STARTED') {
-                    addActivity({ kind: 'narration', label: `Searching codebase: ${event.pattern || ''}` });
-                } else if (type === 'SEARCH_RESULT') {
-                    addActivity({ kind: 'note', label: `${event.count || 0} matches found` });
-                } else if (type === 'FILE_READ') {
-                    addActivity({ kind: 'read', label: `Read ${event.path || 'file'}`, filename: event.path });
-                } else if (type === 'FILE_EDIT_STARTED') {
-                    startLiveDiffFile(event);
-                    addActivity({ kind: event.created ? 'create' : 'edit', label: event.created ? 'Creating file' : 'Editing file', filename: event.path, additions: event.additions, deletions: event.deletions });
-                } else if (type === 'FILE_DIFF') {
-                    appendLiveDiffFile(event);
-                    appendAgentDiff(event);
-                } else if (type === 'FILE_EDIT_COMPLETED') {
-                    if (!event.created) addActivity({ kind: 'done', label: `Edited ${event.path || 'file'}` });
-                } else if (type === 'FILE_CREATED') {
-                    addActivity({ kind: 'done', label: `Created ${event.path || 'file'}` });
-                } else if (type === 'FILE_DELETED') {
-                    addActivity({ kind: 'done', label: `Deleted ${event.path || 'file'}` });
-                } else if (type === 'FILE_MOVED') {
-                    addActivity({ kind: 'done', label: `Moved ${event.source || 'file'} to ${event.destination || 'file'}` });
-                } else if (type === 'COMMAND_STARTED') {
-                    addActivity({ kind: 'narration', label: `Running ${event.command || 'command'}` });
-                } else if (type === 'COMMAND_OUTPUT') {
-                    appendAgentCommandOutput(event);
-                } else if (type === 'COMMAND_COMPLETED') {
-                    addActivity({ kind: 'command', label: `Ran ${event.command || 'command'} (${event.return_code === 0 ? 'passed' : 'failed'})` });
-                } else if (type === 'TEST_STARTED') {
-                    addActivity({ kind: 'narration', label: `Running ${event.command || 'tests'}` });
-                } else if (type === 'TEST_RESULT') {
-                    addActivity({ kind: event.passed ? 'note' : 'error', label: event.passed ? `${event.command || 'Tests'} passed` : `${event.command || 'Tests'} failed` });
-                } else if (type === 'GIT_STATUS' || type === 'GIT_DIFF') {
-                    addActivity({ kind: 'command', label: type === 'GIT_STATUS' ? 'Checked git status' : 'Checked git diff' });
-                } else if (type === 'ERROR') {
-                    addActivity({ kind: 'error', label: event.message || 'Workspace action failed.' });
-                } else if (type === 'RETRY') {
-                    addActivity({ kind: 'narration', label: event.reason || 'Retrying after the real tool result.' });
-                } else if (type === 'VERIFICATION') {
-                    addActivity({ kind: event.status === 'passed' ? 'note' : 'error', label: event.status === 'passed' ? 'Verification complete' : 'Verification failed' });
-                } else if (type === 'AGENT_COMPLETED') {
-                    addActivity({ kind: 'done', label: 'Presenting files' });
-                }
-            }
-
             // Show "Thinking" the instant the request goes out — like Claude.ai — rather
             // than waiting for a real backend status event, which may never arrive for
             // quick replies that skip the planning loop entirely (e.g. "hi").
@@ -2114,7 +1301,6 @@
             let thinkingDone = false;      // true once the model has moved on to answering
             let answerStarted = false;     // true once the first answer token has arrived
             let thinkingFinalized = false; // true once "Thought for Ns" has been set for good
-            let inlineCodeStatus = null;   // the "Writing <file>…" status chip currently shown in chat (Code Mode) — never shows code itself
             let lastThoughtStep = null;    // step name of the most recently rendered thought bubble
             let lastThoughtContentEl = null; // its .thought-content node, so a repeat 'thinking'
                                               // heartbeat can update it in place instead of piling
@@ -2286,7 +1472,92 @@
 
             let assistantFullText = '';
             let codeResult = null; // { code, language, show_preview } — Code Mode only
-            if (mode === 'code') resetLiveDiffBox();
+            const responseDiff = mode === 'code' ? assistantBubble.querySelector('.response-code-diff') : null;
+            const responseDiffTitle = responseDiff ? responseDiff.querySelector('.response-code-diff-title') : null;
+            const responseDiffCount = responseDiff ? responseDiff.querySelector('.response-code-diff-count') : null;
+            const responseDiffDot = responseDiff ? responseDiff.querySelector('.response-code-diff-dot') : null;
+            const responseDiffBox = responseDiff ? responseDiff.querySelector('.response-diff-box') : null;
+            const responseDiffState = { files: {}, order: [], additions: 0, lines: 0, status: 'Generating code' };
+
+            function renderResponseDiff() {
+                if (!responseDiff) return;
+                responseDiff.hidden = false;
+                responseDiffTitle.textContent = responseDiffState.status;
+                responseDiffCount.textContent = `${responseDiffState.order.length} file${responseDiffState.order.length === 1 ? '' : 's'} · ${responseDiffState.lines} line${responseDiffState.lines === 1 ? '' : 's'} · +${responseDiffState.additions}`;
+                responseDiffDot.classList.toggle('done', responseDiffState.status === 'Generated code');
+                responseDiffBox.replaceChildren();
+                if (!responseDiffState.order.length) {
+                    const empty = document.createElement('div');
+                    empty.className = 'response-diff-empty';
+                    empty.textContent = 'Waiting for generated code…';
+                    responseDiffBox.appendChild(empty);
+                    return;
+                }
+                responseDiffState.order.forEach((key) => {
+                    const file = responseDiffState.files[key];
+                    const wrapper = document.createElement('div');
+                    wrapper.className = 'response-diff-file';
+                    const header = document.createElement('div');
+                    header.className = 'response-diff-file-header';
+                    const name = document.createElement('span');
+                    name.className = 'response-diff-file-name';
+                    name.textContent = file.filename || 'generated code';
+                    const stat = document.createElement('span');
+                    stat.className = 'response-diff-file-stat';
+                    stat.textContent = `+${file.lines || 0}`;
+                    header.append(name, stat);
+                    wrapper.appendChild(header);
+                    const pre = document.createElement('pre');
+                    pre.className = 'response-diff-code';
+                    const lines = (file.code || '').split('\n');
+                    if (!file.code) lines[0] = 'Writing…';
+                    lines.forEach((line) => {
+                        const row = document.createElement('span');
+                        row.className = 'response-diff-line added';
+                        row.textContent = line === 'Writing…' ? line : `+ ${line}`;
+                        pre.appendChild(row);
+                    });
+                    wrapper.appendChild(pre);
+                    responseDiffBox.appendChild(wrapper);
+                });
+                responseDiffBox.scrollTop = responseDiffBox.scrollHeight;
+                scrollToBottom();
+            }
+
+            function startResponseDiffFile(filename = '') {
+                const key = filename || '__single__';
+                if (!responseDiffState.files[key]) {
+                    responseDiffState.order.push(key);
+                    responseDiffState.files[key] = { filename, code: '', lines: 0 };
+                }
+                renderResponseDiff();
+            }
+
+            function appendResponseDiffDelta(delta, filename = '') {
+                if (!delta) return;
+                startResponseDiffFile(filename);
+                const file = responseDiffState.files[filename || '__single__'];
+                file.code += delta;
+                file.lines = file.code ? file.code.split('\n').length : 0;
+                responseDiffState.lines = responseDiffState.order.reduce((sum, name) => sum + responseDiffState.files[name].lines, 0);
+                responseDiffState.additions = responseDiffState.lines;
+                renderResponseDiff();
+            }
+
+            function finalizeResponseDiff(result = {}) {
+                if (!responseDiff) return;
+                const entries = result.files && Object.keys(result.files).length ? Object.entries(result.files) : (result.code ? [['__single__', result.code]] : []);
+                entries.forEach(([filename, code]) => {
+                    startResponseDiffFile(filename === '__single__' ? '' : filename);
+                    const file = responseDiffState.files[filename];
+                    file.code = String(code || '');
+                    file.lines = file.code ? file.code.split('\n').length : 0;
+                });
+                responseDiffState.lines = responseDiffState.order.reduce((sum, name) => sum + responseDiffState.files[name].lines, 0);
+                responseDiffState.additions = responseDiffState.lines;
+                responseDiffState.status = 'Generated code';
+                renderResponseDiff();
+            }
 
             // Lives outside .message-prose so setProse() re-parsing the prose HTML
             // on every streamed token never touches it — see createThinkingIndicator.
@@ -2333,21 +1604,15 @@
                                     // Claude.ai instead of a synthesized step-by-step log.
                                 } else if (parsed.type === 'thought') {
                                     appendLiveThought(parsed.text);
-                                } else if (parsed.type === 'activity') {
-                                    addActivity(parsed);
-                                } else if (parsed.type === 'AGENT_STARTED' || parsed.type === 'TASK_ANALYSIS' || parsed.type === 'WORKSPACE_LISTED' || parsed.type === 'SEARCH_STARTED' || parsed.type === 'SEARCH_RESULT' || parsed.type === 'FILE_READ' || parsed.type === 'FILE_EDIT_STARTED' || parsed.type === 'FILE_DIFF' || parsed.type === 'FILE_EDIT_COMPLETED' || parsed.type === 'FILE_CREATED' || parsed.type === 'FILE_DELETED' || parsed.type === 'FILE_MOVED' || parsed.type === 'COMMAND_STARTED' || parsed.type === 'COMMAND_OUTPUT' || parsed.type === 'COMMAND_COMPLETED' || parsed.type === 'TEST_STARTED' || parsed.type === 'TEST_RESULT' || parsed.type === 'GIT_STATUS' || parsed.type === 'GIT_DIFF' || parsed.type === 'ERROR' || parsed.type === 'RETRY' || parsed.type === 'VERIFICATION' || parsed.type === 'AGENT_COMPLETED') {
-                                    renderCodeAgentEvent(parsed);
-                                } else if (parsed.type === 'plan') {
-                                    renderPlanCard(textContainer, parsed);
-                                } else if (parsed.type === 'turn_summary') {
-                                    finalizeActivitySummary(parsed);
+                                } else if (parsed.type === 'RETRY' || parsed.type === 'ERROR') {
+                                    addThought(parsed.type === 'ERROR' ? 'Code generation error' : 'Retrying', parsed.message || parsed.reason || '', parsed.type.toLowerCase());
                                 } else if (parsed.type === 'code_start' || parsed.type === 'code_file_start') {
-                                    if (mode === 'code') startCodeCanvasStream(parsed.language, parsed.filename || '');
+                                    if (mode === 'code') startResponseDiffFile(parsed.filename || '');
                                 } else if (parsed.type === 'code_delta') {
-                                    if (mode === 'code') appendCodeCanvasStream(parsed.delta, parsed.filename || '');
+                                    if (mode === 'code') appendResponseDiffDelta(parsed.delta, parsed.filename || '');
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
-                                    if (mode === 'code') finalizeLiveDiffBox(parsed);
+                                    if (mode === 'code') finalizeResponseDiff(parsed);
                                 } else if (parsed.type === 'message_reset') {
                                     // Compatibility event: clear the current draft if a server
                                     // explicitly asks the client to reset it.
@@ -2367,7 +1632,7 @@
                                     assistantFullText += parsed.assistant_message;
                                     // In Code mode, never let a fenced code block render inside the
                                     // chat bubble while it's still streaming in — it belongs in the
-                                    // code canvas (via code_result below), not typed out as raw text.
+                                    // response diff box (via code_result below), not typed out as raw text.
                                     const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : assistantFullText;
                                     setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)));
                                     if (indicatorEl) textContainer.appendChild(indicatorEl);
@@ -2383,13 +1648,8 @@
                     if (mode === 'code' && hasCodeResult) {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText))));
                         highlightCode(textContainer);
-                        // Generation is done — the live status chip's job is over. The finished
-                        // file(s) go to the canvas + artifact chip instead.
-                        removeInlineCodeStatus(inlineCodeStatus);
-                        appendArtifactChip(textContainer, { language: codeResult.language, code: codeResult.code, files: codeResult.files, fileLanguages: codeResult.file_languages });
-                        updateCodeCanvas({ language: codeResult.language, code: codeResult.code, files: codeResult.files, fileLanguages: codeResult.file_languages, showPreview: codeResult.show_preview });
+                        finalizeResponseDiff(codeResult);
                     } else {
-                        removeInlineCodeStatus(inlineCodeStatus);
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
                         highlightCode(textContainer);
                     }
@@ -2410,11 +1670,7 @@
                     if (mode === 'code' && hasCode) {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText))));
                         highlightCode(textContainer);
-                        // Non-streaming response: the full code arrives in one shot, so there's
-                        // no "live" phase to show — go straight to the chip, as before.
-                        appendArtifactChip(textContainer, { language: data.language, code: data.code, files: data.files, fileLanguages: data.file_languages });
-                        finalizeLiveDiffBox(data);
-                        updateCodeCanvas({ language: data.language, code: data.code, files: data.files, fileLanguages: data.file_languages, showPreview: data.show_preview });
+                        finalizeResponseDiff(data);
                     } else {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
                         highlightCode(textContainer);
