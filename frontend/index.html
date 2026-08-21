@@ -432,6 +432,30 @@
         .canvas-file-tab:hover { background-color:var(--bg-hover); color:var(--text-primary); }
         .canvas-file-tab.active { background-color:var(--bg-input); color:var(--text-primary); }
         .canvas-file-tab .canvas-file-tab-dot { width:6px; height:6px; border-radius:50%; background-color:var(--accent); flex-shrink:0; animation:inlineStreamPulse 1s ease-in-out infinite; }
+        /* Live Code mode diff box: stays visible while the agent is writing, and
+           settles into a compact generated-code diff once the turn completes. */
+        .canvas-live-diff { flex-shrink:0; border-bottom:1px solid var(--border-color); background:#151719; }
+        .canvas-live-diff[hidden] { display:none; }
+        .canvas-live-diff-header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 14px; color:var(--text-secondary); font-size:12px; }
+        .canvas-live-diff-status { display:flex; align-items:center; gap:8px; min-width:0; }
+        .canvas-live-diff-dot { width:7px; height:7px; border-radius:50%; background:var(--accent); flex-shrink:0; animation:inlineStreamPulse 1s ease-in-out infinite; }
+        .canvas-live-diff-dot.done { animation:none; background:#3fb950; }
+        .canvas-live-diff-title { color:var(--text-primary); font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .canvas-live-diff-count { font:11.5px 'Courier New', Courier, monospace; color:#a9b1bb; white-space:nowrap; }
+        .canvas-diff-box { margin:0 12px 12px; border:1px solid rgba(255,255,255,0.12); border-radius:9px; background:#0d0f10; overflow:hidden; box-shadow:inset 0 1px 0 rgba(255,255,255,0.03); }
+        .canvas-diff-box-empty { padding:14px; color:#7d8590; font:12px/1.5 'Courier New', Courier, monospace; }
+        .canvas-live-file + .canvas-live-file { border-top:1px solid rgba(255,255,255,0.09); }
+        .canvas-live-file-header { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:7px 10px; color:var(--text-primary); background:rgba(255,255,255,0.045); font:11.5px 'Courier New', Courier, monospace; }
+        .canvas-live-file-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .canvas-live-file-stat { color:#a9b1bb; white-space:nowrap; }
+        .canvas-live-file-stat .add { color:#aff5b4; }
+        .canvas-live-file-stat .del { color:#ffb4b0; margin-left:6px; }
+        .canvas-live-code { max-height:300px; overflow:auto; margin:0; padding:7px 0; color:#a9b1bb; font:12px/1.55 'Courier New', Courier, monospace; white-space:pre; }
+        .canvas-live-line { display:block; min-width:max-content; padding:0 10px; }
+        .canvas-live-line.added { color:#aff5b4; background:rgba(46,160,67,.16); }
+        .canvas-live-line.removed { color:#ffb4b0; background:rgba(248,81,73,.14); }
+        .canvas-live-line.meta { color:#79c0ff; background:rgba(56,139,253,.10); }
+        .canvas-live-line.generated { color:#d5f5d7; background:rgba(46,160,67,.12); }
         .canvas-body { flex:1; min-height:0; position:relative; }
         .canvas-view { width:100%; height:100%; overflow:auto; }
         .canvas-view[hidden] { display:none; }
@@ -670,6 +694,18 @@
             </div>
         </div>
         <div class="canvas-file-tabs" id="canvasFileTabs" hidden></div>
+        <section class="canvas-live-diff" id="canvasLiveDiff" hidden aria-live="polite">
+            <div class="canvas-live-diff-header">
+                <div class="canvas-live-diff-status">
+                    <span class="canvas-live-diff-dot" id="canvasLiveDiffDot"></span>
+                    <span class="canvas-live-diff-title" id="canvasLiveDiffTitle">Generating code</span>
+                </div>
+                <span class="canvas-live-diff-count" id="canvasLiveDiffCount">0 lines</span>
+            </div>
+            <div class="canvas-diff-box" id="canvasLiveDiffBox">
+                <div class="canvas-diff-box-empty">Waiting for the first generated file…</div>
+            </div>
+        </section>
         <div class="canvas-body">
             <div class="canvas-view" id="canvasPreviewView">
                 <iframe id="canvasPreviewFrame" sandbox="allow-scripts allow-same-origin allow-forms allow-modals"></iframe>
@@ -1317,6 +1353,161 @@
         const canvasCodeEl = document.getElementById('canvasCode');
         let streamingActive = false; // true while code_delta events are live-filling the canvas
         const canvasPreviewFrame = document.getElementById('canvasPreviewFrame');
+        const canvasLiveDiff = document.getElementById('canvasLiveDiff');
+        const canvasLiveDiffDot = document.getElementById('canvasLiveDiffDot');
+        const canvasLiveDiffTitle = document.getElementById('canvasLiveDiffTitle');
+        const canvasLiveDiffCount = document.getElementById('canvasLiveDiffCount');
+        const canvasLiveDiffBox = document.getElementById('canvasLiveDiffBox');
+        let liveDiffState = { active: false, status: 'Generating code', files: {}, order: [], additions: 0, deletions: 0, lines: 0 };
+
+        function liveDiffLineClass(line, generated = false) {
+            if (generated) return 'generated';
+            if (line.startsWith('+') && !line.startsWith('+++')) return 'added';
+            if (line.startsWith('-') && !line.startsWith('---')) return 'removed';
+            if (line.startsWith('@@')) return 'meta';
+            return '';
+        }
+
+        function liveDiffCountText() {
+            const fileCount = liveDiffState.order.length;
+            const files = `${fileCount} file${fileCount === 1 ? '' : 's'}`;
+            const lines = `${liveDiffState.lines} line${liveDiffState.lines === 1 ? '' : 's'}`;
+            return `${files} · ${lines} · +${liveDiffState.additions} / −${liveDiffState.deletions}`;
+        }
+
+        function renderLiveDiffBox() {
+            if (!liveDiffState.active) return;
+            canvasLiveDiff.hidden = false;
+            canvasLiveDiffTitle.textContent = liveDiffState.status;
+            canvasLiveDiffCount.textContent = liveDiffCountText();
+            canvasLiveDiffDot.classList.toggle('done', liveDiffState.status === 'Generated code');
+            canvasLiveDiffBox.replaceChildren();
+
+            if (!liveDiffState.order.length) {
+                const empty = document.createElement('div');
+                empty.className = 'canvas-diff-box-empty';
+                empty.textContent = 'Waiting for the first generated file…';
+                canvasLiveDiffBox.appendChild(empty);
+                return;
+            }
+
+            liveDiffState.order.forEach((key) => {
+                const file = liveDiffState.files[key];
+                if (!file) return;
+                const wrapper = document.createElement('div');
+                wrapper.className = 'canvas-live-file';
+                const header = document.createElement('div');
+                header.className = 'canvas-live-file-header';
+                const name = document.createElement('span');
+                name.className = 'canvas-live-file-name';
+                name.textContent = file.filename || 'generated code';
+                const stat = document.createElement('span');
+                stat.className = 'canvas-live-file-stat';
+                stat.innerHTML = `<span class="add">+${file.additions || 0}</span><span class="del">−${file.deletions || 0}</span>`;
+                header.append(name, stat);
+                wrapper.appendChild(header);
+
+                const pre = document.createElement('pre');
+                pre.className = 'canvas-live-code';
+                const source = file.diff || file.code || '';
+                if (!source) {
+                    const waiting = document.createElement('span');
+                    waiting.className = 'canvas-live-line';
+                    waiting.textContent = 'Writing…';
+                    pre.appendChild(waiting);
+                } else {
+                    source.split('\\n').forEach((line) => {
+                        const row = document.createElement('span');
+                        row.className = `canvas-live-line ${liveDiffLineClass(line, !!file.generated)}`.trim();
+                        row.textContent = line;
+                        pre.appendChild(row);
+                    });
+                }
+                wrapper.appendChild(pre);
+                canvasLiveDiffBox.appendChild(wrapper);
+            });
+        }
+
+        function resetLiveDiffBox() {
+            liveDiffState = { active: false, status: 'Generating code', files: {}, order: [], additions: 0, deletions: 0, lines: 0 };
+            canvasLiveDiff.hidden = true;
+            canvasLiveDiffBox.replaceChildren();
+        }
+
+        function startLiveDiffFile(event = {}) {
+            const key = event.path || '__single__';
+            if (!liveDiffState.files[key]) {
+                liveDiffState.order.push(key);
+                liveDiffState.files[key] = { filename: event.path || '', code: '', diff: '', additions: 0, deletions: 0, generated: false };
+            }
+            const file = liveDiffState.files[key];
+            file.additions = Number(event.additions || 0);
+            file.deletions = Number(event.deletions || 0);
+            liveDiffState.additions = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].additions || 0), 0);
+            liveDiffState.deletions = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].deletions || 0), 0);
+            liveDiffState.lines = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].newLines || 0), 0);
+            liveDiffState.active = true;
+            liveDiffState.status = 'Generating code';
+            if (currentMode === 'code') {
+                modes.code.canvas.open = true;
+                codeCanvas.hidden = false;
+                setCanvasTab('code');
+            }
+            renderLiveDiffBox();
+        }
+
+        function appendLiveDiffFile(event = {}) {
+            startLiveDiffFile(event);
+            const key = event.path || '__single__';
+            const file = liveDiffState.files[key];
+            file.diff = String(event.diff || '');
+            file.newLines = Number(event.new_lines || (event.new_content ? String(event.new_content).split('\\n').length : 0));
+            file.additions = Number(event.additions || file.additions || 0);
+            file.deletions = Number(event.deletions || file.deletions || 0);
+            liveDiffState.additions = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].additions || 0), 0);
+            liveDiffState.deletions = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].deletions || 0), 0);
+            liveDiffState.lines = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].newLines || 0), 0);
+            renderLiveDiffBox();
+        }
+
+        function appendLiveGeneratedCode(delta, filename = '') {
+            if (!delta) return;
+            startLiveDiffFile({ path: filename });
+            const key = filename || '__single__';
+            const file = liveDiffState.files[key];
+            file.generated = true;
+            file.code = (file.code || '') + delta;
+            file.newLines = file.code.split('\\n').length;
+            file.additions = file.newLines;
+            liveDiffState.additions = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].additions || 0), 0);
+            liveDiffState.lines = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].newLines || 0), 0);
+            renderLiveDiffBox();
+        }
+
+        function finalizeLiveDiffBox(result = {}) {
+            const hasFiles = result.files && Object.keys(result.files).length > 0;
+            const entries = hasFiles ? Object.entries(result.files) : (result.code ? [['__single__', result.code]] : []);
+            if (!entries.length && !liveDiffState.order.length) return;
+            entries.forEach(([filename, code]) => {
+                if (!liveDiffState.files[filename]) {
+                    liveDiffState.order.push(filename);
+                    liveDiffState.files[filename] = { filename: filename === '__single__' ? '' : filename, code: '', diff: '', additions: 0, deletions: 0, generated: true };
+                }
+                const file = liveDiffState.files[filename];
+                file.code = String(code || '');
+                file.newLines = file.code ? file.code.split('\\n').length : 0;
+                if (!file.diff) {
+                    file.generated = true;
+                    if (!file.additions) file.additions = file.newLines;
+                }
+            });
+            liveDiffState.additions = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].additions || 0), 0);
+            liveDiffState.deletions = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].deletions || 0), 0);
+            liveDiffState.lines = liveDiffState.order.reduce((sum, name) => sum + (liveDiffState.files[name].newLines || 0), 0);
+            liveDiffState.active = true;
+            liveDiffState.status = 'Generated code';
+            renderLiveDiffBox();
+        }
 
         function toggleSidebar() { sidebar.classList.toggle('collapsed'); }
 
@@ -1877,8 +2068,10 @@
                 } else if (type === 'FILE_READ') {
                     addActivity({ kind: 'read', label: `Read ${event.path || 'file'}`, filename: event.path });
                 } else if (type === 'FILE_EDIT_STARTED') {
+                    startLiveDiffFile(event);
                     addActivity({ kind: event.created ? 'create' : 'edit', label: event.created ? 'Creating file' : 'Editing file', filename: event.path, additions: event.additions, deletions: event.deletions });
                 } else if (type === 'FILE_DIFF') {
+                    appendLiveDiffFile(event);
                     appendAgentDiff(event);
                 } else if (type === 'FILE_EDIT_COMPLETED') {
                     if (!event.created) addActivity({ kind: 'done', label: `Edited ${event.path || 'file'}` });
@@ -2093,6 +2286,7 @@
 
             let assistantFullText = '';
             let codeResult = null; // { code, language, show_preview } — Code Mode only
+            if (mode === 'code') resetLiveDiffBox();
 
             // Lives outside .message-prose so setProse() re-parsing the prose HTML
             // on every streamed token never touches it — see createThinkingIndicator.
@@ -2147,12 +2341,13 @@
                                     renderPlanCard(textContainer, parsed);
                                 } else if (parsed.type === 'turn_summary') {
                                     finalizeActivitySummary(parsed);
-                                } else if (parsed.type === 'code_start' || parsed.type === 'code_file_start' || parsed.type === 'code_delta') {
-                                    // Deliberately hidden during generation. Code Mode shows only
-                                    // real backend thoughts and workspace activity; the final
-                                    // code/preview is reconciled from code_result after the turn.
+                                } else if (parsed.type === 'code_start' || parsed.type === 'code_file_start') {
+                                    if (mode === 'code') startCodeCanvasStream(parsed.language, parsed.filename || '');
+                                } else if (parsed.type === 'code_delta') {
+                                    if (mode === 'code') appendCodeCanvasStream(parsed.delta, parsed.filename || '');
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
+                                    if (mode === 'code') finalizeLiveDiffBox(parsed);
                                 } else if (parsed.type === 'message_reset') {
                                     // Compatibility event: clear the current draft if a server
                                     // explicitly asks the client to reset it.
@@ -2218,6 +2413,7 @@
                         // Non-streaming response: the full code arrives in one shot, so there's
                         // no "live" phase to show — go straight to the chip, as before.
                         appendArtifactChip(textContainer, { language: data.language, code: data.code, files: data.files, fileLanguages: data.file_languages });
+                        finalizeLiveDiffBox(data);
                         updateCodeCanvas({ language: data.language, code: data.code, files: data.files, fileLanguages: data.file_languages, showPreview: data.show_preview });
                     } else {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
