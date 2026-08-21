@@ -855,7 +855,7 @@ async def code_decide(request: CodeChatRequest, state: dict, observations: list[
         return {'summary': str(parsed.get('summary') or 'Continuing with the next workspace action.'), 'tool': parsed['tool'], 'args': parsed.get('args') if isinstance(parsed.get('args'), dict) else {}}
     except Exception:
         await code_emit(progress, 'ERROR', message='The agent returned an invalid tool decision.')
-        return {'summary': '', 'tool': 'finish', 'args': {}}
+        return {'summary': '', 'tool': '__decision_error__', 'args': {}}
 
 
 async def code_list_files(root: pathlib.Path, progress) -> dict:
@@ -1087,6 +1087,9 @@ async def autonomous_code_once(request: CodeChatRequest, session: dict, progress
             await code_emit(progress, 'TASK_ANALYSIS', summary=decision['summary'], tool=decision['tool'])
         tool = decision['tool']
         args = decision['args']
+        if tool == '__decision_error__':
+            await code_emit(progress, 'ERROR', message='The agent cannot continue until the model decision service is available.')
+            break
         if tool == 'finish':
             if not state['verification_done']:
                 await code_emit(progress, 'RETRY', reason='The workspace has not been verified yet; choosing a real test or check before finishing.')
@@ -1165,16 +1168,6 @@ async def clear_session(request: ClearSessionRequest):
     return {"status": "success", "message": f"Session {request.session_id} cleared."}
 
 
-async def forward_live_events(task: asyncio.Task, progress_queue: asyncio.Queue, session_id: str):
-    """Yield queue events while the backend task is still running."""
-    while not task.done() or not progress_queue.empty():
-        try:
-            event = await asyncio.wait_for(progress_queue.get(), timeout=2.5)
-            yield event
-        except asyncio.TimeoutError:
-            yield {"type": "status", "step": "processing", "label": "Working", "detail": "The backend is still processing the request."}
-
-
 async def generate_stream(request: ChatRequest, session: dict, session_id: str):
     progress_queue: asyncio.Queue = asyncio.Queue()
     task = asyncio.create_task(generate_response_once(request, session, progress_queue))
@@ -1199,37 +1192,6 @@ async def generate_stream(request: ChatRequest, session: dict, session_id: str):
     session["messages"].append(AIMessage(content=final_response))
 
 
-async def generate_code_stream(request: CodeChatRequest, session: dict, session_id: str):
-    progress_queue: asyncio.Queue = asyncio.Queue()
-    task = asyncio.create_task(generate_code_once(request, session, progress_queue))
-    result = None
-    streamed_text = ""
-    try:
-        async for event in forward_live_events(task, progress_queue, session_id):
-            if event["type"] in ("status", "thought", "activity", "turn_summary", "plan"):
-                yield f"data: {json.dumps(event)}\n\n"
-            elif event["type"] == "token":
-                # Code-mode output is intentionally not streamed. The final response
-                # is emitted after the workspace action and verification complete.
-                continue
-        result = await task
-    except Exception as exc:
-        print(f"[{session_id}] Code generation failed: {exc}")
-        result = {
-            "response": "I could not generate code right now. Please try again.",
-            "code": "",
-            "language": "",
-            "files": {},
-            "file_languages": {},
-            "show_preview": False,
-        }
-    if result.get("code") or result.get("files"):
-        yield f"data: {json.dumps({'type': 'code_result', **result, 'session_id': session_id})}\n\n"
-    if not streamed_text:
-        yield f"data: {json.dumps({'type': 'message', 'assistant_message': result['response'], 'conversation_id': session_id, 'session_id': session_id})}\n\n"
-    session["messages"].append(AIMessage(content=result["response"]))
-
-
 @app.post("/code-chat")
 async def code_chat(request: CodeChatRequest):
     session = sessions.setdefault(request.session_id, {"messages": []})
@@ -1242,7 +1204,7 @@ async def code_chat(request: CodeChatRequest):
         )
     thinking_steps = []
     try:
-        result = await generate_code_once(request, session, thinking_steps)
+        result = await autonomous_code_once(request, session, thinking_steps)
     except Exception as exc:
         print(f"[{request.session_id}] Code generation failed: {exc}")
         result = {
