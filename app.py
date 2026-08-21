@@ -810,7 +810,8 @@ async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=No
     existing = state["existing_files"]
     languages = state["existing_file_languages"]
     workspace = "\n\n".join(f"--- FILE: {name} ({languages.get(name, 'text')}) ---\n{content}" for name, content in existing.items()) or "(empty workspace)"
-    default_filename = next(iter(existing)) if len(existing) == 1 else ""
+    planned_targets = state.get("planned_files") or infer_workspace_files(state.get("latest_message", ""), existing)
+    default_filename = next(iter(existing)) if len(existing) == 1 else (planned_targets[0] if len(planned_targets) == 1 else "")
     issue = f"\nConcrete issue to fix:\n{fix_issue}\n" if fix_issue else ""
     if existing:
         format_rules = (
@@ -856,11 +857,21 @@ async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=No
     touched = []
 
     if action_blocks:
-        updated, edited, ok = apply_action_blocks(existing, action_blocks, default_filename)
-        if not ok:
-            await publish_activity(progress, "note", "The proposed edit did not match the current file exactly; no partial change was applied.")
-            return {"raw": raw, "files": dict(existing), "file_languages": dict(languages), "touched_files": [], "explanation": "No change was applied because the exact edit could not be verified."}
-        touched.extend(edited)
+        if existing:
+            updated, edited, ok = apply_action_blocks(existing, action_blocks, default_filename)
+            if not ok:
+                await publish_activity(progress, "note", "The proposed edit did not match the current file exactly; no partial change was applied.")
+                return {"raw": raw, "files": dict(existing), "file_languages": dict(languages), "touched_files": [], "explanation": "No change was applied because the exact edit could not be verified."}
+            touched.extend(edited)
+        else:
+            for filename, _search, replace in action_blocks:
+                target = filename or default_filename
+                if not target or not replace.strip():
+                    await publish_activity(progress, "note", "The proposed new file did not include a valid target or implementation.")
+                    return {"raw": raw, "files": {}, "file_languages": {}, "touched_files": [], "explanation": "No file was created because the action was incomplete."}
+                updated[target] = replace.strip()
+                updated_languages[target] = target.rsplit('.', 1)[-1].lower() if '.' in target else "text"
+                touched.append(target)
     for filename, content in created_files.items():
         updated[filename] = content
         updated_languages[filename] = created_languages.get(filename, "text")
@@ -1083,8 +1094,9 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
             if event["type"] in ("status", "thought", "activity", "turn_summary", "plan"):
                 yield f"data: {json.dumps(event)}\n\n"
             elif event["type"] == "token":
-                streamed_text += event["text"]
-                yield f"data: {json.dumps({'type': 'message', 'assistant_message': event['text'], 'conversation_id': session_id, 'session_id': session_id})}\n\n"
+                # Code-mode output is intentionally not streamed. The final response
+                # is emitted after the workspace action and verification complete.
+                continue
         result = await task
     except Exception as exc:
         print(f"[{session_id}] Code generation failed: {exc}")
