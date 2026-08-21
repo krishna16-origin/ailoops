@@ -192,6 +192,11 @@
         @keyframes inlineStreamPulse { 0%,100% { opacity:0.3; } 50% { opacity:1; } }
         .response-code-diff-title { color:var(--text-primary); font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .response-code-diff-count { font:11.5px 'Courier New', Courier, monospace; color:#a9b1bb; white-space:nowrap; }
+        .response-code-diff-tabs { display:flex; gap:4px; padding:8px 10px 0; background:#151719; }
+        .response-code-diff-tab { border:1px solid transparent; border-bottom:0; border-radius:7px 7px 0 0; padding:6px 11px; background:transparent; color:var(--text-secondary); font:12px 'Inter',sans-serif; cursor:pointer; }
+        .response-code-diff-tab:hover:not(:disabled) { color:var(--text-primary); background:rgba(255,255,255,0.05); }
+        .response-code-diff-tab.active { color:var(--text-primary); background:#0d0f10; border-color:rgba(255,255,255,0.12); }
+        .response-code-diff-tab:disabled { opacity:0.4; cursor:not-allowed; }
         .response-diff-box { max-height:360px; overflow:auto; background:#0d0f10; }
         .response-diff-empty { padding:14px; color:#7d8590; font:12px/1.5 'Courier New', Courier, monospace; }
         .response-diff-file + .response-diff-file { border-top:1px solid rgba(255,255,255,0.09); }
@@ -200,6 +205,9 @@
         .response-diff-file-stat { color:#aff5b4; white-space:nowrap; }
         .response-diff-code { margin:0; padding:7px 0; color:#aff5b4; font:12px/1.55 'Courier New', Courier, monospace; white-space:pre; }
         .response-diff-line { display:block; min-width:max-content; padding:0 10px; color:#aff5b4; background:rgba(46,160,67,.12); }
+        .response-preview-canvas { height:420px; background:#fff; }
+        .response-preview-canvas[hidden] { display:none; }
+        .response-preview-canvas iframe { display:block; width:100%; height:100%; border:0; background:#fff; }
 
         .thinking-block { margin-top:2px; }
         .thinking-toggle { background:none; border:none; padding:0; font-size:13px; font-family:inherit; color:var(--text-secondary); cursor:pointer; }
@@ -1180,8 +1188,26 @@
                             <div class="response-code-diff-status"><span class="response-code-diff-dot"></span><span class="response-code-diff-title">Generating code</span></div>
                             <span class="response-code-diff-count">0 lines</span>
                         </div>
+                        <div class="response-code-diff-tabs">
+                            <button type="button" class="response-code-diff-tab active" data-response-view="diff">Diff</button>
+                            <button type="button" class="response-code-diff-tab" data-response-view="preview" disabled>Preview</button>
+                        </div>
                         <div class="response-diff-box"><div class="response-diff-empty">Waiting for generated code…</div></div>
+                        <div class="response-preview-canvas" hidden><iframe title="Generated code preview" sandbox="allow-scripts"></iframe></div>
                     `;
+                    const diffTab = diffBox.querySelector('[data-response-view="diff"]');
+                    const previewTab = diffBox.querySelector('[data-response-view="preview"]');
+                    const diffView = diffBox.querySelector('.response-diff-box');
+                    const previewView = diffBox.querySelector('.response-preview-canvas');
+                    const setResponseView = (view) => {
+                        const showPreview = view === 'preview' && !previewTab.disabled;
+                        diffTab.classList.toggle('active', !showPreview);
+                        previewTab.classList.toggle('active', showPreview);
+                        diffView.hidden = showPreview;
+                        previewView.hidden = !showPreview;
+                    };
+                    diffTab.addEventListener('click', () => setResponseView('diff'));
+                    previewTab.addEventListener('click', () => setResponseView('preview'));
                     contentDiv.appendChild(diffBox);
                 }
 
@@ -1477,6 +1503,8 @@
             const responseDiffCount = responseDiff ? responseDiff.querySelector('.response-code-diff-count') : null;
             const responseDiffDot = responseDiff ? responseDiff.querySelector('.response-code-diff-dot') : null;
             const responseDiffBox = responseDiff ? responseDiff.querySelector('.response-diff-box') : null;
+            const responsePreviewTab = responseDiff ? responseDiff.querySelector('[data-response-view="preview"]') : null;
+            const responsePreviewFrame = responseDiff ? responseDiff.querySelector('.response-preview-canvas iframe') : null;
             const responseDiffState = { files: {}, order: [], additions: 0, lines: 0, status: 'Generating code' };
 
             function renderResponseDiff() {
@@ -1546,7 +1574,8 @@
 
             function finalizeResponseDiff(result = {}) {
                 if (!responseDiff) return;
-                const entries = result.files && Object.keys(result.files).length ? Object.entries(result.files) : (result.code ? [['__single__', result.code]] : []);
+                const hasFiles = result.files && Object.keys(result.files).length > 0;
+                const entries = hasFiles ? Object.entries(result.files) : (result.code ? [['__single__', result.code]] : []);
                 entries.forEach(([filename, code]) => {
                     startResponseDiffFile(filename === '__single__' ? '' : filename);
                     const file = responseDiffState.files[filename];
@@ -1557,6 +1586,27 @@
                 responseDiffState.additions = responseDiffState.lines;
                 responseDiffState.status = 'Generated code';
                 renderResponseDiff();
+
+                const previewable = ['html', 'htm', 'css', 'jsx', 'tsx', 'js', 'javascript', 'react'];
+                let previewEntry = null;
+                let previewLanguage = '';
+                for (const [filename, code] of entries) {
+                    const language = hasFiles ? ((result.file_languages && result.file_languages[filename]) || '') : (result.language || '');
+                    const extension = (filename || '').split('.').pop().toLowerCase();
+                    if (previewable.includes(language.toLowerCase()) || previewable.includes(extension)) {
+                        previewEntry = [filename, code];
+                        previewLanguage = language || extension;
+                        break;
+                    }
+                }
+                if (!previewEntry && entries.length === 1 && result.language) {
+                    previewEntry = entries[0];
+                    previewLanguage = result.language;
+                }
+                if (responsePreviewTab && responsePreviewFrame && previewEntry) {
+                    responsePreviewFrame.srcdoc = buildPreviewDoc(previewLanguage, previewEntry[1]);
+                    responsePreviewTab.disabled = false;
+                }
             }
 
             // Lives outside .message-prose so setProse() re-parsing the prose HTML
