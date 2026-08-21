@@ -73,6 +73,10 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
         model_name = "deepseek-ai/deepseek-v4-pro"
     elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
+    elif model_type_clean in {"glm", "glm5.2", "glm-5.2"}:
+        model_name = "z-ai/glm-5.1"
+    elif model_type_clean in {"kimi", "kimik2.6", "kimi-k2.6"}:
+        model_name = "moonshotai/kimi-k2.6"
     return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=120)
 
 
@@ -742,7 +746,7 @@ async def code_idea_node(request: CodeChatRequest, session: dict, progress=None)
         "fences. Think naturally inside one <think>...</think> block, then give one concise sentence summarizing the "
         "understanding.\n\nWorkspace files:\n" + manifest + "\n\nUser request:\n" + request.message
     )
-    llm = get_llm("reasoning" if request.model in {"glm", "kimik2.6"} else "balanced", 0.2, min(1800, config["max_tokens"]))
+    llm = get_llm(request.model, 0.2, min(1800, config["max_tokens"]))
     try:
         raw = await invoke_model([SystemMessage(content="You are the idea stage."), HumanMessage(content=prompt)], llm, progress, on_answer_piece=_swallow_answer_piece)
     except Exception as exc:
@@ -753,6 +757,19 @@ async def code_idea_node(request: CodeChatRequest, session: dict, progress=None)
 
 async def _swallow_answer_piece(_text: str) -> None:
     return None
+
+
+def infer_workspace_files(message: str, existing: dict) -> list[str]:
+    """Recover a concrete file target when the model omits the FILES marker."""
+    if existing:
+        return list(existing)[:8]
+    text = (message or "").lower()
+    candidates = re.findall(r"\b[\w./-]+\.(?:html?|css|jsx?|tsx?|json|py|md)\b", text)
+    if candidates:
+        return list(dict.fromkeys(candidates))[:8]
+    if any(word in text for word in ("html", "website", "web page", "webpage", "landing page", "frontend", "button", "style")):
+        return ["index.html"]
+    return []
 
 
 async def code_plan_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
@@ -779,9 +796,12 @@ async def code_plan_node(request: CodeChatRequest, state: dict, progress=None) -
             name = line.strip().strip("-*• ").strip("`")
             if name and re.fullmatch(r"[\w./-]+\.[A-Za-z0-9]+", name):
                 planned.append(name)
-    if not planned and existing:
-        planned = list(existing)[:8]
-    await publish_event(progress, {"type": "plan", "summary": summary or "Plan the requested implementation and validate it before presenting the result.", "files": planned[:8]})
+    if not planned:
+        planned = infer_workspace_files(state["latest_message"], existing)
+    if not summary:
+        target_text = ", ".join(planned) if planned else "the requested workspace"
+        summary = f"I will make the requested change in {target_text}."
+    await publish_event(progress, {"type": "plan", "summary": summary, "files": planned[:8]})
     state.update({"plan_summary": summary, "planned_files": planned[:8]})
     return state
 
@@ -805,8 +825,7 @@ async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=No
         "Exact SEARCH/REPLACE format:\n<<<<<<< SEARCH\n<existing lines exactly>\n=======\n<replacement lines>\n>>>>>>> REPLACE\n\n"
         "Nothing outside the action blocks or FILE/fenced blocks.\n\nWorkspace:\n" + workspace + "\n\nPlan:\n" + state.get("plan_summary", "") + "\n\nUser request:\n" + state["latest_message"]
     )
-    model_type = "reasoning" if request.model in {"glm", "kimik2.6"} else "balanced"
-    llm = get_llm(model_type, 0.2, state["config"]["max_tokens"])
+    llm = get_llm(request.model, 0.2, min(6000, state["config"]["max_tokens"]))
     if existing:
         for filename in list(existing)[:8]:
             await publish_activity(progress, "read", f"Reading {filename}", filename=filename)
