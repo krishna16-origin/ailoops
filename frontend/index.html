@@ -301,6 +301,17 @@
         .activity-diff-add { color:#3fb950; }
         .activity-diff-del { color:#f85149; margin-left:4px; }
         .activity-row-status { font-style:italic; opacity:0.85; }
+        .activity-row-error { color:#f85149; }
+        .activity-diff-block { margin:6px 0 10px 0; border:1px solid var(--border-color); border-radius:8px; background:#101214; overflow:hidden; }
+        .activity-diff-block summary { cursor:pointer; padding:7px 10px; color:var(--text-primary); font-size:12px; font-family:'Courier New', Courier, monospace; list-style:none; }
+        .activity-diff-block summary::-webkit-details-marker { display:none; }
+        .activity-diff-code { margin:0; padding:8px 0; max-height:360px; overflow:auto; font:12px/1.55 'Courier New', Courier, monospace; white-space:pre; }
+        .activity-diff-line { display:block; padding:0 10px; min-width:max-content; }
+        .activity-diff-line-context { color:#a9b1bb; }
+        .activity-diff-line-added { color:#aff5b4; background:rgba(46,160,67,.16); }
+        .activity-diff-line-removed { color:#ffb4b0; background:rgba(248,81,73,.14); }
+        .activity-diff-line-meta { color:#79c0ff; background:rgba(56,139,253,.10); }
+        .activity-command-output { margin:4px 0 8px 23px; padding:8px 10px; max-height:180px; overflow:auto; border-left:2px solid var(--border-color); background:#101214; color:#a9b1bb; font:12px/1.5 'Courier New', Courier, monospace; white-space:pre-wrap; }
 
         /* ============== CODE MODE: build plan card ==============
            Shown once, right before the very first build in a session — a short
@@ -1807,6 +1818,86 @@
                 else if (!activityContent.childElementCount) activityBlock.style.display = 'none';
             }
 
+            function appendAgentDiff(event) {
+                if (!activityContent) return;
+                const details = document.createElement('details');
+                details.className = 'activity-diff-block';
+                details.open = true;
+                const summary = document.createElement('summary');
+                summary.textContent = `${event.path || 'file'}  +${event.additions || 0} -${event.deletions || 0}`;
+                const pre = document.createElement('pre');
+                pre.className = 'activity-diff-code';
+                const diff = String(event.diff || '');
+                for (const line of diff.split('\n')) {
+                    const row = document.createElement('span');
+                    row.className = 'activity-diff-line ' + (line.startsWith('+') && !line.startsWith('+++') ? 'activity-diff-line-added' : line.startsWith('-') && !line.startsWith('---') ? 'activity-diff-line-removed' : line.startsWith('@@') ? 'activity-diff-line-meta' : 'activity-diff-line-context');
+                    row.textContent = line;
+                    pre.appendChild(row);
+                }
+                details.appendChild(summary);
+                details.appendChild(pre);
+                activityContent.appendChild(details);
+                scrollToBottom();
+            }
+
+            function appendAgentCommandOutput(event) {
+                if (!activityContent || !event.output) return;
+                const output = document.createElement('pre');
+                output.className = 'activity-command-output';
+                output.textContent = String(event.output);
+                activityContent.appendChild(output);
+                scrollToBottom();
+            }
+
+            function renderCodeAgentEvent(event) {
+                const type = event.type;
+                if (type === 'AGENT_STARTED') {
+                    addActivity({ kind: 'narration', label: 'Inspecting project' });
+                } else if (type === 'TASK_ANALYSIS') {
+                    addActivity({ kind: 'narration', label: event.summary || 'Determining the next workspace action.' });
+                } else if (type === 'WORKSPACE_LISTED') {
+                    addActivity({ kind: 'read', label: `${event.count || 0} workspace files found` });
+                } else if (type === 'SEARCH_STARTED') {
+                    addActivity({ kind: 'narration', label: `Searching codebase: ${event.pattern || ''}` });
+                } else if (type === 'SEARCH_RESULT') {
+                    addActivity({ kind: 'note', label: `${event.count || 0} matches found` });
+                } else if (type === 'FILE_READ') {
+                    addActivity({ kind: 'read', label: `Read ${event.path || 'file'}`, filename: event.path });
+                } else if (type === 'FILE_EDIT_STARTED') {
+                    addActivity({ kind: event.created ? 'create' : 'edit', label: event.created ? 'Creating file' : 'Editing file', filename: event.path, additions: event.additions, deletions: event.deletions });
+                } else if (type === 'FILE_DIFF') {
+                    appendAgentDiff(event);
+                } else if (type === 'FILE_EDIT_COMPLETED') {
+                    if (!event.created) addActivity({ kind: 'done', label: `Edited ${event.path || 'file'}` });
+                } else if (type === 'FILE_CREATED') {
+                    addActivity({ kind: 'done', label: `Created ${event.path || 'file'}` });
+                } else if (type === 'FILE_DELETED') {
+                    addActivity({ kind: 'done', label: `Deleted ${event.path || 'file'}` });
+                } else if (type === 'FILE_MOVED') {
+                    addActivity({ kind: 'done', label: `Moved ${event.source || 'file'} to ${event.destination || 'file'}` });
+                } else if (type === 'COMMAND_STARTED') {
+                    addActivity({ kind: 'narration', label: `Running ${event.command || 'command'}` });
+                } else if (type === 'COMMAND_OUTPUT') {
+                    appendAgentCommandOutput(event);
+                } else if (type === 'COMMAND_COMPLETED') {
+                    addActivity({ kind: 'command', label: `Ran ${event.command || 'command'} (${event.return_code === 0 ? 'passed' : 'failed'})` });
+                } else if (type === 'TEST_STARTED') {
+                    addActivity({ kind: 'narration', label: `Running ${event.command || 'tests'}` });
+                } else if (type === 'TEST_RESULT') {
+                    addActivity({ kind: event.passed ? 'note' : 'error', label: event.passed ? `${event.command || 'Tests'} passed` : `${event.command || 'Tests'} failed` });
+                } else if (type === 'GIT_STATUS' || type === 'GIT_DIFF') {
+                    addActivity({ kind: 'command', label: type === 'GIT_STATUS' ? 'Checked git status' : 'Checked git diff' });
+                } else if (type === 'ERROR') {
+                    addActivity({ kind: 'error', label: event.message || 'Workspace action failed.' });
+                } else if (type === 'RETRY') {
+                    addActivity({ kind: 'narration', label: event.reason || 'Retrying after the real tool result.' });
+                } else if (type === 'VERIFICATION') {
+                    addActivity({ kind: event.status === 'passed' ? 'note' : 'error', label: event.status === 'passed' ? 'Verification complete' : 'Verification failed' });
+                } else if (type === 'AGENT_COMPLETED') {
+                    addActivity({ kind: 'done', label: 'Presenting files' });
+                }
+            }
+
             // Show "Thinking" the instant the request goes out — like Claude.ai — rather
             // than waiting for a real backend status event, which may never arrive for
             // quick replies that skip the planning loop entirely (e.g. "hi").
@@ -2037,6 +2128,8 @@
                                     appendLiveThought(parsed.text);
                                 } else if (parsed.type === 'activity') {
                                     addActivity(parsed);
+                                } else if (parsed.type === 'AGENT_STARTED' || parsed.type === 'TASK_ANALYSIS' || parsed.type === 'WORKSPACE_LISTED' || parsed.type === 'SEARCH_STARTED' || parsed.type === 'SEARCH_RESULT' || parsed.type === 'FILE_READ' || parsed.type === 'FILE_EDIT_STARTED' || parsed.type === 'FILE_DIFF' || parsed.type === 'FILE_EDIT_COMPLETED' || parsed.type === 'FILE_CREATED' || parsed.type === 'FILE_DELETED' || parsed.type === 'FILE_MOVED' || parsed.type === 'COMMAND_STARTED' || parsed.type === 'COMMAND_OUTPUT' || parsed.type === 'COMMAND_COMPLETED' || parsed.type === 'TEST_STARTED' || parsed.type === 'TEST_RESULT' || parsed.type === 'GIT_STATUS' || parsed.type === 'GIT_DIFF' || parsed.type === 'ERROR' || parsed.type === 'RETRY' || parsed.type === 'VERIFICATION' || parsed.type === 'AGENT_COMPLETED') {
+                                    renderCodeAgentEvent(parsed);
                                 } else if (parsed.type === 'plan') {
                                     renderPlanCard(textContainer, parsed);
                                 } else if (parsed.type === 'turn_summary') {

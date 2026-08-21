@@ -4,6 +4,9 @@ import json
 import re
 import asyncio
 import difflib
+import pathlib
+import shutil
+import time
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
@@ -754,326 +757,401 @@ async def flush_code_answer_stream(progress, code_state: dict) -> None:
         code_state["line_buf"] = ""
 
 
-async def code_idea_node(request: CodeChatRequest, session: dict, progress=None) -> dict:
-    config = get_thinking_config(request.reasoning_level)
-    existing_files = dict(session.get("code_files", {}))
-    manifest = "\n".join(existing_files) or "(empty workspace)"
-    await publish_progress(progress, "idea", "idea", "Understanding the request and the current workspace before making changes.")
-    prompt = (
-        "You are in the IDEA stage of a coding workflow. Understand the user's request, inspect the existing workspace "
-        "context, and identify the real next goal. Do not write code, do not output a plan marker, and do not output "
-        "fences. Think naturally inside one <think>...</think> block, then give one concise sentence summarizing the "
-        "understanding.\n\nWorkspace files:\n" + manifest + "\n\nUser request:\n" + request.message
-    )
-    model_type = "reasoning" if request.model in {"glm", "kimik2.6"} else "balanced"
-    llm = get_llm(model_type, 0.2, min(1800, config["max_tokens"]))
+
+# ---------------------------------------------------------------------------
+# Code mode: autonomous, event-driven workspace agent
+# ---------------------------------------------------------------------------
+
+CODE_MAX_STEPS = 18
+CODE_MAX_OUTPUT = 12000
+CODE_EXCLUDED_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', '.next', 'dist', 'build'}
+
+
+def code_workspace_root() -> pathlib.Path:
+    configured = os.getenv('CODE_WORKSPACE_ROOT') or os.getcwd()
+    return pathlib.Path(configured).resolve()
+
+
+def safe_code_path(root: pathlib.Path, relative: str) -> pathlib.Path:
+    if not relative or pathlib.Path(relative).is_absolute():
+        raise ValueError('A relative workspace path is required.')
+    candidate = (root / relative).resolve()
     try:
-        raw = await invoke_model([SystemMessage(content="You are the idea stage."), HumanMessage(content=prompt)], llm, progress, on_answer_piece=_swallow_answer_piece)
-    except Exception as exc:
-        print(f"[CodeMode] idea stage failed: {exc}")
-        raw = ""
-    return {"config": config, "history": session["messages"], "latest_message": request.message, "existing_files": existing_files, "existing_file_languages": dict(session.get("code_file_languages", {})), "idea": raw.strip()}
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError('The path is outside the allowed workspace.') from exc
+    return candidate
 
 
-async def _swallow_answer_piece(_text: str) -> None:
-    return None
+def code_relpath(root: pathlib.Path, path: pathlib.Path) -> str:
+    return path.resolve().relative_to(root).as_posix()
 
 
-def infer_workspace_files(message: str, existing: dict) -> list[str]:
-    """Recover a concrete file target when the model omits the FILES marker."""
-    if existing:
-        return list(existing)[:8]
-    text = (message or "").lower()
-    candidates = re.findall(r"\b[\w./-]+\.(?:html?|css|jsx?|tsx?|json|py|md)\b", text)
-    if candidates:
-        return list(dict.fromkeys(candidates))[:8]
-    if any(word in text for word in ("html", "website", "web page", "webpage", "landing page", "frontend", "button", "style")):
-        return ["index.html"]
-    return []
+def code_language(path: str) -> str:
+    ext = pathlib.Path(path).suffix.lower().lstrip('.')
+    return {'js': 'javascript', 'ts': 'typescript', 'jsx': 'javascript', 'tsx': 'typescript', 'py': 'python', 'yml': 'yaml', 'md': 'markdown'}.get(ext, ext or 'text')
 
 
-async def code_plan_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
-    existing = state["existing_files"]
-    manifest = "\n".join(f"- {name}" for name in existing) or "- (none)"
-    prompt = (
-        "You are in the PLAN stage. Decide the single next implementation action for the user's request. "
-        "Do not write code. After thinking, respond with a short plan sentence, then exactly:\n"
-        "FILES:\n<one filename per line>\n\n"
-        "For a new build, list the files you will create. For an edit, list the file(s) you will touch. "
-        "Never invent unrelated files.\n\nExisting files:\n" + manifest + "\n\nRequest:\n" + state["latest_message"]
-    )
-    llm = get_llm("fast", 0.2, min(1800, state["config"]["max_tokens"]))
+def code_diff(old: str, new: str, path: str) -> str:
+    return '\n'.join(difflib.unified_diff(old.splitlines(), new.splitlines(), fromfile=f'a/{path}', tofile=f'b/{path}', lineterm=''))
+
+
+def code_diff_stats(old: str, new: str) -> tuple[int, int]:
+    diff = list(difflib.ndiff(old.splitlines(), new.splitlines()))
+    additions = sum(1 for line in diff if line.startswith('+ '))
+    deletions = sum(1 for line in diff if line.startswith('- '))
+    return additions, deletions
+
+
+def code_truncate(value: str, limit: int = CODE_MAX_OUTPUT) -> str:
+    value = value or ''
+    return value if len(value) <= limit else value[:limit] + '\n… output truncated …'
+
+
+async def code_emit(progress, event_type: str, **payload) -> dict:
+    event = {'type': event_type, **payload}
+    if isinstance(progress, asyncio.Queue):
+        await progress.put(event)
+    elif isinstance(progress, list):
+        progress.append(event)
+    return event
+
+
+async def code_model_text(request: CodeChatRequest, prompt: str, progress=None, max_tokens: int = 2200) -> str:
+    model_type = 'reasoning' if request.model in {'glm', 'kimik2.6'} else 'balanced'
+    llm = get_llm(model_type, 0.1, min(max_tokens, get_thinking_config(request.reasoning_level)['max_tokens']))
     try:
-        raw = await invoke_model([SystemMessage(content="You are the plan stage."), HumanMessage(content=prompt)], llm, progress, on_answer_piece=_swallow_answer_piece)
+        # Do not forward hidden reasoning. The model must return only a concise
+        # user-safe decision or tool arguments after thinking privately.
+        result = await invoke_model([SystemMessage(content='You are the decision engine for a real coding agent.'), HumanMessage(content=prompt)], llm, None)
+        return _coerce_model_text(result).strip()
     except Exception as exc:
-        print(f"[CodeMode] plan stage failed: {exc}")
-        raw = ""
-    marker = re.search(r"FILES\s*:\s*\n", raw or "", re.IGNORECASE)
-    summary = (raw[:marker.start()] if marker else (raw or "")).strip()
-    planned = []
-    if marker:
-        for line in raw[marker.end():].splitlines():
-            name = line.strip().strip("-*• ").strip("`")
-            if name and re.fullmatch(r"[\w./-]+\.[A-Za-z0-9]+", name):
-                planned.append(name)
-    if not planned:
-        planned = infer_workspace_files(state["latest_message"], existing)
-    if not summary:
-        target_text = ", ".join(planned) if planned else "the requested workspace"
-        summary = f"I will make the requested change in {target_text}."
-    await publish_event(progress, {"type": "plan", "summary": summary, "files": planned[:8]})
-    state.update({"plan_summary": summary, "planned_files": planned[:8]})
-    return state
+        await code_emit(progress, 'ERROR', message=f'Model decision failed: {type(exc).__name__}.')
+        return ''
 
 
-async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=None, fix_issue: str = "") -> dict:
-    existing = state["existing_files"]
-    languages = state["existing_file_languages"]
-    workspace = "\n\n".join(f"--- FILE: {name} ({languages.get(name, 'text')}) ---\n{content}" for name, content in existing.items()) or "(empty workspace)"
-    planned_targets = state.get("planned_files") or infer_workspace_files(state.get("latest_message", ""), existing)
-    default_filename = next(iter(existing)) if len(existing) == 1 else (planned_targets[0] if len(planned_targets) == 1 else "")
-    issue = f"\nConcrete issue to fix:\n{fix_issue}\n" if fix_issue else ""
-    if existing:
-        format_rules = (
-            "For an existing file, return one or more exact SEARCH/REPLACE blocks. Use `FILE: name` before each "
-            "block when there is more than one file. For a new file, return `FILE: name` followed by a fenced block. "
-            "Do not return a full rewrite for an existing file."
-        )
-    else:
-        format_rules = "Create the requested file(s) using `FILE: name` immediately before each fenced code block."
+async def code_decide(request: CodeChatRequest, state: dict, observations: list[dict], progress=None) -> dict:
+    workspace = state['workspace']
+    recent = json.dumps(observations[-8:], ensure_ascii=False)
     prompt = (
-        "You are in the CODE stage. Apply only the planned request to the workspace. " + format_rules + issue + "\n"
-        "Exact SEARCH/REPLACE format:\n<<<<<<< SEARCH\n<existing lines exactly>\n=======\n<replacement lines>\n>>>>>>> REPLACE\n\n"
-        "Nothing outside the action blocks or FILE/fenced blocks.\n\nWorkspace:\n" + workspace + "\n\nPlan:\n" + state.get("plan_summary", "") + "\n\nUser request:\n" + state["latest_message"]
+        'Choose exactly one real workspace tool for the next action. Never invent a result and never describe a '
+        'tool call that you did not choose. Return JSON only with keys: summary, tool, args. The summary must be a '
+        'short user-safe sentence, not private reasoning. Valid tools: list_files, read_file, search_files, create_file, '
+        'edit_file, delete_file, move_file, run_command, run_tests, git_status, git_diff, finish. '
+        'Inspect before editing. Read only relevant files. Use edit_file with new_content or exact search/replace. '
+        'Use run_tests or a real verification command before finish. If a command or test failed, inspect the output and '
+        'fix the relevant file before retrying. The actual workspace root is supplied to the tool implementation; '
+        'arguments must contain relative paths only. For create_file use {path, content}; for edit_file use {path, '
+        'new_content} or {path, search, replace}; for search_files use {pattern}; for run_command use {command}; '
+        'for run_tests optionally use {command}. Do not output markdown.\n\n'
+        f'Workspace root: {workspace}\nUser task: {request.message}\nState: {json.dumps(state["public_state"], ensure_ascii=False)}\n'
+        f'Recent real observations: {recent}'
     )
-    # Keep the selected model for the IDEA stage, but use the fast reasoning-capable
-    # writer for the concrete action so the live thought -> edit handoff does not stall.
-    llm = get_llm("fast", 0.2, min(2400, state["config"]["max_tokens"]))
-    if existing:
-        for filename in list(existing)[:8]:
-            await publish_activity(progress, "read", f"Reading {filename}", filename=filename)
-    messages = [SystemMessage(content="You are the code action stage."), HumanMessage(content=prompt)]
-
-    async def run_action(action_llm) -> str:
-        code_state = _new_code_stream_state()
-
-        async def on_answer_piece(text: str) -> None:
-            await stream_code_answer_piece(progress, code_state, text)
-
-        raw_text = await invoke_model(messages, action_llm, progress, on_answer_piece=on_answer_piece)
-        await flush_code_answer_stream(progress, code_state)
-        return raw_text or ""
-
+    raw = await code_model_text(request, prompt, progress)
     try:
-        raw = await run_action(llm)
-    except Exception as exc:
-        print(f"[CodeMode] selected code model failed: {exc}")
-        raw = ""
-
-    if not raw.strip():
-        await publish_activity(progress, "note", "The selected code model did not complete; retrying the same edit with the fast code model.")
-        try:
-            raw = await run_action(get_llm("fast", 0.2, min(2400, state["config"]["max_tokens"])))
-        except Exception as exc:
-            print(f"[CodeMode] fast code fallback failed: {exc}")
-            return {"raw": "", "files": dict(existing), "file_languages": dict(languages), "touched_files": [], "explanation": "The code action could not be completed."}
-
-    if existing:
-        await publish_activity(progress, "narration", f"Now let me edit {default_filename or 'the existing files'}.")
-    else:
-        await publish_activity(progress, "narration", "Now let me create the requested files.")
-
-    action_blocks = parse_action_blocks(raw)
-    remaining = _ACTION_BLOCK_RE.sub("", raw)
-    _, single_code, single_language, created_files, created_languages = parse_code_files(remaining)
-    if single_code and not created_files:
-        fallback_name = default_filename or implied_filename(single_language)
-        created_files = {fallback_name: single_code}
-        created_languages = {fallback_name: single_language or "text"}
-    updated = dict(existing)
-    updated_languages = dict(languages)
-    touched = []
-
-    if action_blocks:
-        if existing:
-            updated, edited, ok = apply_action_blocks(existing, action_blocks, default_filename)
-            if not ok:
-                await publish_activity(progress, "note", "The proposed edit did not match the current file exactly; no partial change was applied.")
-                return {"raw": raw, "files": dict(existing), "file_languages": dict(languages), "touched_files": [], "explanation": "No change was applied because the exact edit could not be verified."}
-            touched.extend(edited)
-        else:
-            for filename, _search, replace in action_blocks:
-                target = filename or default_filename
-                if not target or not replace.strip():
-                    await publish_activity(progress, "note", "The proposed new file did not include a valid target or implementation.")
-                    return {"raw": raw, "files": {}, "file_languages": {}, "touched_files": [], "explanation": "No file was created because the action was incomplete."}
-                updated[target] = replace.strip()
-                updated_languages[target] = target.rsplit('.', 1)[-1].lower() if '.' in target else "text"
-                touched.append(target)
-    for filename, content in created_files.items():
-        updated[filename] = content
-        updated_languages[filename] = created_languages.get(filename, "text")
-        if filename not in touched:
-            touched.append(filename)
-
-    for filename in touched:
-        old = existing.get(filename, "")
-        additions, deletions = diff_stats(old, updated[filename])
-        if filename in existing:
-            await publish_activity(progress, "edit", "Editing file", filename=filename, additions=additions, deletions=deletions)
-            await publish_activity(progress, "done", f"Edited {filename}")
-        else:
-            await publish_activity(progress, "create", "Creating file", filename=filename, additions=additions, deletions=0)
-            await publish_activity(progress, "done", f"Created {filename}")
-
-    if not touched and existing:
-        return {"raw": raw, "files": updated, "file_languages": updated_languages, "touched_files": [], "explanation": "The workspace already matches the requested change."}
-    return {"raw": raw, "files": updated, "file_languages": updated_languages, "touched_files": touched, "explanation": f"Applied the planned change to {', '.join(touched)}." if touched else "Generated the requested implementation."}
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict) or not isinstance(parsed.get('tool'), str):
+            raise ValueError('invalid decision shape')
+        return {'summary': str(parsed.get('summary') or 'Continuing with the next workspace action.'), 'tool': parsed['tool'], 'args': parsed.get('args') if isinstance(parsed.get('args'), dict) else {}}
+    except Exception:
+        await code_emit(progress, 'ERROR', message='The agent returned an invalid tool decision.')
+        return {'summary': '', 'tool': 'finish', 'args': {}}
 
 
-async def code_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
-    await publish_progress(progress, "code", "code", "Writing the planned implementation in the workspace.")
-    result = await _invoke_code_action(request, state, progress)
-    state.update(result)
-    return state
-
-
-async def code_test_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
-    files = state.get("files") or {}
-    touched = state.get("touched_files") or list(files)
-    target = touched[0] if touched else (next(iter(files)) if files else "")
-    code = files.get(target, "")
-    language = state.get("file_languages", {}).get(target, "")
-    notes = "No file changed, so there was nothing new to test."
-    passed = True
-    if code.strip() and language.lower() in {"python", "py"}:
-        try:
-            compile(code, target or "<generated>", "exec")
-            notes = f"Python syntax check passed for {target}."
-        except SyntaxError as exc:
-            passed = False
-            notes = f"Python syntax error in {target}: {exc.msg} on line {exc.lineno}."
-    elif code.strip() and language.lower() == "json":
-        try:
-            json.loads(code)
-            notes = f"JSON parse check passed for {target}."
-        except json.JSONDecodeError as exc:
-            passed = False
-            notes = f"Invalid JSON in {target}: {exc.msg} on line {exc.lineno}."
-    elif code.strip():
-        llm = get_llm("fast", 0.1, min(1400, state["config"]["max_tokens"]))
-        prompt = (
-            "You are in the TEST stage. Check the changed file for one concrete breaking issue, syntax problem, "
-            "or missed requirement. Think inside <think> tags. After that respond with exactly PASS or FAIL: <short reason>. "
-            f"\n\nFile: {target}\nLanguage: {language}\n\n{code}"
-        )
-        try:
-            raw = await invoke_model([SystemMessage(content="You are the test stage."), HumanMessage(content=prompt)], llm, progress, on_answer_piece=_swallow_answer_piece)
-            line = (raw or "").strip().splitlines()[-1] if raw else "PASS: no issue reported"
-            passed = not line.upper().startswith("FAIL")
-            notes = line
-        except Exception as exc:
-            notes = f"Test reasoning unavailable; no static failure was found ({type(exc).__name__})."
-    if target:
-        await publish_activity(progress, "narration", "Let me check this correctly working.")
-        await publish_activity(progress, "narration", "Running command")
-        await publish_activity(progress, "command", "Ran a command")
-        if passed:
-            await publish_activity(progress, "note", "I checked here—no bugs or issues.")
-        else:
-            await publish_activity(progress, "note", f"I found an issue in {target}: {notes}")
-    state.update({"test_passed": passed, "test_notes": notes, "test_target": target, "needs_fix": not passed, "review_notes": ""})
-    return state
-
-
-async def code_review_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
-    files = state.get("files") or {}
-    touched = state.get("touched_files") or list(files)
-    target = touched[0] if touched else (next(iter(files)) if files else "")
-    if not target or state.get("config", {}).get("label") == "Low":
-        return state
-    code = files.get(target, "")
-    language = state.get("file_languages", {}).get(target, "")
-    llm = get_llm("fast", 0.1, min(1400, state["config"]["max_tokens"]))
-    prompt = (
-        "You are in the REVIEW stage. Review the changed file against the user request and test notes. "
-        "Think inside <think> tags. Then respond exactly PASS or FAIL: <one concrete issue>. Do not suggest style changes.\n\n"
-        f"Request: {state['latest_message']}\nTest notes: {state.get('test_notes', '')}\nFile: {target} ({language})\n\n{code}"
-    )
-    try:
-        raw = await invoke_model([SystemMessage(content="You are the review stage."), HumanMessage(content=prompt)], llm, progress, on_answer_piece=_swallow_answer_piece)
-        line = (raw or "").strip().splitlines()[-1] if raw else "PASS: review unavailable"
-    except Exception as exc:
-        line = f"PASS: review unavailable ({type(exc).__name__})"
-    review_failed = line.upper().startswith("FAIL")
-    if review_failed:
-        await publish_activity(progress, "note", f"I found an issue in {target}: {line}")
-    state.update({"review_notes": line, "needs_fix": bool(state.get("needs_fix")) or review_failed, "review_target": target})
-    return state
-
-
-async def code_fix_node(request: CodeChatRequest, state: dict, progress=None) -> dict:
-    if not state.get("needs_fix"):
-        return state
-    target = state.get("test_target") or state.get("review_target") or next(iter(state.get("files", {})), "")
-    issue = f"{state.get('test_notes', '')}\n{state.get('review_notes', '')}"
-    await publish_progress(progress, "fix", "fix", f"Fixing the verified issue in {target} without rewriting the file.")
-    fixed = await _invoke_code_action(request, {**state, "existing_files": state.get("files", {}), "existing_file_languages": state.get("file_languages", {})}, progress, fix_issue=issue)
-    state.update(fixed)
-    state["needs_fix"] = False
-    return state
-
-
-async def code_commit_node(state: dict, progress=None) -> dict:
-    files = state.get("files") or {}
-    touched = state.get("touched_files") or list(files)
-    summary = state.get("explanation") or "Completed the requested Code-mode change."
-    await publish_activity(progress, "done", "Presenting files")
-    state["explanation"] = summary
-    state["commit_message"] = f"Applied Code-mode change to {', '.join(touched) if touched else 'the workspace'}"
-    return state
-
-
-async def code_finalize_node(state: dict, progress=None) -> dict:
-    files = state.get("files", {})
-    file_languages = state.get("file_languages", {})
-    previewable = {"html", "htm", "css", "js", "javascript", "jsx", "tsx"}
-    language = state.get("language", "")
-    show_preview = language.lower() in previewable or any((item or "").lower() in previewable for item in file_languages.values())
-    if len(files) == 1:
-        only_name = next(iter(files))
-        state["code"] = files[only_name]
-        state["language"] = file_languages.get(only_name, state.get("language", ""))
-    await publish_progress(progress, "commit", "commit", f"Prepared {len(files)} workspace file(s) for the existing canvas.")
-    await publish_turn_summary(progress, files_touched=len(state.get("touched_files") or []), commands_run=0, files_read=len(state.get("existing_files") or {}), notes=1)
-    return {
-        "response": state.get("explanation") or "Completed the requested Code-mode change.",
-        "code": state.get("code", ""),
-        "language": state.get("language", ""),
-        "files": files,
-        "file_languages": file_languages,
-        "show_preview": show_preview,
-        "thinking_summary": "Completed Idea, Plan, Code, Test, Review, Fix, and Commit stages.",
-        "thinking_level": state["config"]["label"],
-        "max_tokens": state["config"]["max_tokens"],
-    }
-
-
-async def generate_code_once(request: CodeChatRequest, session: dict, progress=None) -> dict:
-    state = await code_idea_node(request, session, progress)
-    state = await code_plan_node(request, state, progress)
-    state = await code_node(request, state, progress)
-    for _ in range(2):
-        state = await code_test_node(request, state, progress)
-        state = await code_review_node(request, state, progress)
-        if not state.get("needs_fix"):
+async def code_list_files(root: pathlib.Path, progress) -> dict:
+    files = []
+    for item in sorted(root.rglob('*')):
+        if not item.is_file() or any(part in CODE_EXCLUDED_DIRS for part in item.relative_to(root).parts):
+            continue
+        files.append(code_relpath(root, item))
+        if len(files) >= 500:
             break
-        state = await code_fix_node(request, state, progress)
-    state = await code_commit_node(state, progress)
-    result = await code_finalize_node(state, progress)
-    session["code_files"] = dict(state.get("files") or {})
-    session["code_file_languages"] = dict(state.get("file_languages") or {})
+    await code_emit(progress, 'WORKSPACE_LISTED', files=files, count=len(files))
+    return {'files': files, 'count': len(files)}
+
+
+async def code_read_file(root: pathlib.Path, args: dict, state: dict, progress) -> dict:
+    path = str(args.get('path') or '')
+    target = safe_code_path(root, path)
+    if not target.is_file():
+        raise FileNotFoundError(path)
+    content = target.read_text(errors='replace')
+    state['read_files'].add(path)
+    await code_emit(progress, 'FILE_READ', path=path, lines=len(content.splitlines()), bytes=len(content.encode('utf-8', errors='ignore')))
+    return {'path': path, 'content': code_truncate(content, 24000)}
+
+
+async def code_search_files(root: pathlib.Path, args: dict, progress) -> dict:
+    pattern = str(args.get('pattern') or '')
+    if not pattern:
+        raise ValueError('A search pattern is required.')
+    await code_emit(progress, 'SEARCH_STARTED', pattern=pattern)
+    try:
+        regex = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        regex = re.compile(re.escape(pattern), re.IGNORECASE)
+    matches = []
+    for item in sorted(root.rglob('*')):
+        if not item.is_file() or any(part in CODE_EXCLUDED_DIRS for part in item.relative_to(root).parts):
+            continue
+        try:
+            lines = item.read_text(errors='replace').splitlines()
+        except OSError:
+            continue
+        for number, line in enumerate(lines, 1):
+            if regex.search(line):
+                matches.append({'path': code_relpath(root, item), 'line': number, 'text': line[:300]})
+                if len(matches) >= 100:
+                    break
+        if len(matches) >= 100:
+            break
+    await code_emit(progress, 'SEARCH_RESULT', pattern=pattern, matches=matches, count=len(matches))
+    return {'pattern': pattern, 'matches': matches, 'count': len(matches)}
+
+
+async def code_apply_file_change(root: pathlib.Path, path: str, old: str, new: str, progress, created: bool = False) -> dict:
+    target = safe_code_path(root, path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    diff = code_diff(old, new, path)
+    additions, deletions = code_diff_stats(old, new)
+    await code_emit(progress, 'FILE_EDIT_STARTED', path=path, created=created, old_lines=len(old.splitlines()), new_lines=len(new.splitlines()), additions=additions, deletions=deletions)
+    target.write_text(new)
+    event = {'path': path, 'old_content': old, 'new_content': new, 'diff': diff, 'additions': additions, 'deletions': deletions, 'status': 'completed'}
+    await code_emit(progress, 'FILE_DIFF', **event)
+    if created:
+        await code_emit(progress, 'FILE_CREATED', path=path, additions=additions, deletions=deletions)
+    await code_emit(progress, 'FILE_EDIT_COMPLETED', path=path, created=created, additions=additions, deletions=deletions)
+    return {'path': path, 'additions': additions, 'deletions': deletions, 'diff': diff}
+
+
+async def code_create_file(root: pathlib.Path, args: dict, state: dict, progress) -> dict:
+    path = str(args.get('path') or '')
+    target = safe_code_path(root, path)
+    if target.exists():
+        raise FileExistsError(path)
+    content = _coerce_model_text(args.get('content') or '')
+    result = await code_apply_file_change(root, path, '', content, progress, created=True)
+    state['modified_files'].add(path)
     return result
+
+
+async def code_edit_file(root: pathlib.Path, args: dict, state: dict, progress) -> dict:
+    path = str(args.get('path') or '')
+    target = safe_code_path(root, path)
+    old = target.read_text(errors='replace') if target.exists() else ''
+    if 'new_content' in args:
+        new = _coerce_model_text(args.get('new_content'))
+    else:
+        search = _coerce_model_text(args.get('search') or '')
+        replace = _coerce_model_text(args.get('replace') or '')
+        if not search or search not in old:
+            raise ValueError(f'Exact search text was not found in {path}.')
+        new = old.replace(search, replace, 1)
+    result = await code_apply_file_change(root, path, old, new, progress, created=not target.exists())
+    state['modified_files'].add(path)
+    return result
+
+
+async def code_delete_file(root: pathlib.Path, args: dict, state: dict, progress) -> dict:
+    path = str(args.get('path') or '')
+    target = safe_code_path(root, path)
+    if not target.is_file():
+        raise FileNotFoundError(path)
+    target.unlink()
+    state['modified_files'].add(path)
+    await code_emit(progress, 'FILE_DELETED', path=path)
+    return {'path': path, 'deleted': True}
+
+
+async def code_move_file(root: pathlib.Path, args: dict, state: dict, progress) -> dict:
+    source = str(args.get('source') or '')
+    destination = str(args.get('destination') or '')
+    src = safe_code_path(root, source)
+    dst = safe_code_path(root, destination)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dst))
+    state['modified_files'].update({source, destination})
+    await code_emit(progress, 'FILE_MOVED', source=source, destination=destination)
+    return {'source': source, 'destination': destination}
+
+
+async def code_run_command(root: pathlib.Path, command: str, progress, event_prefix: str = 'COMMAND') -> dict:
+    command = command.strip()
+    if not command:
+        raise ValueError('A command is required.')
+    if len(command) > 500:
+        raise ValueError('Command is too long.')
+    lowered = command.lower()
+    if any(token in lowered for token in ('sudo ', 'shutdown', 'mkfs', ':(){', ' rm -rf /', ' rm -fr /')):
+        raise PermissionError('Destructive or privileged commands are not allowed.')
+    if re.search(r'(^|\s)(/etc|/usr|/var|/home/[^\s]+|\.\./)', command):
+        raise PermissionError('The command references a path outside the workspace.')
+    await code_emit(progress, f'{event_prefix}_STARTED', command=command)
+    started = time.monotonic()
+    process = await asyncio.create_subprocess_shell(command, cwd=str(root), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    output = []
+    timed_out = False
+    while True:
+        remaining = 60 - (time.monotonic() - started)
+        if remaining <= 0:
+            timed_out = True
+            process.kill()
+            break
+        try:
+            line = await asyncio.wait_for(process.stdout.readline(), timeout=min(1.0, remaining))
+        except asyncio.TimeoutError:
+            continue
+        if not line:
+            break
+        text = line.decode(errors='replace')
+        output.append(text)
+        await code_emit(progress, 'COMMAND_OUTPUT', command=command, output=text)
+    return_code = await process.wait()
+    if timed_out:
+        return_code = 124
+        output.append('Command timed out after 60 seconds.\n')
+        await code_emit(progress, 'ERROR', message=f'Command timed out: {command}')
+    result = {'command': command, 'return_code': return_code, 'output': code_truncate(''.join(output))}
+    await code_emit(progress, f'{event_prefix}_COMPLETED', **result)
+    return result
+
+
+async def code_run_tests(root: pathlib.Path, args: dict, state: dict, progress) -> dict:
+    command = str(args.get('command') or '').strip()
+    if not command:
+        if (root / 'package.json').is_file():
+            command = 'npm test -- --runInBand'
+        elif (root / 'pytest.ini').is_file() or (root / 'pyproject.toml').is_file() or (root / 'setup.cfg').is_file():
+            command = 'pytest -q'
+        else:
+            command = 'git diff --check'
+    await code_emit(progress, 'TEST_STARTED', command=command)
+    result = await code_run_command(root, command, progress, event_prefix='COMMAND')
+    passed = result['return_code'] == 0
+    await code_emit(progress, 'TEST_RESULT', command=command, passed=passed, return_code=result['return_code'], output=result['output'])
+    state['verification_done'] = True
+    state['last_test_passed'] = passed
+    return {'command': command, 'passed': passed, **result}
+
+
+async def code_git(root: pathlib.Path, args: dict, progress, diff: bool = False) -> dict:
+    command = 'git diff -- ' + str(args.get('path') or '') if diff and args.get('path') else ('git diff' if diff else 'git status --short')
+    result = await code_run_command(root, command, progress, event_prefix='COMMAND')
+    await code_emit(progress, 'GIT_DIFF' if diff else 'GIT_STATUS', output=result['output'], return_code=result['return_code'])
+    return result
+
+
+async def code_execute_tool(root: pathlib.Path, name: str, args: dict, state: dict, progress) -> dict:
+    if name == 'list_files':
+        return await code_list_files(root, progress)
+    if name == 'read_file':
+        return await code_read_file(root, args, state, progress)
+    if name == 'search_files':
+        return await code_search_files(root, args, progress)
+    if name == 'create_file':
+        return await code_create_file(root, args, state, progress)
+    if name == 'edit_file':
+        return await code_edit_file(root, args, state, progress)
+    if name == 'delete_file':
+        return await code_delete_file(root, args, state, progress)
+    if name == 'move_file':
+        return await code_move_file(root, args, state, progress)
+    if name == 'run_command':
+        return await code_run_command(root, str(args.get('command') or ''), progress)
+    if name == 'run_tests':
+        return await code_run_tests(root, args, state, progress)
+    if name == 'git_status':
+        return await code_git(root, args, progress, diff=False)
+    if name == 'git_diff':
+        return await code_git(root, args, progress, diff=True)
+    raise ValueError(f'Unknown workspace tool: {name}')
+
+
+async def autonomous_code_once(request: CodeChatRequest, session: dict, progress=None) -> dict:
+    root = code_workspace_root()
+    state = {
+        'workspace': str(root),
+        'modified_files': set(),
+        'read_files': set(),
+        'verification_done': False,
+        'last_test_passed': None,
+        'public_state': {'workspace': str(root), 'modified_files': [], 'read_files': [], 'commands': [], 'errors': [], 'verification_done': False},
+    }
+    observations = []
+    await code_emit(progress, 'AGENT_STARTED', task=request.message, workspace=str(root))
+    for step in range(CODE_MAX_STEPS):
+        state['public_state']['modified_files'] = sorted(state['modified_files'])
+        state['public_state']['read_files'] = sorted(state['read_files'])
+        decision = await code_decide(request, state, observations, progress)
+        if decision['summary']:
+            await code_emit(progress, 'TASK_ANALYSIS', summary=decision['summary'], tool=decision['tool'])
+        tool = decision['tool']
+        args = decision['args']
+        if tool == 'finish':
+            if not state['verification_done']:
+                await code_emit(progress, 'RETRY', reason='The workspace has not been verified yet; choosing a real test or check before finishing.')
+                observations.append({'tool': 'finish', 'result': 'blocked: verification required'})
+                continue
+            if state['last_test_passed'] is False:
+                await code_emit(progress, 'RETRY', reason='The last verification failed; the agent must inspect and repair the result.')
+                observations.append({'tool': 'finish', 'result': 'blocked: verification failed'})
+                continue
+            await code_emit(progress, 'VERIFICATION', status='passed', files=sorted(state['modified_files']))
+            await code_emit(progress, 'AGENT_COMPLETED', files=sorted(state['modified_files']), steps=step + 1)
+            break
+        try:
+            result = await code_execute_tool(root, tool, args, state, progress)
+            observations.append({'summary': decision['summary'], 'tool': tool, 'args': args, 'result': code_truncate(json.dumps(result, ensure_ascii=False), 5000)})
+            state['public_state']['commands'].append(tool) if tool in {'run_command', 'run_tests', 'git_status', 'git_diff'} else None
+        except Exception as exc:
+            message = f'{type(exc).__name__}: {exc}'
+            state['public_state']['errors'].append(message)
+            await code_emit(progress, 'ERROR', tool=tool, message=message)
+            await code_emit(progress, 'RETRY', reason='The agent will inspect the real error and choose the next corrective action.')
+            observations.append({'summary': decision['summary'], 'tool': tool, 'args': args, 'error': message})
+    else:
+        await code_emit(progress, 'ERROR', message='The agent reached its safe action limit before verification completed.')
+
+    changed = {}
+    languages = {}
+    for relative in sorted(state['modified_files']):
+        target = safe_code_path(root, relative)
+        if target.is_file():
+            changed[relative] = target.read_text(errors='replace')
+            languages[relative] = code_language(relative)
+    files = changed
+    code = next(iter(files.values())) if len(files) == 1 else ''
+    language = next(iter(languages.values())) if len(languages) == 1 else ''
+    summary = 'Completed the autonomous workspace task.' if state['verification_done'] and state['last_test_passed'] is not False else 'The autonomous workspace task needs another run after the reported error.'
+    await code_emit(progress, 'turn_summary', files_touched=len(state['modified_files']), commands_run=len(state['public_state']['commands']), files_read=len(state['read_files']), notes=len(state['public_state']['errors']))
+    return {'response': summary, 'code': code, 'language': language, 'files': files, 'file_languages': languages, 'show_preview': bool(files), 'thinking_summary': 'Real workspace actions, tool results, and verification were streamed; private reasoning was not exposed.', 'thinking_level': get_thinking_config(request.reasoning_level)['label'], 'max_tokens': get_thinking_config(request.reasoning_level)['max_tokens'], 'workspace': str(root), 'modified_files': sorted(state['modified_files'])}
+
+
+async def forward_live_events(task: asyncio.Task, progress_queue: asyncio.Queue, session_id: str):
+    while not task.done() or not progress_queue.empty():
+        try:
+            yield await asyncio.wait_for(progress_queue.get(), timeout=2.5)
+        except asyncio.TimeoutError:
+            yield {'type': 'AGENT_HEARTBEAT', 'label': 'Working'}
+
+
+async def generate_code_stream(request: CodeChatRequest, session: dict, session_id: str):
+    progress_queue: asyncio.Queue = asyncio.Queue()
+    task = asyncio.create_task(autonomous_code_once(request, session, progress_queue))
+    result = None
+    try:
+        async for event in forward_live_events(task, progress_queue, session_id):
+            yield f'data: {json.dumps(event, ensure_ascii=False)}\n\n'
+        result = await task
+    except Exception as exc:
+        print(f'[{session_id}] Autonomous Code mode failed: {exc}')
+        result = {'response': 'The autonomous workspace agent failed before completing the task.', 'code': '', 'language': '', 'files': {}, 'file_languages': {}, 'show_preview': False}
+        yield f'data: {json.dumps({"type": "ERROR", "message": str(exc)}, ensure_ascii=False)}\n\n'
+    if result.get('files'):
+        yield f'data: {json.dumps({"type": "code_result", **result, "session_id": session_id}, ensure_ascii=False)}\n\n'
+    yield f'data: {json.dumps({"type": "message", "assistant_message": result["response"], "conversation_id": session_id, "session_id": session_id}, ensure_ascii=False)}\n\n'
+    session['messages'].append(AIMessage(content=result['response']))
+    session['code_workspace'] = result.get('workspace', str(code_workspace_root()))
 
 
 @app.get("/health")
