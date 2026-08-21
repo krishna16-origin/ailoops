@@ -174,14 +174,21 @@
         .message-text .artifact-preview.code-preview-frame { padding:0; display:block; }
         .message-text .code-preview-frame iframe { width:100%; min-height:360px; border:none; display:block; background:#fff; }
         .message-text .code-card [hidden] { display:none !important; }
-        .message-text .artifact-chip { display:flex; align-items:center; gap:12px; margin:14px 0; padding:10px 14px; border:1px solid var(--border-color); border-radius:12px; background-color:#262626; cursor:pointer; transition:background 0.2s ease, border-color 0.2s ease; max-width:320px; }
+        .message-text .artifact-chip { display:block; margin:14px 0; padding:10px; border:1px solid var(--border-color); border-radius:12px; background-color:#262626; cursor:pointer; transition:background 0.2s ease, border-color 0.2s ease; max-width:440px; }
         .message-text .artifact-chip:hover { background-color:#2d2d2d; border-color:rgba(255,255,255,0.18); }
-        .message-text .artifact-chip-icon { flex-shrink:0; width:34px; height:34px; border-radius:8px; background-color:rgba(16,163,127,0.15); color:var(--accent); display:flex; align-items:center; justify-content:center; }
-        .message-text .artifact-chip-icon svg { width:18px; height:18px; }
+        .message-text .artifact-chip-header { display:flex; align-items:center; gap:10px; padding:2px 3px 9px; }
+        .message-text .artifact-chip-icon { flex-shrink:0; width:30px; height:30px; border-radius:8px; background-color:rgba(16,163,127,0.15); color:var(--accent); display:flex; align-items:center; justify-content:center; }
+        .message-text .artifact-chip-icon svg { width:17px; height:17px; }
         .message-text .artifact-chip-info { flex:1; min-width:0; }
         .message-text .artifact-chip-title { font-size:13.5px; font-weight:500; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .message-text .artifact-chip-meta { font-size:12px; color:var(--text-secondary); margin-top:2px; }
-        .message-text .artifact-chip-btn { flex-shrink:0; background-color:var(--text-primary); color:var(--bg-main); border:none; border-radius:999px; font-size:12.5px; font-weight:600; padding:6px 14px; cursor:pointer; pointer-events:none; }
+        .message-text .artifact-chip-btn { flex-shrink:0; background-color:var(--text-primary); color:var(--bg-main); border:none; border-radius:999px; font-size:12.5px; font-weight:600; padding:6px 14px; cursor:pointer; }
+        .message-text .artifact-file-list { display:flex; flex-direction:column; gap:4px; border-top:1px solid var(--border-color); padding-top:7px; }
+        .message-text .artifact-file-row { display:flex; align-items:center; gap:9px; width:100%; border:0; border-radius:8px; background:transparent; color:var(--text-primary); padding:8px 7px; text-align:left; cursor:pointer; }
+        .message-text .artifact-file-row:hover { background:rgba(255,255,255,0.07); }
+        .message-text .artifact-file-icon { width:18px; height:18px; color:var(--text-secondary); flex-shrink:0; }
+        .message-text .artifact-file-name { flex:1; min-width:0; font-family:'Courier New', Courier, monospace; font-size:12.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .message-text .artifact-file-language { color:var(--text-secondary); font-size:11.5px; }
         /* Small status-only chip shown INSIDE the chat message while a file is being
            generated — names the file and shows a pulsing "writing" dot, but never renders
            the code itself in the chat; the live code only ever appears in the canvas panel.
@@ -1102,28 +1109,45 @@
         // it (re)opens the Canvas panel — this is the ONLY other way besides auto-open to bring
         // the panel back after the user has closed it with X. Pass either `files` (a
         // {filename: code} map, for multi-file builds) or `language`/`code` for a single file.
-        function appendArtifactChip(container, { language, code, files } = {}) {
+        function appendArtifactChip(container, { language, code, files, fileLanguages } = {}) {
             const hasFiles = files && Object.keys(files).length > 0;
             if (!hasFiles && !code) return;
             const chip = document.createElement('div');
             chip.className = 'artifact-chip';
-            const fileCount = hasFiles ? Object.keys(files).length : 1;
-            const title = hasFiles
-                ? (fileCount === 1 ? Object.keys(files)[0] : `${fileCount} files`)
-                : `code.${fileExtensionFor(language)}`;
-            const meta = hasFiles && fileCount > 1
-                ? `${fileCount} files`
-                : new Date().toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+            const entries = hasFiles ? Object.entries(files) : [['__single__', code]];
+            const fileCount = entries.length;
+            const title = hasFiles ? (fileCount === 1 ? entries[0][0] : 'Generated files') : `code.${fileExtensionFor(language)}`;
+            const meta = fileCount === 1 ? '1 file' : `${fileCount} files`;
             chip.innerHTML = `
-                <div class="artifact-chip-icon">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+                <div class="artifact-chip-header">
+                    <div class="artifact-chip-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+                    </div>
+                    <div class="artifact-chip-info">
+                        <div class="artifact-chip-title">${escapeHtml(title)}</div>
+                        <div class="artifact-chip-meta">${escapeHtml(meta)}</div>
+                    </div>
+                    <button type="button" class="artifact-chip-btn">Open</button>
                 </div>
-                <div class="artifact-chip-info">
-                    <div class="artifact-chip-title">${escapeHtml(title)}</div>
-                    <div class="artifact-chip-meta">${escapeHtml(meta)}</div>
-                </div>
-                <button type="button" class="artifact-chip-btn">Open</button>
+                <div class="artifact-file-list"></div>
             `;
+            const list = chip.querySelector('.artifact-file-list');
+            entries.forEach(([filename]) => {
+                const row = document.createElement('button');
+                row.type = 'button';
+                row.className = 'artifact-file-row';
+                const fileLanguage = hasFiles ? ((fileLanguages && fileLanguages[filename]) || '') : (language || '');
+                row.innerHTML = `<svg class="artifact-file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg><span class="artifact-file-name">${escapeHtml(filename === '__single__' ? title : filename)}</span><span class="artifact-file-language">${escapeHtml(friendlyLangLabel(fileLanguage))}</span>`;
+                row.addEventListener('click', (event) => {
+                    event.stopPropagation();
+                    if (modes.code.canvas) {
+                        modes.code.canvas.open = true;
+                        if (hasFiles && modes.code.canvas.files[filename]) modes.code.canvas.activeFile = filename;
+                    }
+                    renderCodeCanvas();
+                });
+                list.appendChild(row);
+            });
             chip.addEventListener('click', () => {
                 if (modes.code.canvas) modes.code.canvas.open = true;
                 renderCodeCanvas();
@@ -1913,7 +1937,7 @@
                         // Generation is done — the live status chip's job is over. The finished
                         // file(s) go to the canvas + artifact chip instead.
                         removeInlineCodeStatus(inlineCodeStatus);
-                        appendArtifactChip(textContainer, { language: codeResult.language, code: codeResult.code, files: codeResult.files });
+                        appendArtifactChip(textContainer, { language: codeResult.language, code: codeResult.code, files: codeResult.files, fileLanguages: codeResult.file_languages });
                         updateCodeCanvas({ language: codeResult.language, code: codeResult.code, files: codeResult.files, fileLanguages: codeResult.file_languages, showPreview: codeResult.show_preview });
                     } else {
                         removeInlineCodeStatus(inlineCodeStatus);
@@ -1935,7 +1959,7 @@
                         highlightCode(textContainer);
                         // Non-streaming response: the full code arrives in one shot, so there's
                         // no "live" phase to show — go straight to the chip, as before.
-                        appendArtifactChip(textContainer, { language: data.language, code: data.code, files: data.files });
+                        appendArtifactChip(textContainer, { language: data.language, code: data.code, files: data.files, fileLanguages: data.file_languages });
                         updateCodeCanvas({ language: data.language, code: data.code, files: data.files, fileLanguages: data.file_languages, showPreview: data.show_preview });
                     } else {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
