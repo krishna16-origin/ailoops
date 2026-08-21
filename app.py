@@ -382,7 +382,7 @@ def _extract_reasoning(obj) -> str:
     return _coerce_model_text(kwargs.get("reasoning_content") or kwargs.get("reasoning") or "")
 
 
-async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None) -> str:
+async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None, thinking_mode: Optional[bool] = None) -> str:
     """Invoke once. When a live queue is provided, stream BOTH the visible answer
     ('token' events) and the model's own live reasoning trace ('thought' events) in
     real time, exactly as the model produces them — mirroring Claude.ai's extended
@@ -401,8 +401,9 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
     the stream for FILE:/fenced-code boundaries and emit code_start/code_file_start/
     code_delta events into the response diff box instead.
 """
+    invoke_kwargs = {} if thinking_mode is None else {"thinking_mode": thinking_mode}
     if not isinstance(progress, asyncio.Queue):
-        result = await llm.ainvoke(messages)
+        result = await llm.ainvoke(messages, **invoke_kwargs)
         reasoning = _extract_reasoning(result)
         if reasoning and isinstance(progress, list):
             progress.append({"step": "reasoning", "label": "Thinking", "detail": reasoning.strip()})
@@ -467,7 +468,7 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
                 buffer = buffer[idx + len(tag):]
                 in_thought = False
 
-    async for chunk in llm.astream(messages):
+    async for chunk in llm.astream(messages, **invoke_kwargs):
         reasoning_piece = _extract_reasoning(chunk)
         if reasoning_piece:
             reasoning_seen = True
@@ -649,23 +650,27 @@ def extract_code_artifact(text: str) -> tuple[str, str, str, dict, dict]:
 # ---------------------------------------------------------------------------
 
 CODE_MAX_OUTPUT = 12000
+CODE_GENERATION_TIMEOUT = 90
 
 
 async def generate_code_once(request: CodeChatRequest, session: dict, progress=None, on_answer_piece=None) -> dict:
     config = get_thinking_config(request.reasoning_level)
-    model_type = 'reasoning' if request.model in {'glm', 'kimik2.6'} else 'balanced'
+    model_key = (request.model or 'glm').strip().lower()
     await publish_progress(
         progress,
         'code_generation_started',
         'code_generation_started',
         f"Generating code with {config['label']} effort and a {config['max_tokens']}-token budget.",
     )
-    llm = get_llm(model_type, 0.2, config['max_tokens'])
+    llm = get_llm(model_key, 0.2, config['max_tokens'])
+    code_model_key = model_key
+    thinking_mode = True if code_model_key in {'kimik2.6', 'kimi-k2.6', 'glm', 'glm5.2', 'glm-5.2'} else None
     raw_response = await invoke_model(
         build_code_messages(session['messages'], request.reasoning_level),
         llm,
         progress,
         on_answer_piece=on_answer_piece,
+        thinking_mode=thinking_mode,
     )
     explanation, code, language, files, file_languages = extract_code_artifact(raw_response)
     if not explanation:
@@ -697,7 +702,12 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
     async def on_answer_piece(text: str) -> None:
         await stream_code_answer_piece(progress_queue, code_state, text)
 
-    task = asyncio.create_task(generate_code_once(request, session, progress_queue, on_answer_piece))
+    task = asyncio.create_task(
+        asyncio.wait_for(
+            generate_code_once(request, session, progress_queue, on_answer_piece),
+            timeout=CODE_GENERATION_TIMEOUT,
+        )
+    )
     result = None
     try:
         async for event in forward_live_events(task, progress_queue, session_id):
