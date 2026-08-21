@@ -851,9 +851,6 @@ async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=No
     if existing:
         for filename in list(existing)[:8]:
             await publish_activity(progress, "read", f"Reading {filename}", filename=filename)
-        await publish_activity(progress, "narration", f"Now let me edit {default_filename or 'the existing files'}.")
-    else:
-        await publish_activity(progress, "narration", "Now let me create the requested files.")
     messages = [SystemMessage(content="You are the code action stage."), HumanMessage(content=prompt)]
 
     async def run_action(action_llm) -> str:
@@ -879,6 +876,11 @@ async def _invoke_code_action(request: CodeChatRequest, state: dict, progress=No
         except Exception as exc:
             print(f"[CodeMode] fast code fallback failed: {exc}")
             return {"raw": "", "files": dict(existing), "file_languages": dict(languages), "touched_files": [], "explanation": "The code action could not be completed."}
+
+    if existing:
+        await publish_activity(progress, "narration", f"Now let me edit {default_filename or 'the existing files'}.")
+    else:
+        await publish_activity(progress, "narration", "Now let me create the requested files.")
 
     action_blocks = parse_action_blocks(raw)
     remaining = _ACTION_BLOCK_RE.sub("", raw)
@@ -943,9 +945,6 @@ async def code_test_node(request: CodeChatRequest, state: dict, progress=None) -
     language = state.get("file_languages", {}).get(target, "")
     notes = "No file changed, so there was nothing new to test."
     passed = True
-    if target:
-        await publish_activity(progress, "narration", "Let me check this correctly working.")
-        await publish_activity(progress, "narration", "Running command")
     if code.strip() and language.lower() in {"python", "py"}:
         try:
             compile(code, target or "<generated>", "exec")
@@ -975,6 +974,8 @@ async def code_test_node(request: CodeChatRequest, state: dict, progress=None) -
         except Exception as exc:
             notes = f"Test reasoning unavailable; no static failure was found ({type(exc).__name__})."
     if target:
+        await publish_activity(progress, "narration", "Let me check this correctly working.")
+        await publish_activity(progress, "narration", "Running command")
         await publish_activity(progress, "command", "Ran a command")
         if passed:
             await publish_activity(progress, "note", "I checked here—no bugs or issues.")
