@@ -73,7 +73,9 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
     elif model_type_clean in {"glm", "glm5.2", "glm-5.2"}:
-        model_name = "z-ai/glm-5.1"
+        # NVIDIA's current endpoint is z-ai/glm-5.2. The old z-ai/glm-5.1
+        # function is degraded and causes Code mode requests to fail.
+        model_name = "z-ai/glm-5.2"
     elif model_type_clean in {"kimi", "kimik2.6", "kimi-k2.6"}:
         model_name = "moonshotai/kimi-k2.6"
     return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=120)
