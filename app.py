@@ -72,13 +72,16 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
         model_name = "deepseek-ai/deepseek-v4-pro"
     elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
-    elif model_type_clean in {"glm", "glm5.2", "glm-5.2"}:
-        # NVIDIA's current endpoint is z-ai/glm-5.2. The old z-ai/glm-5.1
-        # function is degraded and causes Code mode requests to fail.
-        model_name = "z-ai/glm-5.2"
-    elif model_type_clean in {"kimi", "kimik2.6", "kimi-k2.6"}:
-        model_name = "moonshotai/kimi-k2.6"
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=120)
+    elif model_type_clean in {"gpt120b", "gpt-oss-120b", "openai/gpt-oss-120b"}:
+        model_name = "openai/gpt-oss-120b"
+    elif model_type_clean in {"glm", "glm5.2", "glm-5.2", "kimi", "kimik2.6", "kimi-k2.6"}:
+        # GLM 5.2 is currently end-of-life on the deployed NVIDIA account and
+        # Kimi K2.6 is not provisioned there. Keep old request values compatible
+        # but route them to the available GPT-OSS 120B provider instead.
+        model_name = "openai/gpt-oss-120b"
+    if model_name == "openai/gpt-oss-120b":
+        max_tokens = min(max_tokens, 4096)
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
 
 
 def strip_thinking(text: str) -> str:
@@ -382,7 +385,7 @@ def _extract_reasoning(obj) -> str:
     return _coerce_model_text(kwargs.get("reasoning_content") or kwargs.get("reasoning") or "")
 
 
-async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None, thinking_mode: Optional[bool] = None) -> str:
+async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None, thinking_mode: Optional[bool] = None, reasoning_effort: Optional[str] = None) -> str:
     """Invoke once. When a live queue is provided, stream BOTH the visible answer
     ('token' events) and the model's own live reasoning trace ('thought' events) in
     real time, exactly as the model produces them — mirroring Claude.ai's extended
@@ -402,6 +405,8 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
     code_delta events into the response diff box instead.
 """
     invoke_kwargs = {} if thinking_mode is None else {"thinking_mode": thinking_mode}
+    if reasoning_effort:
+        invoke_kwargs["reasoning_effort"] = reasoning_effort
     if not isinstance(progress, asyncio.Queue):
         result = await llm.ainvoke(messages, **invoke_kwargs)
         reasoning = _extract_reasoning(result)
@@ -664,13 +669,17 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
     )
     llm = get_llm(model_key, 0.2, config['max_tokens'])
     code_model_key = model_key
-    thinking_mode = True if code_model_key in {'kimik2.6', 'kimi-k2.6', 'glm', 'glm5.2', 'glm-5.2'} else None
+    thinking_mode = None
+    reasoning_effort = ({'low': 'low', 'medium': 'medium', 'high': 'high'}.get(normalize_thinking_level(request.reasoning_level))
+                        if code_model_key in {'gpt120b', 'gpt-oss-120b', 'openai/gpt-oss-120b', 'kimi', 'kimik2.6', 'kimi-k2.6', 'glm', 'glm5.2', 'glm-5.2'}
+                        else None)
     raw_response = await invoke_model(
         build_code_messages(session['messages'], request.reasoning_level),
         llm,
         progress,
         on_answer_piece=on_answer_piece,
         thinking_mode=thinking_mode,
+        reasoning_effort=reasoning_effort,
     )
     explanation, code, language, files, file_languages = extract_code_artifact(raw_response)
     if not explanation:
