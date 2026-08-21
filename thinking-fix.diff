@@ -1,11 +1,26 @@
 diff --git a/app.py b/app.py
-index e9f91b6..0cc033a 100644
+index e9f91b6..5e26612 100644
 --- a/app.py
 +++ b/app.py
-@@ -305,14 +305,37 @@ def build_messages(history: List[BaseMessage], thinking_level: str, search_text:
+@@ -285,6 +285,13 @@ async def publish_turn_summary(progress, **counts) -> None:
+         await progress.put({"type": "turn_summary", **counts})
+ 
+ 
++async def publish_event(progress, event: dict) -> None:
++    """Publish an arbitrary already-shaped SSE event (used for code_start /
++    code_file_start / code_delta, whose payloads vary by call site)."""
++    if isinstance(progress, asyncio.Queue):
++        await progress.put(event)
++
++
+ def build_messages(history: List[BaseMessage], thinking_level: str, search_text: str = "") -> List[BaseMessage]:
+     level_key = normalize_thinking_level(thinking_level)
+     config = THINKING_LEVELS[level_key]
+@@ -305,14 +312,50 @@ def build_messages(history: List[BaseMessage], thinking_level: str, search_text:
      return [SystemMessage(content=system_text), *history[-6:]]
  
  
+-async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None) -> str:
 +def _extract_reasoning(obj) -> str:
 +    """Pull live reasoning text out of langchain_nvidia_ai_endpoints' normalized
 +    channel. Per the library's own docs, additional_kwargs['reasoning_content'] is
@@ -17,7 +32,7 @@ index e9f91b6..0cc033a 100644
 +    return kwargs.get("reasoning_content") or kwargs.get("reasoning") or ""
 +
 +
- async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None) -> str:
++async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None) -> str:
      """Invoke once. When a live queue is provided, stream BOTH the visible answer
      ('token' events) and the model's own live reasoning trace ('thought' events) in
      real time, exactly as the model produces them — mirroring Claude.ai's extended
@@ -30,7 +45,12 @@ index e9f91b6..0cc033a 100644
 +    of live thinking text here. Inline <think>/<thinking> tags inside `content` are
 +    still parsed out as a fallback for models that only do it that way, and are
 +    never re-published once the reasoning_content channel has already surfaced the
-+    same text, so the thinking pane never shows anything twice."""
++    same text, so the thinking pane never shows anything twice.
++
++    `on_answer_piece`, if given, receives each live slice of answer text instead of
++    it being published as a plain 'token' event — Code mode uses this to re-parse
++    the stream for FILE:/fenced-code boundaries and emit code_start/code_file_start/
++    code_delta events into the canvas instead."""
      if not isinstance(progress, asyncio.Queue):
          result = await llm.ainvoke(messages)
 -        return strip_thinking(getattr(result, "content", "") or "").strip()
@@ -39,10 +59,18 @@ index e9f91b6..0cc033a 100644
 +            progress.append({"step": "reasoning", "label": "Thinking", "detail": reasoning.strip()})
 +        content = getattr(result, "content", "") or ""
 +        return strip_thinking(content).strip()
++
++    async def emit_answer(text: str) -> None:
++        if not text:
++            return
++        if on_answer_piece is not None:
++            await on_answer_piece(text)
++        else:
++            await publish_token(progress, text)
  
      OPEN_TAGS = ("<think>", "<thinking>")
      CLOSE_TAGS = ("</think>", "</thinking>")
-@@ -321,6 +344,12 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
+@@ -321,6 +364,12 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
      full = ""
      buffer = ""
      in_thought = False
@@ -55,7 +83,21 @@ index e9f91b6..0cc033a 100644
  
      async def drain(flush_all: bool) -> None:
          nonlocal buffer, in_thought
-@@ -347,16 +376,23 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
+@@ -332,11 +381,11 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
+                     hold_back = 0 if flush_all else min(len(buffer), max_tag_len - 1)
+                     send_len = len(buffer) - hold_back
+                     if send_len > 0:
+-                        await publish_token(progress, buffer[:send_len])
++                        await emit_answer(buffer[:send_len])
+                         buffer = buffer[send_len:]
+                     return
+                 if idx:
+-                    await publish_token(progress, buffer[:idx])
++                    await emit_answer(buffer[:idx])
+                 tag = next(t for t in OPEN_TAGS if buffer[idx:].startswith(t))
+                 buffer = buffer[idx + len(tag):]
+                 in_thought = True
+@@ -347,16 +396,23 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
                      hold_back = 0 if flush_all else min(len(buffer), max_tag_len - 1)
                      send_len = len(buffer) - hold_back
                      if send_len > 0:
@@ -81,6 +123,103 @@ index e9f91b6..0cc033a 100644
          piece = getattr(chunk, "content", "") or ""
          if not piece:
              continue
+@@ -520,6 +576,68 @@ def extract_code_artifact(text: str) -> tuple[str, str, str, dict, dict]:
+     return explanation, "", "", files, file_languages
+ 
+ 
++_FENCE_OPEN_RE = re.compile(r"^```([A-Za-z0-9_+#.-]*)\s*$")
++_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
++_FILE_HEADER_RE = re.compile(r"^\s*FILE\s*:\s*(.+?)\s*$", re.IGNORECASE)
++
++
++def _new_code_stream_state() -> dict:
++    return {"in_code": False, "pending_filename": None, "current_file": "", "line_buf": ""}
++
++
++async def _stream_code_line(progress, line: str, code_state: dict) -> None:
++    """Consume one complete line of the model's (post-thinking) answer text and
++    turn it into the right live event. A `FILE: name` header is swallowed and
++    remembered; a fenced-code open/close line flips between prose and code; prose
++    lines stream to the chat bubble as plain 'token' events exactly as before,
++    while code lines now stream straight into the canvas as 'code_delta' events —
++    the event type the frontend's code canvas already knew how to render live,
++    that the backend was simply never sending, so the canvas only ever filled in
++    all at once at the very end instead of live as the model wrote it."""
++    if not code_state["in_code"]:
++        file_match = _FILE_HEADER_RE.match(line)
++        if file_match:
++            code_state["pending_filename"] = file_match.group(1).strip().strip("`")
++            return
++        fence_match = _FENCE_OPEN_RE.match(line)
++        if fence_match:
++            language = fence_match.group(1) or ""
++            filename = code_state["pending_filename"] or ""
++            code_state["pending_filename"] = None
++            code_state["in_code"] = True
++            code_state["current_file"] = filename
++            if filename:
++                await publish_event(progress, {"type": "code_file_start", "language": language, "filename": filename})
++            else:
++                await publish_event(progress, {"type": "code_start", "language": language})
++            return
++        await publish_token(progress, line + "\n")
++    else:
++        if _FENCE_CLOSE_RE.match(line):
++            code_state["in_code"] = False
++            return
++        await publish_event(progress, {"type": "code_delta", "delta": line + "\n", "filename": code_state["current_file"]})
++
++
++async def stream_code_answer_piece(progress, code_state: dict, text: str) -> None:
++    """Feed a live slice of raw answer text into the line-buffered code parser
++    above. Model output doesn't arrive aligned to line boundaries, so this holds
++    onto whatever's left of the current line between calls."""
++    code_state["line_buf"] += text
++    while "\n" in code_state["line_buf"]:
++        line, code_state["line_buf"] = code_state["line_buf"].split("\n", 1)
++        await _stream_code_line(progress, line, code_state)
++
++
++async def flush_code_answer_stream(progress, code_state: dict) -> None:
++    """Called once the model's turn is fully done — the last line of a response
++    usually has no trailing newline, so it never gets processed inside the loop
++    above and has to be flushed explicitly."""
++    if code_state["line_buf"]:
++        await _stream_code_line(progress, code_state["line_buf"], code_state)
++        code_state["line_buf"] = ""
++
++
+ async def code_understand_node(request: CodeChatRequest, session: dict, progress=None) -> dict:
+     config = get_thinking_config(request.reasoning_level)
+     excerpt = request_excerpt(session["messages"][-1].content if session["messages"] else "")
+@@ -532,7 +650,17 @@ async def code_compose_node(request: CodeChatRequest, state: dict, progress=None
+     model_type = "reasoning" if request.model in {"glm", "kimik2.6"} else "balanced"
+     await publish_progress(progress, "code_compose_node", "code_compose_node", f"Invoking the code model with {config['label']} effort and a {config['max_tokens']}-token budget.")
+     llm = get_llm(model_type, 0.2, config["max_tokens"])
+-    state["raw"] = await invoke_model(build_code_messages(state["history"], request.reasoning_level), llm, progress)
++
++    code_state = _new_code_stream_state()
++
++    async def on_answer_piece(text: str) -> None:
++        await stream_code_answer_piece(progress, code_state, text)
++
++    state["raw"] = await invoke_model(
++        build_code_messages(state["history"], request.reasoning_level), llm, progress,
++        on_answer_piece=on_answer_piece,
++    )
++    await flush_code_answer_stream(progress, code_state)
+     return state
+ 
+ 
+@@ -641,7 +769,7 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
+     streamed_text = ""
+     try:
+         async for event in forward_live_events(task, progress_queue, session_id):
+-            if event["type"] in ("status", "thought", "activity", "turn_summary"):
++            if event["type"] in ("status", "thought", "activity", "turn_summary", "code_start", "code_file_start", "code_delta"):
+                 yield f"data: {json.dumps(event)}\n\n"
+             elif event["type"] == "token":
+                 streamed_text += event["text"]
 diff --git a/frontend/index.html b/frontend/index.html
 index 8243312..4d68d93 100644
 --- a/frontend/index.html
