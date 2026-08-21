@@ -807,8 +807,16 @@ def is_sensitive_path(relative: str) -> bool:
 
 
 def code_workspace_root() -> pathlib.Path:
-    configured = os.getenv('CODE_WORKSPACE_ROOT') or os.getcwd()
-    return pathlib.Path(configured).resolve()
+    configured = os.getenv('CODE_WORKSPACE_ROOT')
+    if configured:
+        root = pathlib.Path(configured).resolve()
+    else:
+        # Isolate the agent's workspace from the app's own deployed source directory
+        # (os.getcwd() on Render is the app's source folder) so it never lists, reads,
+        # or edits this application's own code.
+        root = (pathlib.Path(os.getcwd()) / 'agent_workspace').resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def safe_code_path(root: pathlib.Path, relative: str) -> pathlib.Path:
