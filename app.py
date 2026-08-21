@@ -294,6 +294,19 @@ def _new_code_stream_state() -> dict:
     return {"in_code": False, "pending_filename": None, "current_file": "", "line_buf": ""}
 
 
+def _guess_raw_code_language(line: str) -> str:
+    clean = (line or '').strip()
+    if re.match(r'(?i)^(<!doctype\\s+html|<html\\b|</?[a-z][^>]*>)', clean):
+        return 'html'
+    if re.match(r'^(?:from\\s+\\w+|import\\s+\\w+|(?:async\\s+)?def\\s+\\w+|class\\s+\\w+)', clean):
+        return 'python'
+    if re.match(r'^(?:const|let|var|function|export|import)\\s+', clean):
+        return 'javascript'
+    if re.match(r'^(?:[.#]?[A-Za-z_][\\w-]*\\s*\\{|@media\\b)', clean):
+        return 'css'
+    return ''
+
+
 async def _stream_code_line(progress, line: str, code_state: dict) -> None:
     if not code_state["in_code"]:
         file_match = _FILE_HEADER_RE.match(line)
@@ -309,6 +322,13 @@ async def _stream_code_line(progress, line: str, code_state: dict) -> None:
             code_state["current_file"] = filename
             event = {"type": "code_file_start", "language": language, "filename": filename} if filename else {"type": "code_start", "language": language}
             await publish_event(progress, event)
+            return
+        raw_language = _guess_raw_code_language(line)
+        if raw_language:
+            code_state["in_code"] = True
+            code_state["current_file"] = ""
+            await publish_event(progress, {"type": "code_start", "language": raw_language})
+            await publish_event(progress, {"type": "code_delta", "delta": line + "\n", "filename": ""})
             return
         await publish_token(progress, line + "\n")
     elif _FENCE_CLOSE_RE.match(line):
@@ -627,7 +647,11 @@ def extract_code_artifact(text: str) -> tuple[str, str, str, dict, dict]:
 
     matches = list(re.finditer(r"```([A-Za-z0-9_+#.-]*)\s*\n([\s\S]*?)```", source))
     if not matches:
-        return source.strip(), "", "", {}, {}
+        raw = source.strip()
+        raw_language = _guess_raw_code_language(raw.splitlines()[0] if raw else '')
+        if raw_language:
+            return "", raw, raw_language, {}, {}
+        return raw, "", "", {}, {}
     if len(matches) == 1:
         language = (matches[0].group(1) or "text").lower()
         code = matches[0].group(2).strip()
