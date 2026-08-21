@@ -443,10 +443,6 @@
                  picker attached to the message composer (see input-container below). -->
             <div class="settings-panel" id="chatSettings">
                 <div class="sidebar-setting-item">
-                    <label title="Maximum Goal Iterations">Max Iterations</label>
-                    <input type="number" id="iterSetting" value="2" min="1" max="10">
-                </div>
-                <div class="sidebar-setting-item">
                     <label title="Stream Response Tokens">Stream Response</label>
                     <input type="checkbox" id="streamSetting" checked>
                 </div>
@@ -558,7 +554,12 @@
                 <option value="balanced" selected>Osiris</option>
                 <option value="reasoning">Amun-Ra</option>
             </select>
-            <input type="number" id="tempSetting" value="0.7" step="0.1" min="0" max="1">
+            <select id="tempSetting">
+                <option value="low">Low</option>
+                <option value="medium" selected>Medium</option>
+                <option value="high">High</option>
+                <option value="max">Max</option>
+            </select>
             <select id="codeModel">
                 <option value="kimi" selected>Kimi K2.6</option>
                 <option value="glm">GLM 5.2</option>
@@ -1142,7 +1143,7 @@
         // sessions, transcripts, and opening-scene text. Switching modes
         // just swaps which one is visible; nothing is destroyed. ----------
         const MODE_COPY = {
-            chat: { title: 'How can I help you achieve your goal?', subtitle: 'Execution destroys all excuses', placeholder: 'Describe your objective...' },
+            chat: { title: 'How can I help?', subtitle: 'Clear answers, one direct pass', placeholder: 'Ask anything...' },
             code: { title: 'What do you want to build?', subtitle: 'Code with reasoning, previewed instantly', placeholder: 'Describe the code you need...' }
         };
         const modes = {
@@ -1191,29 +1192,29 @@
             chat: [
                 { value: 'fast', name: 'Horus', desc: 'Fastest for quick answers' },
                 { value: 'balanced', name: 'Osiris', desc: 'Most efficient for everyday tasks' },
-                { value: 'reasoning', name: 'Amun-Ra', desc: 'For complex, multi-step objectives' }
+                { value: 'reasoning', name: 'Amun-Ra', desc: 'For complex requests' }
             ],
             code: [
                 { value: 'kimi', name: 'Kimi K2.6', desc: 'Balanced everyday coding' },
                 { value: 'glm', name: 'GLM 5.2', desc: 'Alternative model for code tasks' },
-                { value: 'kimik2.6', name: 'Kimi K2.6 (Thinking)', desc: 'Extended reasoning before it codes' }
+                { value: 'kimik2.6', name: 'Kimi K2.6 (Thinking)', desc: 'Larger thinking budget for code' }
             ]
         };
 
         const LEVEL_OPTIONS = {
             chat: {
-                label: 'Temperature',
-                desc: 'Higher temperature makes responses more varied and creative, but less predictable.',
+                label: 'Thinking',
+                desc: 'Choose how much model reasoning budget to use before the direct answer.',
                 options: [
-                    { value: '0.3', label: 'Low' },
-                    { value: '0.7', label: 'Medium', isDefault: true },
-                    { value: '0.9', label: 'High' },
-                    { value: '1', label: 'Max' }
+                    { value: 'low', label: 'Low' },
+                    { value: 'medium', label: 'Medium', isDefault: true },
+                    { value: 'high', label: 'High' },
+                    { value: 'max', label: 'Max' }
                 ]
             },
             code: {
                 label: 'Effort',
-                desc: 'Higher effort runs more reasoning passes \u2014 more thorough, but slower.',
+                desc: 'Higher effort gives the model a larger completion budget.',
                 options: [
                     { value: 'low', label: 'Low' },
                     { value: 'medium', label: 'Medium', isDefault: true },
@@ -1417,7 +1418,7 @@
             const historyList = document.getElementById('historyList');
             const item = document.createElement('div');
             item.className = 'history-item';
-            item.textContent = currentMode === 'code' ? 'New Code Session' : 'New Objective';
+            item.textContent = currentMode === 'code' ? 'New Code Session' : 'New Chat';
             historyList.prepend(item);
         }
 
@@ -1453,7 +1454,7 @@
                 if (text) highlightCode(contentDiv.querySelector('.message-prose'));
 
                 // Thinking block starts EMPTY and expanded. It is only ever populated
-                // with real 'status' events from the backend (planner/executor/etc),
+                // with real user-facing progress summaries from the backend,
                 // and it stays open + growing until the first actual answer token
                 // arrives — exactly like Claude: think first, then answer.
                 // Identical wiring is used for both Chat mode and Code mode.
@@ -1563,8 +1564,7 @@
 
             if (mode === 'chat') {
                 const modelType = document.getElementById('modelType').value;
-                const temp = parseFloat(document.getElementById('tempSetting').value);
-                const maxIters = parseInt(document.getElementById('iterSetting').value);
+                const thinkingLevel = document.getElementById('tempSetting').value;
                 useStream = document.getElementById('streamSetting').checked;
                 apiUrl = `${API_BASE}/chat`;
                 payload = {
@@ -1572,8 +1572,8 @@
                     session_id: modes.chat.sessionId,
                     model_type: modelType,
                     stream: useStream,
-                    temperature: temp,
-                    max_iterations: maxIters
+                    temperature: 0.3,
+                    thinking_level: thinkingLevel
                 };
             } else {
                 const codeModel = document.getElementById('codeModel').value;
@@ -1717,9 +1717,9 @@
                 return thoughtIcons['default'];
             }
 
-            // Real backend progress event (planner / executor / reflector / evaluator,
-            // or the Code Mode equivalents). Reveals the block on the first thought
+                                        // Real backend progress event for the direct response pass. Reveals the block
             // and keeps it expanded while it grows. Shared by both modes.
+
             function addThought(label, detail, step) {
                 if (thinkingDone) return;
                 thinkingBlock.style.display = 'block';
@@ -1870,9 +1870,8 @@
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
                                 } else if (parsed.type === 'message_reset') {
-                                    // The backend started a fresh answer draft (another planning
-                                    // iteration ran) — what's streamed so far is stale, so clear
-                                    // the bubble instead of appending the new draft onto it.
+                                    // Compatibility event: clear the current draft if a server
+                                    // explicitly asks the client to reset it.
                                     assistantFullText = '';
                                     setProse(textContainer, '');
                                     if (indicatorEl) indicatorEl.remove();
@@ -1918,6 +1917,7 @@
 
                 } else {
                     const data = await response.json();
+                    if (data.thinking_summary) addThought('Thinking', data.thinking_summary, 'summary');
                     assistantFullText = data.response;
                     const hasCode = data && (data.code || (data.files && Object.keys(data.files).length > 0));
                     if (mode === 'code' && hasCode) {
