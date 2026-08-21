@@ -213,6 +213,22 @@ def trim_memory(messages: List[BaseMessage], limit: int = 10) -> List[BaseMessag
     return messages[-limit:]
 
 
+async def publish_progress(progress, step: str, label: str, detail: str) -> None:
+    """Publish a concrete backend event to a queue or collect it for non-streaming replies."""
+    event = {"type": "status", "step": step, "label": label, "detail": detail}
+    if isinstance(progress, asyncio.Queue):
+        await progress.put(event)
+    elif isinstance(progress, list):
+        progress.append({k: event[k] for k in ("step", "label", "detail")})
+
+
+async def publish_token(progress, text: str) -> None:
+    if not text:
+        return
+    if isinstance(progress, asyncio.Queue):
+        await progress.put({"type": "token", "text": text})
+
+
 def build_messages(history: List[BaseMessage], thinking_level: str, search_text: str = "") -> List[BaseMessage]:
     config = get_thinking_config(thinking_level)
     system_text = (
@@ -227,29 +243,66 @@ def build_messages(history: List[BaseMessage], thinking_level: str, search_text:
     return [SystemMessage(content=system_text), *history[-6:]]
 
 
-async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA) -> str:
-    """Invoke the model exactly once and return its final answer."""
-    result = await llm.ainvoke(messages)
-    return strip_thinking(getattr(result, "content", "") or "").strip()
+async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None) -> str:
+    """Invoke once; stream visible answer chunks when a live queue is provided."""
+    if not isinstance(progress, asyncio.Queue):
+        result = await llm.ainvoke(messages)
+        return strip_thinking(getattr(result, "content", "") or "").strip()
+
+    full = ""
+    pending = ""
+    hidden_open = False
+    async for chunk in llm.astream(messages):
+        piece = getattr(chunk, "content", "") or ""
+        if not piece:
+            continue
+        full += piece
+        pending += piece
+
+        if not hidden_open and ("<think>" in pending or "<thinking>" in pending):
+            hidden_open = True
+        if hidden_open:
+            close_positions = [p for p in (pending.find("</think>"), pending.find("</thinking>")) if p >= 0]
+            if not close_positions:
+                continue
+            close_at = min(close_positions)
+            close_tag = "</thinking>" if pending.find("</thinking>") == close_at else "</think>"
+            pending = pending[close_at + len(close_tag):]
+            hidden_open = False
+        await publish_token(progress, pending)
+        pending = ""
+
+    if pending and not hidden_open:
+        await publish_token(progress, pending)
+    return strip_thinking(full).strip()
 
 
-async def generate_response_once(request: "ChatRequest", session: dict) -> str:
+async def generate_response_once(request: "ChatRequest", session: dict, progress=None) -> str:
     history = session["messages"]
     latest = history[-1].content if history else ""
+    config = get_thinking_config(request.thinking_level)
+    await publish_progress(progress, "received", "Request received", "The backend accepted the chat request.")
     search_text = ""
     links = []
     images = []
     if needs_web_search(latest):
         query = resolve_search_query(history, latest)
+        await publish_progress(progress, "search_start", "Looking up information", f"Searching for current context: {query}")
         (search_text, links), images = await asyncio.gather(web_search(query), web_image_search(query))
-    config = get_thinking_config(request.thinking_level)
+        result_count = len(links)
+        await publish_progress(progress, "search_done", "Context ready", f"The backend received {result_count} web result(s).")
+    else:
+        await publish_progress(progress, "search_skip", "No web lookup needed", "The request can be answered from the conversation context.")
+    await publish_progress(progress, "model_start", "Composing the answer", f"Invoking the selected model with {config['label']} thinking and a {config['max_tokens']}-token budget.")
     llm = get_llm(request.model_type, request.temperature, config["max_tokens"])
-    response = await invoke_model(build_messages(history, request.thinking_level, search_text), llm)
+    response = await invoke_model(build_messages(history, request.thinking_level, search_text), llm, progress)
     if not response:
         response = "I apologize, I encountered an issue formulating my answer."
     sources = build_web_sources_markdown(links, images)
     if sources:
         response += sources
+        await publish_token(progress, sources)
+    await publish_progress(progress, "complete", "Answer ready", "The backend completed the direct response.")
     return response
 
 
@@ -315,13 +368,20 @@ def extract_code_artifact(text: str) -> tuple[str, str, str]:
     return explanation, code.strip(), (language or "text").lower()
 
 
-async def generate_code_once(request: CodeChatRequest, session: dict) -> dict:
+async def generate_code_once(request: CodeChatRequest, session: dict, progress=None) -> dict:
     config = get_thinking_config(request.reasoning_level)
+    await publish_progress(progress, "received", "Request received", "The backend accepted the code request.")
     model_type = "reasoning" if request.model in {"glm", "kimik2.6"} else "balanced"
+    await publish_progress(progress, "model_start", "Generating code", f"Invoking the selected code model with {config['label']} effort and a {config['max_tokens']}-token budget.")
     llm = get_llm(model_type, 0.2, config["max_tokens"])
-    result = await llm.ainvoke(build_code_messages(session["messages"], request.reasoning_level))
-    raw = strip_thinking(getattr(result, "content", "") or "").strip()
+    result_text = await invoke_model(build_code_messages(session["messages"], request.reasoning_level), llm, progress)
+    raw = result_text
     explanation, code, language = extract_code_artifact(raw)
+    if code:
+        await publish_progress(progress, "artifact", "Artifact extracted", f"The backend extracted a {language or 'text'} code artifact for the canvas.")
+    else:
+        await publish_progress(progress, "artifact_missing", "No artifact block found", "The backend received text without a fenced code artifact.")
+    await publish_progress(progress, "complete", "Code response ready", "The backend completed the direct code response.")
     return {
         "response": explanation or "I generated the requested code.",
         "code": code,
@@ -346,25 +406,53 @@ async def clear_session(request: ClearSessionRequest):
     return {"status": "success", "message": f"Session {request.session_id} cleared."}
 
 
+async def forward_live_events(task: asyncio.Task, progress_queue: asyncio.Queue, session_id: str):
+    """Yield queue events while the backend task is still running."""
+    while not task.done() or not progress_queue.empty():
+        try:
+            event = await asyncio.wait_for(progress_queue.get(), timeout=2.5)
+            yield event
+        except asyncio.TimeoutError:
+            yield {"type": "status", "step": "processing", "label": "Working", "detail": "The backend is still processing the request."}
+
+
 async def generate_stream(request: ChatRequest, session: dict, session_id: str):
-    config = get_thinking_config(request.thinking_level)
-    detail = f"Using {config['label']} thinking with a {config['max_tokens']}-token budget."
-    yield f"data: {json.dumps({'type': 'status', 'step': 'generate_response', 'label': 'Generating response', 'detail': detail})}\n\n"
+    progress_queue: asyncio.Queue = asyncio.Queue()
+    task = asyncio.create_task(generate_response_once(request, session, progress_queue))
+    final_response = ""
+    emitted_content = False
     try:
-        final_response = await generate_response_once(request, session)
+        async for event in forward_live_events(task, progress_queue, session_id):
+            if event["type"] == "status":
+                yield f"data: {json.dumps(event)}\n\n"
+            elif event["type"] == "token":
+                emitted_content = True
+                final_response += event["text"]
+                yield f"data: {json.dumps({'type': 'message', 'assistant_message': event['text'], 'conversation_id': session_id, 'session_id': session_id})}\n\n"
+        completed_response = await task
+        if not emitted_content:
+            final_response = completed_response
+            yield f"data: {json.dumps({'type': 'message', 'assistant_message': final_response, 'conversation_id': session_id, 'session_id': session_id})}\n\n"
     except Exception as exc:
         print(f"[{session_id}] Response generation failed: {exc}")
         final_response = "I could not generate a response right now. Please try again."
-    yield f"data: {json.dumps({'type': 'message', 'assistant_message': final_response, 'conversation_id': session_id, 'session_id': session_id})}\n\n"
+        yield f"data: {json.dumps({'type': 'message', 'assistant_message': final_response, 'conversation_id': session_id, 'session_id': session_id})}\n\n"
     session["messages"].append(AIMessage(content=final_response))
 
 
 async def generate_code_stream(request: CodeChatRequest, session: dict, session_id: str):
-    config = get_thinking_config(request.reasoning_level)
-    detail = f"Generating code directly with {config['label']} effort and a {config['max_tokens']}-token budget."
-    yield f"data: {json.dumps({'type': 'status', 'step': 'generate_code', 'label': 'Working', 'detail': detail})}\n\n"
+    progress_queue: asyncio.Queue = asyncio.Queue()
+    task = asyncio.create_task(generate_code_once(request, session, progress_queue))
+    result = None
+    streamed_text = ""
     try:
-        result = await generate_code_once(request, session)
+        async for event in forward_live_events(task, progress_queue, session_id):
+            if event["type"] == "status":
+                yield f"data: {json.dumps(event)}\n\n"
+            elif event["type"] == "token":
+                streamed_text += event["text"]
+                yield f"data: {json.dumps({'type': 'message', 'assistant_message': event['text'], 'conversation_id': session_id, 'session_id': session_id})}\n\n"
+        result = await task
     except Exception as exc:
         print(f"[{session_id}] Code generation failed: {exc}")
         result = {
@@ -377,7 +465,8 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
         }
     if result.get("code"):
         yield f"data: {json.dumps({'type': 'code_result', **result, 'session_id': session_id})}\n\n"
-    yield f"data: {json.dumps({'type': 'message', 'assistant_message': result['response'], 'conversation_id': session_id, 'session_id': session_id})}\n\n"
+    if not streamed_text:
+        yield f"data: {json.dumps({'type': 'message', 'assistant_message': result['response'], 'conversation_id': session_id, 'session_id': session_id})}\n\n"
     session["messages"].append(AIMessage(content=result["response"]))
 
 
@@ -391,8 +480,9 @@ async def code_chat(request: CodeChatRequest):
             generate_code_stream(request, session, request.session_id),
             media_type="text/event-stream",
         )
+    thinking_steps = []
     try:
-        result = await generate_code_once(request, session)
+        result = await generate_code_once(request, session, thinking_steps)
     except Exception as exc:
         print(f"[{request.session_id}] Code generation failed: {exc}")
         result = {
@@ -404,6 +494,7 @@ async def code_chat(request: CodeChatRequest):
             "show_preview": False,
         }
     session["messages"].append(AIMessage(content=result["response"]))
+    result["thinking_steps"] = thinking_steps
     return {"session_id": request.session_id, **result}
 
 
@@ -417,8 +508,9 @@ async def chat(request: ChatRequest):
             generate_stream(request, session, request.session_id),
             media_type="text/event-stream",
         )
+    thinking_steps = []
     try:
-        response = await generate_response_once(request, session)
+        response = await generate_response_once(request, session, thinking_steps)
     except Exception as exc:
         print(f"[{request.session_id}] Response generation failed: {exc}")
         response = "I could not generate a response right now. Please try again."
@@ -428,6 +520,7 @@ async def chat(request: ChatRequest):
         "response": response,
         "session_id": request.session_id,
         "thinking_summary": f"Answered directly with {config['label']} thinking; no planning or revision pass was run.",
+        "thinking_steps": thinking_steps,
         "thinking_level": config["label"],
         "max_tokens": config["max_tokens"],
     }

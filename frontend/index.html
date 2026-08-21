@@ -1917,7 +1917,11 @@
 
                 } else {
                     const data = await response.json();
-                    if (data.thinking_summary) addThought('Thinking', data.thinking_summary, 'summary');
+                    if (Array.isArray(data.thinking_steps)) {
+                        data.thinking_steps.forEach(step => addThought(step.label, step.detail, step.step));
+                    } else if (data.thinking_summary) {
+                        addThought('Thinking', data.thinking_summary, 'summary');
+                    }
                     assistantFullText = data.response;
                     const hasCode = data && (data.code || (data.files && Object.keys(data.files).length > 0));
                     if (mode === 'code' && hasCode) {
