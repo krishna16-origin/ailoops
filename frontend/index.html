@@ -1959,7 +1959,11 @@
                             try {
                                 const parsed = JSON.parse(jsonStr);
                                 if (parsed.type === 'status') {
-                                    addThought(parsed.label, parsed.detail, parsed.step);
+                                    // Backend node narration ("chat_understand_node", "Invoking the
+                                    // model with...", etc.) is intentionally not shown here anymore —
+                                    // the Thinking panel now only ever displays the model's own real
+                                    // reasoning trace (see the 'thought' branch below), matching
+                                    // Claude.ai instead of a synthesized step-by-step log.
                                 } else if (parsed.type === 'thought') {
                                     appendLiveThought(parsed.text);
                                 } else if (parsed.type === 'activity') {
@@ -2028,10 +2032,14 @@
 
                 } else {
                     const data = await response.json();
+                    // Only the model's real reasoning (step === 'reasoning', added
+                    // server-side in the non-streaming invoke_model() path) belongs in
+                    // the Thinking panel — synthetic backend-node narration and the
+                    // generic thinking_summary line are no longer shown.
                     if (Array.isArray(data.thinking_steps)) {
-                        data.thinking_steps.forEach(step => addThought(step.label, step.detail, step.step));
-                    } else if (data.thinking_summary) {
-                        addThought('Thinking', data.thinking_summary, 'summary');
+                        data.thinking_steps
+                            .filter(step => step.step === 'reasoning')
+                            .forEach(step => addThought(step.label, step.detail, step.step));
                     }
                     assistantFullText = data.response;
                     const hasCode = data && (data.code || (data.files && Object.keys(data.files).length > 0));
