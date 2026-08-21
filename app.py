@@ -807,16 +807,8 @@ def is_sensitive_path(relative: str) -> bool:
 
 
 def code_workspace_root() -> pathlib.Path:
-    configured = os.getenv('CODE_WORKSPACE_ROOT')
-    if configured:
-        root = pathlib.Path(configured).resolve()
-    else:
-        # Isolate the agent's workspace from the app's own deployed source directory
-        # (os.getcwd() on Render is the app's source folder) so it never lists, reads,
-        # or edits this application's own code.
-        root = (pathlib.Path(os.getcwd()) / 'agent_workspace').resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    configured = os.getenv('CODE_WORKSPACE_ROOT') or os.getcwd()
+    return pathlib.Path(configured).resolve()
 
 
 def safe_code_path(root: pathlib.Path, relative: str) -> pathlib.Path:
@@ -886,9 +878,8 @@ async def code_decide(request: CodeChatRequest, state: dict, observations: list[
         'short user-safe sentence, not private reasoning. Valid tools: list_files, read_file, search_files, create_file, '
         'edit_file, delete_file, move_file, run_command, run_tests, git_status, git_diff, finish. '
         'Inspect before editing. Read only relevant files. Use edit_file with new_content or exact search/replace. '
-        'Use run_tests or a real verification command before finish. If a command or test failed, inspect the output and '
-        'fix the relevant file before retrying. The actual workspace root is supplied to the tool implementation; '
-        'arguments must contain relative paths only. For create_file use {path, content}; for edit_file use {path, '
+        'Call finish once the requested code has been written. Arguments must contain relative paths only. '
+        'For create_file use {path, content}; for edit_file use {path, '
         'new_content} or {path, search, replace}; for search_files use {pattern}; for run_command use {command}; '
         'for run_tests optionally use {command}. Do not output markdown.\n\n'
         f'Workspace root: {workspace}\nUser task: {request.message}\nState: {json.dumps(state["public_state"], ensure_ascii=False)}\n'
@@ -1155,15 +1146,6 @@ async def autonomous_code_once(request: CodeChatRequest, session: dict, progress
             await code_emit(progress, 'ERROR', message='The agent cannot continue until the model decision service is available.')
             break
         if tool == 'finish':
-            if not state['verification_done']:
-                await code_emit(progress, 'RETRY', reason='The workspace has not been verified yet; choosing a real test or check before finishing.')
-                observations.append({'tool': 'finish', 'result': 'blocked: verification required'})
-                continue
-            if state['last_test_passed'] is False:
-                await code_emit(progress, 'RETRY', reason='The last verification failed; the agent must inspect and repair the result.')
-                observations.append({'tool': 'finish', 'result': 'blocked: verification failed'})
-                continue
-            await code_emit(progress, 'VERIFICATION', status='passed', files=sorted(state['modified_files']))
             await code_emit(progress, 'AGENT_COMPLETED', files=sorted(state['modified_files']), steps=step + 1)
             break
         try:
@@ -1177,7 +1159,7 @@ async def autonomous_code_once(request: CodeChatRequest, session: dict, progress
             await code_emit(progress, 'RETRY', reason='The agent will inspect the real error and choose the next corrective action.')
             observations.append({'summary': decision['summary'], 'tool': tool, 'args': args, 'error': message})
     else:
-        await code_emit(progress, 'ERROR', message='The agent reached its safe action limit before verification completed.')
+        await code_emit(progress, 'ERROR', message='The agent reached its safe action limit before finishing.')
 
     changed = {}
     languages = {}
@@ -1189,9 +1171,9 @@ async def autonomous_code_once(request: CodeChatRequest, session: dict, progress
     files = changed
     code = next(iter(files.values())) if len(files) == 1 else ''
     language = next(iter(languages.values())) if len(languages) == 1 else ''
-    summary = 'Completed the autonomous workspace task.' if state['verification_done'] and state['last_test_passed'] is not False else 'The autonomous workspace task needs another run after the reported error.'
+    summary = 'Completed the task.' if state['modified_files'] else 'The task needs another run after the reported error.'
     await code_emit(progress, 'turn_summary', files_touched=len(state['modified_files']), commands_run=len(state['public_state']['commands']), files_read=len(state['read_files']), notes=len(state['public_state']['errors']))
-    return {'response': summary, 'code': code, 'language': language, 'files': files, 'file_languages': languages, 'show_preview': bool(files), 'thinking_summary': 'Real workspace actions, tool results, and verification were streamed; private reasoning was not exposed.', 'thinking_level': get_thinking_config(request.reasoning_level)['label'], 'max_tokens': get_thinking_config(request.reasoning_level)['max_tokens'], 'workspace': str(root), 'modified_files': sorted(state['modified_files'])}
+    return {'response': summary, 'code': code, 'language': language, 'files': files, 'file_languages': languages, 'show_preview': bool(files), 'thinking_summary': 'Real workspace actions and tool results were streamed; private reasoning was not exposed.', 'thinking_level': get_thinking_config(request.reasoning_level)['label'], 'max_tokens': get_thinking_config(request.reasoning_level)['max_tokens'], 'workspace': str(root), 'modified_files': sorted(state['modified_files'])}
 
 
 async def forward_live_events(task: asyncio.Task, progress_queue: asyncio.Queue, session_id: str):
