@@ -869,6 +869,32 @@ async def code_model_text(request: CodeChatRequest, prompt: str, progress=None, 
         return ''
 
 
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n?([\s\S]*?)```", re.IGNORECASE)
+
+
+def _extract_json_object(text: str) -> str:
+    """Best-effort extraction of a JSON object from a model's raw text output.
+
+    Chat/reasoning models very commonly wrap a requested JSON payload in
+    ```json ... ``` fences, or add a stray sentence of commentary before or
+    after it, even when explicitly told not to. A plain json.loads(raw) on
+    that output fails every time, which previously made the whole Code mode
+    agent abort on step one any time the model didn't return perfectly bare
+    JSON. This pulls the {...} payload out first so parsing gets a fair shot.
+    """
+    if not text:
+        return text
+    cleaned = text.strip()
+    fence_match = _JSON_FENCE_RE.search(cleaned)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+    start = cleaned.find('{')
+    end = cleaned.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        return cleaned[start:end + 1]
+    return cleaned
+
+
 async def code_decide(request: CodeChatRequest, state: dict, observations: list[dict], progress=None) -> dict:
     workspace = state['workspace']
     recent = json.dumps(observations[-8:], ensure_ascii=False)
@@ -881,19 +907,30 @@ async def code_decide(request: CodeChatRequest, state: dict, observations: list[
         'Call finish once the requested code has been written. Arguments must contain relative paths only. '
         'For create_file use {path, content}; for edit_file use {path, '
         'new_content} or {path, search, replace}; for search_files use {pattern}; for run_command use {command}; '
-        'for run_tests optionally use {command}. Do not output markdown.\n\n'
+        'for run_tests optionally use {command}. Respond with the raw JSON object only — no markdown code fences, '
+        'no ```json wrapper, and no explanatory text before or after it.\n\n'
         f'Workspace root: {workspace}\nUser task: {request.message}\nState: {json.dumps(state["public_state"], ensure_ascii=False)}\n'
         f'Recent real observations: {recent}'
     )
     raw = await code_model_text(request, prompt, progress)
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(_extract_json_object(raw))
         if not isinstance(parsed, dict) or not isinstance(parsed.get('tool'), str):
             raise ValueError('invalid decision shape')
-        return {'summary': str(parsed.get('summary') or 'Continuing with the next workspace action.'), 'tool': parsed['tool'], 'args': parsed.get('args') if isinstance(parsed.get('args'), dict) else {}}
+        args = parsed.get('args')
+        if isinstance(args, str):
+            # Some models double-encode args as a JSON string instead of an
+            # object; try to recover it instead of silently discarding it.
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
+        return {'summary': str(parsed.get('summary') or 'Continuing with the next workspace action.'), 'tool': parsed['tool'], 'args': args}
     except Exception:
         await code_emit(progress, 'ERROR', message='The agent returned an invalid tool decision.')
-        return {'summary': '', 'tool': '__decision_error__', 'args': {}}
+        return {'summary': '', 'tool': '__decision_error__', 'args': {}, 'raw': code_truncate(raw, 500)}
 
 
 async def code_list_files(root: pathlib.Path, progress) -> dict:
@@ -1133,6 +1170,7 @@ async def autonomous_code_once(request: CodeChatRequest, session: dict, progress
         'public_state': {'workspace': str(root), 'modified_files': [], 'read_files': [], 'commands': [], 'errors': [], 'verification_done': False},
     }
     observations = []
+    decision_errors = 0
     await code_emit(progress, 'AGENT_STARTED', task=request.message, workspace=str(root))
     for step in range(CODE_MAX_STEPS):
         state['public_state']['modified_files'] = sorted(state['modified_files'])
@@ -1143,8 +1181,22 @@ async def autonomous_code_once(request: CodeChatRequest, session: dict, progress
         tool = decision['tool']
         args = decision['args']
         if tool == '__decision_error__':
-            await code_emit(progress, 'ERROR', message='The agent cannot continue until the model decision service is available.')
-            break
+            # A single malformed response (e.g. JSON wrapped in markdown fences,
+            # or a stray sentence of commentary) used to abort the whole agent
+            # on step one. Give the model a few chances to self-correct instead,
+            # feeding the bad output back so it can see what went wrong.
+            decision_errors += 1
+            observations.append({
+                'summary': 'Previous response could not be parsed.',
+                'tool': '__decision_error__',
+                'error': 'Reply with the raw JSON object only — no markdown fences, no extra text.',
+                'raw_output': decision.get('raw', ''),
+            })
+            if decision_errors >= 3:
+                await code_emit(progress, 'ERROR', message='The agent could not produce a valid tool decision after several attempts.')
+                break
+            continue
+        decision_errors = 0
         if tool == 'finish':
             await code_emit(progress, 'AGENT_COMPLETED', files=sorted(state['modified_files']), steps=step + 1)
             break
