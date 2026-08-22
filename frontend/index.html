@@ -1337,7 +1337,7 @@
                 // Code Mode is intentionally always live: plan, activity, file,
                 // diff, artifact, and final-message events arrive over SSE.
                 useStream = true;
-                apiUrl = `${API_BASE}/code-chat`;
+                apiUrl = `${API_BASE}/agent/run`;
                 payload = {
                     message: text,
                     session_id: modes.code.sessionId,
@@ -1572,6 +1572,8 @@
             const workflowRowsByActivity = new Map(); // activity id -> live row
             const liveWorkflowStats = { commands: 0, files_edited: 0, files_viewed: 0, notes: 0 };
             let livePlanRows = 0;
+            let liveAgentRow = null;
+            let liveProgressThoughtEl = null;
 
             const WORKFLOW_ICONS = {
                 edit: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.6 1.6 0 0 1 2.3 2.3L5.5 13 2 14l1-3.5 8.5-8Z"/></svg>',
@@ -1750,14 +1752,42 @@
                 scrollToBottom();
             }
 
-            function addLiveAgentMessage(text) {
+            function appendLiveAgentMessage(text) {
                 if (!text) return;
                 const listEl = ensureLiveWorkflow();
                 if (!listEl) return;
-                const row = createWorkflowRow({ kind: 'note', text });
-                listEl.appendChild(row);
-                liveWorkflowStats.notes += 1;
-                updateLiveWorkflowSummary();
+                if (!liveAgentRow) {
+                    liveAgentRow = createWorkflowRow({ kind: 'note', text: '' });
+                    listEl.appendChild(liveAgentRow);
+                    liveWorkflowStats.notes += 1;
+                    updateLiveWorkflowSummary();
+                }
+                const textEl = liveAgentRow.querySelector('span:last-child');
+                if (textEl) textEl.textContent += text;
+                scrollToBottom();
+            }
+
+            function addLiveAgentMessage(text) {
+                appendLiveAgentMessage(text);
+            }
+
+            function appendLiveProgressThought(text) {
+                if (!text) return;
+                thinkingBlock.style.display = 'block';
+                thinkingContent.classList.add('expanded');
+                thinkingToggle.textContent = 'Working';
+                thinkingToggle.classList.add('shimmer');
+                if (!liveProgressThoughtEl) {
+                    const item = document.createElement('div');
+                    item.className = 'thought-item';
+                    item.innerHTML = `<div class="thought-bullet"></div><span class="thought-node">backend_progress</span>`;
+                    liveProgressThoughtEl = document.createElement('div');
+                    liveProgressThoughtEl.className = 'thought-live-content';
+                    item.appendChild(liveProgressThoughtEl);
+                    thinkingContent.appendChild(item);
+                }
+                liveProgressThoughtEl.textContent += text;
+                liveProgressThoughtEl.scrollTop = liveProgressThoughtEl.scrollHeight;
                 scrollToBottom();
             }
 
@@ -2075,9 +2105,12 @@
                                     });
                                     updateLiveWorkflowSummary();
                                     scrollToBottom();
+                                } else if (parsed.type === 'agent_message_delta' && mode === 'code') {
+                                    appendLiveAgentMessage(parsed.text || '');
+                                    appendLiveProgressThought(parsed.text || '');
                                 } else if (parsed.type === 'agent_message' && mode === 'code') {
-                                    addLiveAgentMessage(parsed.text || '');
-                                    addThought('Working', parsed.text || '', 'progress');
+                                    appendLiveAgentMessage(parsed.text || '');
+                                    appendLiveProgressThought(parsed.text || '');
                                 } else if (parsed.type === 'activity_start' && mode === 'code') {
                                     const activity = parsed.activity || parsed;
                                     addLiveWorkflowRow(activity, 'running');

@@ -254,7 +254,11 @@ def parse_agent_turn(raw: str) -> Optional[dict]:
 # then the activity starts, then the completed file/diff event follows.
 # ---------------------------------------------------------------------------
 def make_agent_stream_watcher(emit, activity_id):
-    state = {"buffer": "", "thought_emitted": False, "activity_emitted": False, "final_started": False, "final_emitted": False}
+    state = {
+        "buffer": "", "line_cursor": 0, "thought_cursor": 0,
+        "thought_started": False, "thought_done": False,
+        "activity_emitted": False, "final_started": False, "final_emitted": False,
+    }
 
     async def process_line(line: str) -> None:
         clean = line.strip()
@@ -262,11 +266,6 @@ def make_agent_stream_watcher(emit, activity_id):
             if clean:
                 state["final_emitted"] = True
                 await emit({"type": "final_message", "text": clean})
-        elif clean.upper().startswith("THOUGHT:") and not state["thought_emitted"]:
-            thought = clean.split(":", 1)[1].strip()
-            if thought:
-                state["thought_emitted"] = True
-                await emit({"type": "agent_message", "text": thought})
         elif clean.upper().startswith("ACTION:"):
             state["action"] = clean.split(":", 1)[1].strip().lower()
             if state["action"] == "final":
@@ -279,19 +278,44 @@ def make_agent_stream_watcher(emit, activity_id):
                 public_action = {"read_file": "read", "edit_file": "edit", "create_file": "create", "delete_file": "delete"}[action]
                 await emit({"type": "activity_start", "activity": {"id": activity_id, "action": public_action, "file": file_path, "status": "running"}})
 
+    async def emit_thought_delta() -> None:
+        if not state["thought_started"]:
+            marker = state["buffer"].upper().find("THOUGHT:")
+            if marker < 0:
+                return
+            state["thought_started"] = True
+            state["thought_cursor"] = marker + len("THOUGHT:")
+        if state["thought_done"]:
+            return
+        newline = state["buffer"].find("\n", state["thought_cursor"])
+        end = newline if newline >= 0 else len(state["buffer"])
+        if end > state["thought_cursor"]:
+            delta = state["buffer"][state["thought_cursor"]:end]
+            state["thought_cursor"] = end
+            if delta.strip():
+                await emit({"type": "agent_message_delta", "text": delta})
+        if newline >= 0:
+            state["thought_done"] = True
+            state["thought_cursor"] = newline + 1
+
     async def watcher(text: str) -> None:
         if not text:
             return
         state["buffer"] += text
-        while "\n" in state["buffer"]:
-            line, state["buffer"] = state["buffer"].split("\n", 1)
+        await emit_thought_delta()
+        while state["line_cursor"] < len(state["buffer"]):
+            newline = state["buffer"].find("\n", state["line_cursor"])
+            if newline < 0:
+                break
+            line = state["buffer"][state["line_cursor"]:newline]
+            state["line_cursor"] = newline + 1
             await process_line(line)
 
     async def flush() -> None:
-        if state["buffer"].strip():
-            remaining = state["buffer"]
-            state["buffer"] = ""
-            await process_line(remaining)
+        await emit_thought_delta()
+        if state["line_cursor"] < len(state["buffer"]):
+            await process_line(state["buffer"][state["line_cursor"]:])
+            state["line_cursor"] = len(state["buffer"])
 
     watcher.state = state
     watcher.flush = flush
@@ -406,7 +430,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         action = turn["action"]
         path = turn["path"]
 
-        if thought and not getattr(watcher, "state", {}).get("thought_emitted"):
+        if thought and not getattr(watcher, "state", {}).get("thought_started"):
             await emit({"type": "agent_message", "text": thought})
         if thought:
             activities.append({"kind": _classify_note_kind(thought), "text": thought})

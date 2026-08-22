@@ -11,7 +11,7 @@ async def main():
 
     async def fake_run(request, session, emit):
         await emit({"type": "plan_created", "steps": ["Read index.html", "Edit index.html"]})
-        await emit({"type": "agent_message", "text": "I'll inspect the existing structure first."})
+        await emit({"type": "agent_message_delta", "text": "I'll inspect the existing structure first."})
         await emit({"type": "activity_start", "activity": {"id": "activity_1", "action": "read", "file": "index.html", "status": "running"}})
         await emit({"type": "file_read", "activity": {"id": "activity_1", "action": "read", "file": "index.html", "status": "completed"}, "file": "index.html", "content": "<html />"})
         await emit({"type": "activity_complete", "activity": {"id": "activity_1", "action": "read", "file": "index.html", "status": "completed"}})
@@ -30,7 +30,7 @@ async def main():
             assert frame.startswith("data: ") and frame.endswith("\n\n"), frame
             frames.append(json.loads(frame[6:].strip()))
         types = [frame["type"] for frame in frames]
-        expected = ["plan_created", "agent_message", "activity_start", "file_read", "activity_complete", "final_message", "artifact_created", "complete"]
+        expected = ["plan_created", "agent_message_delta", "activity_start", "file_read", "activity_complete", "final_message", "artifact_created", "complete"]
         assert types == expected, types
         assert all(frame["session_id"] == "session-test" for frame in frames)
         print("SSE_CONTRACT_OK")

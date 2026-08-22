@@ -705,6 +705,7 @@ async def generate_stream(request: ChatRequest, session: dict, session_id: str):
     session["messages"].append(AIMessage(content=final_response))
 
 
+@app.post("/agent/run")
 @app.post("/code-chat")
 async def code_chat(request: CodeChatRequest):
     session = sessions.setdefault(request.session_id, {"messages": []})
