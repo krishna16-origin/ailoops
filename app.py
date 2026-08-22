@@ -300,8 +300,60 @@ _FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _FILE_HEADER_RE = re.compile(r"^\s*FILE\s*:\s*(.+?)\s*$", re.IGNORECASE)
 
 
-def _new_code_stream_state() -> dict:
-    return {"in_code": False, "pending_filename": None, "current_file": "", "line_buf": ""}
+def _new_code_stream_state(previous_files: Optional[dict] = None) -> dict:
+    return {
+        "in_code": False,
+        "pending_filename": None,
+        "current_file": "",
+        "current_language": "",
+        "line_buf": "",
+        # Full text accumulated so far for the file currently streaming, keyed
+        # by filename ("" for a single unnamed file) — lets us diff the real,
+        # complete file the instant its fence closes instead of waiting for
+        # the whole (possibly multi-file) response to finish.
+        "file_content": {},
+        # Snapshot of what this session generated last turn, taken once up
+        # front so every live diff this turn compares against the same
+        # baseline instead of a moving target.
+        "previous_files": previous_files or {},
+        # Filenames already diffed and emitted this turn, so a stray repeat
+        # fence (or the end-of-stream flush) never double-emits one file.
+        "seen_files": set(),
+    }
+
+
+def _diff_stats_and_lines(old_content: Optional[str], new_content: str) -> tuple[int, int, list]:
+    """Real line-level diff of one file's new content against what this same
+    session generated for it last turn (or None for a brand-new file). Shared
+    by the live per-file streaming event and the final turn summary so the
+    two always agree on the same numbers."""
+    new_lines = new_content.splitlines()
+    if old_content is None:
+        return len(new_lines), 0, [{"type": "add", "text": ln} for ln in new_lines]
+    old_lines = old_content.splitlines()
+    sm = difflib.SequenceMatcher(a=old_lines, b=new_lines)
+    diff_lines: list = []
+    additions = deletions = 0
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            for ln in new_lines[j1:j2]:
+                diff_lines.append({"type": "context", "text": ln})
+        elif tag == "delete":
+            for ln in old_lines[i1:i2]:
+                diff_lines.append({"type": "del", "text": ln})
+            deletions += (i2 - i1)
+        elif tag == "insert":
+            for ln in new_lines[j1:j2]:
+                diff_lines.append({"type": "add", "text": ln})
+            additions += (j2 - j1)
+        elif tag == "replace":
+            for ln in old_lines[i1:i2]:
+                diff_lines.append({"type": "del", "text": ln})
+            for ln in new_lines[j1:j2]:
+                diff_lines.append({"type": "add", "text": ln})
+            deletions += (i2 - i1)
+            additions += (j2 - j1)
+    return additions, deletions, diff_lines
 
 
 def _guess_raw_code_language(line: str) -> str:
@@ -317,6 +369,31 @@ def _guess_raw_code_language(line: str) -> str:
     return ''
 
 
+async def _emit_file_diff(progress, code_state: dict) -> None:
+    """Diff the file that just finished streaming against what this session
+    generated for it last turn, and publish the result as one live event —
+    this is what lets the activity feed and diff/preview canvas update file
+    by file as generation happens, instead of only once at the very end."""
+    filename = code_state["current_file"]
+    if filename in code_state["seen_files"]:
+        return
+    content = code_state["file_content"].get(filename, "").rstrip("\n")
+    if not content:
+        return
+    old_content = code_state["previous_files"].get(filename)
+    additions, deletions, diff_lines = _diff_stats_and_lines(old_content, content)
+    code_state["seen_files"].add(filename)
+    await publish_event(progress, {
+        "type": "code_file_diff",
+        "filename": filename,
+        "language": code_state["current_language"],
+        "additions": additions,
+        "deletions": deletions,
+        "diff_lines": diff_lines,
+        "content": content,
+    })
+
+
 async def _stream_code_line(progress, line: str, code_state: dict) -> None:
     if not code_state["in_code"]:
         file_match = _FILE_HEADER_RE.match(line)
@@ -330,6 +407,8 @@ async def _stream_code_line(progress, line: str, code_state: dict) -> None:
             code_state["pending_filename"] = None
             code_state["in_code"] = True
             code_state["current_file"] = filename
+            code_state["current_language"] = language
+            code_state["file_content"][filename] = ""
             event = {"type": "code_file_start", "language": language, "filename": filename} if filename else {"type": "code_start", "language": language}
             await publish_event(progress, event)
             return
@@ -337,14 +416,21 @@ async def _stream_code_line(progress, line: str, code_state: dict) -> None:
         if raw_language:
             code_state["in_code"] = True
             code_state["current_file"] = ""
+            code_state["current_language"] = raw_language
+            code_state["file_content"][""] = line + "\n"
             await publish_event(progress, {"type": "code_start", "language": raw_language})
             await publish_event(progress, {"type": "code_delta", "delta": line + "\n", "filename": ""})
             return
         await publish_token(progress, line + "\n")
     elif _FENCE_CLOSE_RE.match(line):
+        await _emit_file_diff(progress, code_state)
         code_state["in_code"] = False
+        code_state["current_file"] = ""
+        code_state["current_language"] = ""
     else:
-        await publish_event(progress, {"type": "code_delta", "delta": line + "\n", "filename": code_state["current_file"]})
+        filename = code_state["current_file"]
+        code_state["file_content"][filename] = code_state["file_content"].get(filename, "") + line + "\n"
+        await publish_event(progress, {"type": "code_delta", "delta": line + "\n", "filename": filename})
 
 
 async def stream_code_answer_piece(progress, code_state: dict, text: str) -> None:
@@ -358,6 +444,13 @@ async def flush_code_answer_stream(progress, code_state: dict) -> None:
     if code_state["line_buf"]:
         await _stream_code_line(progress, code_state["line_buf"], code_state)
         code_state["line_buf"] = ""
+    if code_state["in_code"]:
+        # Stream ended without a closing ``` — truncated output, or the
+        # unfenced-code fallback path, which never sees one at all. Emit
+        # whatever was captured so the diff panel and file cards still show
+        # the real result instead of ending up empty.
+        await _emit_file_diff(progress, code_state)
+        code_state["in_code"] = False
 
 
 def build_messages(history: List[BaseMessage], thinking_level: str, search_text: str = "") -> List[BaseMessage]:
@@ -711,24 +804,20 @@ def build_turn_activities(files: dict, code: str, language: str, explanation: st
     for filename, new_content in all_files.items():
         display_name = filename or (f"generated.{language}" if language else "generated code")
         old_content = previous_files.get(filename)
+        additions, deletions, diff_lines = _diff_stats_and_lines(old_content, new_content)
         if old_content is not None:
             # This file already existed in the session — genuinely "viewed" it
             # (it's the context the model was given) before editing it.
             activities.append({"kind": "view", "text": f"Reviewed the current contents of {display_name} before editing"})
             viewed_count += 1
-            old_lines = old_content.splitlines()
-            new_lines = new_content.splitlines()
-            sm = difflib.SequenceMatcher(a=old_lines, b=new_lines)
-            additions = deletions = 0
-            for tag, i1, i2, j1, j2 in sm.get_opcodes():
-                if tag in ("replace", "delete"):
-                    deletions += (i2 - i1)
-                if tag in ("replace", "insert"):
-                    additions += (j2 - j1)
-            activities.append({"kind": "edit", "file": display_name, "additions": additions, "deletions": deletions})
-        else:
-            additions = len(new_content.splitlines())
-            activities.append({"kind": "edit", "file": display_name, "additions": additions, "deletions": 0})
+        activities.append({
+            "kind": "edit",
+            "file": display_name,
+            "filename": filename,
+            "additions": additions,
+            "deletions": deletions,
+            "diff_lines": diff_lines,
+        })
         edited_count += 1
 
     for note in _split_explanation_into_notes(explanation):
@@ -810,9 +899,20 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
     }
 
 
+CODE_STREAM_FORWARD_TYPES = {
+    'status', 'thought', 'code_start', 'code_file_start', 'code_delta',
+    'code_file_diff', 'AGENT_HEARTBEAT', 'RETRY', 'ERROR',
+}
+
+
 async def generate_code_stream(request: CodeChatRequest, session: dict, session_id: str):
     progress_queue: asyncio.Queue = asyncio.Queue()
-    code_state = _new_code_stream_state()
+    # Snapshot what this session generated last turn *before* generation
+    # starts, so every live per-file diff this turn compares against the
+    # same fixed baseline (session['code_files'] itself is only updated once
+    # generation finishes, inside generate_code_once).
+    previous_files = dict(session.get('code_files') or {})
+    code_state = _new_code_stream_state(previous_files)
     emitted_content = False
 
     async def on_answer_piece(text: str) -> None:
@@ -828,7 +928,7 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
     try:
         async for event in forward_live_events(task, progress_queue, session_id):
             event_type = event.get('type')
-            if event_type in {'status', 'thought', 'code_start', 'code_file_start', 'code_delta', 'AGENT_HEARTBEAT', 'RETRY', 'ERROR'}:
+            if event_type in CODE_STREAM_FORWARD_TYPES:
                 yield f'data: {json.dumps(event, ensure_ascii=False)}\n\n'
             elif event_type == 'token':
                 emitted_content = True
@@ -837,7 +937,7 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
         while not progress_queue.empty():
             event = progress_queue.get_nowait()
             event_type = event.get('type')
-            if event_type in {'status', 'thought', 'code_start', 'code_file_start', 'code_delta', 'AGENT_HEARTBEAT', 'RETRY', 'ERROR'}:
+            if event_type in CODE_STREAM_FORWARD_TYPES:
                 yield f'data: {json.dumps(event, ensure_ascii=False)}\n\n'
         result = await task
     except Exception as exc:
