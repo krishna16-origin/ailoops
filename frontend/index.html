@@ -1365,7 +1365,7 @@
             let thinkingDone = false;
       // true once the model has moved on to answering
             let answerStarted = false;     // true once the first answer token has arrived
-            let thinkingFinalized = false; // true once "Thought for Ns" has been set for good
+            let thinkingFinalized = false; // true once the progress block is finalized
             let lastThoughtStep = null;    // step name of the most recently rendered thought bubble
             let lastThoughtContentEl = null; // its .thought-content node, so a repeat 'thinking'
                                               // heartbeat can update it in place instead of piling
@@ -1513,15 +1513,18 @@
                 if (cursor) cursor.remove();
             }
 
-            // Called once the response is fully done (stream ended, or non-streaming
-            // reply received). Settles the main toggle into "Thought for Ns" and stops
-            // the shimmer for good, Claude-style. Same behavior for both modes.
+            // Called once the response is fully done. Code Mode settles into a neutral
+            // live-progress label; Chat Mode removes this block entirely.
             function finishThinking() {
                 if (thinkingFinalized) return;
                 thinkingFinalized = true;
                 thinkingDone = true;
-                const seconds = Math.max(1, Math.round((Date.now() - thinkingStartTime) / 1000));
-                thinkingToggle.textContent = `Thought for ${seconds}s`;
+                if (mode === 'chat') {
+                    // Chat mode never exposes internal reasoning or a thought timer.
+                    thinkingBlock.remove();
+                    return;
+                }
+                thinkingToggle.textContent = 'Live progress';
                 thinkingToggle.classList.remove('shimmer');
                 thinkingContent.classList.remove('expanded');
                 const liveCursor = liveThoughtEl ? liveThoughtEl.querySelector('.thought-live-cursor') : null;
