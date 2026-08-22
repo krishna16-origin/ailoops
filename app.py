@@ -2,7 +2,6 @@ import os
 import os
 import json
 import re
-import difflib
 import asyncio
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
@@ -335,67 +334,6 @@ async def publish_event(progress, event: dict) -> None:
         await progress.put(event)
 
 
-_FENCE_OPEN_RE = re.compile(r"^```([A-Za-z0-9_+#.-]*)\s*$")
-_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
-_FILE_HEADER_RE = re.compile(r"^\s*FILE\s*:\s*(.+?)\s*$", re.IGNORECASE)
-
-
-def _new_code_stream_state(previous_files: Optional[dict] = None) -> dict:
-    return {
-        "in_code": False,
-        "pending_filename": None,
-        "current_file": "",
-        "current_language": "",
-        "line_buf": "",
-        # Full text accumulated so far for the file currently streaming, keyed
-        # by filename ("" for a single unnamed file) — lets us diff the real,
-        # complete file the instant its fence closes instead of waiting for
-        # the whole (possibly multi-file) response to finish.
-        "file_content": {},
-        # Snapshot of what this session generated last turn, taken once up
-        # front so every live diff this turn compares against the same
-        # baseline instead of a moving target.
-        "previous_files": previous_files or {},
-        # Filenames already diffed and emitted this turn, so a stray repeat
-        # fence (or the end-of-stream flush) never double-emits one file.
-        "seen_files": set(),
-    }
-
-
-def _diff_stats_and_lines(old_content: Optional[str], new_content: str) -> tuple[int, int, list]:
-    """Real line-level diff of one file's new content against what this same
-    session generated for it last turn (or None for a brand-new file). Shared
-    by the live per-file streaming event and the final turn summary so the
-    two always agree on the same numbers."""
-    new_lines = new_content.splitlines()
-    if old_content is None:
-        return len(new_lines), 0, [{"type": "add", "text": ln} for ln in new_lines]
-    old_lines = old_content.splitlines()
-    sm = difflib.SequenceMatcher(a=old_lines, b=new_lines)
-    diff_lines: list = []
-    additions = deletions = 0
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            for ln in new_lines[j1:j2]:
-                diff_lines.append({"type": "context", "text": ln})
-        elif tag == "delete":
-            for ln in old_lines[i1:i2]:
-                diff_lines.append({"type": "del", "text": ln})
-            deletions += (i2 - i1)
-        elif tag == "insert":
-            for ln in new_lines[j1:j2]:
-                diff_lines.append({"type": "add", "text": ln})
-            additions += (j2 - j1)
-        elif tag == "replace":
-            for ln in old_lines[i1:i2]:
-                diff_lines.append({"type": "del", "text": ln})
-            for ln in new_lines[j1:j2]:
-                diff_lines.append({"type": "add", "text": ln})
-            deletions += (i2 - i1)
-            additions += (j2 - j1)
-    return additions, deletions, diff_lines
-
-
 def _guess_raw_code_language(line: str) -> str:
     clean = (line or '').strip()
     if re.match(r'(?i)^(<!doctype\s+html|<html\b|</?[a-z][^>]*>)', clean):
@@ -407,90 +345,6 @@ def _guess_raw_code_language(line: str) -> str:
     if re.match(r'^(?:[.#]?[A-Za-z_][\w-]*\s*\{|@media\b)', clean):
         return 'css'
     return ''
-
-
-async def _emit_file_diff(progress, code_state: dict) -> None:
-    """Diff the file that just finished streaming against what this session
-    generated for it last turn, and publish the result as one live event —
-    this is what lets the activity feed and diff/preview canvas update file
-    by file as generation happens, instead of only once at the very end."""
-    filename = code_state["current_file"]
-    if filename in code_state["seen_files"]:
-        return
-    content = code_state["file_content"].get(filename, "").rstrip("\n")
-    if not content:
-        return
-    old_content = code_state["previous_files"].get(filename)
-    additions, deletions, diff_lines = _diff_stats_and_lines(old_content, content)
-    code_state["seen_files"].add(filename)
-    await publish_event(progress, {
-        "type": "code_file_diff",
-        "filename": filename,
-        "language": code_state["current_language"],
-        "additions": additions,
-        "deletions": deletions,
-        "diff_lines": diff_lines,
-        "content": content,
-    })
-
-
-async def _stream_code_line(progress, line: str, code_state: dict) -> None:
-    if not code_state["in_code"]:
-        file_match = _FILE_HEADER_RE.match(line)
-        if file_match:
-            code_state["pending_filename"] = file_match.group(1).strip().strip("`")
-            return
-        fence_match = _FENCE_OPEN_RE.match(line)
-        if fence_match:
-            language = fence_match.group(1) or ""
-            filename = code_state["pending_filename"] or ""
-            code_state["pending_filename"] = None
-            code_state["in_code"] = True
-            code_state["current_file"] = filename
-            code_state["current_language"] = language
-            code_state["file_content"][filename] = ""
-            event = {"type": "code_file_start", "language": language, "filename": filename} if filename else {"type": "code_start", "language": language}
-            await publish_event(progress, event)
-            return
-        raw_language = _guess_raw_code_language(line)
-        if raw_language:
-            code_state["in_code"] = True
-            code_state["current_file"] = ""
-            code_state["current_language"] = raw_language
-            code_state["file_content"][""] = line + "\n"
-            await publish_event(progress, {"type": "code_start", "language": raw_language})
-            await publish_event(progress, {"type": "code_delta", "delta": line + "\n", "filename": ""})
-            return
-        await publish_token(progress, line + "\n")
-    elif _FENCE_CLOSE_RE.match(line):
-        await _emit_file_diff(progress, code_state)
-        code_state["in_code"] = False
-        code_state["current_file"] = ""
-        code_state["current_language"] = ""
-    else:
-        filename = code_state["current_file"]
-        code_state["file_content"][filename] = code_state["file_content"].get(filename, "") + line + "\n"
-        await publish_event(progress, {"type": "code_delta", "delta": line + "\n", "filename": filename})
-
-
-async def stream_code_answer_piece(progress, code_state: dict, text: str) -> None:
-    code_state["line_buf"] += text
-    while "\n" in code_state["line_buf"]:
-        line, code_state["line_buf"] = code_state["line_buf"].split("\n", 1)
-        await _stream_code_line(progress, line, code_state)
-
-
-async def flush_code_answer_stream(progress, code_state: dict) -> None:
-    if code_state["line_buf"]:
-        await _stream_code_line(progress, code_state["line_buf"], code_state)
-        code_state["line_buf"] = ""
-    if code_state["in_code"]:
-        # Stream ended without a closing ``` — truncated output, or the
-        # unfenced-code fallback path, which never sees one at all. Emit
-        # whatever was captured so the diff panel and file cards still show
-        # the real result instead of ending up empty.
-        await _emit_file_diff(progress, code_state)
-        code_state["in_code"] = False
 
 
 def build_messages(history: List[BaseMessage], thinking_level: str, search_text: str = "") -> List[BaseMessage]:
@@ -895,104 +749,14 @@ def extract_code_artifact(text: str) -> tuple[str, str, str, dict, dict]:
     return explanation, "", "", files, file_languages
 
 
-def _split_explanation_into_notes(explanation: str) -> List[str]:
-    """Break the model's own explanation into short note bullets — real content
-    from the model, not synthesized narration — for the activity feed's clock-icon
-    lines (e.g. 'Architected CSS styling and engineered component rendering logic.')."""
-    if not explanation:
-        return []
-    # Prefer existing bullet/numbered lines if the model already wrote them.
-    bullet_lines = [ln.strip(" -*\t") for ln in explanation.splitlines() if re.match(r"^\s*([-*]|\d+[.)])\s+\S", ln)]
-    if bullet_lines:
-        return [b for b in bullet_lines if b][:6]
-    # Otherwise split into sentences and keep the short, concrete ones.
-    sentences = re.split(r"(?<=[.!?])\s+", explanation.strip())
-    notes = [s.strip() for s in sentences if 8 <= len(s.strip()) <= 160]
-    return notes[:4]
-
-
-def build_turn_activities(files: dict, code: str, language: str, explanation: str, previous_files: dict) -> tuple[list, dict]:
-    """Build a Claude-Code-style activity trace for one Code-mode turn, using only
-    real signal already available: a genuine per-file diff against what this same
-    session generated last turn (difflib), plus the model's own explanation text
-    split into short notes. No fabricated tool calls are added."""
-    activities: list = []
-    all_files = dict(files) if files else ({"": code} if code else {})
-
-    edited_count = 0
-    viewed_count = 0
-
-    for filename, new_content in all_files.items():
-        display_name = filename or (f"generated.{language}" if language else "generated code")
-        old_content = previous_files.get(filename)
-        additions, deletions, diff_lines = _diff_stats_and_lines(old_content, new_content)
-        if old_content is not None:
-            # This file already existed in the session — genuinely "viewed" it
-            # (it's the context the model was given) before editing it.
-            activities.append({"kind": "view", "text": f"Reviewed the current contents of {display_name} before editing"})
-            viewed_count += 1
-        activities.append({
-            "kind": "edit",
-            "file": display_name,
-            "filename": filename,
-            "additions": additions,
-            "deletions": deletions,
-            "diff_lines": diff_lines,
-        })
-        edited_count += 1
-
-    for note in _split_explanation_into_notes(explanation):
-        activities.append({"kind": "note", "text": note})
-
-    note_count = sum(1 for a in activities if a["kind"] == "note")
-    summary = {
-        "commands": 0,
-        "files_edited": edited_count,
-        "files_viewed": viewed_count,
-        "notes": note_count,
-    }
-    return activities, summary
-
-
 # ---------------------------------------------------------------------------
-# Code mode: direct response generation with HTTP SSE code streaming.
-# Generated code is returned only through the response stream. The frontend
-# receives the explanation as message events and the code body as
-# code_start/code_delta events for one live diff box inside the assistant response.
+# Code mode: user prompt in, generated code out.
 # ---------------------------------------------------------------------------
 
 CODE_MAX_OUTPUT = 20000
 
-# A flat timeout doesn't work here: 'low' effort on the 'fast' model finishes in
-# seconds, but 'max' effort (40k-token budget) on the 'strong' reasoning model can
-# legitimately take well over a minute of real thinking + generation. A single
-# 90s cap was killing those requests mid-generation via asyncio.wait_for() —
-# discarding everything already produced — exactly when the UI showed something
-# like "Thought for 93s" right before the generic failure message. Sizing the
-# timeout to the actual token budget and model tier fixes that at the root,
-# instead of just raising the number and hoping it's big enough next time too.
-CODE_GENERATION_TIMEOUT_FLOOR = 120.0      # never less than this, even for the smallest request
-CODE_GENERATION_TIMEOUT_CEILING = 1200.0   # hard cap so a genuinely stuck call can never hang forever
-
-# How much of the completion budget a model's own <think> block is allowed to
-# consume before producing any visible answer text, expressed as a fraction of
-# max_tokens (converted to a rough character count at ~4 chars/token — this only
-# needs to be a safety valve, not a precise limit). Seen in practice: a verbose
-# model can burn an entire request's timeout re-litigating its own plan and
-# never reach the code. When exceeded, generate_code_once() aborts that attempt
-# and retries once with thinking disabled so code is still guaranteed to land.
-CODE_THINK_BUDGET_FRACTION = 0.45
-CODE_THINK_CHARS_PER_TOKEN = 4
-
-# Rough real-world seconds of generation time per 1000 completion tokens, per
-# model tier — 'strong' is a much larger reasoning model and is meaningfully
-# slower per token than 'fast'/'medium', and needs proportionally more headroom
-# before a slow-but-healthy response gets mistaken for a hang.
-CODE_MODEL_SECONDS_PER_1K_TOKENS = {
-    "fast": 15.0,
-    "medium": 22.0,
-    "strong": 35.0,
-}
+# One flat timeout for every code-mode request, regardless of model or effort.
+CODE_GENERATION_TIMEOUT = 300.0
 
 
 def resolve_code_model_key(model: str) -> str:
@@ -1001,85 +765,23 @@ def resolve_code_model_key(model: str) -> str:
     return key if key in CODE_MODEL_MAP else DEFAULT_CODE_MODEL
 
 
-def get_code_generation_timeout(model_key: str, reasoning_level: str) -> float:
-    """Size the generation timeout to this request's actual token budget and
-    model speed, instead of one flat number that's wrong for most requests."""
-    max_tokens = get_code_thinking_config(reasoning_level)["max_tokens"]
-    seconds_per_1k = CODE_MODEL_SECONDS_PER_1K_TOKENS.get(
-        model_key, CODE_MODEL_SECONDS_PER_1K_TOKENS[DEFAULT_CODE_MODEL]
-    )
-    estimated = (max_tokens / 1000.0) * seconds_per_1k
-    return max(CODE_GENERATION_TIMEOUT_FLOOR, min(estimated, CODE_GENERATION_TIMEOUT_CEILING))
-
-
-async def generate_code_once(request: CodeChatRequest, session: dict, progress=None, on_answer_piece=None) -> dict:
+async def generate_code_once(request: CodeChatRequest, session: dict, progress=None) -> dict:
+    """User prompt in, generated code out: build the prompt, call the model
+    once, pull the code out of the response, remember it for this session."""
     config = get_code_thinking_config(request.reasoning_level)
     model_key = resolve_code_model_key(request.model)
-    await publish_progress(
-        progress,
-        'code_generation_started',
-        'code_generation_started',
-        f"Generating code with {config['label']} effort and a {config['max_tokens']}-token budget.",
-    )
     llm = get_code_llm(model_key, 0.2, config['max_tokens'])
-    # Explicitly request thinking mode. All three Code-mode models support it
-    # (confirmed via each model's thinking_param_enable entry in the installed
-    # langchain_nvidia_ai_endpoints package), but none get it by default — passing
-    # thinking_mode=True here is what actually turns on live reasoning streaming.
-    #
-    # max_think_chars enforces CODE_THINK_BUDGET_FRACTION: if the model spends more
-    # than that share of its token budget planning without producing any visible
-    # answer text, invoke_model raises ThinkingBudgetExceeded instead of letting it
-    # ramble until the outer generation timeout kills the whole turn and discards
-    # everything. On that signal we retry once, immediately, with thinking turned
-    # off entirely — so code still lands even from a model that won't stop planning.
     code_messages = build_code_messages(session['messages'], request.reasoning_level, session.get('code_files'))
-    max_think_chars = int(config['max_tokens'] * CODE_THINK_BUDGET_FRACTION * CODE_THINK_CHARS_PER_TOKEN)
-    try:
-        raw_response = await invoke_model(
-            code_messages,
-            llm,
-            progress,
-            on_answer_piece=on_answer_piece,
-            thinking_mode=True,
-            max_think_chars=max_think_chars,
-        )
-    except ThinkingBudgetExceeded as exc:
-        print(f"[code-mode] thinking budget exceeded ({exc}); retrying once with thinking disabled")
-        await publish_event(progress, {
-            "type": "RETRY",
-            "reason": f"Still planning after {max_think_chars} chars of reasoning — retrying with thinking off so code lands.",
-        })
-        raw_response = await invoke_model(
-            code_messages,
-            llm,
-            progress,
-            on_answer_piece=on_answer_piece,
-            thinking_mode=False,
-        )
+    raw_response = await invoke_model(code_messages, llm, progress, thinking_mode=True)
     explanation, code, language, files, file_languages = extract_code_artifact(raw_response)
-    # Only treat this as a failure when extract_code_artifact truly found no code
-    # (no fenced blocks, no raw code fallback) — not just because the model skipped
-    # the FILE: header on an otherwise-valid single fenced block. The old check here
-    # required the literal `FILE: path` line before ANY code was accepted, which
-    # threw away perfectly good code from models that didn't use that exact format.
     if not code and not files:
         return {
             'response': (
                 'The model returned no code artifact. Please ask again and require the complete implementation '
                 'inside fenced code blocks with a `FILE: relative/path.ext` header.'
             ),
-            'code': '',
-            'language': '',
-            'files': {},
-            'file_languages': {},
-            'show_preview': False,
+            'code': '', 'language': '', 'files': {}, 'file_languages': {}, 'show_preview': False,
             'artifact_error': True,
-            'thinking_summary': 'No code artifact was returned; no file-system actions were run.',
-            'thinking_level': config['label'],
-            'max_tokens': config['max_tokens'],
-            'activities': [],
-            'activity_summary': {},
         }
     if not explanation:
         explanation = 'Generated the requested code.'
@@ -1089,10 +791,8 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
         filename: (content[:CODE_MAX_OUTPUT] + '\n… output truncated …' if len(content) > CODE_MAX_OUTPUT else content)
         for filename, content in files.items()
     }
-    previous_files = dict(session.get('code_files') or {})
-    activities, activity_summary = build_turn_activities(files, code, language, explanation, previous_files)
-    # Remember what we just generated so the *next* turn in this session can
-    # diff against real prior content instead of guessing.
+    # Remember what we just generated so a follow-up edit turn has real
+    # ground truth instead of guessing.
     session_files = session.setdefault('code_files', {})
     if files:
         session_files.update(files)
@@ -1105,40 +805,17 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
         'files': files,
         'file_languages': file_languages,
         'show_preview': bool(code or files),
-        'thinking_summary': 'Generated directly in the response stream; no file-system actions were run.',
-        'thinking_level': config['label'],
-        'max_tokens': config['max_tokens'],
-        'activities': activities,
-        'activity_summary': activity_summary,
     }
 
 
-CODE_STREAM_FORWARD_TYPES = {
-    'status', 'thought', 'code_start', 'code_file_start', 'code_delta',
-    'code_file_diff', 'AGENT_HEARTBEAT', 'RETRY', 'ERROR',
-}
+CODE_STREAM_FORWARD_TYPES = {'status', 'thought', 'AGENT_HEARTBEAT', 'ERROR'}
 
 
 async def generate_code_stream(request: CodeChatRequest, session: dict, session_id: str):
     progress_queue: asyncio.Queue = asyncio.Queue()
-    # Snapshot what this session generated last turn *before* generation
-    # starts, so every live per-file diff this turn compares against the
-    # same fixed baseline (session['code_files'] itself is only updated once
-    # generation finishes, inside generate_code_once).
-    previous_files = dict(session.get('code_files') or {})
-    code_state = _new_code_stream_state(previous_files)
     emitted_content = False
-
-    async def on_answer_piece(text: str) -> None:
-        await stream_code_answer_piece(progress_queue, code_state, text)
-
-    model_key = resolve_code_model_key(request.model)
-    timeout = get_code_generation_timeout(model_key, request.reasoning_level)
     task = asyncio.create_task(
-        asyncio.wait_for(
-            generate_code_once(request, session, progress_queue, on_answer_piece),
-            timeout=timeout,
-        )
+        asyncio.wait_for(generate_code_once(request, session, progress_queue), timeout=CODE_GENERATION_TIMEOUT)
     )
     result = None
     try:
@@ -1149,20 +826,11 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
             elif event_type == 'token':
                 emitted_content = True
                 yield f"data: {json.dumps({'type': 'message', 'assistant_message': event['text'], 'conversation_id': session_id, 'session_id': session_id}, ensure_ascii=False)}\n\n"
-        await flush_code_answer_stream(progress_queue, code_state)
-        while not progress_queue.empty():
-            event = progress_queue.get_nowait()
-            event_type = event.get('type')
-            if event_type in CODE_STREAM_FORWARD_TYPES:
-                yield f'data: {json.dumps(event, ensure_ascii=False)}\n\n'
         result = await task
     except asyncio.TimeoutError:
-        print(f'[{session_id}] Code generation timed out after {timeout:.0f}s (model={model_key}, effort={request.reasoning_level}).')
+        print(f'[{session_id}] Code generation timed out after {CODE_GENERATION_TIMEOUT:.0f}s.')
         result = {
-            'response': (
-                f"That response was taking longer than expected and timed out after {timeout:.0f}s. "
-                "Try a lower reasoning effort or a faster model, or just ask again."
-            ),
+            'response': "That response timed out. Try again, or a lower reasoning effort.",
             'code': '', 'language': '', 'files': {}, 'file_languages': {}, 'show_preview': False,
         }
         yield f'data: {json.dumps({"type": "ERROR", "message": "timeout"}, ensure_ascii=False)}\n\n'
@@ -1234,14 +902,13 @@ async def code_chat(request: CodeChatRequest):
         )
     thinking_steps = []
     try:
-        result = await generate_code_once(request, session, thinking_steps)
-    except ThinkingBudgetExceeded as exc:
-        # generate_code_once already retries once internally on this signal for
-        # the streaming path; this outer catch only matters if the retry itself
-        # also exceeded budget (thinking_mode=False shouldn't, but don't hang).
-        print(f"[{request.session_id}] Code generation gave up after repeated thinking-budget overruns: {exc}")
+        result = await asyncio.wait_for(
+            generate_code_once(request, session, thinking_steps), timeout=CODE_GENERATION_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        print(f"[{request.session_id}] Code generation timed out after {CODE_GENERATION_TIMEOUT:.0f}s.")
         result = {
-            "response": "The model kept re-planning instead of writing code. Try again with a lower reasoning effort.",
+            "response": "That response timed out. Try again, or a lower reasoning effort.",
             "code": "", "language": "", "files": {}, "file_languages": {}, "show_preview": False,
         }
     except Exception as exc:
