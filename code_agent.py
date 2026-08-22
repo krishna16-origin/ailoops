@@ -28,13 +28,10 @@ Event vocabulary emitted (new, richer schema):
     activity_error, file_read, file_created, file_edited, file_deleted,
     diff_created, artifact_created, final_message, complete
 
-For zero-friction compatibility with the current frontend (which already
-renders a Claude-Code-style activity feed / diff canvas / file-download
-cards), the streaming path ALSO emits the legacy event shapes it already
-understands (code_file_start, code_file_diff, token/message, code_result) —
-see `_bridge_legacy()`. The final `code_result` payload is shaped exactly like
-the old one: {response, code, language, files, file_languages, show_preview,
-activities, activity_summary}.
+The streaming path emits the rich event vocabulary directly. The final result
+keeps the response/file fields used by the non-streaming endpoint: {response,
+code, language, files, file_languages, show_preview, activities,
+activity_summary, plan, diffs}.
 """
 
 import re
@@ -249,50 +246,16 @@ def parse_agent_turn(raw: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Live stream watcher: fires exactly one cosmetic, best-effort early ping —
-# a legacy 'code_file_start' event the moment the partial stream reveals this
-# turn is an edit_file/create_file for a known path, so the frontend's per-
-# file tab can appear before the full diff is ready. Deliberately does
-# nothing else (no thought streaming, no activity_start) so there is exactly
-# one source of truth for every other event: the main loop, once it parses
-# the COMPLETE response with parse_agent_turn(). A watcher that never fires
-# (unusual formatting, non-streaming mode) is harmless — the frontend already
-# creates the file tab defensively when code_file_diff arrives with no prior
-# code_file_start.
+# Agent-turn output sink.
+#
+# The model's structured THOUGHT/ACTION response is internal protocol data. It
+# must not be streamed into the answer bubble as raw text. User-facing progress
+# is emitted only after a complete turn has been parsed, through the rich event
+# vocabulary below (agent_message, activity_*, file_*, diff_*, artifact_*).
 # ---------------------------------------------------------------------------
-_ACTION_LINE_RE = re.compile(r"ACTION:\s*(?P<action>\w+)", re.IGNORECASE)
-_PATH_LINE_RE = re.compile(r"PATH:\s*(?P<path>[^\n]+)\n", re.IGNORECASE)
-_FENCE_OPEN_RE = re.compile(r"```(?P<lang>[A-Za-z0-9_+#.-]*)[ \t]*\n")
-
-
 def make_agent_stream_watcher(progress):
-    state = {"buffer": "", "done": False}
-
     async def watcher(text: str) -> None:
-        if state["done"] or not text:
-            return
-        state["buffer"] += text
-        if len(state["buffer"]) > 4000:
-            # No header ever this large — give up watching this turn rather
-            # than let the buffer grow for the rest of a long file body.
-            state["done"] = True
-            return
-        am = _ACTION_LINE_RE.search(state["buffer"])
-        if not am:
-            return
-        action = am.group("action").lower()
-        if action not in ("edit_file", "create_file"):
-            state["done"] = True
-            return
-        pm = _PATH_LINE_RE.search(state["buffer"])
-        fm = _FENCE_OPEN_RE.search(state["buffer"])
-        if not pm or not fm:
-            return
-        path = pm.group("path").strip().strip("`")
-        language = (fm.group("lang") or "text").lower()
-        await publish_event(progress, {"type": "code_file_start", "filename": path, "language": language})
-        state["done"] = True
-
+        return None
     return watcher
 
 
@@ -313,9 +276,8 @@ def _classify_note_kind(text: str) -> str:
 # Core loop
 # ---------------------------------------------------------------------------
 async def _run_agent(request: Any, session: dict, emit) -> dict:
-    """Runs the full PLAN -> AGENT LOOP, calling `emit(event)` for every event
-    along the way, and returns the final result dict (legacy code_result shape
-    plus the richer 'diffs'/'plan' fields)."""
+    """Run PLAN -> AGENT LOOP, emit every rich workflow event, and return the
+    final response/file result for the non-streaming endpoint."""
     file_store: Dict[str, str] = session.setdefault("code_files", {})
     history: List[BaseMessage] = session["messages"]
     reasoning_level = request.reasoning_level
@@ -344,12 +306,12 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
 
     for step in range(1, MAX_AGENT_STEPS + 1):
         agent_messages = build_agent_messages(history, transcript, file_store, plan_steps, reasoning_level, step)
-        watcher = make_agent_stream_watcher(emit.queue)
+        watcher = make_agent_stream_watcher(emit)
 
         malformed_retry_note = None
         try:
             raw = await invoke_model(
-                agent_messages, llm, emit.queue,
+                agent_messages, llm, emit,
                 on_answer_piece=watcher, thinking_mode=True, max_think_chars=max_think_chars,
             )
         except ThinkingBudgetExceeded:
@@ -358,8 +320,8 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                     "Stop planning. Respond immediately in the required THOUGHT/ACTION format with a single "
                     "concrete action."
                 ))],
-                llm, emit.queue,
-                on_answer_piece=make_agent_stream_watcher(emit.queue),
+                llm, emit,
+                on_answer_piece=make_agent_stream_watcher(emit),
                 thinking_mode=False,
             )
 
@@ -390,8 +352,12 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
 
         if action == "read_file":
             existing = file_store.get(path)
+            activity_id = f"activity_{len(activities) + 1}"
+            running = {"id": activity_id, "action": "read", "file": path, "status": "running"}
+            await emit({"type": "activity_start", "activity": running, "action": "read", "file": path})
             if existing is None:
-                await emit({"type": "activity_error", "action": "read", "file": path, "message": "File does not exist"})
+                error = {"id": activity_id, "action": "read", "file": path, "status": "error"}
+                await emit({"type": "activity_error", "activity": error, "action": "read", "file": path, "message": "File does not exist"})
                 transcript.append(AIMessage(content=raw))
                 transcript.append(HumanMessage(content=f"TOOL RESULT: {path} does not exist yet. Use create_file to make it."))
             else:
@@ -399,9 +365,9 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 if len(snippet) > CODE_READ_CHAR_LIMIT:
                     snippet = snippet[:CODE_READ_CHAR_LIMIT] + "\n… (truncated; file is longer) …"
                 activities.append({"kind": "view", "text": f"Read {path}"})
-                await emit({"type": "activity_start", "action": "read", "file": path})
-                await emit({"type": "file_read", "file": path, "content": snippet})
-                await emit({"type": "activity_complete", "action": "read", "file": path})
+                completed = {"id": activity_id, "action": "read", "file": path, "status": "completed"}
+                await emit({"type": "file_read", "activity": completed, "file": path, "content": snippet})
+                await emit({"type": "activity_complete", "activity": completed, "action": "read", "file": path})
                 transcript.append(AIMessage(content=raw))
                 transcript.append(HumanMessage(content=f"TOOL RESULT: contents of {path}:\n```\n{snippet}\n```"))
             continue
@@ -422,9 +388,10 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 new_lines = content.splitlines()
                 additions, deletions = len(new_lines), 0
                 diff_lines = [{"type": "add", "content": line} for line in new_lines]
+            activity_id = f"activity_{len(activities) + 1}"
             activities.append({
                 "kind": "edit", "file": path, "filename": path,
-                "additions": additions, "deletions": deletions, "diff_lines": diff_lines,
+                "created": not is_edit, "additions": additions, "deletions": deletions, "diff_lines": diff_lines,
             })
 
             act = "edit" if is_edit else "create"
@@ -432,15 +399,16 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             diff_id = f"diff_{len(diffs) + 1}"
             diffs.append({"diff_id": diff_id, "file": path, "additions": additions, "deletions": deletions, "diff_lines": diff_lines})
 
-            await emit({"type": "activity_start", "action": act, "file": path})
-            await emit({"type": evt_type, "file": path, "additions": additions, "deletions": deletions, "diff_id": diff_id})
-            await emit({
-                "type": "code_file_diff", "filename": path, "language": _guess_language(path),
-                "additions": additions, "deletions": deletions, "diff_lines": diff_lines, "content": content,
-            })
+            running = {"id": activity_id, "action": act, "file": path, "status": "running"}
+            completed = {"id": activity_id, "action": act, "file": path, "status": "completed"}
+            await emit({"type": "activity_start", "activity": running, "action": act, "file": path})
+            await emit({"type": evt_type, "activity": completed, "file": path, "additions": additions,
+                        "deletions": deletions, "diff_id": diff_id, "language": _guess_language(path),
+                        "content": content, "diff_lines": diff_lines})
             await emit({"type": "diff_created", "diff_id": diff_id, "file": path, "diff_lines": diff_lines,
-                        "additions": additions, "deletions": deletions})
-            await emit({"type": "activity_complete", "action": act, "file": path})
+                        "additions": additions, "deletions": deletions, "content": content,
+                        "language": _guess_language(path)})
+            await emit({"type": "activity_complete", "activity": completed, "action": act, "file": path})
 
             transcript.append(AIMessage(content=raw))
             transcript.append(HumanMessage(content=f"TOOL RESULT: {path} saved ({additions} additions, {deletions} deletions)."))
@@ -449,10 +417,13 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         if action == "delete_file":
             existed = path in file_store
             file_store.pop(path, None)
+            activity_id = f"activity_{len(activities) + 1}"
             activities.append({"kind": "command", "text": f"rm {path}"})
-            await emit({"type": "activity_start", "action": "delete", "file": path})
-            await emit({"type": "file_deleted", "file": path, "existed": existed})
-            await emit({"type": "activity_complete", "action": "delete", "file": path})
+            running = {"id": activity_id, "action": "delete", "file": path, "status": "running"}
+            completed = {"id": activity_id, "action": "delete", "file": path, "status": "completed"}
+            await emit({"type": "activity_start", "activity": running, "action": "delete", "file": path})
+            await emit({"type": "file_deleted", "activity": completed, "file": path, "existed": existed})
+            await emit({"type": "activity_complete", "activity": completed, "action": "delete", "file": path})
             transcript.append(AIMessage(content=raw))
             transcript.append(HumanMessage(content=f"TOOL RESULT: {path} {'deleted' if existed else 'did not exist; nothing to delete'}."))
             continue
@@ -480,8 +451,10 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     notes = sum(1 for a in activities if a["kind"] in ("note", "plan"))
     activity_summary = {"commands": commands, "files_edited": files_edited, "files_viewed": files_viewed, "notes": notes}
 
-    await emit({"type": "artifact_created", "files": list(turn_files_touched.keys())})
-    await emit({"type": "complete"})
+    await emit({"type": "artifact_created", "files": turn_files_touched, "file_languages": file_languages,
+                "activities": activities, "activity_summary": activity_summary, "plan": plan_steps,
+                "diffs": diffs})
+    await emit({"type": "complete", "status": "completed"})
 
     result = {
         "response": final_text,
@@ -548,51 +521,36 @@ async def _forward_with_heartbeat(task: asyncio.Task, queue: asyncio.Queue):
 
 
 async def stream_code_agent(request: Any, session: dict, session_id: str):
-    """Streaming: yields SSE 'data: ...\\n\\n' frames — the new rich event
-    vocabulary plus legacy-shaped events (token/message, code_file_start,
-    code_file_diff, code_result, message_reset, ERROR) the current frontend
-    already knows how to render."""
+    """Stream the pasted workflow's rich SSE event vocabulary directly."""
     queue: asyncio.Queue = asyncio.Queue()
-    task = asyncio.create_task(asyncio.wait_for(_run_agent(request, session, _QueueEmitter(queue)), timeout=CODE_GENERATION_TIMEOUT))
+    task = asyncio.create_task(asyncio.wait_for(
+        _run_agent(request, session, _QueueEmitter(queue)),
+        timeout=CODE_GENERATION_TIMEOUT,
+    ))
 
-    emitted_content = False
-    did_reset = False
     result = None
     try:
         async for event in _forward_with_heartbeat(task, queue):
-            etype = event.get("type")
-            if etype == "agent_message":
-                emitted_content = True
-                text = event.get("text", "")
-                if text:
-                    yield f"data: {json.dumps({'type': 'message', 'assistant_message': text, 'conversation_id': session_id, 'session_id': session_id}, ensure_ascii=False)}\n\n"
-            elif etype in ("code_file_start", "code_file_diff", "AGENT_HEARTBEAT"):
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            elif etype in ("plan_created", "activity_start", "activity_complete", "activity_error",
-                           "file_read", "file_created", "file_edited", "file_deleted",
-                           "diff_created", "artifact_created", "final_message", "complete"):
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            event = dict(event)
+            event["session_id"] = session_id
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         result, transcript = await task
     except asyncio.TimeoutError:
         result = {
             "response": "That response timed out. Try again, or a lower reasoning effort.",
             "code": "", "language": "", "files": {}, "file_languages": {}, "show_preview": False,
         }
-        yield f'data: {json.dumps({"type": "message_reset"}, ensure_ascii=False)}\n\n'
-        did_reset = True
-        yield f'data: {json.dumps({"type": "ERROR", "message": "timeout"}, ensure_ascii=False)}\n\n'
+        yield f'data: {json.dumps({"type": "activity_error", "status": "error", "message": "timeout", "session_id": session_id}, ensure_ascii=False)}\n\n'
+        yield f'data: {json.dumps({"type": "final_message", "text": result["response"], "session_id": session_id}, ensure_ascii=False)}\n\n'
+        yield f'data: {json.dumps({"type": "complete", "status": "error", "session_id": session_id}, ensure_ascii=False)}\n\n'
     except Exception as exc:
         print(f"[{session_id}] Code agent failed: {exc}")
         result = {
             "response": "I could not generate code right now. Please try again.",
             "code": "", "language": "", "files": {}, "file_languages": {}, "show_preview": False,
         }
-        yield f'data: {json.dumps({"type": "message_reset"}, ensure_ascii=False)}\n\n'
-        did_reset = True
-        yield f'data: {json.dumps({"type": "ERROR", "message": str(exc)}, ensure_ascii=False)}\n\n'
+        yield f'data: {json.dumps({"type": "activity_error", "status": "error", "message": str(exc), "session_id": session_id}, ensure_ascii=False)}\n\n'
+        yield f'data: {json.dumps({"type": "final_message", "text": result["response"], "session_id": session_id}, ensure_ascii=False)}\n\n'
+        yield f'data: {json.dumps({"type": "complete", "status": "error", "session_id": session_id}, ensure_ascii=False)}\n\n'
 
-    if result.get("code") or result.get("files"):
-        yield f'data: {json.dumps({"type": "code_result", **result, "session_id": session_id}, ensure_ascii=False)}\n\n'
-    if not emitted_content or did_reset:
-        yield f'data: {json.dumps({"type": "message", "assistant_message": result["response"], "conversation_id": session_id, "session_id": session_id}, ensure_ascii=False)}\n\n'
     session["messages"].append(AIMessage(content=result["response"]))

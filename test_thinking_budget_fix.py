@@ -1,88 +1,50 @@
-"""
-Verifies the ThinkingBudgetExceeded wiring without hitting the real NVIDIA API.
-
-Simulates exactly the failure mode from the 704s timeout: on the first call the
-model streams a huge wall of reasoning_content and never gets to real answer
-text. Before the fix this would just run forever (or until the outer timeout)
-and discard everything. After the fix, invoke_model should raise
-ThinkingBudgetExceeded partway through, generate_code_once should catch it and
-immediately retry with thinking_mode=False, and that retry (a normal, well-
-behaved response) should produce real code + files + an activity trace shaped
-like the screenshot (Read/Edited rows + a summary line).
-"""
+"""Offline regression test for the pasted PLAN -> FILE EVENTS -> SSE workflow."""
 import asyncio
 from types import SimpleNamespace
 
-import app
-
-
-class FakeChunk:
-    def __init__(self, content="", reasoning=""):
-        self.content = content
-        self.additional_kwargs = {"reasoning_content": reasoning} if reasoning else {}
-
-
-class RamblingThenGoodLLM:
-    """First .astream() call: 5000 chars of reasoning, never reaches an answer
-    (mirrors the real 704s run). Second call (thinking disabled): answers
-    immediately with a real FILE:-tagged code block."""
-
-    def __init__(self):
-        self.calls = 0
-
-    async def astream(self, messages, **kwargs):
-        self.calls += 1
-        if self.calls == 1:
-            # Simulate a model burning its whole budget "still planning" —
-            # chunked, like a real streaming response. Sized comfortably above
-            # the real max_think_chars for reasoning_level="low"
-            # (16000 tokens * 0.45 * 4 chars/token = 28800 chars).
-            chunk_text = "Let me reconsider the architecture once more. " * 100  # 4800 chars/chunk
-            for _ in range(10):  # 48,000 chars total, well over the 28,800 budget
-                yield FakeChunk(reasoning=chunk_text)
-        else:
-            # Retry call (thinking_mode=False): well-behaved, answers directly.
-            yield FakeChunk(
-                content=(
-                    "Built the landing page.\n\n"
-                    "FILE: index.html\n```html\n<!doctype html><html><body>Hello</body></html>\n```\n"
-                )
-            )
+import code_agent
+from langchain_core.messages import HumanMessage
 
 
 async def main():
-    fake_llm = RamblingThenGoodLLM()
-    app.get_code_llm = lambda *a, **k: fake_llm
+    calls = {"count": 0}
 
-    request = SimpleNamespace(
-        reasoning_level="low",
-        model="strong",
-    )
-    session = {"messages": [app.HumanMessage(content="Build me a landing page")]}
-    progress_queue: asyncio.Queue = asyncio.Queue()
+    async def fake_invoke(messages, llm, progress=None, on_answer_piece=None, thinking_mode=None, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return "1. Read index.html\n2. Edit index.html\n3. Review the result"
+        if calls["count"] == 2:
+            return "THOUGHT: I will inspect the existing page first.\nACTION: read_file\nPATH: index.html"
+        if calls["count"] == 3:
+            return "THOUGHT: I will add the feed without replacing unrelated content.\nACTION: edit_file\nPATH: index.html\n```html\n<html>\n<body>\n<section class=\"activity-feed\">Live activity</section>\n</body>\n</html>\n```"
+        return "THOUGHT: The activity feed is complete.\nACTION: final\nThe activity feed is complete."
 
-    result = await app.generate_code_once(request, session, progress_queue)
+    original_invoke = code_agent.invoke_model
+    original_llm = code_agent.get_code_llm
+    try:
+        code_agent.invoke_model = fake_invoke
+        code_agent.get_code_llm = lambda *args, **kwargs: object()
+        session = {
+            "messages": [HumanMessage(content="Add an activity feed to my application.")],
+            "code_files": {"index.html": "<html>\n<body>\n<h1>App</h1>\n</body>\n</html>"},
+        }
+        request = SimpleNamespace(message="Add an activity feed to my application.", reasoning_level="medium", model="medium")
+        events = []
 
-    events = []
-    while not progress_queue.empty():
-        events.append(progress_queue.get_nowait())
+        async def emit(event):
+            events.append(event)
 
-    retry_events = [e for e in events if e.get("type") == "RETRY"]
-    print(f"Raw events seen: {events}")
-
-    print(f"LLM was called {fake_llm.calls} times (expect 2: rambling attempt + retry)")
-    print(f"RETRY event published: {len(retry_events) == 1} -> {retry_events}")
-    print(f"Code artifact produced: {bool(result['files'] or result['code'])}")
-    print(f"Files: {list(result['files'].keys())}")
-    print(f"Explanation text shown to user: {result['response']!r}")
-    print(f"Activities (matches screenshot shape): {result['activities']}")
-    print(f"Activity summary line data: {result['activity_summary']}")
-
-    assert fake_llm.calls == 2, "expected exactly one retry"
-    assert len(retry_events) == 1, "expected a RETRY progress event"
-    assert result["files"].get("index.html"), "expected real code to land after retry"
-    assert not result.get("artifact_error"), "should not report artifact_error after a successful retry"
-    print("\nALL CHECKS PASSED — the watchdog fires, retries, and code lands.")
+        result, _ = await code_agent._run_agent(request, session, emit)
+        types = [event["type"] for event in events]
+        expected = ["plan_created", "agent_message", "activity_start", "file_read", "activity_complete", "agent_message", "activity_start", "file_edited", "diff_created", "activity_complete", "agent_message", "final_message", "artifact_created", "complete"]
+        assert types == expected, types
+        assert "activity-feed" in result["files"]["index.html"]
+        assert result["diffs"][0]["additions"] == 1
+        print("RICH_WORKFLOW_REGRESSION_OK")
+        print("EVENTS:", ",".join(types))
+    finally:
+        code_agent.invoke_model = original_invoke
+        code_agent.get_code_llm = original_llm
 
 
 asyncio.run(main())

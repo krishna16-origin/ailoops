@@ -1562,11 +1562,13 @@
             const canvasEl = mode === 'code' ? assistantBubble.querySelector('.response-canvas') : null;
             // Per-file canvas state for this one assistant turn: filename -> { language,
             // additions, deletions, diffLines, content, streaming }. Populated live as
-            // code_file_start / code_file_diff events arrive, and reconciled against the
+            // file_created/file_edited and diff_created events arrive, and reconciled against the
             // authoritative final result in finalizeCodeResult() either way (stream or not).
             const canvasFiles = new Map();
             let canvasActiveTab = null; // filename currently shown, or '__preview__'
             const workflowRowsByFile = new Map(); // filename -> <div class="response-workflow-row">, for live updates
+            const workflowRowsByActivity = new Map(); // activity id -> live row
+            const liveWorkflowStats = { commands: 0, files_edited: 0, files_viewed: 0, notes: 0 };
 
             const WORKFLOW_ICONS = {
                 edit: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.6 1.6 0 0 1 2.3 2.3L5.5 13 2 14l1-3.5 8.5-8Z"/></svg>',
@@ -1594,8 +1596,8 @@
             }
 
             // Shared row builder — used both by the final, authoritative
-            // renderWorkflow() rebuild below AND by the live
-            // code_file_start/code_file_diff handlers further down, so a row
+            // renderWorkflow() rebuild below AND by the live file/diff handlers
+            // further down, so a row
             // streamed in live looks pixel-identical to one built from the
             // final result and never has to be re-created, only updated.
             function createWorkflowRow(activity) {
@@ -1636,7 +1638,8 @@
             }
 
             function setWorkflowEditRowText(textEl, activity) {
-                textEl.innerHTML = `Edited <span class="response-workflow-edit-file">${escapeHtml(activity.file || 'generated code')}</span>` +
+                const verb = activity.verb || (activity.created ? 'Created' : 'Edited');
+                textEl.innerHTML = `${verb} <span class="response-workflow-edit-file">${escapeHtml(activity.file || 'generated code')}</span>` +
                     (activity.additions ? `<span class="response-workflow-add">+${activity.additions}</span>` : '') +
                     (activity.deletions ? `<span class="response-workflow-del">-${activity.deletions}</span>` : '');
             }
@@ -1658,9 +1661,9 @@
                 } else {
                     summaryEl.style.display = 'none';
                 }
-                // This is the final, authoritative trace (from build_turn_activities()
-                // server-side) — it always fully replaces whatever the live
-                // code_file_start/code_file_diff handlers below already built, so any
+                // This is the final, authoritative trace from the backend — it
+                // always fully replaces whatever the live file/diff handlers already
+                // built, so any
                 // ordering/naming quirk in the live preview self-corrects here.
                 listEl.replaceChildren();
                 workflowRowsByFile.clear();
@@ -1674,12 +1677,93 @@
                 scrollToBottom();
             }
 
+            function updateLiveWorkflowSummary() {
+                if (!workflowEl) return;
+                const summaryEl = workflowEl.querySelector('.response-workflow-summary');
+                const parts = [];
+                if (liveWorkflowStats.commands) parts.push(`Ran ${liveWorkflowStats.commands} command${liveWorkflowStats.commands === 1 ? '' : 's'}`);
+                if (liveWorkflowStats.files_edited) parts.push(`edited ${liveWorkflowStats.files_edited} file${liveWorkflowStats.files_edited === 1 ? '' : 's'}`);
+                if (liveWorkflowStats.files_viewed) parts.push(`viewed ${liveWorkflowStats.files_viewed} file${liveWorkflowStats.files_viewed === 1 ? '' : 's'}`);
+                if (liveWorkflowStats.notes) parts.push(`${liveWorkflowStats.notes} note${liveWorkflowStats.notes === 1 ? '' : 's'}`);
+                summaryEl.textContent = parts.join(', ');
+                summaryEl.style.display = parts.length ? '' : 'none';
+            }
+
+            function ensureLiveWorkflow() {
+                if (!workflowEl) return null;
+                workflowEl.hidden = false;
+                return workflowEl.querySelector('.response-workflow-list');
+            }
+
+            function liveActivityKind(action) {
+                if (action === 'read') return 'view';
+                if (action === 'edit' || action === 'create') return 'edit';
+                if (action === 'delete') return 'command';
+                return 'note';
+            }
+
+            function liveActivityText(action, file, status = 'running') {
+                const verb = action === 'read' ? 'Reading' : action === 'edit' ? 'Editing' : action === 'create' ? 'Creating' : action === 'delete' ? 'Deleting' : action;
+                const past = action === 'read' ? 'Read' : action === 'edit' ? 'Edited' : action === 'create' ? 'Created' : action === 'delete' ? 'Deleted' : action;
+                return `${status === 'running' ? verb : past} ${file || 'file'}${status === 'running' ? '…' : ''}`;
+            }
+
+            function addLiveWorkflowRow(activity, status = 'running') {
+                const listEl = ensureLiveWorkflow();
+                if (!listEl) return null;
+                const id = activity.id || `${activity.action || 'activity'}:${activity.file || ''}:${listEl.children.length}`;
+                const action = activity.action || 'note';
+                const file = activity.file || '';
+                const kind = liveActivityKind(action);
+                const rowActivity = kind === 'edit'
+                    ? { kind, file, filename: file, additions: 0, deletions: 0 }
+                    : { kind, text: liveActivityText(action, file, status) };
+                const row = createWorkflowRow(rowActivity);
+                row.dataset.activityId = id;
+                row.dataset.action = action;
+                row.dataset.file = file;
+                if (status === 'running') row.classList.add('working');
+                listEl.appendChild(row);
+                workflowRowsByActivity.set(id, row);
+                if (kind === 'edit') workflowRowsByFile.set(file, row);
+                return row;
+            }
+
+            function updateLiveWorkflowRow(activity, status = 'completed', extra = {}) {
+                const id = activity && activity.id;
+                let row = id ? workflowRowsByActivity.get(id) : null;
+                if (!row && activity) row = addLiveWorkflowRow(activity, status);
+                if (!row) return;
+                row.classList.toggle('working', status === 'running');
+                const action = activity.action || row.dataset.action || 'note';
+                const file = activity.file || row.dataset.file || '';
+                if (action === 'edit' || action === 'create') {
+                    const textEl = row.querySelector('span:last-child');
+                    if (textEl) setWorkflowEditRowText(textEl, { file, verb: action === 'create' ? 'Created' : 'Edited', additions: extra.additions || 0, deletions: extra.deletions || 0 });
+                } else {
+                    const textEl = row.querySelector('span:last-child');
+                    if (textEl) textEl.textContent = status === 'error' ? `Unable to ${action} ${file || 'file'}` : liveActivityText(action, file, status);
+                }
+                scrollToBottom();
+            }
+
+            function addLiveAgentMessage(text) {
+                if (!text) return;
+                const listEl = ensureLiveWorkflow();
+                if (!listEl) return;
+                const row = createWorkflowRow({ kind: 'note', text });
+                listEl.appendChild(row);
+                liveWorkflowStats.notes += 1;
+                updateLiveWorkflowSummary();
+                scrollToBottom();
+            }
+
             // ============== CODE MODE: live diff + preview canvas ==============
             // Wires up the .response-canvas markup: a row of per-file tabs (each
             // showing a live +added/-removed count as soon as that file's diff is
             // known) plus a Preview tab that renders the generated site in a
-            // sandboxed iframe. Updated incrementally as code_file_start /
-            // code_file_diff SSE events arrive, and reconciled once more from the
+            // sandboxed iframe. Updated incrementally as file/diff SSE events
+            // arrive, and reconciled once more from the
             // authoritative final result — so it works the same whether the file
             // came from a live stream or a plain (non-streaming) response.
             const PREVIEWABLE_EXT = new Set(['html', 'htm']);
@@ -1963,43 +2047,40 @@
                             const jsonStr = line.slice(5).trim();
                             try {
                                 const parsed = JSON.parse(jsonStr);
-                                if (parsed.type === 'status') {
-                                    // Backend node narration ("chat_understand_node", "Invoking the
-                                    // model with...", etc.) is intentionally not shown here anymore —
-                                    // the Thinking panel now only ever displays the model's own real
-                                    // reasoning trace (see the 'thought' branch below), matching
-                                    // Claude.ai instead of a synthesized step-by-step log.
-                                } else if (parsed.type === 'thought') {
-                                    appendLiveThought(parsed.text);
-                                } else if (parsed.type === 'RETRY' || parsed.type === 'ERROR') {
-                                    addThought(parsed.type === 'ERROR' ? 'Code generation error' : 'Retrying', parsed.message || parsed.reason || '', parsed.type.toLowerCase());
-                                } else if (parsed.type === 'code_start' || parsed.type === 'code_delta') {
-                                    // Raw code text is not visualized live in the chat bubble itself —
-                                    // it belongs in the diff/preview canvas (below), populated by
-                                    // code_file_start / code_file_diff instead.
-                                } else if (parsed.type === 'code_file_start' && mode === 'code') {
-                                    // A new file just started streaming: show its tab immediately with
-                                    // a spinner, before any diff/counts are known yet.
-                                    const key = parsed.filename || '';
-                                    upsertCanvasFile(key, { language: parsed.language || '', streaming: true });
-                                    // Also grow the activity feed itself live — an "Editing <file>…"
-                                    // row appears the instant the file starts, exactly like a Claude
-                                    // Code session narrating each edit as it happens, instead of the
-                                    // whole feed only popping in at the very end of the turn.
-                                    if (workflowEl && !workflowRowsByFile.has(key)) {
-                                        workflowEl.hidden = false;
-                                        const row = createWorkflowRow({ kind: 'edit', file: canvasFileLabel(key), filename: key, additions: 0, deletions: 0 });
-                                        workflowRowsByFile.set(key, row);
-                                        workflowEl.querySelector('.response-workflow-list').appendChild(row);
-                                        scrollToBottom();
-                                    }
-                                } else if (parsed.type === 'code_file_diff' && mode === 'code') {
-                                    // One file just finished streaming and the backend computed its
-                                    // real diff — this is what makes the +added/-removed counts (and
-                                    // the diff/preview panel) update live, file by file, instead of
-                                    // only once at the very end of the turn.
-                                    const key = parsed.filename || '';
-                                    upsertCanvasFile(key, {
+                                if (parsed.type === 'plan_created' && mode === 'code') {
+                                    const steps = Array.isArray(parsed.steps) ? parsed.steps : [];
+                                    steps.forEach((step) => {
+                                        const listEl = ensureLiveWorkflow();
+                                        if (!listEl) return;
+                                        listEl.appendChild(createWorkflowRow({ kind: 'plan', text: step }));
+                                        liveWorkflowStats.notes += 1;
+                                    });
+                                    updateLiveWorkflowSummary();
+                                    scrollToBottom();
+                                } else if (parsed.type === 'agent_message' && mode === 'code') {
+                                    addLiveAgentMessage(parsed.text || '');
+                                } else if (parsed.type === 'activity_start' && mode === 'code') {
+                                    const activity = parsed.activity || parsed;
+                                    addLiveWorkflowRow(activity, 'running');
+                                } else if (parsed.type === 'activity_complete' && mode === 'code') {
+                                    const activity = parsed.activity || parsed;
+                                    updateLiveWorkflowRow(activity, 'completed');
+                                    if (activity.action === 'read') liveWorkflowStats.files_viewed += 1;
+                                    if (activity.action === 'edit' || activity.action === 'create') liveWorkflowStats.files_edited += 1;
+                                    if (activity.action === 'delete') liveWorkflowStats.commands += 1;
+                                    updateLiveWorkflowSummary();
+                                } else if (parsed.type === 'activity_error' && mode === 'code') {
+                                    const activity = parsed.activity || parsed;
+                                    updateLiveWorkflowRow(activity, 'error');
+                                    addLiveAgentMessage(parsed.message || 'The file operation could not be completed.');
+                                } else if (parsed.type === 'file_read' && mode === 'code') {
+                                    const activity = parsed.activity || { id: `read:${parsed.file}`, action: 'read', file: parsed.file };
+                                    updateLiveWorkflowRow(activity, 'completed');
+                                } else if ((parsed.type === 'file_created' || parsed.type === 'file_edited') && mode === 'code') {
+                                    const action = parsed.type === 'file_created' ? 'create' : 'edit';
+                                    const activity = parsed.activity || { id: `${action}:${parsed.file}`, action, file: parsed.file };
+                                    updateLiveWorkflowRow(activity, 'completed', parsed);
+                                    upsertCanvasFile(parsed.file || '', {
                                         language: parsed.language || '',
                                         additions: parsed.additions || 0,
                                         deletions: parsed.deletions || 0,
@@ -2007,36 +2088,37 @@
                                         content: parsed.content || '',
                                         streaming: false,
                                     });
-                                    // Live-update the matching workflow row's +added/-removed counts
-                                    // now that the real diff is known. The final renderWorkflow() call
-                                    // still fully rebuilds the feed once the turn completes (adding the
-                                    // "Read"/"diff -u" rows and note/plan bullets around this edit), so
-                                    // this is purely an early, self-correcting preview.
-                                    let row = workflowRowsByFile.get(key);
-                                    if (!row && workflowEl) {
-                                        // Defensive fallback: create it now if code_file_start's row
-                                        // somehow wasn't built yet, so the diff is never lost.
-                                        workflowEl.hidden = false;
-                                        row = createWorkflowRow({ kind: 'edit', file: canvasFileLabel(key), filename: key, additions: 0, deletions: 0 });
-                                        workflowRowsByFile.set(key, row);
-                                        workflowEl.querySelector('.response-workflow-list').appendChild(row);
+                                } else if (parsed.type === 'file_deleted' && mode === 'code') {
+                                    const activity = parsed.activity || { id: `delete:${parsed.file}`, action: 'delete', file: parsed.file };
+                                    updateLiveWorkflowRow(activity, 'completed');
+                                } else if (parsed.type === 'diff_created' && mode === 'code') {
+                                    upsertCanvasFile(parsed.file || '', {
+                                        language: parsed.language || '',
+                                        additions: parsed.additions || 0,
+                                        deletions: parsed.deletions || 0,
+                                        diffLines: parsed.diff_lines || [],
+                                        content: parsed.content || '',
+                                        streaming: false,
+                                    });
+                                } else if (parsed.type === 'artifact_created' && mode === 'code') {
+                                    codeResult = Object.assign({}, codeResult || {}, parsed);
+                                    renderFileCards(codeResult);
+                                } else if (parsed.type === 'final_message') {
+                                    assistantFullText = parsed.text || '';
+                                    if (assistantFullText) {
+                                        startAnswering();
+                                        setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
                                     }
-                                    if (row) {
-                                        const textEl = row.querySelector('span:last-child');
-                                        if (textEl) setWorkflowEditRowText(textEl, { file: canvasFileLabel(key), additions: parsed.additions, deletions: parsed.deletions });
-                                    }
-                                } else if (parsed.type === 'code_result') {
-                                    codeResult = parsed;
-                                    if (mode === 'code') finalizeCodeResult(parsed);
-                                } else if (parsed.type === 'message_reset') {
-                                    // Compatibility event: clear the current draft if a server
-                                    // explicitly asks the client to reset it.
-                                    assistantFullText = '';
-                                    setProse(textContainer, '');
-                                    if (indicatorEl) indicatorEl.remove();
-                                    indicatorEl = createThinkingIndicator('thinking');
-                                    textContainer.appendChild(indicatorEl);
+                                } else if (parsed.type === 'complete') {
+                                    if (mode === 'code' && codeResult) finalizeCodeResult(codeResult);
+                                } else if (parsed.type === 'thought') {
+                                    appendLiveThought(parsed.text);
+                                } else if (parsed.type === 'status') {
+                                    // Chat mode retains its existing status contract; Code mode uses the rich workflow events above.
+                                } else if (parsed.type === 'RETRY' || parsed.type === 'ERROR') {
+                                    addThought(parsed.type === 'ERROR' ? 'Generation error' : 'Retrying', parsed.message || parsed.reason || '', parsed.type.toLowerCase());
                                 } else if (parsed.assistant_message) {
+
                                     if (!answerStarted) {
                                         answerStarted = true;
                                         finishThinking(); // collapse thoughts the instant the answer begins
@@ -2047,7 +2129,7 @@
                                     assistantFullText += parsed.assistant_message;
                                     // In Code mode, never let a fenced code block render inside the
                                     // chat bubble while it's still streaming in — it belongs in the
-                                    // response diff box (via code_result below), not typed out as raw text.
+                                    // response canvas, not typed out as raw text.
                                     scheduleAnswerRender();
                                 }
                             } catch (e) {

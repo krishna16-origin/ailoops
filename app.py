@@ -127,7 +127,7 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
     # nvidia/nemotron-3-nano-30b-a3b gets thinking on by default) — verified against
     # the installed package's _statics.py model table. Thinking must be explicitly
     # requested per call via the thinking_mode=True invocation kwarg (equivalent to
-    # .with_thinking_mode(enabled=True)); see generate_code_once(). Without it, the
+    # .with_thinking_mode(enabled=True)); see invoke_model(). Without it, the
     # model never opens a <think> block, additional_kwargs['reasoning_content'] stays
     # empty, and nothing streams to the thinking pane.
     return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
@@ -428,9 +428,9 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
     same text, so the thinking pane never shows anything twice.
 
     `on_answer_piece`, if given, receives each live slice of answer text instead of
-    it being published as a plain 'token' event — Code mode uses this to re-parse
-    the stream for FILE:/fenced-code boundaries and emit code_start/code_file_start/
-    code_delta events into the response diff box instead.
+    it being published as a plain answer token. The Code-mode agent uses this sink
+    to keep its structured THOUGHT/ACTION protocol out of the user-facing answer;
+    parsed progress is emitted through the rich activity/file/diff events.
 
     `max_think_chars`, if given, caps how much reasoning text a model may produce
     before any visible answer text has appeared. Exceeding it raises
