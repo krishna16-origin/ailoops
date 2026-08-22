@@ -489,8 +489,8 @@
             <!-- Code mode settings — Model and Effort moved to the composer picker too. -->
             <div class="settings-panel" id="codeSettings" hidden>
                 <div class="sidebar-setting-item">
-                    <label title="Stream Response Tokens">Stream Response</label>
-                    <input type="checkbox" id="codeStreamSetting" checked>
+                    <label title="Code Mode always uses live activity events">Live activity stream</label>
+                    <input type="checkbox" id="codeStreamSetting" checked disabled>
                 </div>
             </div>
         </div>
@@ -1334,7 +1334,9 @@
             } else {
                 const codeModel = document.getElementById('codeModel').value;
                 const reasoningLevel = document.getElementById('codeReasoningLevel').value;
-                useStream = document.getElementById('codeStreamSetting').checked;
+                // Code Mode is intentionally always live: plan, activity, file,
+                // diff, artifact, and final-message events arrive over SSE.
+                useStream = true;
                 apiUrl = `${API_BASE}/code-chat`;
                 payload = {
                     message: text,
@@ -1569,6 +1571,7 @@
             const workflowRowsByFile = new Map(); // filename -> <div class="response-workflow-row">, for live updates
             const workflowRowsByActivity = new Map(); // activity id -> live row
             const liveWorkflowStats = { commands: 0, files_edited: 0, files_viewed: 0, notes: 0 };
+            let livePlanRows = 0;
 
             const WORKFLOW_ICONS = {
                 edit: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.6 1.6 0 0 1 2.3 2.3L5.5 13 2 14l1-3.5 8.5-8Z"/></svg>',
@@ -2047,12 +2050,22 @@
                             const jsonStr = line.slice(5).trim();
                             try {
                                 const parsed = JSON.parse(jsonStr);
-                                if (parsed.type === 'plan_created' && mode === 'code') {
+                                if (parsed.type === 'plan_update' && mode === 'code') {
+                                    const listEl = ensureLiveWorkflow();
+                                    if (listEl && parsed.step) {
+                                        listEl.appendChild(createWorkflowRow({ kind: 'plan', text: parsed.step }));
+                                        livePlanRows += 1;
+                                        liveWorkflowStats.notes += 1;
+                                        updateLiveWorkflowSummary();
+                                        scrollToBottom();
+                                    }
+                                } else if (parsed.type === 'plan_created' && mode === 'code') {
                                     const steps = Array.isArray(parsed.steps) ? parsed.steps : [];
-                                    steps.forEach((step) => {
+                                    if (!livePlanRows) steps.forEach((step) => {
                                         const listEl = ensureLiveWorkflow();
                                         if (!listEl) return;
                                         listEl.appendChild(createWorkflowRow({ kind: 'plan', text: step }));
+                                        livePlanRows += 1;
                                         liveWorkflowStats.notes += 1;
                                     });
                                     updateLiveWorkflowSummary();
@@ -2104,7 +2117,7 @@
                                     codeResult = Object.assign({}, codeResult || {}, parsed);
                                     renderFileCards(codeResult);
                                 } else if (parsed.type === 'final_message') {
-                                    assistantFullText = parsed.text || '';
+                                    assistantFullText += parsed.text || '';
                                     if (assistantFullText) {
                                         startAnswering();
                                         setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));

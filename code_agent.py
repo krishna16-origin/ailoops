@@ -246,16 +246,73 @@ def parse_agent_turn(raw: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Agent-turn output sink.
+# Incremental protocol observers.
 #
-# The model's structured THOUGHT/ACTION response is internal protocol data. It
-# must not be streamed into the answer bubble as raw text. User-facing progress
-# is emitted only after a complete turn has been parsed, through the rich event
-# vocabulary below (agent_message, activity_*, file_*, diff_*, artifact_*).
+# Model turns still have to complete before the backend can safely execute a
+# file operation, but their user-facing protocol lines are observed as they
+# arrive. This is what makes the SSE timeline feel live: the thought appears,
+# then the activity starts, then the completed file/diff event follows.
 # ---------------------------------------------------------------------------
-def make_agent_stream_watcher(progress):
+def make_agent_stream_watcher(emit, activity_id):
+    state = {"buffer": "", "thought_emitted": False, "activity_emitted": False, "final_started": False, "final_emitted": False}
+
+    async def process_line(line: str) -> None:
+        clean = line.strip()
+        if state.get("final_started"):
+            if clean:
+                state["final_emitted"] = True
+                await emit({"type": "final_message", "text": clean})
+        elif clean.upper().startswith("THOUGHT:") and not state["thought_emitted"]:
+            thought = clean.split(":", 1)[1].strip()
+            if thought:
+                state["thought_emitted"] = True
+                await emit({"type": "agent_message", "text": thought})
+        elif clean.upper().startswith("ACTION:"):
+            state["action"] = clean.split(":", 1)[1].strip().lower()
+            if state["action"] == "final":
+                state["final_started"] = True
+        elif clean.upper().startswith("PATH:") and not state["activity_emitted"]:
+            action = state.get("action", "")
+            file_path = clean.split(":", 1)[1].strip().strip("`")
+            if action in {"read_file", "edit_file", "create_file", "delete_file"} and file_path:
+                state["activity_emitted"] = True
+                public_action = {"read_file": "read", "edit_file": "edit", "create_file": "create", "delete_file": "delete"}[action]
+                await emit({"type": "activity_start", "activity": {"id": activity_id, "action": public_action, "file": file_path, "status": "running"}})
+
     async def watcher(text: str) -> None:
-        return None
+        if not text:
+            return
+        state["buffer"] += text
+        while "\n" in state["buffer"]:
+            line, state["buffer"] = state["buffer"].split("\n", 1)
+            await process_line(line)
+
+    async def flush() -> None:
+        if state["buffer"].strip():
+            remaining = state["buffer"]
+            state["buffer"] = ""
+            await process_line(remaining)
+
+    watcher.state = state
+    watcher.flush = flush
+    return watcher
+
+
+def make_plan_stream_watcher(emit):
+    state = {"buffer": "", "seen": 0}
+
+    async def watcher(text: str) -> None:
+        if not text:
+            return
+        state["buffer"] += text
+        while "\n" in state["buffer"]:
+            line, state["buffer"] = state["buffer"].split("\n", 1)
+            clean = line.strip()
+            match = re.match(r"^(?:\d+[.)]|[-*])\s*(.+)$", clean)
+            if match:
+                state["seen"] += 1
+                await emit({"type": "plan_update", "index": state["seen"], "step": match.group(1).strip(), "status": "running"})
+
     return watcher
 
 
@@ -291,13 +348,20 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     try:
         plan_messages = build_plan_messages(history, file_store, reasoning_level)
         plan_llm = get_code_llm(model_key, 0.2, min(config["max_tokens"], 4000))
-        plan_text = await invoke_model(plan_messages, plan_llm, None, thinking_mode=False)
+        plan_progress = getattr(emit, "queue", None) or emit
+        plan_text = await invoke_model(
+            plan_messages,
+            plan_llm,
+            plan_progress,
+            on_answer_piece=make_plan_stream_watcher(emit),
+            thinking_mode=False,
+        )
         plan_steps = parse_plan(plan_text)
     except Exception:
         plan_steps = []
     await emit({"type": "plan_created", "steps": plan_steps})
 
-    activities: List[dict] = []
+    activities: List[dict] = [{"kind": "plan", "text": step} for step in plan_steps]
     diffs: List[dict] = []
     transcript: List[BaseMessage] = []
     turn_files_touched: Dict[str, str] = {}
@@ -306,12 +370,14 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
 
     for step in range(1, MAX_AGENT_STEPS + 1):
         agent_messages = build_agent_messages(history, transcript, file_store, plan_steps, reasoning_level, step)
-        watcher = make_agent_stream_watcher(emit)
+        activity_id = f"activity_turn_{step}"
+        progress = getattr(emit, "queue", None) or emit
+        watcher = make_agent_stream_watcher(emit, activity_id)
 
         malformed_retry_note = None
         try:
             raw = await invoke_model(
-                agent_messages, llm, emit,
+                agent_messages, llm, progress,
                 on_answer_piece=watcher, thinking_mode=True, max_think_chars=max_think_chars,
             )
         except ThinkingBudgetExceeded:
@@ -320,11 +386,12 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                     "Stop planning. Respond immediately in the required THOUGHT/ACTION format with a single "
                     "concrete action."
                 ))],
-                llm, emit,
-                on_answer_piece=make_agent_stream_watcher(emit),
+                llm, progress,
+                on_answer_piece=make_agent_stream_watcher(emit, activity_id),
                 thinking_mode=False,
             )
 
+        await watcher.flush()
         turn = parse_agent_turn(raw)
         if turn is None:
             transcript.append(AIMessage(content=raw))
@@ -339,22 +406,24 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         action = turn["action"]
         path = turn["path"]
 
-        if thought:
+        if thought and not getattr(watcher, "state", {}).get("thought_emitted"):
             await emit({"type": "agent_message", "text": thought})
+        if thought:
             activities.append({"kind": _classify_note_kind(thought), "text": thought})
 
         if action == "final":
             final_text = turn["content"] or thought or "Done."
-            await emit({"type": "final_message", "text": final_text})
+            if not getattr(watcher, "state", {}).get("final_emitted"):
+                await emit({"type": "final_message", "text": final_text})
             reached_final = True
             transcript.append(AIMessage(content=raw))
             break
 
         if action == "read_file":
             existing = file_store.get(path)
-            activity_id = f"activity_{len(activities) + 1}"
             running = {"id": activity_id, "action": "read", "file": path, "status": "running"}
-            await emit({"type": "activity_start", "activity": running, "action": "read", "file": path})
+            if not getattr(watcher, "state", {}).get("activity_emitted"):
+                await emit({"type": "activity_start", "activity": running, "action": "read", "file": path})
             if existing is None:
                 error = {"id": activity_id, "action": "read", "file": path, "status": "error"}
                 await emit({"type": "activity_error", "activity": error, "action": "read", "file": path, "message": "File does not exist"})
@@ -388,7 +457,6 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 new_lines = content.splitlines()
                 additions, deletions = len(new_lines), 0
                 diff_lines = [{"type": "add", "content": line} for line in new_lines]
-            activity_id = f"activity_{len(activities) + 1}"
             activities.append({
                 "kind": "edit", "file": path, "filename": path,
                 "created": not is_edit, "additions": additions, "deletions": deletions, "diff_lines": diff_lines,
@@ -401,7 +469,8 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
 
             running = {"id": activity_id, "action": act, "file": path, "status": "running"}
             completed = {"id": activity_id, "action": act, "file": path, "status": "completed"}
-            await emit({"type": "activity_start", "activity": running, "action": act, "file": path})
+            if not getattr(watcher, "state", {}).get("activity_emitted"):
+                await emit({"type": "activity_start", "activity": running, "action": act, "file": path})
             await emit({"type": evt_type, "activity": completed, "file": path, "additions": additions,
                         "deletions": deletions, "diff_id": diff_id, "language": _guess_language(path),
                         "content": content, "diff_lines": diff_lines})
@@ -417,11 +486,11 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         if action == "delete_file":
             existed = path in file_store
             file_store.pop(path, None)
-            activity_id = f"activity_{len(activities) + 1}"
             activities.append({"kind": "command", "text": f"rm {path}"})
             running = {"id": activity_id, "action": "delete", "file": path, "status": "running"}
             completed = {"id": activity_id, "action": "delete", "file": path, "status": "completed"}
-            await emit({"type": "activity_start", "activity": running, "action": "delete", "file": path})
+            if not getattr(watcher, "state", {}).get("activity_emitted"):
+                await emit({"type": "activity_start", "activity": running, "action": "delete", "file": path})
             await emit({"type": "file_deleted", "activity": completed, "file": path, "existed": existed})
             await emit({"type": "activity_complete", "activity": completed, "action": "delete", "file": path})
             transcript.append(AIMessage(content=raw))

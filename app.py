@@ -714,6 +714,11 @@ async def code_chat(request: CodeChatRequest):
         return StreamingResponse(
             code_agent.stream_code_agent(request, session, request.session_id),
             media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
     try:
         result = await code_agent.run_code_agent_once(request, session)
