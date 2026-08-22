@@ -79,10 +79,13 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
 
 
+CODE_WORKING_MODEL = "z-ai/glm-5.2"
+# Keep the existing UI choices, but route every Code-mode choice through the
+# verified working endpoint so model selection cannot select a hanging provider.
 CODE_MODEL_MAP = {
-    "fast": "deepseek-ai/deepseek-v4-flash-0731",
-    "medium": "minimaxai/minimax-m3",
-    "strong": "nvidia/nemotron-3-ultra-550b-a55b",
+    "fast": CODE_WORKING_MODEL,
+    "medium": CODE_WORKING_MODEL,
+    "strong": CODE_WORKING_MODEL,
 }
 DEFAULT_CODE_MODEL = "medium"
 
@@ -930,7 +933,10 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
         f"Generating code with {config['label']} effort and a {config['max_tokens']}-token budget.",
     )
     llm = get_code_llm(model_key, 0.2, config['max_tokens'])
-    thinking_mode = None
+    # GLM 5.2 requires explicit thinking mode for reliable Code-mode output.
+    # The UI effort selection still controls the token budget above; only the
+    # provider endpoint is normalized to the working Code-mode model.
+    thinking_mode = True
     reasoning_effort = None
     raw_response = await invoke_model(
         build_code_messages(session['messages'], request.reasoning_level, session.get('code_files')),
