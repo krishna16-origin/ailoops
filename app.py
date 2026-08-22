@@ -879,14 +879,49 @@ def build_turn_activities(files: dict, code: str, language: str, explanation: st
 # ---------------------------------------------------------------------------
 
 CODE_MAX_OUTPUT = 12000
-CODE_GENERATION_TIMEOUT = 90
+
+# A flat timeout doesn't work here: 'low' effort on the 'fast' model finishes in
+# seconds, but 'max' effort (40k-token budget) on the 'strong' reasoning model can
+# legitimately take well over a minute of real thinking + generation. A single
+# 90s cap was killing those requests mid-generation via asyncio.wait_for() —
+# discarding everything already produced — exactly when the UI showed something
+# like "Thought for 93s" right before the generic failure message. Sizing the
+# timeout to the actual token budget and model tier fixes that at the root,
+# instead of just raising the number and hoping it's big enough next time too.
+CODE_GENERATION_TIMEOUT_FLOOR = 90.0     # never less than this, even for the smallest request
+CODE_GENERATION_TIMEOUT_CEILING = 300.0  # hard cap so a genuinely stuck call can never hang forever
+
+# Rough real-world seconds of generation time per 1000 completion tokens, per
+# model tier — 'strong' is a much larger reasoning model and is meaningfully
+# slower per token than 'fast'/'medium', and needs proportionally more headroom
+# before a slow-but-healthy response gets mistaken for a hang.
+CODE_MODEL_SECONDS_PER_1K_TOKENS = {
+    "fast": 12.0,
+    "medium": 18.0,
+    "strong": 30.0,
+}
+
+
+def resolve_code_model_key(model: str) -> str:
+    """Normalize a requested Code-mode model name to a valid CODE_MODEL_MAP key."""
+    key = (model or DEFAULT_CODE_MODEL).strip().lower()
+    return key if key in CODE_MODEL_MAP else DEFAULT_CODE_MODEL
+
+
+def get_code_generation_timeout(model_key: str, reasoning_level: str) -> float:
+    """Size the generation timeout to this request's actual token budget and
+    model speed, instead of one flat number that's wrong for most requests."""
+    max_tokens = get_thinking_config(reasoning_level)["max_tokens"]
+    seconds_per_1k = CODE_MODEL_SECONDS_PER_1K_TOKENS.get(
+        model_key, CODE_MODEL_SECONDS_PER_1K_TOKENS[DEFAULT_CODE_MODEL]
+    )
+    estimated = (max_tokens / 1000.0) * seconds_per_1k
+    return max(CODE_GENERATION_TIMEOUT_FLOOR, min(estimated, CODE_GENERATION_TIMEOUT_CEILING))
 
 
 async def generate_code_once(request: CodeChatRequest, session: dict, progress=None, on_answer_piece=None) -> dict:
     config = get_thinking_config(request.reasoning_level)
-    model_key = (request.model or DEFAULT_CODE_MODEL).strip().lower()
-    if model_key not in CODE_MODEL_MAP:
-        model_key = DEFAULT_CODE_MODEL
+    model_key = resolve_code_model_key(request.model)
     await publish_progress(
         progress,
         'code_generation_started',
@@ -956,10 +991,12 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
     async def on_answer_piece(text: str) -> None:
         await stream_code_answer_piece(progress_queue, code_state, text)
 
+    model_key = resolve_code_model_key(request.model)
+    timeout = get_code_generation_timeout(model_key, request.reasoning_level)
     task = asyncio.create_task(
         asyncio.wait_for(
             generate_code_once(request, session, progress_queue, on_answer_piece),
-            timeout=CODE_GENERATION_TIMEOUT,
+            timeout=timeout,
         )
     )
     result = None
@@ -978,6 +1015,16 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
             if event_type in CODE_STREAM_FORWARD_TYPES:
                 yield f'data: {json.dumps(event, ensure_ascii=False)}\n\n'
         result = await task
+    except asyncio.TimeoutError:
+        print(f'[{session_id}] Code generation timed out after {timeout:.0f}s (model={model_key}, effort={request.reasoning_level}).')
+        result = {
+            'response': (
+                f"That response was taking longer than expected and timed out after {timeout:.0f}s. "
+                "Try a lower reasoning effort or a faster model, or just ask again."
+            ),
+            'code': '', 'language': '', 'files': {}, 'file_languages': {}, 'show_preview': False,
+        }
+        yield f'data: {json.dumps({"type": "ERROR", "message": "timeout"}, ensure_ascii=False)}\n\n'
     except Exception as exc:
         print(f'[{session_id}] Code generation failed: {exc}')
         result = {'response': 'I could not generate code right now. Please try again.', 'code': '', 'language': '', 'files': {}, 'file_languages': {}, 'show_preview': False}
