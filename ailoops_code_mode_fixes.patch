@@ -1,0 +1,71 @@
+diff --git a/app.py b/app.py
+index 9db4472..00bd954 100644
+--- a/app.py
++++ b/app.py
+@@ -110,7 +110,7 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
+ # NVIDIA's current text LLM-APIs catalog and use the standard synchronous
+ # chat-completions interface, matching what ChatNVIDIA expects.
+ CODE_MODEL_MAP = {
+-    "fast": "deepseek-ai/deepseek-v4-flash-0731",
++    "fast": "deepseek-ai/deepseek-v4-flash",
+     "medium": "minimaxai/minimax-m3",
+     "strong": "nvidia/nemotron-3-ultra-550b-a55b",
+ }
+@@ -123,11 +123,14 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
+     so the two never collide on the same key."""
+     model_type_clean = (model_type or DEFAULT_CODE_MODEL).strip().lower()
+     model_name = CODE_MODEL_MAP.get(model_type_clean, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
+-    # No forced with_thinking_mode() here — that was only ever added as a
+-    # workaround for the now-removed GLM 5.2 model. deepseek-v4-flash-0731,
+-    # minimax-m3, and nemotron-3-ultra-550b-a55b all surface reasoning through
+-    # additional_kwargs['reasoning_content'] by default (see _extract_reasoning
+-    # below), so no extra invocation kwarg is needed to get live thinking output.
++    # IMPORTANT: none of deepseek-v4-flash, minimax-m3, or nemotron-3-ultra-550b-a55b
++    # are in langchain_nvidia_ai_endpoints' default-thinking model list (only
++    # nvidia/nemotron-3-nano-30b-a3b gets thinking on by default) — verified against
++    # the installed package's _statics.py model table. Thinking must be explicitly
++    # requested per call via the thinking_mode=True invocation kwarg (equivalent to
++    # .with_thinking_mode(enabled=True)); see generate_code_once(). Without it, the
++    # model never opens a <think> block, additional_kwargs['reasoning_content'] stays
++    # empty, and nothing streams to the thinking pane.
+     return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
+ 
+ 
+@@ -969,26 +972,24 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
+         f"Generating code with {config['label']} effort and a {config['max_tokens']}-token budget.",
+     )
+     llm = get_code_llm(model_key, 0.2, config['max_tokens'])
+-    # Thinking is configured on the Code-mode runnable in get_code_llm().
+-    # Do not pass thinking_mode as an invocation kwarg; ChatNVIDIA exposes
+-    # thinking through with_thinking_mode().
+-    thinking_mode = None
+-    reasoning_effort = None
++    # Explicitly request thinking mode. All three Code-mode models support it
++    # (confirmed via each model's thinking_param_enable entry in the installed
++    # langchain_nvidia_ai_endpoints package), but none get it by default — passing
++    # thinking_mode=True here is what actually turns on live reasoning streaming.
+     raw_response = await invoke_model(
+         build_code_messages(session['messages'], request.reasoning_level, session.get('code_files')),
+         llm,
+         progress,
+         on_answer_piece=on_answer_piece,
+-        thinking_mode=thinking_mode,
+-        reasoning_effort=reasoning_effort,
+-    )
+-    has_named_artifact = re.search(
+-        r"(?:^|\n)\s*FILE\s*:\s*[^\n]+\n\s*```[A-Za-z0-9_+#.-]*\s*\n[\s\S]*?```",
+-        raw_response or "",
+-        re.IGNORECASE,
++        thinking_mode=True,
+     )
+     explanation, code, language, files, file_languages = extract_code_artifact(raw_response)
+-    if not has_named_artifact:
++    # Only treat this as a failure when extract_code_artifact truly found no code
++    # (no fenced blocks, no raw code fallback) — not just because the model skipped
++    # the FILE: header on an otherwise-valid single fenced block. The old check here
++    # required the literal `FILE: path` line before ANY code was accepted, which
++    # threw away perfectly good code from models that didn't use that exact format.
++    if not code and not files:
+         return {
+             'response': (
+                 'The model returned no code artifact. Please ask again and require the complete implementation '
