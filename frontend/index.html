@@ -1593,6 +1593,54 @@
                 return escapeHtml(str).replace(/`([^`]+)`/g, '<code>$1</code>');
             }
 
+            // Shared row builder — used both by the final, authoritative
+            // renderWorkflow() rebuild below AND by the live
+            // code_file_start/code_file_diff handlers further down, so a row
+            // streamed in live looks pixel-identical to one built from the
+            // final result and never has to be re-created, only updated.
+            function createWorkflowRow(activity) {
+                const row = document.createElement('div');
+                row.className = `response-workflow-row ${activity.kind}`;
+                const icon = document.createElement('span');
+                icon.className = 'response-workflow-icon';
+                icon.innerHTML = WORKFLOW_ICONS[activity.kind] || WORKFLOW_ICONS.note;
+                row.appendChild(icon);
+                const text = document.createElement('span');
+                if (activity.kind === 'edit') {
+                    setWorkflowEditRowText(text, activity);
+                    // Clicking an edited-file row jumps to that file's tab in the
+                    // diff/preview canvas below, the same way a file card does.
+                    if (activity.filename !== undefined) {
+                        row.style.cursor = 'pointer';
+                        row.addEventListener('click', () => openCanvasTab(activity.filename));
+                    }
+                } else if (activity.kind === 'note') {
+                    text.className = 'response-workflow-note-text';
+                    text.innerHTML = inlineBackticks(activity.text || '');
+                } else if (activity.kind === 'plan') {
+                    // Forward-looking "next step" bullet — same inline-backtick
+                    // handling as a note, just muted instead of bold.
+                    text.className = 'response-workflow-plain';
+                    text.innerHTML = inlineBackticks(activity.text || '');
+                } else if (activity.kind === 'command') {
+                    // A real server-side operation (e.g. "diff -u file.html") —
+                    // shown verbatim, monospaced, like terminal output.
+                    text.className = 'response-workflow-command-text';
+                    text.textContent = activity.text || '';
+                } else {
+                    text.className = 'response-workflow-plain';
+                    text.innerHTML = inlineBackticks(activity.text || '');
+                }
+                row.appendChild(text);
+                return row;
+            }
+
+            function setWorkflowEditRowText(textEl, activity) {
+                textEl.innerHTML = `Edited <span class="response-workflow-edit-file">${escapeHtml(activity.file || 'generated code')}</span>` +
+                    (activity.additions ? `<span class="response-workflow-add">+${activity.additions}</span>` : '') +
+                    (activity.deletions ? `<span class="response-workflow-del">-${activity.deletions}</span>` : '');
+            }
+
             function renderWorkflow(activities, summary) {
                 if (!workflowEl || !Array.isArray(activities) || !activities.length) return;
                 workflowEl.hidden = false;
@@ -1610,45 +1658,17 @@
                 } else {
                     summaryEl.style.display = 'none';
                 }
+                // This is the final, authoritative trace (from build_turn_activities()
+                // server-side) — it always fully replaces whatever the live
+                // code_file_start/code_file_diff handlers below already built, so any
+                // ordering/naming quirk in the live preview self-corrects here.
                 listEl.replaceChildren();
                 workflowRowsByFile.clear();
                 activities.forEach((activity) => {
-                    const row = document.createElement('div');
-                    row.className = `response-workflow-row ${activity.kind}`;
-                    const icon = document.createElement('span');
-                    icon.className = 'response-workflow-icon';
-                    icon.innerHTML = WORKFLOW_ICONS[activity.kind] || WORKFLOW_ICONS.note;
-                    row.appendChild(icon);
-                    const text = document.createElement('span');
-                    if (activity.kind === 'edit') {
-                        text.innerHTML = `Edited <span class="response-workflow-edit-file">${escapeHtml(activity.file || 'generated code')}</span>` +
-                            (activity.additions ? `<span class="response-workflow-add">+${activity.additions}</span>` : '') +
-                            (activity.deletions ? `<span class="response-workflow-del">-${activity.deletions}</span>` : '');
-                        // Clicking an edited-file row jumps to that file's tab in the
-                        // diff/preview canvas below, the same way a file card does.
-                        if (activity.filename !== undefined) {
-                            row.style.cursor = 'pointer';
-                            row.addEventListener('click', () => openCanvasTab(activity.filename));
-                            workflowRowsByFile.set(activity.filename, row);
-                        }
-                    } else if (activity.kind === 'note') {
-                        text.className = 'response-workflow-note-text';
-                        text.innerHTML = inlineBackticks(activity.text || '');
-                    } else if (activity.kind === 'plan') {
-                        // Forward-looking "next step" bullet — same inline-backtick
-                        // handling as a note, just muted instead of bold.
-                        text.className = 'response-workflow-plain';
-                        text.innerHTML = inlineBackticks(activity.text || '');
-                    } else if (activity.kind === 'command') {
-                        // A real server-side operation (e.g. "diff -u file.html") —
-                        // shown verbatim, monospaced, like terminal output.
-                        text.className = 'response-workflow-command-text';
-                        text.textContent = activity.text || '';
-                    } else {
-                        text.className = 'response-workflow-plain';
-                        text.innerHTML = inlineBackticks(activity.text || '');
+                    const row = createWorkflowRow(activity);
+                    if (activity.kind === 'edit' && activity.filename !== undefined) {
+                        workflowRowsByFile.set(activity.filename, row);
                     }
-                    row.appendChild(text);
                     listEl.appendChild(row);
                 });
                 scrollToBottom();
@@ -1962,6 +1982,17 @@
                                     // a spinner, before any diff/counts are known yet.
                                     const key = parsed.filename || '';
                                     upsertCanvasFile(key, { language: parsed.language || '', streaming: true });
+                                    // Also grow the activity feed itself live — an "Editing <file>…"
+                                    // row appears the instant the file starts, exactly like a Claude
+                                    // Code session narrating each edit as it happens, instead of the
+                                    // whole feed only popping in at the very end of the turn.
+                                    if (workflowEl && !workflowRowsByFile.has(key)) {
+                                        workflowEl.hidden = false;
+                                        const row = createWorkflowRow({ kind: 'edit', file: canvasFileLabel(key), filename: key, additions: 0, deletions: 0 });
+                                        workflowRowsByFile.set(key, row);
+                                        workflowEl.querySelector('.response-workflow-list').appendChild(row);
+                                        scrollToBottom();
+                                    }
                                 } else if (parsed.type === 'code_file_diff' && mode === 'code') {
                                     // One file just finished streaming and the backend computed its
                                     // real diff — this is what makes the +added/-removed counts (and
@@ -1976,18 +2007,23 @@
                                         content: parsed.content || '',
                                         streaming: false,
                                     });
-                                    // Live-update the matching workflow row too, if it already exists
-                                    // (it may not, until finalizeCodeResult builds the full trace) —
-                                    // the final renderWorkflow() call still resyncs everything exactly
-                                    // once the turn completes, so this is purely an early preview.
-                                    const row = workflowRowsByFile.get(key);
+                                    // Live-update the matching workflow row's +added/-removed counts
+                                    // now that the real diff is known. The final renderWorkflow() call
+                                    // still fully rebuilds the feed once the turn completes (adding the
+                                    // "Read"/"diff -u" rows and note/plan bullets around this edit), so
+                                    // this is purely an early, self-correcting preview.
+                                    let row = workflowRowsByFile.get(key);
+                                    if (!row && workflowEl) {
+                                        // Defensive fallback: create it now if code_file_start's row
+                                        // somehow wasn't built yet, so the diff is never lost.
+                                        workflowEl.hidden = false;
+                                        row = createWorkflowRow({ kind: 'edit', file: canvasFileLabel(key), filename: key, additions: 0, deletions: 0 });
+                                        workflowRowsByFile.set(key, row);
+                                        workflowEl.querySelector('.response-workflow-list').appendChild(row);
+                                    }
                                     if (row) {
                                         const textEl = row.querySelector('span:last-child');
-                                        if (textEl) {
-                                            textEl.innerHTML = `Edited <span class="response-workflow-edit-file">${escapeHtml(canvasFileLabel(key))}</span>` +
-                                                (parsed.additions ? `<span class="response-workflow-add">+${parsed.additions}</span>` : '') +
-                                                (parsed.deletions ? `<span class="response-workflow-del">-${parsed.deletions}</span>` : '');
-                                        }
+                                        if (textEl) setWorkflowEditRowText(textEl, { file: canvasFileLabel(key), additions: parsed.additions, deletions: parsed.deletions });
                                     }
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
