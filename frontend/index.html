@@ -2019,6 +2019,9 @@
             setProse(textContainer, '');
             indicatorEl = createThinkingIndicator('thinking');
             textContainer.appendChild(indicatorEl);
+            if (mode === 'code') {
+                addThought('Planning', 'Preparing a live file-operation plan…', 'plan');
+            }
 
             try {
                 const response = await fetch(apiUrl, {
@@ -2056,6 +2059,7 @@
                                         listEl.appendChild(createWorkflowRow({ kind: 'plan', text: parsed.step }));
                                         livePlanRows += 1;
                                         liveWorkflowStats.notes += 1;
+                                        addThought('Planning', parsed.step, 'plan');
                                         updateLiveWorkflowSummary();
                                         scrollToBottom();
                                     }
@@ -2067,17 +2071,21 @@
                                         listEl.appendChild(createWorkflowRow({ kind: 'plan', text: step }));
                                         livePlanRows += 1;
                                         liveWorkflowStats.notes += 1;
+                                        addThought('Planning', step, 'plan');
                                     });
                                     updateLiveWorkflowSummary();
                                     scrollToBottom();
                                 } else if (parsed.type === 'agent_message' && mode === 'code') {
                                     addLiveAgentMessage(parsed.text || '');
+                                    addThought('Working', parsed.text || '', 'progress');
                                 } else if (parsed.type === 'activity_start' && mode === 'code') {
                                     const activity = parsed.activity || parsed;
                                     addLiveWorkflowRow(activity, 'running');
+                                    addThought('Working', liveActivityText(activity.action, activity.file, 'running'), 'activity');
                                 } else if (parsed.type === 'activity_complete' && mode === 'code') {
                                     const activity = parsed.activity || parsed;
                                     updateLiveWorkflowRow(activity, 'completed');
+                                    addThought('Completed', liveActivityText(activity.action, activity.file, 'completed'), 'activity');
                                     if (activity.action === 'read') liveWorkflowStats.files_viewed += 1;
                                     if (activity.action === 'edit' || activity.action === 'create') liveWorkflowStats.files_edited += 1;
                                     if (activity.action === 'delete') liveWorkflowStats.commands += 1;
@@ -2086,6 +2094,7 @@
                                     const activity = parsed.activity || parsed;
                                     updateLiveWorkflowRow(activity, 'error');
                                     addLiveAgentMessage(parsed.message || 'The file operation could not be completed.');
+                                    addThought('Needs attention', parsed.message || 'The file operation could not be completed.', 'activity_error');
                                 } else if (parsed.type === 'file_read' && mode === 'code') {
                                     const activity = parsed.activity || { id: `read:${parsed.file}`, action: 'read', file: parsed.file };
                                     updateLiveWorkflowRow(activity, 'completed');
