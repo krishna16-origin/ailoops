@@ -2,6 +2,7 @@ import os
 import os
 import json
 import re
+import difflib
 import asyncio
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
@@ -671,6 +672,69 @@ def extract_code_artifact(text: str) -> tuple[str, str, str, dict, dict]:
     return explanation, "", "", files, file_languages
 
 
+def _split_explanation_into_notes(explanation: str) -> List[str]:
+    """Break the model's own explanation into short note bullets — real content
+    from the model, not synthesized narration — for the activity feed's clock-icon
+    lines (e.g. 'Architected CSS styling and engineered component rendering logic.')."""
+    if not explanation:
+        return []
+    # Prefer existing bullet/numbered lines if the model already wrote them.
+    bullet_lines = [ln.strip(" -*\t") for ln in explanation.splitlines() if re.match(r"^\s*([-*]|\d+[.)])\s+\S", ln)]
+    if bullet_lines:
+        return [b for b in bullet_lines if b][:6]
+    # Otherwise split into sentences and keep the short, concrete ones.
+    sentences = re.split(r"(?<=[.!?])\s+", explanation.strip())
+    notes = [s.strip() for s in sentences if 8 <= len(s.strip()) <= 160]
+    return notes[:4]
+
+
+def build_turn_activities(files: dict, code: str, language: str, explanation: str, previous_files: dict) -> tuple[list, dict]:
+    """Build a Claude-Code-style activity trace for one Code-mode turn, using only
+    real signal already available: a genuine per-file diff against what this same
+    session generated last turn (difflib), plus the model's own explanation text
+    split into short notes. No fabricated tool calls are added."""
+    activities: list = []
+    all_files = dict(files) if files else ({"": code} if code else {})
+
+    edited_count = 0
+    viewed_count = 0
+
+    for filename, new_content in all_files.items():
+        display_name = filename or (f"generated.{language}" if language else "generated code")
+        old_content = previous_files.get(filename)
+        if old_content is not None:
+            # This file already existed in the session — genuinely "viewed" it
+            # (it's the context the model was given) before editing it.
+            activities.append({"kind": "view", "text": f"Reviewed the current contents of {display_name} before editing"})
+            viewed_count += 1
+            old_lines = old_content.splitlines()
+            new_lines = new_content.splitlines()
+            sm = difflib.SequenceMatcher(a=old_lines, b=new_lines)
+            additions = deletions = 0
+            for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag in ("replace", "delete"):
+                    deletions += (i2 - i1)
+                if tag in ("replace", "insert"):
+                    additions += (j2 - j1)
+            activities.append({"kind": "edit", "file": display_name, "additions": additions, "deletions": deletions})
+        else:
+            additions = len(new_content.splitlines())
+            activities.append({"kind": "edit", "file": display_name, "additions": additions, "deletions": 0})
+        edited_count += 1
+
+    for note in _split_explanation_into_notes(explanation):
+        activities.append({"kind": "note", "text": note})
+
+    note_count = sum(1 for a in activities if a["kind"] == "note")
+    summary = {
+        "commands": 0,
+        "files_edited": edited_count,
+        "files_viewed": viewed_count,
+        "notes": note_count,
+    }
+    return activities, summary
+
+
 # ---------------------------------------------------------------------------
 # Code mode: direct response generation with HTTP SSE code streaming.
 # Generated code is returned only through the response stream. The frontend
@@ -714,6 +778,15 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
         filename: (content[:CODE_MAX_OUTPUT] + '\n… output truncated …' if len(content) > CODE_MAX_OUTPUT else content)
         for filename, content in files.items()
     }
+    previous_files = dict(session.get('code_files') or {})
+    activities, activity_summary = build_turn_activities(files, code, language, explanation, previous_files)
+    # Remember what we just generated so the *next* turn in this session can
+    # diff against real prior content instead of guessing.
+    session_files = session.setdefault('code_files', {})
+    if files:
+        session_files.update(files)
+    elif code:
+        session_files[''] = code
     return {
         'response': explanation,
         'code': code,
@@ -724,6 +797,8 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
         'thinking_summary': 'Generated directly in the response stream; no file-system actions were run.',
         'thinking_level': config['label'],
         'max_tokens': config['max_tokens'],
+        'activities': activities,
+        'activity_summary': activity_summary,
     }
 
 
