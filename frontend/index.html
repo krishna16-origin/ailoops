@@ -1512,6 +1512,29 @@
 
             let assistantFullText = '';
             let codeResult = null; // { code, language, files, activities, activity_summary } — Code Mode only
+
+            // Re-parsing the whole accumulated markdown and rewriting innerHTML on
+            // EVERY streamed token (which fast models can emit dozens of times a
+            // second) is what causes visible stutter/freeze on longer answers — the
+            // render work grows with the text while the token rate stays high, so
+            // rendering falls behind and the UI appears stuck. Coalescing all tokens
+            // that arrive within one frame into a single render keeps the display
+            // just as smooth (still up to 60 updates/sec) while cutting the actual
+            // parse+DOM work by however many tokens land per frame. The stream loop
+            // below always does one more full, unthrottled render right after it
+            // ends, so no trailing token is ever lost to a skipped frame.
+            let renderScheduled = false;
+            function scheduleAnswerRender() {
+                if (renderScheduled) return;
+                renderScheduled = true;
+                requestAnimationFrame(() => {
+                    renderScheduled = false;
+                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : assistantFullText;
+                    setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)));
+                    if (indicatorEl) textContainer.appendChild(indicatorEl);
+                    scrollToBottom();
+                });
+            }
             const workflowEl = mode === 'code' ? assistantBubble.querySelector('.response-workflow') : null;
             const fileCardsEl = mode === 'code' ? assistantBubble.querySelector('.response-file-cards') : null;
             const canvasEl = mode === 'code' ? assistantBubble.querySelector('.response-canvas') : null;
@@ -1950,10 +1973,7 @@
                                     // In Code mode, never let a fenced code block render inside the
                                     // chat bubble while it's still streaming in — it belongs in the
                                     // response diff box (via code_result below), not typed out as raw text.
-                                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : assistantFullText;
-                                    setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)));
-                                    if (indicatorEl) textContainer.appendChild(indicatorEl);
-                                    scrollToBottom();
+                                    scheduleAnswerRender();
                                 }
                             } catch (e) {
                                 console.error('Failed to parse SSE chunk:', jsonStr, e);
