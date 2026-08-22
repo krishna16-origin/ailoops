@@ -79,9 +79,9 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
 
 
-CODE_WORKING_MODEL = "z-ai/glm-5.2"
+CODE_WORKING_MODEL = "moonshotai/kimi-k2.6"
 # Keep the existing UI choices, but route every Code-mode choice through the
-# verified working endpoint so model selection cannot select a hanging provider.
+# verified working endpoint so model selection cannot select an unavailable provider.
 CODE_MODEL_MAP = {
     "fast": CODE_WORKING_MODEL,
     "medium": CODE_WORKING_MODEL,
