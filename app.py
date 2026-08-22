@@ -929,6 +929,10 @@ CODE_STREAM_FORWARD_TYPES = {'status', 'thought', 'AGENT_HEARTBEAT', 'ERROR'}
 async def generate_code_stream(request: CodeChatRequest, session: dict, session_id: str):
     progress_queue: asyncio.Queue = asyncio.Queue()
     emitted_content = False
+    # True once a message_reset has been sent — at that point the client's draft
+    # is blank again, so the fallback response below must always be (re-)sent as
+    # a fresh message even if tokens had already streamed before the reset.
+    did_reset = False
     task = asyncio.create_task(
         asyncio.wait_for(generate_code_once(request, session, progress_queue), timeout=CODE_GENERATION_TIMEOUT)
     )
@@ -948,16 +952,35 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
             'response': "That response timed out. Try again, or a lower reasoning effort.",
             'code': '', 'language': '', 'files': {}, 'file_languages': {}, 'show_preview': False,
         }
+        # Whatever partial/unclosed code text streamed in before the timeout (which
+        # may still contain a raw, un-fenced FILE: block) must be wiped from the
+        # client's draft before the clean fallback message renders — otherwise the
+        # fallback text just gets appended after the leftover raw content instead
+        # of replacing it.
+        yield f'data: {json.dumps({"type": "message_reset"}, ensure_ascii=False)}\n\n'
+        did_reset = True
         yield f'data: {json.dumps({"type": "ERROR", "message": "timeout"}, ensure_ascii=False)}\n\n'
     except Exception as exc:
         print(f'[{session_id}] Code generation failed: {exc}')
         result = {'response': 'I could not generate code right now. Please try again.', 'code': '', 'language': '', 'files': {}, 'file_languages': {}, 'show_preview': False}
+        yield f'data: {json.dumps({"type": "message_reset"}, ensure_ascii=False)}\n\n'
+        did_reset = True
         yield f'data: {json.dumps({"type": "ERROR", "message": str(exc)}, ensure_ascii=False)}\n\n'
     if result.get('artifact_error'):
+        # Same reasoning: the model's raw (headerless or malformed) output already
+        # streamed live as prose — clear it before showing the "no code artifact"
+        # fallback so the two don't concatenate into more garbled text.
+        yield f'data: {json.dumps({"type": "message_reset"}, ensure_ascii=False)}\n\n'
+        did_reset = True
         yield f'data: {json.dumps({"type": "ERROR", "message": "no_code_artifact"}, ensure_ascii=False)}\n\n'
     if result.get('code') or result.get('files'):
         yield f'data: {json.dumps({"type": "code_result", **result, "session_id": session_id}, ensure_ascii=False)}\n\n'
-    if not emitted_content:
+    # Normally the fallback response text is only needed if nothing streamed at
+    # all. But once a message_reset has fired, the client's draft was wiped back
+    # to blank regardless of what streamed before it — so the fallback text must
+    # always be (re-)sent in that case too, or the bubble is left empty with no
+    # explanation of what went wrong.
+    if not emitted_content or did_reset:
         yield f'data: {json.dumps({"type": "message", "assistant_message": result["response"], "conversation_id": session_id, "session_id": session_id}, ensure_ascii=False)}\n\n'
     session['messages'].append(AIMessage(content=result['response']))
 
