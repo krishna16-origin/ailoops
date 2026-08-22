@@ -306,13 +306,13 @@ def _new_code_stream_state() -> dict:
 
 def _guess_raw_code_language(line: str) -> str:
     clean = (line or '').strip()
-    if re.match(r'(?i)^(<!doctype\\s+html|<html\\b|</?[a-z][^>]*>)', clean):
+    if re.match(r'(?i)^(<!doctype\s+html|<html\b|</?[a-z][^>]*>)', clean):
         return 'html'
-    if re.match(r'^(?:from\\s+\\w+|import\\s+\\w+|(?:async\\s+)?def\\s+\\w+|class\\s+\\w+)', clean):
+    if re.match(r'^(?:from\s+\w+|import\s+\w+|(?:async\s+)?def\s+\w+|class\s+\w+)', clean):
         return 'python'
-    if re.match(r'^(?:const|let|var|function|export|import)\\s+', clean):
+    if re.match(r'^(?:const|let|var|function|export|import)\s+', clean):
         return 'javascript'
-    if re.match(r'^(?:[.#]?[A-Za-z_][\\w-]*\\s*\\{|@media\\b)', clean):
+    if re.match(r'^(?:[.#]?[A-Za-z_][\w-]*\s*\{|@media\b)', clean):
         return 'css'
     return ''
 
