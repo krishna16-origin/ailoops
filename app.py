@@ -55,6 +55,27 @@ CODE_THINKING_DEPTH_INSTRUCTIONS = {
     "max": "Plan like a principal engineer: weigh multiple architectures and their trade-offs, edge cases, error handling, performance, and testability; decide on the strongest approach and justify it to yourself, then write the implementation.",
 }
 
+# Code output needs a much bigger completion budget than a chat answer — a
+# multi-file build (e.g. a Three.js site with several JS/CSS files) can easily
+# run to tens of thousands of tokens of actual code, on top of the <think>
+# planning block. Reusing Chat mode's THINKING_LEVELS (medium=16000) here was
+# letting the model's own planning/explanation prose eat the entire budget
+# before it ever reached a FILE:/fenced code block — producing exactly the
+# "wrote a whole plan, then nothing" failure mode. Code mode gets its own,
+# larger ceiling per tier instead.
+CODE_THINKING_LEVELS = {
+    "low": {"label": "Low", "max_tokens": 16000, "description": "Quick, focused thinking"},
+    "medium": {"label": "Medium", "max_tokens": 32000, "description": "Balanced analysis"},
+    "high": {"label": "High", "max_tokens": 48000, "description": "Deep reasoning"},
+    "extra": {"label": "Extra", "max_tokens": 60000, "description": "Comprehensive analysis"},
+    "max": {"label": "Max", "max_tokens": 65536, "description": "Exhaustive reasoning"},  # NVIDIA's hard per-request ceiling
+}
+
+
+def get_code_thinking_config(level: str) -> dict:
+    """Like get_thinking_config(), but sized for Code mode's much larger completions."""
+    return CODE_THINKING_LEVELS[normalize_thinking_level(level)]
+
 
 def normalize_thinking_level(level: str) -> str:
     """Fold any input onto one of the five valid thinking-level keys."""
@@ -731,7 +752,7 @@ CODE_CONTEXT_CHAR_LIMIT_PER_FILE = 8000
 
 def build_code_messages(history: List[BaseMessage], reasoning_level: str, code_files: Optional[dict] = None) -> List[BaseMessage]:
     level_key = normalize_thinking_level(reasoning_level)
-    config = THINKING_LEVELS[level_key]
+    config = CODE_THINKING_LEVELS[level_key]
     depth = CODE_THINKING_DEPTH_INSTRUCTIONS[level_key]
     system_text = (
         build_constitution_block() + "\n\n"
@@ -739,10 +760,14 @@ def build_code_messages(history: List[BaseMessage], reasoning_level: str, code_f
         "You do not have filesystem or shell access. Never claim that you created, saved, ran, or previewed a file.\n"
         f"Before writing code, think inside a single <think>...</think> block. {depth}\n"
         "Write that block as your own natural engineering reasoning — not a restatement of these instructions.\n"
-        "After the closing </think> tag, give a concise user-facing explanation and put the complete implementation in "
-        "fenced code blocks. Put a separate line `FILE: relative/path/to/file.ext` immediately before every block, "
-        "including a single-file response. Use the correct language tag for every block. Never respond with only a "
-        "claimed filesystem path. If you cannot provide code, say so plainly instead of claiming that a file exists.\n"
+        "After the closing </think> tag, write the code FIRST, before any explanation. Put a separate line "
+        "`FILE: relative/path/to/file.ext` immediately before every fenced code block, including a single-file "
+        "response, and put the complete implementation in that block — never a snippet or placeholder. Use the "
+        "correct language tag for every block. Only after every file is fully written, add a short user-facing "
+        "explanation (2-3 sentences, not a design essay or an architecture writeup) below the code. If your "
+        "response is cut off, it must never be the code that got cut off — the explanation is expendable, the "
+        "code is not. Never respond with only a claimed filesystem path. If you cannot provide code, say so "
+        "plainly instead of claiming that a file exists.\n"
         "If a CURRENT PROJECT FILES section appears below, those are the real, up-to-date contents of every file "
         "already generated in this session — treat them as ground truth even if the conversation history above "
         "is summarized or trimmed. When the user asks you to change, add to, fix, or extend something, edit those "
@@ -903,8 +928,8 @@ CODE_MAX_OUTPUT = 20000
 # like "Thought for 93s" right before the generic failure message. Sizing the
 # timeout to the actual token budget and model tier fixes that at the root,
 # instead of just raising the number and hoping it's big enough next time too.
-CODE_GENERATION_TIMEOUT_FLOOR = 120.0     # never less than this, even for the smallest request
-CODE_GENERATION_TIMEOUT_CEILING = 900.0  # hard cap so a genuinely stuck call can never hang forever
+CODE_GENERATION_TIMEOUT_FLOOR = 120.0      # never less than this, even for the smallest request
+CODE_GENERATION_TIMEOUT_CEILING = 1200.0   # hard cap so a genuinely stuck call can never hang forever
 
 # Rough real-world seconds of generation time per 1000 completion tokens, per
 # model tier — 'strong' is a much larger reasoning model and is meaningfully
@@ -926,7 +951,7 @@ def resolve_code_model_key(model: str) -> str:
 def get_code_generation_timeout(model_key: str, reasoning_level: str) -> float:
     """Size the generation timeout to this request's actual token budget and
     model speed, instead of one flat number that's wrong for most requests."""
-    max_tokens = get_thinking_config(reasoning_level)["max_tokens"]
+    max_tokens = get_code_thinking_config(reasoning_level)["max_tokens"]
     seconds_per_1k = CODE_MODEL_SECONDS_PER_1K_TOKENS.get(
         model_key, CODE_MODEL_SECONDS_PER_1K_TOKENS[DEFAULT_CODE_MODEL]
     )
@@ -935,7 +960,7 @@ def get_code_generation_timeout(model_key: str, reasoning_level: str) -> float:
 
 
 async def generate_code_once(request: CodeChatRequest, session: dict, progress=None, on_answer_piece=None) -> dict:
-    config = get_thinking_config(request.reasoning_level)
+    config = get_code_thinking_config(request.reasoning_level)
     model_key = resolve_code_model_key(request.model)
     await publish_progress(
         progress,
