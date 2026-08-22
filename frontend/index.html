@@ -1198,7 +1198,7 @@
                 // Identical wiring is used for both Chat mode and Code mode.
                 const statusDiv = document.createElement('div');
                 statusDiv.className = 'thinking-block';
-                statusDiv.style.display = 'none'; // hidden until we actually get a thought
+                statusDiv.style.display = 'none'; // Chat mode never exposes private reasoning
                 statusDiv.innerHTML = `
                     <button type="button" class="thinking-toggle">Thinking</button>
                     <div class="thinking-content expanded"></div>
@@ -1358,11 +1358,12 @@
             // Show "Thinking" the instant the request goes out — like Claude.ai — rather
             // than waiting for a real backend status event, which may never arrive for
             // quick replies that skip the planning loop entirely (e.g. "hi").
-            thinkingBlock.style.display = 'block';
-            thinkingToggle.textContent = 'Thinking';
+                        thinkingBlock.style.display = mode === 'code' ? 'block' : 'none';
+            thinkingToggle.textContent = 'Working';
             thinkingToggle.classList.add('shimmer');
 
-            let thinkingDone = false;      // true once the model has moved on to answering
+            let thinkingDone = false;
+      // true once the model has moved on to answering
             let answerStarted = false;     // true once the first answer token has arrived
             let thinkingFinalized = false; // true once "Thought for Ns" has been set for good
             let lastThoughtStep = null;    // step name of the most recently rendered thought bubble
@@ -1397,7 +1398,7 @@
             // and keeps it expanded while it grows. Shared by both modes.
 
             function addThought(label, detail, step) {
-                if (thinkingDone) return;
+                if (thinkingDone || mode === 'chat') return;
                 thinkingBlock.style.display = 'block';
                 thinkingToggle.textContent = label || 'Thinking';
                 thinkingToggle.classList.add('shimmer');
@@ -2166,7 +2167,9 @@
                                     }
                                 } else if (parsed.type === 'complete') {
                                     if (mode === 'code' && codeResult) finalizeCodeResult(codeResult);
-                                } else if (parsed.type === 'thought') {
+                                } else if (parsed.type === 'thought' && mode === 'code') {
+                                    // Only Code Mode may display safe progress traces;
+                                    // Chat Mode never renders private model reasoning.
                                     appendLiveThought(parsed.text);
                                 } else if (parsed.type === 'status') {
                                     // Chat mode retains its existing status contract; Code mode uses the rich workflow events above.
@@ -2209,11 +2212,8 @@
                     // server-side in the non-streaming invoke_model() path) belongs in
                     // the Thinking panel — synthetic backend-node narration and the
                     // generic thinking_summary line are no longer shown.
-                    if (Array.isArray(data.thinking_steps)) {
-                        data.thinking_steps
-                            .filter(step => step.step === 'reasoning')
-                            .forEach(step => addThought(step.label, step.detail, step.step));
-                    }
+                    // Private reasoning is intentionally not rendered in Chat mode.
+                    // Only the final response is user-visible here.
                     assistantFullText = data.response;
                     const hasCode = data && (data.code || (data.files && Object.keys(data.files).length > 0));
                     if (mode === 'code' && hasCode) {

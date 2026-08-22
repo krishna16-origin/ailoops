@@ -443,8 +443,8 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
     if not isinstance(progress, asyncio.Queue):
         result = await llm.ainvoke(messages, **invoke_kwargs)
         reasoning = _extract_reasoning(result)
-        if reasoning and isinstance(progress, list):
-            progress.append({"step": "reasoning", "label": "Thinking", "detail": reasoning.strip()})
+        # Keep model reasoning internal for watchdog/diagnostic use only. Never
+        # place private reasoning into the user-facing response payload.
         content = _coerce_model_text(getattr(result, "content", "") or "")
         answer_text = strip_thinking(content).strip()
         if max_think_chars is not None and not answer_text and len(reasoning) > max_think_chars:
@@ -688,7 +688,7 @@ async def generate_stream(request: ChatRequest, session: dict, session_id: str):
     emitted_content = False
     try:
         async for event in forward_live_events(task, progress_queue, session_id):
-            if event["type"] in ("status", "thought"):
+            if event["type"] == "status":
                 yield f"data: {json.dumps(event)}\n\n"
             elif event["type"] == "token":
                 emitted_content = True
