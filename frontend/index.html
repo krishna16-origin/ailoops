@@ -818,10 +818,29 @@
         }
 
         // Remove fenced code blocks from the prose stream; code is rendered in the
-        // in-response diff box instead.
+        // in-response diff box instead. Also handles the LIVE, still-streaming case:
+        // while a `FILE: path` header or its fence hasn't closed yet, the raw code
+        // (which is often a full HTML document with its own <style>/<body> tags)
+        // must never reach marked.parse() — marked passes raw HTML straight through,
+        // so an unstripped mid-stream chunk gets injected directly into the page
+        // DOM (e.g. a stray <body style="background:#000"> rendering as a giant
+        // black block in the middle of the chat). Everything from the first
+        // still-open FILE:/fence marker onward is dropped rather than shown.
         function stripCodeFence(text) {
             if (!text) return text;
-            return text.replace(/```[\w+#.-]*\n[\s\S]*?```/g, '').trim();
+            // Drop each closed `FILE: path` header together with its fenced block,
+            // as one unit — mirrors the backend's named-file extraction pattern, so
+            // the header line isn't left behind as orphaned prose.
+            let cleaned = text.replace(/(?:^|\n)[ \t]*FILE\s*:\s*[^\n]+\n[ \t]*```[\w+#.-]*\n[\s\S]*?```/gi, '');
+            // Drop any remaining closed, unnamed fenced block too.
+            cleaned = cleaned.replace(/```[\w+#.-]*\n[\s\S]*?```/g, '');
+            // Anything left that starts a FILE: header or a fence marker is
+            // necessarily still open/unclosed — every fully closed pair or bare
+            // block was already removed above — so truncate right before it
+            // rather than ever rendering it raw.
+            const openMarker = cleaned.search(/(?:^|\n)[ \t]*FILE\s*:|```/i);
+            if (openMarker !== -1) cleaned = cleaned.slice(0, openMarker);
+            return cleaned.trim();
         }
 
         function renderPlanCard(container, plan) {
