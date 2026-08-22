@@ -894,6 +894,17 @@ CODE_MAX_OUTPUT = 20000
 # One flat timeout for every code-mode request, regardless of model or effort.
 CODE_GENERATION_TIMEOUT = 300.0
 
+# Cap how much of the token budget a Code-mode turn is allowed to spend
+# planning (inside <think>) before any visible answer text appears. Past this
+# fraction, invoke_model raises ThinkingBudgetExceeded instead of letting a
+# verbose plan silently consume the whole completion budget and leave nothing
+# for the actual code — the exact "wrote a whole plan, then nothing" failure.
+CODE_THINK_BUDGET_FRACTION = 0.55
+# Rough chars-per-token estimate for English/code text, used only to size the
+# character-based watchdog against a token-based budget — not exact, just a
+# safety margin so code still has room to land after the plan.
+CODE_THINK_CHARS_PER_TOKEN = 4
+
 
 def resolve_code_model_key(model: str) -> str:
     """Normalize a requested Code-mode model name to a valid CODE_MODEL_MAP key."""
@@ -903,18 +914,66 @@ def resolve_code_model_key(model: str) -> str:
 
 async def generate_code_once(request: CodeChatRequest, session: dict, progress=None) -> dict:
     """User prompt in, generated code out: build the prompt, call the model
-    once, pull the code out of the response, remember it for this session."""
+    once, pull the code out of the response, remember it for this session.
+
+    Guards against the "planned everything, wrote nothing" failure two ways:
+    (1) a thinking-budget watchdog aborts the first attempt early if the model
+    is still planning past CODE_THINK_BUDGET_FRACTION of its token budget with
+    no visible answer yet, instead of silently burning the whole budget on a
+    plan and leaving nothing for code; (2) regardless of *why* the first
+    attempt came back with no parseable code (budget watchdog, or the model
+    just didn't fence it), exactly one automatic retry runs with thinking
+    disabled and an explicit "stop planning, output code now" instruction —
+    so this is invisible self-recovery for the common case, not a dead end
+    the user has to manually retry."""
     config = get_code_thinking_config(request.reasoning_level)
     model_key = resolve_code_model_key(request.model)
     llm = get_code_llm(model_key, 0.2, config['max_tokens'])
     code_messages = build_code_messages(session['messages'], request.reasoning_level, session.get('code_files'))
-    raw_response = await invoke_model(code_messages, llm, progress, thinking_mode=True)
+    max_think_chars = int(config['max_tokens'] * CODE_THINK_BUDGET_FRACTION * CODE_THINK_CHARS_PER_TOKEN)
+
+    retried_for_budget = False
+    try:
+        raw_response = await invoke_model(
+            code_messages, llm, progress, thinking_mode=True, max_think_chars=max_think_chars,
+        )
+    except ThinkingBudgetExceeded as exc:
+        await publish_progress(
+            progress, "code_thinking_retry", "Retrying without extended thinking",
+            f"Still planning after ~{max_think_chars} characters of reasoning with no code yet "
+            f"({exc}) — retrying once with thinking off so code lands.",
+        )
+        retried_for_budget = True
+        raw_response = await invoke_model(code_messages, llm, progress, thinking_mode=False)
+
     explanation, code, language, files, file_languages = extract_code_artifact(raw_response)
+
+    if not code and not files and not retried_for_budget:
+        # The model answered inside budget but still produced nothing
+        # extract_code_artifact could parse (e.g. it skipped fencing). One
+        # more automatic attempt — thinking disabled, explicit nudge — before
+        # surfacing a failure to the user. Bounded to a single retry total,
+        # same as the budget-exceeded branch above, so a stubborn model can't
+        # loop the request past the outer generation timeout.
+        await publish_progress(
+            progress, "code_artifact_retry", "Retrying — no code found",
+            "The first response had no parseable code block. Retrying once with a direct instruction "
+            "to output code only.",
+        )
+        nudge = SystemMessage(content=(
+            "Your previous response did not contain a parseable code artifact. Skip all planning or "
+            "explanation this time. Output ONLY a `FILE: relative/path.ext` line immediately followed by "
+            "a fenced code block, for every file, with no other text before the first FILE: line."
+        ))
+        raw_response = await invoke_model(code_messages + [nudge], llm, progress, thinking_mode=False)
+        explanation, code, language, files, file_languages = extract_code_artifact(raw_response)
+
     if not code and not files:
         return {
             'response': (
-                'The model returned no code artifact. Please ask again and require the complete implementation '
-                'inside fenced code blocks with a `FILE: relative/path.ext` header.'
+                'The model returned no code artifact even after a retry. Please try again, or a lower '
+                'reasoning effort — very code-heavy requests (e.g. a full WebGL/Three.js build) can outrun '
+                'the planning budget at higher effort levels.'
             ),
             'code': '', 'language': '', 'files': {}, 'file_languages': {}, 'show_preview': False,
             'artifact_error': True,
