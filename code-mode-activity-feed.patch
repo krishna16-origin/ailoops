@@ -1,5 +1,5 @@
 diff --git a/app.py b/app.py
-index 58e8909..b75d0f4 100644
+index 58e8909..b762f11 100644
 --- a/app.py
 +++ b/app.py
 @@ -2,6 +2,7 @@ import os
@@ -10,7 +10,49 @@ index 58e8909..b75d0f4 100644
  import asyncio
  from datetime import datetime, timezone
  from typing import List, Dict, Any, Optional
-@@ -671,6 +672,69 @@ def extract_code_artifact(text: str) -> tuple[str, str, str, dict, dict]:
+@@ -65,22 +66,31 @@ def get_thinking_config(level: str) -> dict:
+ 
+ 
+ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
+-    """Create the selected model with the requested completion-token budget."""
++    """Create the selected Chat-mode model (Horus/Osiris/Amun-Ra). Code mode uses
++    its own get_code_llm() with an independent fast/medium/strong tier set."""
+     model_name = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+     model_type_clean = (model_type or "balanced").strip().lower()
+     if model_type_clean == "fast":
+         model_name = "deepseek-ai/deepseek-v4-pro"
+     elif model_type_clean == "reasoning":
+         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
+-    elif model_type_clean in {"gpt120b", "gpt-oss-120b", "openai/gpt-oss-120b"}:
+-        model_name = "openai/gpt-oss-120b"
+-    elif model_type_clean in {"glm", "glm5.2", "glm-5.2", "kimi", "kimik2.6", "kimi-k2.6"}:
+-        # GLM 5.2 is currently end-of-life on the deployed NVIDIA account and
+-        # Kimi K2.6 is not provisioned there. Keep old request values compatible
+-        # but route them to the available GPT-OSS 120B provider instead.
+-        model_name = "openai/gpt-oss-120b"
+-    if model_name == "openai/gpt-oss-120b":
+-        max_tokens = min(max_tokens, 4096)
++    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
++
++
++CODE_MODEL_MAP = {
++    "fast": "deepseek-ai/deepseek-v4-flash-0731",
++    "medium": "minimaxai/minimax-m3",
++    "strong": "nvidia/nemotron-3-ultra-550b-a55b",
++}
++DEFAULT_CODE_MODEL = "medium"
++
++
++def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
++    """Create the selected Code-mode model. Code mode has its own fast/medium/strong
++    tiers, kept separate from Chat mode's Horus/Osiris/Amun-Ra models in get_llm()
++    so the two never collide on the same key."""
++    model_type_clean = (model_type or DEFAULT_CODE_MODEL).strip().lower()
++    model_name = CODE_MODEL_MAP.get(model_type_clean, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
+     return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
+ 
+ 
+@@ -671,6 +681,69 @@ def extract_code_artifact(text: str) -> tuple[str, str, str, dict, dict]:
      return explanation, "", "", files, file_languages
  
  
@@ -80,7 +122,32 @@ index 58e8909..b75d0f4 100644
  # ---------------------------------------------------------------------------
  # Code mode: direct response generation with HTTP SSE code streaming.
  # Generated code is returned only through the response stream. The frontend
-@@ -714,6 +778,15 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
+@@ -684,19 +757,18 @@ CODE_GENERATION_TIMEOUT = 90
+ 
+ async def generate_code_once(request: CodeChatRequest, session: dict, progress=None, on_answer_piece=None) -> dict:
+     config = get_thinking_config(request.reasoning_level)
+-    model_key = (request.model or 'glm').strip().lower()
++    model_key = (request.model or DEFAULT_CODE_MODEL).strip().lower()
++    if model_key not in CODE_MODEL_MAP:
++        model_key = DEFAULT_CODE_MODEL
+     await publish_progress(
+         progress,
+         'code_generation_started',
+         'code_generation_started',
+         f"Generating code with {config['label']} effort and a {config['max_tokens']}-token budget.",
+     )
+-    llm = get_llm(model_key, 0.2, config['max_tokens'])
+-    code_model_key = model_key
++    llm = get_code_llm(model_key, 0.2, config['max_tokens'])
+     thinking_mode = None
+-    reasoning_effort = ({'low': 'low', 'medium': 'medium', 'high': 'high'}.get(normalize_thinking_level(request.reasoning_level))
+-                        if code_model_key in {'gpt120b', 'gpt-oss-120b', 'openai/gpt-oss-120b', 'kimi', 'kimik2.6', 'kimi-k2.6', 'glm', 'glm5.2', 'glm-5.2'}
+-                        else None)
++    reasoning_effort = None
+     raw_response = await invoke_model(
+         build_code_messages(session['messages'], request.reasoning_level),
+         llm,
+@@ -714,6 +786,15 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
          filename: (content[:CODE_MAX_OUTPUT] + '\n… output truncated …' if len(content) > CODE_MAX_OUTPUT else content)
          for filename, content in files.items()
      }
@@ -96,7 +163,7 @@ index 58e8909..b75d0f4 100644
      return {
          'response': explanation,
          'code': code,
-@@ -724,6 +797,8 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
+@@ -724,6 +805,8 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
          'thinking_summary': 'Generated directly in the response stream; no file-system actions were run.',
          'thinking_level': config['label'],
          'max_tokens': config['max_tokens'],
@@ -106,7 +173,7 @@ index 58e8909..b75d0f4 100644
  
  
 diff --git a/frontend/index.html b/frontend/index.html
-index 9bab565..328e2e4 100644
+index 9bab565..24e720d 100644
 --- a/frontend/index.html
 +++ b/frontend/index.html
 @@ -182,36 +182,44 @@
@@ -184,6 +251,19 @@ index 9bab565..328e2e4 100644
  
          .thinking-block { margin-top:2px; }
          .thinking-toggle { background:none; border:none; padding:0; font-size:13px; font-family:inherit; color:var(--text-secondary); cursor:pointer; }
+@@ -560,9 +568,9 @@
+                 <option value="max">Max</option>
+             </select>
+             <select id="codeModel">
+-                <option value="gpt120b" selected>GPT-OSS 120B</option>
+-                <option value="glm">GLM 5.2 (unavailable)</option>
+-                <option value="kimik2.6">Kimi K2.6 (unavailable)</option>
++                <option value="fast">Flash</option>
++                <option value="medium" selected>Minimax M3</option>
++                <option value="strong">Nemotron Ultra</option>
+             </select>
+             <select id="codeReasoningLevel">
+                 <option value="low">Low</option>
 @@ -579,6 +587,7 @@
      <script src="https://cdn.jsdelivr.net/npm/marked-katex-extension/lib/index.umd.js"></script>
      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -232,6 +312,19 @@ index 9bab565..328e2e4 100644
          function highlightCode(el) {
              el.querySelectorAll('pre code').forEach(codeEl => {
                  hljs.highlightElement(codeEl);
+@@ -916,9 +892,9 @@
+                 { value: 'reasoning', name: 'Amun-Ra', desc: 'For complex requests' }
+             ],
+             code: [
+-                { value: 'gpt120b', name: 'GPT-OSS 120B', desc: 'Available coding and reasoning model' },
+-                { value: 'glm', name: 'GLM 5.2', desc: 'Currently unavailable on the deployed NVIDIA account' },
+-                { value: 'kimik2.6', name: 'Kimi K2.6 (Thinking)', desc: 'Currently unavailable on the deployed NVIDIA account' }
++                { value: 'fast', name: 'Flash', desc: 'deepseek-ai/deepseek-v4-flash-0731 — fastest, best for quick edits' },
++                { value: 'medium', name: 'Minimax M3', desc: 'minimaxai/minimax-m3 — balanced speed and quality' },
++                { value: 'strong', name: 'Nemotron Ultra', desc: 'nvidia/nemotron-3-ultra-550b-a55b — strongest, best for hard problems' }
+             ]
+         };
+ 
 @@ -1183,36 +1159,29 @@
                  body.appendChild(statusDiv);
  
