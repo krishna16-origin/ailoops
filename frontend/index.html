@@ -193,6 +193,8 @@
         .response-workflow-row.note .response-workflow-icon { color:#8b949e; }
         .response-workflow-row.edit .response-workflow-icon { color:#79c0ff; }
         .response-workflow-row.view .response-workflow-icon { color:#8b949e; }
+        .response-workflow-row.plan .response-workflow-icon { color:#8b949e; }
+        .response-workflow-row.command .response-workflow-icon { color:#d2a8ff; }
         .response-workflow-row.working .response-workflow-icon { color:var(--accent); }
         .response-workflow-note-text { color:var(--text-primary); font-weight:600; }
         .response-workflow-note-text code { font:12px 'Courier New', Courier, monospace; background:var(--bg-hover); border:1px solid var(--border-color); border-radius:4px; padding:1px 5px; color:var(--text-primary); font-weight:400; }
@@ -201,6 +203,7 @@
         .response-workflow-del { color:#f85149; font:12.5px 'Courier New', Courier, monospace; margin-left:4px; }
         .response-workflow-plain { color:var(--text-secondary); }
         .response-workflow-plain code { font:12px 'Courier New', Courier, monospace; background:var(--bg-hover); border:1px solid var(--border-color); border-radius:4px; padding:1px 5px; color:var(--text-primary); }
+        .response-workflow-command-text { color:#d2a8ff; font:12.5px 'Courier New', Courier, monospace; }
         .code-mode-message .message-prose,
         .code-mode-message .message-prose p { font-weight:600; color:var(--text-primary); }
 
@@ -1569,6 +1572,13 @@
                 edit: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.6 1.6 0 0 1 2.3 2.3L5.5 13 2 14l1-3.5 8.5-8Z"/></svg>',
                 view: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 2 5.5 4.5 8M11.5 3 14 5.5 11.5 8M9.5 2.5l-3 8"/></svg>',
                 note: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><path d="M8 5v3l2 1.5"/></svg>',
+                // Forward-looking "here's what I'll do next" bullet — a plain dot,
+                // deliberately lighter-weight than the note clock so accomplishment
+                // (note) and next-step (plan) rows read differently at a glance.
+                plan: '<svg viewBox="0 0 16 16" fill="currentColor"><circle cx="8" cy="8" r="3"/></svg>',
+                // Real server-side operation (currently: an actual diff computation),
+                // shown the same way a terminal/tool-call row reads in Claude Code.
+                command: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M4 6.5 6.5 8.5 4 10.5M8 10.5h3.5"/></svg>',
             };
             const FILE_ICON = {
                 code: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 2 5.5 4.5 8M11.5 3 14 5.5 11.5 8M9.5 2.5l-3 8"/></svg>',
@@ -1624,6 +1634,16 @@
                     } else if (activity.kind === 'note') {
                         text.className = 'response-workflow-note-text';
                         text.innerHTML = inlineBackticks(activity.text || '');
+                    } else if (activity.kind === 'plan') {
+                        // Forward-looking "next step" bullet — same inline-backtick
+                        // handling as a note, just muted instead of bold.
+                        text.className = 'response-workflow-plain';
+                        text.innerHTML = inlineBackticks(activity.text || '');
+                    } else if (activity.kind === 'command') {
+                        // A real server-side operation (e.g. "diff -u file.html") —
+                        // shown verbatim, monospaced, like terminal output.
+                        text.className = 'response-workflow-command-text';
+                        text.textContent = activity.text || '';
                     } else {
                         text.className = 'response-workflow-plain';
                         text.innerHTML = inlineBackticks(activity.text || '');
