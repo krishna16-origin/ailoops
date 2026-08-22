@@ -1,0 +1,336 @@
+diff --git a/__pycache__/app.cpython-312.pyc b/__pycache__/app.cpython-312.pyc
+index b0beafe..079d9e7 100644
+Binary files a/__pycache__/app.cpython-312.pyc and b/__pycache__/app.cpython-312.pyc differ
+diff --git a/app.py b/app.py
+index b66278f..d3657b4 100644
+--- a/app.py
++++ b/app.py
+@@ -1,5 +1,4 @@
+ import os
+-import os
+ import json
+ import re
+ import difflib
+@@ -815,6 +814,81 @@ def _diff_file(old_content: str, new_content: str) -> tuple[int, int, list]:
+     return additions, deletions, diff_lines
+ 
+ 
++# Mirrors extract_code_artifact()'s named_pattern header, but only the opening
++# half (FILE: line + opening fence) — used to detect a file boundary the
++# moment it appears in the live stream, before the closing ``` has arrived.
++_FILE_HEADER_LIVE_RE = re.compile(
++    r"(?:^|\n)[ \t]*FILE\s*:\s*(?P<filename>[^\n]+)\n\s*```(?P<language>[A-Za-z0-9_+#.-]*)[ \t]*\n",
++    re.IGNORECASE,
++)
++
++
++def make_code_stream_watcher(progress, previous_files: dict):
++    """Build the `on_answer_piece` callback invoke_model() calls for every live
++    slice of visible answer text in Code mode. Two jobs, both on the same raw
++    stream: (1) forward the text on as a normal 'token' event exactly like the
++    default path would, so the chat bubble still renders/streams as before;
++    (2) incrementally watch for `FILE: name` + fenced-code boundaries so the
++    frontend's diff/preview canvas can populate file by file, live, instead of
++    only once at the very end of the turn — emitting 'code_file_start' the
++    moment a file's header and opening fence are seen, and 'code_file_diff'
++    (with a real difflib diff against this session's last version of that
++    file) the moment its closing fence arrives. Stateful per call site: a
++    fresh watcher must be created per invoke_model() attempt, since a retry
++    starts the answer stream over from nothing."""
++    state = {"buffer": "", "mode": "scan", "filename": None, "language": ""}
++
++    async def watcher(text: str) -> None:
++        await publish_token(progress, text)
++        state["buffer"] += text
++        while True:
++            if state["mode"] == "scan":
++                match = _FILE_HEADER_LIVE_RE.search(state["buffer"])
++                if not match:
++                    # Only the tail of a long buffer could still be a partial
++                    # header, so it's safe to trim while still scanning — this
++                    # keeps the trailing explanation text (after the last file,
++                    # where no further FILE: header will ever arrive) from
++                    # growing this buffer for the rest of the turn.
++                    if len(state["buffer"]) > 4000:
++                        state["buffer"] = state["buffer"][-2000:]
++                    return
++                filename = match.group("filename").strip().strip("`")
++                language = (match.group("language") or "text").lower()
++                state["filename"] = filename
++                state["language"] = language
++                state["buffer"] = state["buffer"][match.end():]
++                state["mode"] = "code"
++                if filename:
++                    await publish_event(progress, {
++                        "type": "code_file_start", "filename": filename, "language": language,
++                    })
++            else:  # state["mode"] == "code"
++                idx = state["buffer"].find("```")
++                if idx == -1:
++                    return
++                code = state["buffer"][:idx].rstrip("\n")
++                filename = state["filename"]
++                old_content = previous_files.get(filename)
++                if old_content is not None:
++                    additions, deletions, diff_lines = _diff_file(old_content, code)
++                else:
++                    new_lines = code.splitlines()
++                    additions, deletions = len(new_lines), 0
++                    diff_lines = [{"type": "add", "content": line} for line in new_lines]
++                if filename:
++                    await publish_event(progress, {
++                        "type": "code_file_diff", "filename": filename, "language": state["language"],
++                        "additions": additions, "deletions": deletions, "diff_lines": diff_lines,
++                        "content": code,
++                    })
++                state["buffer"] = state["buffer"][idx + 3:]
++                state["mode"] = "scan"
++                state["filename"] = None
++
++    return watcher
++
++
+ def build_turn_activities(files: dict, code: str, language: str, explanation: str, previous_files: dict) -> tuple[list, dict]:
+     """Build a Claude-Code-style activity trace for one Code-mode turn, using only
+     real signal already available: a genuine per-file diff against what this same
+@@ -932,10 +1006,18 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
+     code_messages = build_code_messages(session['messages'], request.reasoning_level, session.get('code_files'))
+     max_think_chars = int(config['max_tokens'] * CODE_THINK_BUDGET_FRACTION * CODE_THINK_CHARS_PER_TOKEN)
+ 
++    # Snapshot what existed *before* this turn's update. Used both by the live
++    # per-file watcher below (so it can diff each file the instant its fence
++    # closes) and by the final activity trace after generation — both diff
++    # against this exact same real baseline, so the live preview and the
++    # authoritative end-of-turn result never disagree.
++    previous_files = dict(session.get('code_files') or {})
++
+     retried_for_budget = False
+     try:
+         raw_response = await invoke_model(
+-            code_messages, llm, progress, thinking_mode=True, max_think_chars=max_think_chars,
++            code_messages, llm, progress, on_answer_piece=make_code_stream_watcher(progress, previous_files),
++            thinking_mode=True, max_think_chars=max_think_chars,
+         )
+     except ThinkingBudgetExceeded as exc:
+         await publish_progress(
+@@ -944,7 +1026,14 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
+             f"({exc}) — retrying once with thinking off so code lands.",
+         )
+         retried_for_budget = True
+-        raw_response = await invoke_model(code_messages, llm, progress, thinking_mode=False)
++        # Fresh watcher: a retry restarts the answer stream from nothing, so
++        # the previous attempt's in-progress file/fence state must not carry
++        # over (it would otherwise misparse the new stream as a continuation
++        # of a file the model never even starts again).
++        raw_response = await invoke_model(
++            code_messages, llm, progress, on_answer_piece=make_code_stream_watcher(progress, previous_files),
++            thinking_mode=False,
++        )
+ 
+     explanation, code, language, files, file_languages = extract_code_artifact(raw_response)
+ 
+@@ -965,7 +1054,10 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
+             "explanation this time. Output ONLY a `FILE: relative/path.ext` line immediately followed by "
+             "a fenced code block, for every file, with no other text before the first FILE: line."
+         ))
+-        raw_response = await invoke_model(code_messages + [nudge], llm, progress, thinking_mode=False)
++        raw_response = await invoke_model(
++            code_messages + [nudge], llm, progress,
++            on_answer_piece=make_code_stream_watcher(progress, previous_files), thinking_mode=False,
++        )
+         explanation, code, language, files, file_languages = extract_code_artifact(raw_response)
+ 
+     if not code and not files:
+@@ -986,9 +1078,8 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
+         filename: (content[:CODE_MAX_OUTPUT] + '\n… output truncated …' if len(content) > CODE_MAX_OUTPUT else content)
+         for filename, content in files.items()
+     }
+-    # Snapshot what existed *before* this turn's update, so the activity trace
+-    # below can genuinely diff against it instead of guessing.
+-    previous_files = dict(session.get('code_files') or {})
++    # previous_files was already snapshotted above, before generation started,
++    # so this diffs against the same real baseline the live watcher used.
+     activities, activity_summary = build_turn_activities(files, code, language, explanation, previous_files)
+     # Remember what we just generated so a follow-up edit turn has real
+     # ground truth instead of guessing.
+@@ -1009,7 +1100,15 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
+     }
+ 
+ 
+-CODE_STREAM_FORWARD_TYPES = {'status', 'thought', 'AGENT_HEARTBEAT', 'ERROR'}
++CODE_STREAM_FORWARD_TYPES = {
++    'status', 'thought', 'AGENT_HEARTBEAT', 'ERROR',
++    # Live per-file canvas events from make_code_stream_watcher() — without
++    # these listed here, generate_code_stream()'s forwarder below silently
++    # drops them (any type not in this set and not 'token' is discarded), so
++    # the frontend's already-built live file tabs/diff counts never fire and
++    # the whole canvas only ever appears once, all at once, at the very end.
++    'code_file_start', 'code_file_diff',
++}
+ 
+ 
+ async def generate_code_stream(request: CodeChatRequest, session: dict, session_id: str):
+diff --git a/frontend/index.html b/frontend/index.html
+index d91e77b..035535f 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -1593,6 +1593,54 @@
+                 return escapeHtml(str).replace(/`([^`]+)`/g, '<code>$1</code>');
+             }
+ 
++            // Shared row builder — used both by the final, authoritative
++            // renderWorkflow() rebuild below AND by the live
++            // code_file_start/code_file_diff handlers further down, so a row
++            // streamed in live looks pixel-identical to one built from the
++            // final result and never has to be re-created, only updated.
++            function createWorkflowRow(activity) {
++                const row = document.createElement('div');
++                row.className = `response-workflow-row ${activity.kind}`;
++                const icon = document.createElement('span');
++                icon.className = 'response-workflow-icon';
++                icon.innerHTML = WORKFLOW_ICONS[activity.kind] || WORKFLOW_ICONS.note;
++                row.appendChild(icon);
++                const text = document.createElement('span');
++                if (activity.kind === 'edit') {
++                    setWorkflowEditRowText(text, activity);
++                    // Clicking an edited-file row jumps to that file's tab in the
++                    // diff/preview canvas below, the same way a file card does.
++                    if (activity.filename !== undefined) {
++                        row.style.cursor = 'pointer';
++                        row.addEventListener('click', () => openCanvasTab(activity.filename));
++                    }
++                } else if (activity.kind === 'note') {
++                    text.className = 'response-workflow-note-text';
++                    text.innerHTML = inlineBackticks(activity.text || '');
++                } else if (activity.kind === 'plan') {
++                    // Forward-looking "next step" bullet — same inline-backtick
++                    // handling as a note, just muted instead of bold.
++                    text.className = 'response-workflow-plain';
++                    text.innerHTML = inlineBackticks(activity.text || '');
++                } else if (activity.kind === 'command') {
++                    // A real server-side operation (e.g. "diff -u file.html") —
++                    // shown verbatim, monospaced, like terminal output.
++                    text.className = 'response-workflow-command-text';
++                    text.textContent = activity.text || '';
++                } else {
++                    text.className = 'response-workflow-plain';
++                    text.innerHTML = inlineBackticks(activity.text || '');
++                }
++                row.appendChild(text);
++                return row;
++            }
++
++            function setWorkflowEditRowText(textEl, activity) {
++                textEl.innerHTML = `Edited <span class="response-workflow-edit-file">${escapeHtml(activity.file || 'generated code')}</span>` +
++                    (activity.additions ? `<span class="response-workflow-add">+${activity.additions}</span>` : '') +
++                    (activity.deletions ? `<span class="response-workflow-del">-${activity.deletions}</span>` : '');
++            }
++
+             function renderWorkflow(activities, summary) {
+                 if (!workflowEl || !Array.isArray(activities) || !activities.length) return;
+                 workflowEl.hidden = false;
+@@ -1610,45 +1658,17 @@
+                 } else {
+                     summaryEl.style.display = 'none';
+                 }
++                // This is the final, authoritative trace (from build_turn_activities()
++                // server-side) — it always fully replaces whatever the live
++                // code_file_start/code_file_diff handlers below already built, so any
++                // ordering/naming quirk in the live preview self-corrects here.
+                 listEl.replaceChildren();
+                 workflowRowsByFile.clear();
+                 activities.forEach((activity) => {
+-                    const row = document.createElement('div');
+-                    row.className = `response-workflow-row ${activity.kind}`;
+-                    const icon = document.createElement('span');
+-                    icon.className = 'response-workflow-icon';
+-                    icon.innerHTML = WORKFLOW_ICONS[activity.kind] || WORKFLOW_ICONS.note;
+-                    row.appendChild(icon);
+-                    const text = document.createElement('span');
+-                    if (activity.kind === 'edit') {
+-                        text.innerHTML = `Edited <span class="response-workflow-edit-file">${escapeHtml(activity.file || 'generated code')}</span>` +
+-                            (activity.additions ? `<span class="response-workflow-add">+${activity.additions}</span>` : '') +
+-                            (activity.deletions ? `<span class="response-workflow-del">-${activity.deletions}</span>` : '');
+-                        // Clicking an edited-file row jumps to that file's tab in the
+-                        // diff/preview canvas below, the same way a file card does.
+-                        if (activity.filename !== undefined) {
+-                            row.style.cursor = 'pointer';
+-                            row.addEventListener('click', () => openCanvasTab(activity.filename));
+-                            workflowRowsByFile.set(activity.filename, row);
+-                        }
+-                    } else if (activity.kind === 'note') {
+-                        text.className = 'response-workflow-note-text';
+-                        text.innerHTML = inlineBackticks(activity.text || '');
+-                    } else if (activity.kind === 'plan') {
+-                        // Forward-looking "next step" bullet — same inline-backtick
+-                        // handling as a note, just muted instead of bold.
+-                        text.className = 'response-workflow-plain';
+-                        text.innerHTML = inlineBackticks(activity.text || '');
+-                    } else if (activity.kind === 'command') {
+-                        // A real server-side operation (e.g. "diff -u file.html") —
+-                        // shown verbatim, monospaced, like terminal output.
+-                        text.className = 'response-workflow-command-text';
+-                        text.textContent = activity.text || '';
+-                    } else {
+-                        text.className = 'response-workflow-plain';
+-                        text.innerHTML = inlineBackticks(activity.text || '');
++                    const row = createWorkflowRow(activity);
++                    if (activity.kind === 'edit' && activity.filename !== undefined) {
++                        workflowRowsByFile.set(activity.filename, row);
+                     }
+-                    row.appendChild(text);
+                     listEl.appendChild(row);
+                 });
+                 scrollToBottom();
+@@ -1962,6 +1982,17 @@
+                                     // a spinner, before any diff/counts are known yet.
+                                     const key = parsed.filename || '';
+                                     upsertCanvasFile(key, { language: parsed.language || '', streaming: true });
++                                    // Also grow the activity feed itself live — an "Editing <file>…"
++                                    // row appears the instant the file starts, exactly like a Claude
++                                    // Code session narrating each edit as it happens, instead of the
++                                    // whole feed only popping in at the very end of the turn.
++                                    if (workflowEl && !workflowRowsByFile.has(key)) {
++                                        workflowEl.hidden = false;
++                                        const row = createWorkflowRow({ kind: 'edit', file: canvasFileLabel(key), filename: key, additions: 0, deletions: 0 });
++                                        workflowRowsByFile.set(key, row);
++                                        workflowEl.querySelector('.response-workflow-list').appendChild(row);
++                                        scrollToBottom();
++                                    }
+                                 } else if (parsed.type === 'code_file_diff' && mode === 'code') {
+                                     // One file just finished streaming and the backend computed its
+                                     // real diff — this is what makes the +added/-removed counts (and
+@@ -1976,18 +2007,23 @@
+                                         content: parsed.content || '',
+                                         streaming: false,
+                                     });
+-                                    // Live-update the matching workflow row too, if it already exists
+-                                    // (it may not, until finalizeCodeResult builds the full trace) —
+-                                    // the final renderWorkflow() call still resyncs everything exactly
+-                                    // once the turn completes, so this is purely an early preview.
+-                                    const row = workflowRowsByFile.get(key);
++                                    // Live-update the matching workflow row's +added/-removed counts
++                                    // now that the real diff is known. The final renderWorkflow() call
++                                    // still fully rebuilds the feed once the turn completes (adding the
++                                    // "Read"/"diff -u" rows and note/plan bullets around this edit), so
++                                    // this is purely an early, self-correcting preview.
++                                    let row = workflowRowsByFile.get(key);
++                                    if (!row && workflowEl) {
++                                        // Defensive fallback: create it now if code_file_start's row
++                                        // somehow wasn't built yet, so the diff is never lost.
++                                        workflowEl.hidden = false;
++                                        row = createWorkflowRow({ kind: 'edit', file: canvasFileLabel(key), filename: key, additions: 0, deletions: 0 });
++                                        workflowRowsByFile.set(key, row);
++                                        workflowEl.querySelector('.response-workflow-list').appendChild(row);
++                                    }
+                                     if (row) {
+                                         const textEl = row.querySelector('span:last-child');
+-                                        if (textEl) {
+-                                            textEl.innerHTML = `Edited <span class="response-workflow-edit-file">${escapeHtml(canvasFileLabel(key))}</span>` +
+-                                                (parsed.additions ? `<span class="response-workflow-add">+${parsed.additions}</span>` : '') +
+-                                                (parsed.deletions ? `<span class="response-workflow-del">-${parsed.deletions}</span>` : '');
+-                                        }
++                                        if (textEl) setWorkflowEditRowText(textEl, { file: canvasFileLabel(key), additions: parsed.additions, deletions: parsed.deletions });
+                                     }
+                                 } else if (parsed.type === 'code_result') {
+                                     codeResult = parsed;
