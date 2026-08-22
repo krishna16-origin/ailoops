@@ -96,7 +96,8 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
     so the two never collide on the same key."""
     model_type_clean = (model_type or DEFAULT_CODE_MODEL).strip().lower()
     model_name = CODE_MODEL_MAP.get(model_type_clean, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
+    llm = ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
+    return llm.with_thinking_mode(enabled=True)
 
 
 def strip_thinking(text: str) -> str:
@@ -933,10 +934,10 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
         f"Generating code with {config['label']} effort and a {config['max_tokens']}-token budget.",
     )
     llm = get_code_llm(model_key, 0.2, config['max_tokens'])
-    # GLM 5.2 requires explicit thinking mode for reliable Code-mode output.
-    # The UI effort selection still controls the token budget above; only the
-    # provider endpoint is normalized to the working Code-mode model.
-    thinking_mode = True
+    # Thinking is configured on the Code-mode runnable in get_code_llm().
+    # Do not pass thinking_mode as an invocation kwarg; ChatNVIDIA exposes
+    # thinking through with_thinking_mode().
+    thinking_mode = None
     reasoning_effort = None
     raw_response = await invoke_model(
         build_code_messages(session['messages'], request.reasoning_level, session.get('code_files')),
