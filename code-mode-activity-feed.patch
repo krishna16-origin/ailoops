@@ -106,73 +106,245 @@ index 58e8909..b75d0f4 100644
  
  
 diff --git a/frontend/index.html b/frontend/index.html
-index 9bab565..a7c0c65 100644
+index 9bab565..328e2e4 100644
 --- a/frontend/index.html
 +++ b/frontend/index.html
-@@ -209,6 +209,25 @@
-         .response-diff-file-stat { color:#aff5b4; white-space:nowrap; }
-         .response-diff-code { margin:0; padding:5px 0; color:var(--text-primary); background-color:var(--bg-input); font:11px/1.45 'Courier New', Courier, monospace; white-space:pre; }
-         .response-diff-line { display:block; min-width:max-content; padding:0 9px; color:#bcebd8; background-color:rgba(16,163,127,.08); }
+@@ -182,36 +182,44 @@
+         .message-text pre code { background-color:transparent; padding:0; font-size:0.9em; border:none; }
+         .message-text blockquote { border-left:4px solid var(--accent); padding-left:12px; color:var(--text-secondary); margin:12px 0; }
+ 
+-        /* ============== CODE MODE: in-response live diff box ============== */
+-        .response-code-diff { margin-top:10px; border:1px solid var(--border-color); border-radius:8px; background-color:var(--bg-main); overflow:hidden; }
+-        .response-code-diff[hidden] { display:none; }
+-        .response-code-diff-header { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:7px 9px; border-bottom:1px solid var(--border-color); color:var(--text-secondary); font-size:11.5px; }
+-        .response-code-diff-status { display:flex; align-items:center; gap:8px; min-width:0; }
+-        .response-code-diff-dot { width:7px; height:7px; border-radius:50%; background:var(--accent); flex-shrink:0; animation:inlineStreamPulse 1s ease-in-out infinite; }
+-        .response-code-diff-dot.done { animation:none; background:#3fb950; }
+-        @keyframes inlineStreamPulse { 0%,100% { opacity:0.3; } 50% { opacity:1; } }
+-        .response-code-diff-title { color:var(--text-primary); font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+-        .response-code-diff-count { font:11.5px 'Courier New', Courier, monospace; color:#a9b1bb; white-space:nowrap; }
+-        .response-code-diff-tabs { display:flex; gap:3px; padding:5px 8px 0; background-color:var(--bg-main); }
+-        .response-code-diff-tab { border:1px solid transparent; border-bottom:0; border-radius:6px 6px 0 0; padding:5px 9px; background:transparent; color:var(--text-secondary); font:11.5px 'Inter',sans-serif; cursor:pointer; }
+-        .response-code-diff-tab:hover:not(:disabled) { color:var(--text-primary); background-color:var(--bg-hover); }
+-        .response-code-diff-tab.active { color:var(--text-primary); background:var(--bg-input); border-color:var(--border-color); }
+-        .response-code-diff-tab:disabled { opacity:0.4; cursor:not-allowed; }
+-        .response-diff-box { max-height:240px; overflow:auto; background-color:var(--bg-input); scrollbar-width:thin; scrollbar-color:rgba(255,255,255,0.15) transparent; }
+-        .response-diff-box::-webkit-scrollbar { width:4px; height:4px; }
+-        .response-diff-box::-webkit-scrollbar-track { background:transparent; }
+-        .response-diff-box::-webkit-scrollbar-thumb { background-color:rgba(255,255,255,0.15); border-radius:4px; }
+-        .response-diff-box::-webkit-scrollbar-thumb:hover { background-color:rgba(255,255,255,0.25); }
+-        .response-diff-empty { padding:10px; color:var(--text-secondary); font:11.5px/1.45 'Courier New', Courier, monospace; }
+-        .response-diff-file + .response-diff-file { border-top:1px solid rgba(255,255,255,0.09); }
+-        .response-diff-file-header { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 9px; color:var(--text-primary); background-color:var(--bg-hover); border-bottom:1px solid var(--border-color); font:11px 'Courier New', Courier, monospace; }
+-        .response-diff-file-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+-        .response-diff-file-stat { color:#aff5b4; white-space:nowrap; }
+-        .response-diff-code { margin:0; padding:5px 0; color:var(--text-primary); background-color:var(--bg-input); font:11px/1.45 'Courier New', Courier, monospace; white-space:pre; }
+-        .response-diff-line { display:block; min-width:max-content; padding:0 9px; color:#bcebd8; background-color:rgba(16,163,127,.08); }
+-        .response-preview-canvas { height:300px; background-color:var(--bg-input); }
+-        .response-preview-canvas[hidden] { display:none; }
+-        .response-preview-canvas iframe { display:block; width:100%; height:100%; border:0; background:#fff; }
++        /* ============== CODE MODE: workflow trace (steps) ============== */
++        .response-workflow { margin-top:10px; padding-top:2px; }
++        .response-workflow[hidden] { display:none; }
++        .response-workflow-summary { color:var(--text-secondary); font:12px 'Inter',sans-serif; margin:0 0 8px; }
++        .response-workflow-list { display:flex; flex-direction:column; gap:7px; }
++        .response-workflow-row { display:flex; align-items:flex-start; gap:8px; font:13px/1.45 'Inter',sans-serif; color:var(--text-secondary); }
++        .response-workflow-icon { flex:0 0 16px; width:16px; height:16px; margin-top:1px; display:flex; align-items:center; justify-content:center; color:var(--text-secondary); }
++        .response-workflow-icon svg { width:14px; height:14px; }
++        .response-workflow-row.note .response-workflow-icon { color:#8b949e; }
++        .response-workflow-row.edit .response-workflow-icon { color:#79c0ff; }
++        .response-workflow-row.view .response-workflow-icon { color:#8b949e; }
++        .response-workflow-row.working .response-workflow-icon { color:var(--accent); }
++        .response-workflow-note-text { color:var(--text-primary); font-weight:600; }
++        .response-workflow-note-text code { font:12px 'Courier New', Courier, monospace; background:var(--bg-hover); border:1px solid var(--border-color); border-radius:4px; padding:1px 5px; color:var(--text-primary); font-weight:400; }
++        .response-workflow-edit-file { color:var(--text-primary); font:12.5px 'Courier New', Courier, monospace; }
++        .response-workflow-add { color:#3fb950; font:12.5px 'Courier New', Courier, monospace; margin-left:6px; }
++        .response-workflow-del { color:#f85149; font:12.5px 'Courier New', Courier, monospace; margin-left:4px; }
++        .response-workflow-plain { color:var(--text-secondary); }
++        .response-workflow-plain code { font:12px 'Courier New', Courier, monospace; background:var(--bg-hover); border:1px solid var(--border-color); border-radius:4px; padding:1px 5px; color:var(--text-primary); }
++        .code-mode-message .message-prose,
++        .code-mode-message .message-prose p { font-weight:600; color:var(--text-primary); }
 +
-+        /* ============== CODE MODE: Claude-Code-style activity feed ============== */
-+        .response-activity-feed { margin-top:10px; padding-top:2px; }
-+        .response-activity-summary { color:var(--text-secondary); font:12px 'Inter',sans-serif; margin:0 0 8px; }
-+        .response-activity-list { display:flex; flex-direction:column; gap:7px; position:relative; padding-left:2px; }
-+        .response-activity-row { display:flex; align-items:flex-start; gap:8px; font:13px/1.45 'Inter',sans-serif; color:var(--text-secondary); }
-+        .response-activity-icon { flex:0 0 16px; width:16px; height:16px; margin-top:1px; display:flex; align-items:center; justify-content:center; color:var(--text-secondary); }
-+        .response-activity-icon svg { width:14px; height:14px; }
-+        .response-activity-row.note .response-activity-icon { color:#e3b341; }
-+        .response-activity-row.edit .response-activity-icon { color:#79c0ff; }
-+        .response-activity-row.view .response-activity-icon,
-+        .response-activity-row.command .response-activity-icon { color:#8b949e; }
-+        .response-activity-note-text { color:var(--text-primary); font-weight:600; }
-+        .response-activity-note-text code { font:12px 'Courier New', Courier, monospace; background:var(--bg-hover); border:1px solid var(--border-color); border-radius:4px; padding:1px 5px; color:var(--text-primary); font-weight:400; }
-+        .response-activity-edit-file { color:var(--text-primary); font:12.5px 'Courier New', Courier, monospace; }
-+        .response-activity-add { color:#3fb950; font:12.5px 'Courier New', Courier, monospace; margin-left:6px; }
-+        .response-activity-del { color:#f85149; font:12.5px 'Courier New', Courier, monospace; margin-left:4px; }
-+        .response-activity-plain { color:var(--text-secondary); }
-+        .response-activity-plain code { font:12px 'Courier New', Courier, monospace; background:var(--bg-hover); border:1px solid var(--border-color); border-radius:4px; padding:1px 5px; color:var(--text-primary); }
-         .response-preview-canvas { height:300px; background-color:var(--bg-input); }
-         .response-preview-canvas[hidden] { display:none; }
-         .response-preview-canvas iframe { display:block; width:100%; height:100%; border:0; background:#fff; }
-@@ -1183,6 +1202,15 @@
++        /* ============== CODE MODE: downloadable file cards ============== */
++        .response-file-cards { margin-top:14px; }
++        .response-file-cards[hidden] { display:none; }
++        .response-file-card-list { display:flex; flex-direction:column; gap:8px; }
++        .response-file-card { display:flex; align-items:center; gap:12px; padding:11px 14px; border:1px solid var(--border-color); border-radius:10px; background-color:var(--bg-hover); }
++        .response-file-card-icon { flex:0 0 34px; width:34px; height:34px; border-radius:8px; background-color:var(--bg-main); display:flex; align-items:center; justify-content:center; color:var(--text-secondary); }
++        .response-file-card-icon svg { width:16px; height:16px; }
++        .response-file-card-meta { flex:1 1 auto; min-width:0; }
++        .response-file-card-name { color:var(--text-primary); font:13.5px 'Inter',sans-serif; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
++        .response-file-card-type { color:var(--text-secondary); font:11.5px 'Inter',sans-serif; margin-top:2px; }
++        .response-file-card-download { flex:0 0 auto; border:1px solid var(--border-color); border-radius:7px; padding:6px 13px; background:var(--bg-main); color:var(--text-primary); font:12.5px 'Inter',sans-serif; font-weight:500; cursor:pointer; }
++        .response-file-card-download:hover { background-color:var(--bg-input); }
++        .response-file-cards-download-all { margin-top:10px; display:inline-flex; align-items:center; gap:7px; border:1px solid var(--border-color); border-radius:7px; padding:7px 14px; background:var(--bg-hover); color:var(--text-primary); font:12.5px 'Inter',sans-serif; font-weight:500; cursor:pointer; }
++        .response-file-cards-download-all:hover { background-color:var(--bg-input); }
++        .response-file-cards-download-all svg { width:14px; height:14px; }
++
+ 
+         .thinking-block { margin-top:2px; }
+         .thinking-toggle { background:none; border:none; padding:0; font-size:13px; font-family:inherit; color:var(--text-secondary); cursor:pointer; }
+@@ -579,6 +587,7 @@
+     <script src="https://cdn.jsdelivr.net/npm/marked-katex-extension/lib/index.umd.js"></script>
+     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+     <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.5/purify.min.js"></script>
++    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+ 
+     <script>
+         if (typeof marked !== 'undefined' && typeof markedKatex !== 'undefined') {
+@@ -712,39 +721,6 @@
+             logo.classList.add(`state-${state}`);
+         }
+ 
+-        // Maps a language to whatever markup is needed to actually see something
+-        // rendered in a sandboxed iframe. Used only for Code Mode "show_preview" results.
+-        function buildPreviewDoc(language, code) {
+-            const lang = (language || '').trim().toLowerCase();
+-            const safeCode = code || '';
+-
+-            if (lang.includes('html')) {
+-                return safeCode;
+-            }
+-            if (lang.includes('css')) {
+-                return `<!DOCTYPE html><html><head><style>${safeCode}</style></head><body style="font-family:sans-serif;padding:20px;"><h1>Heading</h1><p>Sample paragraph text to preview your CSS against.</p><button>Sample Button</button></body></html>`;
+-            }
+-            if (lang.includes('jsx') || lang.includes('tsx') || lang.includes('react')) {
+-                return `<!DOCTYPE html><html><head>
+-                    <script src="https://unpkg.com/react@18/umd/react.development.js"><\/script>
+-                    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"><\/script>
+-                    <script src="https://unpkg.com/@babel/standalone/babel.min.js"><\/script>
+-                </head><body><div id="root"></div>
+-                <script type="text/babel">
+-                    ${safeCode}
+-                    try {
+-                        const rootEl = document.getElementById('root');
+-                        const Comp = typeof App !== 'undefined' ? App : (typeof default1 !== 'undefined' ? default1 : null);
+-                        if (Comp) { ReactDOM.createRoot(rootEl).render(React.createElement(Comp)); }
+-                    } catch (e) { document.getElementById('root').innerText = 'Preview error: ' + e.message; }
+-                <\/script></body></html>`;
+-            }
+-            // Plain JS or anything else frontend-ish: run inside a minimal page.
+-            return `<!DOCTYPE html><html><body>
+-                <script>${safeCode}<\/script>
+-            </body></html>`;
+-        }
+-
+         function highlightCode(el) {
+             el.querySelectorAll('pre code').forEach(codeEl => {
+                 hljs.highlightElement(codeEl);
+@@ -1183,36 +1159,29 @@
                  body.appendChild(statusDiv);
  
                  if (currentMode === 'code') {
-+                    const activityFeed = document.createElement('section');
-+                    activityFeed.className = 'response-activity-feed';
-+                    activityFeed.hidden = true;
-+                    activityFeed.innerHTML = `
-+                        <p class="response-activity-summary"></p>
-+                        <div class="response-activity-list"></div>
-+                    `;
-+                    contentDiv.appendChild(activityFeed);
+-                    const diffBox = document.createElement('section');
+-                    diffBox.className = 'response-code-diff';
+-                    diffBox.hidden = true;
+-                    diffBox.setAttribute('aria-live', 'polite');
+-                    diffBox.innerHTML = `
+-                        <div class="response-code-diff-header">
+-                            <div class="response-code-diff-status"><span class="response-code-diff-dot"></span><span class="response-code-diff-title">Generating code</span></div>
+-                            <span class="response-code-diff-count">0 lines</span>
+-                        </div>
+-                        <div class="response-code-diff-tabs">
+-                            <button type="button" class="response-code-diff-tab active" data-response-view="diff">Diff</button>
+-                            <button type="button" class="response-code-diff-tab" data-response-view="preview" disabled>Preview</button>
+-                        </div>
+-                        <div class="response-diff-box"><div class="response-diff-empty">Waiting for generated code…</div></div>
+-                        <div class="response-preview-canvas" hidden><iframe title="Generated code preview" sandbox="allow-scripts"></iframe></div>
++                    contentDiv.classList.add('code-mode-message');
 +
-                     const diffBox = document.createElement('section');
-                     diffBox.className = 'response-code-diff';
-                     diffBox.hidden = true;
-@@ -1511,6 +1539,62 @@
-             const responsePreviewFrame = responseDiff ? responseDiff.querySelector('.response-preview-canvas iframe') : null;
-             const responseDiffState = { files: {}, order: [], additions: 0, lines: 0, status: 'Generating code' };
++                    const workflow = document.createElement('section');
++                    workflow.className = 'response-workflow';
++                    workflow.hidden = true;
++                    workflow.setAttribute('aria-live', 'polite');
++                    workflow.innerHTML = `
++                        <p class="response-workflow-summary"></p>
++                        <div class="response-workflow-list"></div>
+                     `;
+-                    const diffTab = diffBox.querySelector('[data-response-view="diff"]');
+-                    const previewTab = diffBox.querySelector('[data-response-view="preview"]');
+-                    const diffView = diffBox.querySelector('.response-diff-box');
+-                    const previewView = diffBox.querySelector('.response-preview-canvas');
+-                    const setResponseView = (view) => {
+-                        const showPreview = view === 'preview' && !previewTab.disabled;
+-                        diffTab.classList.toggle('active', !showPreview);
+-                        previewTab.classList.toggle('active', showPreview);
+-                        diffView.hidden = showPreview;
+-                        previewView.hidden = !showPreview;
+-                    };
+-                    diffTab.addEventListener('click', () => setResponseView('diff'));
+-                    previewTab.addEventListener('click', () => setResponseView('preview'));
+-                    contentDiv.appendChild(diffBox);
++                    contentDiv.appendChild(workflow);
++
++                    const fileCards = document.createElement('section');
++                    fileCards.className = 'response-file-cards';
++                    fileCards.hidden = true;
++                    fileCards.innerHTML = `
++                        <div class="response-file-card-list"></div>
++                        <button type="button" class="response-file-cards-download-all">
++                            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8m0 0 3-3m-3 3L5 7"/><path d="M2.5 11v1.5A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5V11"/></svg>
++                            Download all
++                        </button>
++                    `;
++                    contentDiv.appendChild(fileCards);
+                 }
  
-+            const activityFeedEl = mode === 'code' ? assistantBubble.querySelector('.response-activity-feed') : null;
-+            const ACTIVITY_ICONS = {
+                 body.appendChild(contentDiv);
+@@ -1501,116 +1470,151 @@
+             }
+ 
+             let assistantFullText = '';
+-            let codeResult = null; // { code, language, show_preview } — Code Mode only
+-            const responseDiff = mode === 'code' ? assistantBubble.querySelector('.response-code-diff') : null;
+-            const responseDiffTitle = responseDiff ? responseDiff.querySelector('.response-code-diff-title') : null;
+-            const responseDiffCount = responseDiff ? responseDiff.querySelector('.response-code-diff-count') : null;
+-            const responseDiffDot = responseDiff ? responseDiff.querySelector('.response-code-diff-dot') : null;
+-            const responseDiffBox = responseDiff ? responseDiff.querySelector('.response-diff-box') : null;
+-            const responsePreviewTab = responseDiff ? responseDiff.querySelector('[data-response-view="preview"]') : null;
+-            const responsePreviewFrame = responseDiff ? responseDiff.querySelector('.response-preview-canvas iframe') : null;
+-            const responseDiffState = { files: {}, order: [], additions: 0, lines: 0, status: 'Generating code' };
+-
+-            function renderResponseDiff() {
+-                if (!responseDiff) return;
+-                responseDiff.hidden = false;
+-                responseDiffTitle.textContent = responseDiffState.status;
+-                responseDiffCount.textContent = `${responseDiffState.order.length} file${responseDiffState.order.length === 1 ? '' : 's'} · ${responseDiffState.lines} line${responseDiffState.lines === 1 ? '' : 's'} · +${responseDiffState.additions}`;
+-                responseDiffDot.classList.toggle('done', responseDiffState.status === 'Generated code');
+-                responseDiffBox.replaceChildren();
+-                if (!responseDiffState.order.length) {
+-                    const empty = document.createElement('div');
+-                    empty.className = 'response-diff-empty';
+-                    empty.textContent = 'Waiting for generated code…';
+-                    responseDiffBox.appendChild(empty);
+-                    return;
++            let codeResult = null; // { code, language, files, activities, activity_summary } — Code Mode only
++            const workflowEl = mode === 'code' ? assistantBubble.querySelector('.response-workflow') : null;
++            const fileCardsEl = mode === 'code' ? assistantBubble.querySelector('.response-file-cards') : null;
++
++            const WORKFLOW_ICONS = {
 +                edit: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.6 1.6 0 0 1 2.3 2.3L5.5 13 2 14l1-3.5 8.5-8Z"/></svg>',
 +                view: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 2 5.5 4.5 8M11.5 3 14 5.5 11.5 8M9.5 2.5l-3 8"/></svg>',
-+                command: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M4 6.5 6.5 8.5 4 10.5M8 10.5h3.5"/></svg>',
 +                note: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><path d="M8 5v3l2 1.5"/></svg>',
 +            };
++            const FILE_ICON = {
++                code: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 2 5.5 4.5 8M11.5 3 14 5.5 11.5 8M9.5 2.5l-3 8"/></svg>',
++                plain: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 1.5h5.5L13 5v9.5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-12a1 1 0 0 1 1-1Z"/><path d="M9.5 1.5V5H13"/></svg>',
++            };
++            const CODE_EXTENSIONS = new Set(['html', 'htm', 'css', 'js', 'jsx', 'ts', 'tsx', 'py', 'json', 'java', 'c', 'cpp', 'go', 'rb', 'php', 'swift', 'rs', 'sql', 'sh']);
++
 +            function escapeHtml(str) {
 +                return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 +            }
 +            function inlineBackticks(str) {
 +                return escapeHtml(str).replace(/`([^`]+)`/g, '<code>$1</code>');
 +            }
-+            function renderActivityFeed(activities, summary) {
-+                if (!activityFeedEl || !Array.isArray(activities) || !activities.length) return;
-+                activityFeedEl.hidden = false;
-+                const summaryEl = activityFeedEl.querySelector('.response-activity-summary');
-+                const listEl = activityFeedEl.querySelector('.response-activity-list');
++
++            function renderWorkflow(activities, summary) {
++                if (!workflowEl || !Array.isArray(activities) || !activities.length) return;
++                workflowEl.hidden = false;
++                const summaryEl = workflowEl.querySelector('.response-workflow-summary');
++                const listEl = workflowEl.querySelector('.response-workflow-list');
 +                if (summary) {
 +                    const parts = [];
 +                    if (summary.commands) parts.push(`Ran ${summary.commands} command${summary.commands === 1 ? '' : 's'}`);
@@ -184,41 +356,225 @@ index 9bab565..a7c0c65 100644
 +                    summaryEl.style.display = line ? '' : 'none';
 +                } else {
 +                    summaryEl.style.display = 'none';
-+                }
+                 }
+-                responseDiffState.order.forEach((key) => {
+-                    const file = responseDiffState.files[key];
+-                    const wrapper = document.createElement('div');
+-                    wrapper.className = 'response-diff-file';
+-                    const header = document.createElement('div');
+-                    header.className = 'response-diff-file-header';
+-                    const name = document.createElement('span');
+-                    name.className = 'response-diff-file-name';
+-                    name.textContent = file.filename || 'generated code';
+-                    const stat = document.createElement('span');
+-                    stat.className = 'response-diff-file-stat';
+-                    stat.textContent = `+${file.lines || 0}`;
+-                    header.append(name, stat);
+-                    wrapper.appendChild(header);
+-                    const pre = document.createElement('pre');
+-                    pre.className = 'response-diff-code';
+-                    const lines = (file.code || '').split('\n');
+-                    if (!file.code) lines[0] = 'Writing…';
+-                    lines.forEach((line) => {
+-                        const row = document.createElement('span');
+-                        row.className = 'response-diff-line added';
+-                        row.textContent = line === 'Writing…' ? line : `+ ${line}`;
+-                        pre.appendChild(row);
+-                    });
+-                    wrapper.appendChild(pre);
+-                    responseDiffBox.appendChild(wrapper);
 +                listEl.replaceChildren();
 +                activities.forEach((activity) => {
 +                    const row = document.createElement('div');
-+                    row.className = `response-activity-row ${activity.kind}`;
++                    row.className = `response-workflow-row ${activity.kind}`;
 +                    const icon = document.createElement('span');
-+                    icon.className = 'response-activity-icon';
-+                    icon.innerHTML = ACTIVITY_ICONS[activity.kind] || ACTIVITY_ICONS.note;
++                    icon.className = 'response-workflow-icon';
++                    icon.innerHTML = WORKFLOW_ICONS[activity.kind] || WORKFLOW_ICONS.note;
 +                    row.appendChild(icon);
 +                    const text = document.createElement('span');
 +                    if (activity.kind === 'edit') {
-+                        text.innerHTML = `Edited <span class="response-activity-edit-file">${escapeHtml(activity.file || 'generated code')}</span>` +
-+                            (activity.additions ? `<span class="response-activity-add">+${activity.additions}</span>` : '') +
-+                            (activity.deletions ? `<span class="response-activity-del">-${activity.deletions}</span>` : '');
++                        text.innerHTML = `Edited <span class="response-workflow-edit-file">${escapeHtml(activity.file || 'generated code')}</span>` +
++                            (activity.additions ? `<span class="response-workflow-add">+${activity.additions}</span>` : '') +
++                            (activity.deletions ? `<span class="response-workflow-del">-${activity.deletions}</span>` : '');
 +                    } else if (activity.kind === 'note') {
-+                        text.className = 'response-activity-note-text';
++                        text.className = 'response-workflow-note-text';
 +                        text.innerHTML = inlineBackticks(activity.text || '');
 +                    } else {
-+                        text.className = 'response-activity-plain';
++                        text.className = 'response-workflow-plain';
 +                        text.innerHTML = inlineBackticks(activity.text || '');
 +                    }
 +                    row.appendChild(text);
 +                    listEl.appendChild(row);
+                 });
+-                responseDiffBox.scrollTop = responseDiffBox.scrollHeight;
+                 scrollToBottom();
+             }
+ 
+-            function startResponseDiffFile(filename = '') {
+-                const key = filename || '__single__';
+-                if (!responseDiffState.files[key]) {
+-                    responseDiffState.order.push(key);
+-                    responseDiffState.files[key] = { filename, code: '', lines: 0 };
+-                }
+-                renderResponseDiff();
++            function downloadTextFile(filename, content) {
++                const blob = new Blob([content || ''], { type: 'text/plain;charset=utf-8' });
++                const url = URL.createObjectURL(blob);
++                const a = document.createElement('a');
++                a.href = url;
++                a.download = filename || 'generated-file.txt';
++                document.body.appendChild(a);
++                a.click();
++                a.remove();
++                setTimeout(() => URL.revokeObjectURL(url), 1000);
+             }
+ 
+-            function appendResponseDiffDelta(delta, filename = '') {
+-                if (!delta) return;
+-                startResponseDiffFile(filename);
+-                const file = responseDiffState.files[filename || '__single__'];
+-                file.code += delta;
+-                file.lines = file.code ? file.code.split('\n').length : 0;
+-                responseDiffState.lines = responseDiffState.order.reduce((sum, name) => sum + responseDiffState.files[name].lines, 0);
+-                responseDiffState.additions = responseDiffState.lines;
+-                renderResponseDiff();
++            async function downloadAllFiles(entries) {
++                if (!entries.length) return;
++                if (entries.length === 1) {
++                    downloadTextFile(entries[0].filename, entries[0].content);
++                    return;
++                }
++                // Zip client-side when JSZip is available (no backend/workspace involved);
++                // otherwise fall back to triggering each download individually.
++                if (window.JSZip) {
++                    const zip = new JSZip();
++                    entries.forEach((entry) => zip.file(entry.filename, entry.content || ''));
++                    const blob = await zip.generateAsync({ type: 'blob' });
++                    const url = URL.createObjectURL(blob);
++                    const a = document.createElement('a');
++                    a.href = url;
++                    a.download = 'generated-code.zip';
++                    document.body.appendChild(a);
++                    a.click();
++                    a.remove();
++                    setTimeout(() => URL.revokeObjectURL(url), 1000);
++                } else {
++                    entries.forEach((entry) => downloadTextFile(entry.filename, entry.content));
++                }
+             }
+ 
+-            function finalizeResponseDiff(result = {}) {
+-                if (!responseDiff) return;
++            function renderFileCards(result = {}) {
++                if (!fileCardsEl) return;
+                 const hasFiles = result.files && Object.keys(result.files).length > 0;
+-                const entries = hasFiles ? Object.entries(result.files) : (result.code ? [['__single__', result.code]] : []);
+-                entries.forEach(([filename, code]) => {
+-                    startResponseDiffFile(filename === '__single__' ? '' : filename);
+-                    const file = responseDiffState.files[filename];
+-                    file.code = String(code || '');
+-                    file.lines = file.code ? file.code.split('\n').length : 0;
+-                });
+-                responseDiffState.lines = responseDiffState.order.reduce((sum, name) => sum + responseDiffState.files[name].lines, 0);
+-                responseDiffState.additions = responseDiffState.lines;
+-                responseDiffState.status = 'Generated code';
+-                renderResponseDiff();
+-
+-                const previewable = ['html', 'htm', 'css', 'jsx', 'tsx', 'js', 'javascript', 'react'];
+-                let previewEntry = null;
+-                let previewLanguage = '';
+-                for (const [filename, code] of entries) {
+-                    const language = hasFiles ? ((result.file_languages && result.file_languages[filename]) || '') : (result.language || '');
+-                    const extension = (filename || '').split('.').pop().toLowerCase();
+-                    if (previewable.includes(language.toLowerCase()) || previewable.includes(extension)) {
+-                        previewEntry = [filename, code];
+-                        previewLanguage = language || extension;
+-                        break;
+-                    }
+-                }
+-                if (!previewEntry && entries.length === 1 && result.language) {
+-                    previewEntry = entries[0];
+-                    previewLanguage = result.language;
+-                }
+-                if (responsePreviewTab && responsePreviewFrame && previewEntry) {
+-                    responsePreviewFrame.srcdoc = buildPreviewDoc(previewLanguage, previewEntry[1]);
+-                    responsePreviewTab.disabled = false;
++                const entries = hasFiles
++                    ? Object.entries(result.files).map(([filename, content]) => ({
++                        filename,
++                        content: String(content || ''),
++                        language: (result.file_languages && result.file_languages[filename]) || '',
++                    }))
++                    : (result.code ? [{ filename: `generated.${result.language || 'txt'}`, content: String(result.code), language: result.language || '' }] : []);
++                if (!entries.length) {
++                    fileCardsEl.hidden = true;
++                    return;
+                 }
++                fileCardsEl.hidden = false;
++                const listEl = fileCardsEl.querySelector('.response-file-card-list');
++                listEl.replaceChildren();
++                entries.forEach((entry) => {
++                    const extension = (entry.filename.split('.').pop() || '').toLowerCase();
++                    const isCode = CODE_EXTENSIONS.has(extension) || CODE_EXTENSIONS.has((entry.language || '').toLowerCase());
++                    const card = document.createElement('div');
++                    card.className = 'response-file-card';
++                    card.innerHTML = `
++                        <span class="response-file-card-icon">${isCode ? FILE_ICON.code : FILE_ICON.plain}</span>
++                        <span class="response-file-card-meta">
++                            <div class="response-file-card-name"></div>
++                            <div class="response-file-card-type">${isCode ? `Code · ${extension.toUpperCase()}` : extension.toUpperCase()}</div>
++                        </span>
++                        <button type="button" class="response-file-card-download">Download</button>
++                    `;
++                    card.querySelector('.response-file-card-name').textContent = entry.filename;
++                    card.querySelector('.response-file-card-download').addEventListener('click', () => downloadTextFile(entry.filename, entry.content));
++                    listEl.appendChild(card);
 +                });
++                const downloadAllBtn = fileCardsEl.querySelector('.response-file-cards-download-all');
++                downloadAllBtn.style.display = entries.length > 1 ? '' : 'none';
++                downloadAllBtn.onclick = () => downloadAllFiles(entries);
 +                scrollToBottom();
 +            }
 +
-             function renderResponseDiff() {
-                 if (!responseDiff) return;
-                 responseDiff.hidden = false;
-@@ -1577,6 +1661,7 @@
++            function finalizeCodeResult(result = {}) {
++                renderWorkflow(result.activities, result.activity_summary);
++                renderFileCards(result);
              }
  
-             function finalizeResponseDiff(result = {}) {
-+                renderActivityFeed(result.activities, result.activity_summary);
-                 if (!responseDiff) return;
-                 const hasFiles = result.files && Object.keys(result.files).length > 0;
-                 const entries = hasFiles ? Object.entries(result.files) : (result.code ? [['__single__', result.code]] : []);
+             // Lives outside .message-prose so setProse() re-parsing the prose HTML
+@@ -1660,13 +1664,12 @@
+                                     appendLiveThought(parsed.text);
+                                 } else if (parsed.type === 'RETRY' || parsed.type === 'ERROR') {
+                                     addThought(parsed.type === 'ERROR' ? 'Code generation error' : 'Retrying', parsed.message || parsed.reason || '', parsed.type.toLowerCase());
+-                                } else if (parsed.type === 'code_start' || parsed.type === 'code_file_start') {
+-                                    if (mode === 'code') startResponseDiffFile(parsed.filename || '');
+-                                } else if (parsed.type === 'code_delta') {
+-                                    if (mode === 'code') appendResponseDiffDelta(parsed.delta, parsed.filename || '');
++                                } else if (parsed.type === 'code_start' || parsed.type === 'code_file_start' || parsed.type === 'code_delta') {
++                                    // Raw code text is no longer visualized live — the workflow trace
++                                    // and file cards render once from the final code_result instead.
+                                 } else if (parsed.type === 'code_result') {
+                                     codeResult = parsed;
+-                                    if (mode === 'code') finalizeResponseDiff(parsed);
++                                    if (mode === 'code') finalizeCodeResult(parsed);
+                                 } else if (parsed.type === 'message_reset') {
+                                     // Compatibility event: clear the current draft if a server
+                                     // explicitly asks the client to reset it.
+@@ -1702,7 +1705,7 @@
+                     if (mode === 'code' && hasCodeResult) {
+                         setProse(textContainer, marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText))));
+                         highlightCode(textContainer);
+-                        finalizeResponseDiff(codeResult);
++                        finalizeCodeResult(codeResult);
+                     } else {
+                         setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
+                         highlightCode(textContainer);
+@@ -1724,7 +1727,7 @@
+                     if (mode === 'code' && hasCode) {
+                         setProse(textContainer, marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText))));
+                         highlightCode(textContainer);
+-                        finalizeResponseDiff(data);
++                        finalizeCodeResult(data);
+                     } else {
+                         setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
+                         highlightCode(textContainer);
