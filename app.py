@@ -66,22 +66,31 @@ def get_thinking_config(level: str) -> dict:
 
 
 def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
-    """Create the selected model with the requested completion-token budget."""
+    """Create the selected Chat-mode model (Horus/Osiris/Amun-Ra). Code mode uses
+    its own get_code_llm() with an independent fast/medium/strong tier set."""
     model_name = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
     model_type_clean = (model_type or "balanced").strip().lower()
     if model_type_clean == "fast":
         model_name = "deepseek-ai/deepseek-v4-pro"
     elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
-    elif model_type_clean in {"gpt120b", "gpt-oss-120b", "openai/gpt-oss-120b"}:
-        model_name = "openai/gpt-oss-120b"
-    elif model_type_clean in {"glm", "glm5.2", "glm-5.2", "kimi", "kimik2.6", "kimi-k2.6"}:
-        # GLM 5.2 is currently end-of-life on the deployed NVIDIA account and
-        # Kimi K2.6 is not provisioned there. Keep old request values compatible
-        # but route them to the available GPT-OSS 120B provider instead.
-        model_name = "openai/gpt-oss-120b"
-    if model_name == "openai/gpt-oss-120b":
-        max_tokens = min(max_tokens, 4096)
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
+
+
+CODE_MODEL_MAP = {
+    "fast": "deepseek-ai/deepseek-v4-flash-0731",
+    "medium": "minimaxai/minimax-m3",
+    "strong": "nvidia/nemotron-3-ultra-550b-a55b",
+}
+DEFAULT_CODE_MODEL = "medium"
+
+
+def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
+    """Create the selected Code-mode model. Code mode has its own fast/medium/strong
+    tiers, kept separate from Chat mode's Horus/Osiris/Amun-Ra models in get_llm()
+    so the two never collide on the same key."""
+    model_type_clean = (model_type or DEFAULT_CODE_MODEL).strip().lower()
+    model_name = CODE_MODEL_MAP.get(model_type_clean, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
     return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
 
 
@@ -748,19 +757,18 @@ CODE_GENERATION_TIMEOUT = 90
 
 async def generate_code_once(request: CodeChatRequest, session: dict, progress=None, on_answer_piece=None) -> dict:
     config = get_thinking_config(request.reasoning_level)
-    model_key = (request.model or 'glm').strip().lower()
+    model_key = (request.model or DEFAULT_CODE_MODEL).strip().lower()
+    if model_key not in CODE_MODEL_MAP:
+        model_key = DEFAULT_CODE_MODEL
     await publish_progress(
         progress,
         'code_generation_started',
         'code_generation_started',
         f"Generating code with {config['label']} effort and a {config['max_tokens']}-token budget.",
     )
-    llm = get_llm(model_key, 0.2, config['max_tokens'])
-    code_model_key = model_key
+    llm = get_code_llm(model_key, 0.2, config['max_tokens'])
     thinking_mode = None
-    reasoning_effort = ({'low': 'low', 'medium': 'medium', 'high': 'high'}.get(normalize_thinking_level(request.reasoning_level))
-                        if code_model_key in {'gpt120b', 'gpt-oss-120b', 'openai/gpt-oss-120b', 'kimi', 'kimik2.6', 'kimi-k2.6', 'glm', 'glm5.2', 'glm-5.2'}
-                        else None)
+    reasoning_effort = None
     raw_response = await invoke_model(
         build_code_messages(session['messages'], request.reasoning_level),
         llm,
