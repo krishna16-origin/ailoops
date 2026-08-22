@@ -722,12 +722,13 @@ def build_code_messages(history: List[BaseMessage], reasoning_level: str, code_f
     system_text = (
         build_constitution_block() + "\n\n"
         "You are a practical coding assistant. Produce the requested implementation directly in one pass.\n"
+        "You do not have filesystem or shell access. Never claim that you created, saved, ran, or previewed a file.\n"
         f"Before writing code, think inside a single <think>...</think> block. {depth}\n"
         "Write that block as your own natural engineering reasoning — not a restatement of these instructions.\n"
-        "After the closing </think> tag, give a concise user-facing explanation and put the implementation in "
-        "fenced code blocks. If the request needs multiple files, write a separate line `FILE: path/to/file.ext` "
-        "immediately before each fenced block. Use the correct language tag for every block. If one file is "
-        "enough, return one block without a FILE header.\n"
+        "After the closing </think> tag, give a concise user-facing explanation and put the complete implementation in "
+        "fenced code blocks. Put a separate line `FILE: relative/path/to/file.ext` immediately before every block, "
+        "including a single-file response. Use the correct language tag for every block. Never respond with only a "
+        "claimed filesystem path. If you cannot provide code, say so plainly instead of claiming that a file exists.\n"
         "If a CURRENT PROJECT FILES section appears below, those are the real, up-to-date contents of every file "
         "already generated in this session — treat them as ground truth even if the conversation history above "
         "is summarized or trimmed. When the user asks you to change, add to, fix, or extend something, edit those "
@@ -939,7 +940,30 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
         thinking_mode=thinking_mode,
         reasoning_effort=reasoning_effort,
     )
+    has_named_artifact = re.search(
+        r"(?:^|\n)\s*FILE\s*:\s*[^\n]+\n\s*```[A-Za-z0-9_+#.-]*\s*\n[\s\S]*?```",
+        raw_response or "",
+        re.IGNORECASE,
+    )
     explanation, code, language, files, file_languages = extract_code_artifact(raw_response)
+    if not has_named_artifact:
+        return {
+            'response': (
+                'The model returned no code artifact. Please ask again and require the complete implementation '
+                'inside fenced code blocks with a `FILE: relative/path.ext` header.'
+            ),
+            'code': '',
+            'language': '',
+            'files': {},
+            'file_languages': {},
+            'show_preview': False,
+            'artifact_error': True,
+            'thinking_summary': 'No code artifact was returned; no file-system actions were run.',
+            'thinking_level': config['label'],
+            'max_tokens': config['max_tokens'],
+            'activities': [],
+            'activity_summary': {},
+        }
     if not explanation:
         explanation = 'Generated the requested code.'
     if len(code) > CODE_MAX_OUTPUT:
@@ -1029,6 +1053,8 @@ async def generate_code_stream(request: CodeChatRequest, session: dict, session_
         print(f'[{session_id}] Code generation failed: {exc}')
         result = {'response': 'I could not generate code right now. Please try again.', 'code': '', 'language': '', 'files': {}, 'file_languages': {}, 'show_preview': False}
         yield f'data: {json.dumps({"type": "ERROR", "message": str(exc)}, ensure_ascii=False)}\n\n'
+    if result.get('artifact_error'):
+        yield f'data: {json.dumps({"type": "ERROR", "message": "no_code_artifact"}, ensure_ascii=False)}\n\n'
     if result.get('code') or result.get('files'):
         yield f'data: {json.dumps({"type": "code_result", **result, "session_id": session_id}, ensure_ascii=False)}\n\n'
     if not emitted_content:
