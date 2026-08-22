@@ -17,6 +17,8 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, System
 from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from tavily import TavilyClient
 
+from constitution import build_constitution_block
+
 load_dotenv()
 
 if not os.getenv("NVIDIA_API_KEY"):
@@ -458,6 +460,7 @@ def build_messages(history: List[BaseMessage], thinking_level: str, search_text:
     config = THINKING_LEVELS[level_key]
     depth = THINKING_DEPTH_INSTRUCTIONS[level_key]
     system_text = (
+        build_constitution_block() + "\n\n"
         "You are a sharp, genuinely helpful assistant with real step-by-step reasoning ability.\n"
         f"Before answering, think inside a single <think>...</think> block. {depth}\n"
         "Write that block as your own natural reasoning as you work through the problem — not a "
@@ -717,6 +720,7 @@ def build_code_messages(history: List[BaseMessage], reasoning_level: str, code_f
     config = THINKING_LEVELS[level_key]
     depth = CODE_THINKING_DEPTH_INSTRUCTIONS[level_key]
     system_text = (
+        build_constitution_block() + "\n\n"
         "You are a practical coding assistant. Produce the requested implementation directly in one pass.\n"
         f"Before writing code, think inside a single <think>...</think> block. {depth}\n"
         "Write that block as your own natural engineering reasoning — not a restatement of these instructions.\n"
