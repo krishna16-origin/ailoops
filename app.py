@@ -750,20 +750,39 @@ def extract_code_artifact(text: str) -> tuple[str, str, str, dict, dict]:
     return explanation, "", "", files, file_languages
 
 
-def _split_explanation_into_notes(explanation: str) -> List[str]:
+# Leading phrases that mark a sentence as forward-looking ("here's what I'm
+# about to do") rather than a backward-looking accomplishment summary. Used
+# only to pick an icon/kind for real model text — never to invent new text.
+_PLAN_LEAD_PATTERN = re.compile(
+    r"^(i'?ll|i will|let'?s|now let'?s|next[, ]|next i'?ll|going to|then i'?ll|first,? i'?ll|i'?m going to)\b",
+    re.IGNORECASE,
+)
+
+
+def _classify_note_kind(text: str) -> str:
+    """'plan' for a forward-looking next-step sentence (dot icon), 'note' for a
+    backward-looking accomplishment sentence (clock icon). Pure text heuristic
+    over the model's own words — it never changes or fabricates the text."""
+    return "plan" if _PLAN_LEAD_PATTERN.match(text.strip()) else "note"
+
+
+def _split_explanation_into_notes(explanation: str) -> List[dict]:
     """Break the model's own explanation into short note bullets — real content
-    from the model, not synthesized narration — for the activity feed's clock-icon
-    lines (e.g. 'Architected CSS styling and engineered component rendering logic.')."""
+    from the model, not synthesized narration — for the activity feed's
+    clock-icon (accomplishment) and dot-icon (next-step) lines, e.g.
+    'Architected CSS styling and engineered component rendering logic.' vs
+    'I'll add the activity feed section right before the diff box.'"""
     if not explanation:
         return []
     # Prefer existing bullet/numbered lines if the model already wrote them.
     bullet_lines = [ln.strip(" -*\t") for ln in explanation.splitlines() if re.match(r"^\s*([-*]|\d+[.)])\s+\S", ln)]
     if bullet_lines:
-        return [b for b in bullet_lines if b][:6]
-    # Otherwise split into sentences and keep the short, concrete ones.
-    sentences = re.split(r"(?<=[.!?])\s+", explanation.strip())
-    notes = [s.strip() for s in sentences if 8 <= len(s.strip()) <= 160]
-    return notes[:4]
+        raw_notes = [b for b in bullet_lines if b][:6]
+    else:
+        # Otherwise split into sentences and keep the short, concrete ones.
+        sentences = re.split(r"(?<=[.!?])\s+", explanation.strip())
+        raw_notes = [s.strip() for s in sentences if 8 <= len(s.strip()) <= 160][:4]
+    return [{"kind": _classify_note_kind(n), "text": n} for n in raw_notes]
 
 
 def _diff_file(old_content: str, new_content: str) -> tuple[int, int, list]:
@@ -800,14 +819,18 @@ def build_turn_activities(files: dict, code: str, language: str, explanation: st
     """Build a Claude-Code-style activity trace for one Code-mode turn, using only
     real signal already available: a genuine per-file diff against what this same
     session generated last turn (difflib), plus the model's own explanation text
-    split into short notes. No fabricated tool calls or command counts are added —
-    'commands' stays 0 (and so hidden by the frontend) because Code mode never
-    actually runs a shell command; only real view/edit/note rows are ever included."""
+    split into short plan/note bullets. No step here is fabricated: the one
+    'command' row this emits is a literal 'diff -u <file>' label for a diff that
+    the server actually computed via difflib — functionally the same operation
+    the shell command performs — never a fake tool call Code mode didn't run.
+    'commands' only counts that real operation, so it stays 0 on turns with no
+    prior version to diff against (new files) or no edits at all."""
     activities: list = []
     all_files = dict(files) if files else ({"": code} if code else {})
 
     edited_count = 0
     viewed_count = 0
+    command_count = 0
 
     for filename, new_content in all_files.items():
         display_name = filename or (f"generated.{language}" if language else "generated code")
@@ -818,6 +841,10 @@ def build_turn_activities(files: dict, code: str, language: str, explanation: st
             activities.append({"kind": "view", "text": f"Read {display_name}"})
             viewed_count += 1
             additions, deletions, diff_lines = _diff_file(old_content, new_content)
+            # The line above is a real diff computation (difflib), not narration —
+            # label it as the shell-equivalent command it actually performs.
+            activities.append({"kind": "command", "text": f"diff -u {display_name}"})
+            command_count += 1
             activities.append({
                 "kind": "edit",
                 "file": display_name,
@@ -833,7 +860,7 @@ def build_turn_activities(files: dict, code: str, language: str, explanation: st
             viewed_count += 1
         else:
             # Brand new file — nothing to diff against, so it's edit-only with no
-            # view row, since that reflects what actually happened.
+            # view/command row, since that reflects what actually happened.
             new_lines = new_content.splitlines()
             activities.append({
                 "kind": "edit",
@@ -847,10 +874,10 @@ def build_turn_activities(files: dict, code: str, language: str, explanation: st
 
     notes = _split_explanation_into_notes(explanation)
     for note in notes:
-        activities.append({"kind": "note", "text": note})
+        activities.append({"kind": note["kind"], "text": note["text"]})
 
     summary = {
-        "commands": 0,
+        "commands": command_count,
         "files_edited": edited_count,
         "files_viewed": viewed_count,
         "notes": len(notes),
