@@ -79,13 +79,19 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
 
 
-CODE_WORKING_MODEL = "moonshotai/kimi-k2.6"
-# Keep the existing UI choices, but route every Code-mode choice through the
-# verified working endpoint so model selection cannot select an unavailable provider.
+# Three distinct Code-mode models, one per UI tier (Flash / Minimax M3 / Nemotron
+# Ultra). Earlier today these were all collapsed onto one shared model string that
+# was guessed at repeatedly (z-ai/glm-5.2, then moonshotai/kimi-k2.6) without
+# verifying it against NVIDIA's actual catalog — kimi-k2.6 in particular is listed
+# under NVIDIA's Visual Models catalog rather than its plain-text LLM APIs catalog,
+# and 404s for accounts without that entitlement, which is why nothing was
+# generating or streaming. All three models below are confirmed present in
+# NVIDIA's current text LLM-APIs catalog and use the standard synchronous
+# chat-completions interface, matching what ChatNVIDIA expects.
 CODE_MODEL_MAP = {
-    "fast": CODE_WORKING_MODEL,
-    "medium": CODE_WORKING_MODEL,
-    "strong": CODE_WORKING_MODEL,
+    "fast": "deepseek-ai/deepseek-v4-flash-0731",
+    "medium": "minimaxai/minimax-m3",
+    "strong": "nvidia/nemotron-3-ultra-550b-a55b",
 }
 DEFAULT_CODE_MODEL = "medium"
 
@@ -96,8 +102,12 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
     so the two never collide on the same key."""
     model_type_clean = (model_type or DEFAULT_CODE_MODEL).strip().lower()
     model_name = CODE_MODEL_MAP.get(model_type_clean, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
-    llm = ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
-    return llm.with_thinking_mode(enabled=True)
+    # No forced with_thinking_mode() here — that was only ever added as a
+    # workaround for the now-removed GLM 5.2 model. deepseek-v4-flash-0731,
+    # minimax-m3, and nemotron-3-ultra-550b-a55b all surface reasoning through
+    # additional_kwargs['reasoning_content'] by default (see _extract_reasoning
+    # below), so no extra invocation kwarg is needed to get live thinking output.
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
 
 
 def strip_thinking(text: str) -> str:
@@ -707,7 +717,7 @@ class ClearSessionRequest(BaseModel):
 class CodeChatRequest(BaseModel):
     message: str
     session_id: str
-    model: str = "glm"
+    model: str = DEFAULT_CODE_MODEL  # "medium" — normalized against CODE_MODEL_MAP by resolve_code_model_key()
     reasoning_level: str = DEFAULT_THINKING_LEVEL
     stream: bool = False
 
