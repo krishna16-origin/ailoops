@@ -1638,7 +1638,7 @@
                 });
                 html = html.replace(/<script[^>]+src=["']([^"']+)["'][^>]*><\/script>/gi, (m, src) => {
                     const match = entries.find(([name]) => name.endsWith(src.replace(/^\.?\//, '')));
-                    return match ? `<script>\n${match[1].content}\n</script>` : m;
+                    return match ? `<script>\n${match[1].content}\n<\/script>` : m;
                 });
                 return html;
             }
