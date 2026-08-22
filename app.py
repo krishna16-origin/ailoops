@@ -878,7 +878,7 @@ def build_turn_activities(files: dict, code: str, language: str, explanation: st
 # code_start/code_delta events for one live diff box inside the assistant response.
 # ---------------------------------------------------------------------------
 
-CODE_MAX_OUTPUT = 12000
+CODE_MAX_OUTPUT = 20000
 
 # A flat timeout doesn't work here: 'low' effort on the 'fast' model finishes in
 # seconds, but 'max' effort (40k-token budget) on the 'strong' reasoning model can
@@ -888,17 +888,17 @@ CODE_MAX_OUTPUT = 12000
 # like "Thought for 93s" right before the generic failure message. Sizing the
 # timeout to the actual token budget and model tier fixes that at the root,
 # instead of just raising the number and hoping it's big enough next time too.
-CODE_GENERATION_TIMEOUT_FLOOR = 90.0     # never less than this, even for the smallest request
-CODE_GENERATION_TIMEOUT_CEILING = 300.0  # hard cap so a genuinely stuck call can never hang forever
+CODE_GENERATION_TIMEOUT_FLOOR = 120.0     # never less than this, even for the smallest request
+CODE_GENERATION_TIMEOUT_CEILING = 900.0  # hard cap so a genuinely stuck call can never hang forever
 
 # Rough real-world seconds of generation time per 1000 completion tokens, per
 # model tier — 'strong' is a much larger reasoning model and is meaningfully
 # slower per token than 'fast'/'medium', and needs proportionally more headroom
 # before a slow-but-healthy response gets mistaken for a hang.
 CODE_MODEL_SECONDS_PER_1K_TOKENS = {
-    "fast": 12.0,
-    "medium": 18.0,
-    "strong": 30.0,
+    "fast": 15.0,
+    "medium": 22.0,
+    "strong": 35.0,
 }
 
 
