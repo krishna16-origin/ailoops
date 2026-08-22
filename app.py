@@ -48,11 +48,11 @@ THINKING_DEPTH_INSTRUCTIONS = {
     "max": "Reason exhaustively, like a world-class expert working through a hard problem: decompose it fully, question your own assumptions, consider edge cases and counter-arguments, verify each step, and only then commit to a final answer.",
 }
 CODE_THINKING_DEPTH_INSTRUCTIONS = {
-    "low": "Briefly plan your approach in a couple of sentences before writing code.",
-    "medium": "Plan your approach — data structures, edge cases, file layout — before writing code.",
-    "high": "Plan thoroughly: consider the architecture, data flow, error handling, and edge cases before writing code.",
-    "extra": "Plan extensively: weigh alternative designs, consider performance and maintainability, and enumerate edge cases and failure modes before committing to an approach and writing code.",
-    "max": "Plan like a principal engineer: weigh multiple architectures and their trade-offs, edge cases, error handling, performance, and testability; decide on the strongest approach and justify it to yourself, then write the implementation.",
+    "low": "Plan in 1-2 sentences, commit immediately, then write code. Do not restate or revise the plan.",
+    "medium": "Plan briefly: pick one concrete approach, note file layout and key edge cases in a few sentences, commit, then write code. State each point once — do not second-guess yourself or explore alternatives you won't use.",
+    "high": "Plan once: name the architecture, data flow, and edge cases in a short list. Choose the strongest option the first time you consider it — do not revisit earlier decisions or narrate discarded alternatives. Then write the full implementation.",
+    "extra": "Plan thoroughly but linearly: list the real trade-offs once, pick an approach, and move on immediately. Never re-open a decision already made, and never write phrases like 'actually, let me reconsider' — every sentence should move the plan forward, not restate it.",
+    "max": "Plan like a principal engineer under a deadline: weigh each real architectural option once, commit, and write the plan as a forward-moving list, never a stream-of-consciousness. The instant the plan is complete, stop thinking and write the full implementation — reasoning longer than necessary risks the response timing out before any code is produced.",
 }
 
 # Code output needs a much bigger completion budget than a chat answer — a
@@ -549,7 +549,17 @@ def _extract_reasoning(obj) -> str:
     return _coerce_model_text(kwargs.get("reasoning_content") or kwargs.get("reasoning") or "")
 
 
-async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None, thinking_mode: Optional[bool] = None, reasoning_effort: Optional[str] = None) -> str:
+class ThinkingBudgetExceeded(Exception):
+    """Raised when a model's own <think> block alone consumes more of the
+    completion budget than we're willing to spend on planning, without having
+    produced any visible answer text yet. Seen in practice: a verbose model
+    endlessly re-litigating its own plan ("Actually, let me reconsider...")
+    until the whole request timed out with zero code produced. Catching this
+    lets the caller abort early and retry with thinking disabled instead of
+    waiting out the full generation timeout for nothing."""
+
+
+async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None, thinking_mode: Optional[bool] = None, reasoning_effort: Optional[str] = None, max_think_chars: Optional[int] = None) -> str:
     """Invoke once. When a live queue is provided, stream BOTH the visible answer
     ('token' events) and the model's own live reasoning trace ('thought' events) in
     real time, exactly as the model produces them — mirroring Claude.ai's extended
@@ -567,6 +577,11 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
     it being published as a plain 'token' event — Code mode uses this to re-parse
     the stream for FILE:/fenced-code boundaries and emit code_start/code_file_start/
     code_delta events into the response diff box instead.
+
+    `max_think_chars`, if given, caps how much reasoning text a model may produce
+    before any visible answer text has appeared. Exceeding it raises
+    ThinkingBudgetExceeded so the caller can abort and retry rather than let a
+    model ramble through its entire token/time budget without ever writing code.
 """
     invoke_kwargs = {} if thinking_mode is None else {"thinking_mode": thinking_mode}
     if reasoning_effort:
@@ -582,6 +597,8 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
     async def emit_answer(text: str) -> None:
         if not text:
             return
+        nonlocal answer_started
+        answer_started = True
         if on_answer_piece is not None:
             await on_answer_piece(text)
         else:
@@ -594,6 +611,11 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
     full = ""
     buffer = ""
     in_thought = False
+    answer_started = False  # True the instant real visible answer text has been
+                             # emitted — once true, the thinking-budget watchdog
+                             # below stands down, since the model is no longer
+                             # "stuck" planning.
+    think_chars = 0
     reasoning_seen = False  # True once the model's own reasoning_content channel has
                              # produced real text this turn. Once true, any <think>
                              # tags spotted inside `content` are known to be a mirror
@@ -601,8 +623,15 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
                              # from the visible answer but never re-emitted as a
                              # duplicate thought bubble.
 
+    def check_think_budget() -> None:
+        if max_think_chars is not None and not answer_started and think_chars > max_think_chars:
+            raise ThinkingBudgetExceeded(
+                f"Model produced {think_chars} chars of reasoning (budget {max_think_chars}) "
+                "without any visible answer text yet."
+            )
+
     async def drain(flush_all: bool) -> None:
-        nonlocal buffer, in_thought
+        nonlocal buffer, in_thought, think_chars
         while True:
             if not in_thought:
                 positions = [buffer.find(t) for t in OPEN_TAGS if t in buffer]
@@ -628,11 +657,13 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
                     if send_len > 0:
                         if not reasoning_seen:
                             await publish_thought(progress, buffer[:send_len])
+                            think_chars += send_len
                         buffer = buffer[send_len:]
                     return
                 if idx:
                     if not reasoning_seen:
                         await publish_thought(progress, buffer[:idx])
+                        think_chars += idx
                 tag = next(t for t in CLOSE_TAGS if buffer[idx:].startswith(t))
                 buffer = buffer[idx + len(tag):]
                 in_thought = False
@@ -642,6 +673,8 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
         if reasoning_piece:
             reasoning_seen = True
             await publish_thought(progress, reasoning_piece)
+            think_chars += len(reasoning_piece)
+            check_think_budget()
 
         piece = _coerce_model_text(getattr(chunk, "content", "") or "")
         if not piece:
@@ -649,6 +682,7 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
         full += piece
         buffer += piece
         await drain(flush_all=False)
+        check_think_budget()
 
     await drain(flush_all=True)
     return strip_thinking(full).strip()
@@ -933,6 +967,16 @@ CODE_MAX_OUTPUT = 20000
 # instead of just raising the number and hoping it's big enough next time too.
 CODE_GENERATION_TIMEOUT_FLOOR = 120.0      # never less than this, even for the smallest request
 CODE_GENERATION_TIMEOUT_CEILING = 1200.0   # hard cap so a genuinely stuck call can never hang forever
+
+# How much of the completion budget a model's own <think> block is allowed to
+# consume before producing any visible answer text, expressed as a fraction of
+# max_tokens (converted to a rough character count at ~4 chars/token — this only
+# needs to be a safety valve, not a precise limit). Seen in practice: a verbose
+# model can burn an entire request's timeout re-litigating its own plan and
+# never reach the code. When exceeded, generate_code_once() aborts that attempt
+# and retries once with thinking disabled so code is still guaranteed to land.
+CODE_THINK_BUDGET_FRACTION = 0.45
+CODE_THINK_CHARS_PER_TOKEN = 4
 
 # Rough real-world seconds of generation time per 1000 completion tokens, per
 # model tier — 'strong' is a much larger reasoning model and is meaningfully
