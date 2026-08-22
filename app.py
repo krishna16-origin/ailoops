@@ -1,5 +1,4 @@
 import os
-import os
 import json
 import re
 import difflib
@@ -815,6 +814,81 @@ def _diff_file(old_content: str, new_content: str) -> tuple[int, int, list]:
     return additions, deletions, diff_lines
 
 
+# Mirrors extract_code_artifact()'s named_pattern header, but only the opening
+# half (FILE: line + opening fence) — used to detect a file boundary the
+# moment it appears in the live stream, before the closing ``` has arrived.
+_FILE_HEADER_LIVE_RE = re.compile(
+    r"(?:^|\n)[ \t]*FILE\s*:\s*(?P<filename>[^\n]+)\n\s*```(?P<language>[A-Za-z0-9_+#.-]*)[ \t]*\n",
+    re.IGNORECASE,
+)
+
+
+def make_code_stream_watcher(progress, previous_files: dict):
+    """Build the `on_answer_piece` callback invoke_model() calls for every live
+    slice of visible answer text in Code mode. Two jobs, both on the same raw
+    stream: (1) forward the text on as a normal 'token' event exactly like the
+    default path would, so the chat bubble still renders/streams as before;
+    (2) incrementally watch for `FILE: name` + fenced-code boundaries so the
+    frontend's diff/preview canvas can populate file by file, live, instead of
+    only once at the very end of the turn — emitting 'code_file_start' the
+    moment a file's header and opening fence are seen, and 'code_file_diff'
+    (with a real difflib diff against this session's last version of that
+    file) the moment its closing fence arrives. Stateful per call site: a
+    fresh watcher must be created per invoke_model() attempt, since a retry
+    starts the answer stream over from nothing."""
+    state = {"buffer": "", "mode": "scan", "filename": None, "language": ""}
+
+    async def watcher(text: str) -> None:
+        await publish_token(progress, text)
+        state["buffer"] += text
+        while True:
+            if state["mode"] == "scan":
+                match = _FILE_HEADER_LIVE_RE.search(state["buffer"])
+                if not match:
+                    # Only the tail of a long buffer could still be a partial
+                    # header, so it's safe to trim while still scanning — this
+                    # keeps the trailing explanation text (after the last file,
+                    # where no further FILE: header will ever arrive) from
+                    # growing this buffer for the rest of the turn.
+                    if len(state["buffer"]) > 4000:
+                        state["buffer"] = state["buffer"][-2000:]
+                    return
+                filename = match.group("filename").strip().strip("`")
+                language = (match.group("language") or "text").lower()
+                state["filename"] = filename
+                state["language"] = language
+                state["buffer"] = state["buffer"][match.end():]
+                state["mode"] = "code"
+                if filename:
+                    await publish_event(progress, {
+                        "type": "code_file_start", "filename": filename, "language": language,
+                    })
+            else:  # state["mode"] == "code"
+                idx = state["buffer"].find("```")
+                if idx == -1:
+                    return
+                code = state["buffer"][:idx].rstrip("\n")
+                filename = state["filename"]
+                old_content = previous_files.get(filename)
+                if old_content is not None:
+                    additions, deletions, diff_lines = _diff_file(old_content, code)
+                else:
+                    new_lines = code.splitlines()
+                    additions, deletions = len(new_lines), 0
+                    diff_lines = [{"type": "add", "content": line} for line in new_lines]
+                if filename:
+                    await publish_event(progress, {
+                        "type": "code_file_diff", "filename": filename, "language": state["language"],
+                        "additions": additions, "deletions": deletions, "diff_lines": diff_lines,
+                        "content": code,
+                    })
+                state["buffer"] = state["buffer"][idx + 3:]
+                state["mode"] = "scan"
+                state["filename"] = None
+
+    return watcher
+
+
 def build_turn_activities(files: dict, code: str, language: str, explanation: str, previous_files: dict) -> tuple[list, dict]:
     """Build a Claude-Code-style activity trace for one Code-mode turn, using only
     real signal already available: a genuine per-file diff against what this same
@@ -932,10 +1006,18 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
     code_messages = build_code_messages(session['messages'], request.reasoning_level, session.get('code_files'))
     max_think_chars = int(config['max_tokens'] * CODE_THINK_BUDGET_FRACTION * CODE_THINK_CHARS_PER_TOKEN)
 
+    # Snapshot what existed *before* this turn's update. Used both by the live
+    # per-file watcher below (so it can diff each file the instant its fence
+    # closes) and by the final activity trace after generation — both diff
+    # against this exact same real baseline, so the live preview and the
+    # authoritative end-of-turn result never disagree.
+    previous_files = dict(session.get('code_files') or {})
+
     retried_for_budget = False
     try:
         raw_response = await invoke_model(
-            code_messages, llm, progress, thinking_mode=True, max_think_chars=max_think_chars,
+            code_messages, llm, progress, on_answer_piece=make_code_stream_watcher(progress, previous_files),
+            thinking_mode=True, max_think_chars=max_think_chars,
         )
     except ThinkingBudgetExceeded as exc:
         await publish_progress(
@@ -944,7 +1026,14 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
             f"({exc}) — retrying once with thinking off so code lands.",
         )
         retried_for_budget = True
-        raw_response = await invoke_model(code_messages, llm, progress, thinking_mode=False)
+        # Fresh watcher: a retry restarts the answer stream from nothing, so
+        # the previous attempt's in-progress file/fence state must not carry
+        # over (it would otherwise misparse the new stream as a continuation
+        # of a file the model never even starts again).
+        raw_response = await invoke_model(
+            code_messages, llm, progress, on_answer_piece=make_code_stream_watcher(progress, previous_files),
+            thinking_mode=False,
+        )
 
     explanation, code, language, files, file_languages = extract_code_artifact(raw_response)
 
@@ -965,7 +1054,10 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
             "explanation this time. Output ONLY a `FILE: relative/path.ext` line immediately followed by "
             "a fenced code block, for every file, with no other text before the first FILE: line."
         ))
-        raw_response = await invoke_model(code_messages + [nudge], llm, progress, thinking_mode=False)
+        raw_response = await invoke_model(
+            code_messages + [nudge], llm, progress,
+            on_answer_piece=make_code_stream_watcher(progress, previous_files), thinking_mode=False,
+        )
         explanation, code, language, files, file_languages = extract_code_artifact(raw_response)
 
     if not code and not files:
@@ -986,9 +1078,8 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
         filename: (content[:CODE_MAX_OUTPUT] + '\n… output truncated …' if len(content) > CODE_MAX_OUTPUT else content)
         for filename, content in files.items()
     }
-    # Snapshot what existed *before* this turn's update, so the activity trace
-    # below can genuinely diff against it instead of guessing.
-    previous_files = dict(session.get('code_files') or {})
+    # previous_files was already snapshotted above, before generation started,
+    # so this diffs against the same real baseline the live watcher used.
     activities, activity_summary = build_turn_activities(files, code, language, explanation, previous_files)
     # Remember what we just generated so a follow-up edit turn has real
     # ground truth instead of guessing.
@@ -1009,7 +1100,15 @@ async def generate_code_once(request: CodeChatRequest, session: dict, progress=N
     }
 
 
-CODE_STREAM_FORWARD_TYPES = {'status', 'thought', 'AGENT_HEARTBEAT', 'ERROR'}
+CODE_STREAM_FORWARD_TYPES = {
+    'status', 'thought', 'AGENT_HEARTBEAT', 'ERROR',
+    # Live per-file canvas events from make_code_stream_watcher() — without
+    # these listed here, generate_code_stream()'s forwarder below silently
+    # drops them (any type not in this set and not 'token' is discarded), so
+    # the frontend's already-built live file tabs/diff counts never fire and
+    # the whole canvas only ever appears once, all at once, at the very end.
+    'code_file_start', 'code_file_diff',
+}
 
 
 async def generate_code_stream(request: CodeChatRequest, session: dict, session_id: str):
