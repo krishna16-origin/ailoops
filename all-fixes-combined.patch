@@ -1,0 +1,1648 @@
+diff --git a/app.py b/app.py
+index 6f33600..9957a2d 100644
+--- a/app.py
++++ b/app.py
+@@ -750,20 +750,39 @@ def extract_code_artifact(text: str) -> tuple[str, str, str, dict, dict]:
+     return explanation, "", "", files, file_languages
+ 
+ 
+-def _split_explanation_into_notes(explanation: str) -> List[str]:
++# Leading phrases that mark a sentence as forward-looking ("here's what I'm
++# about to do") rather than a backward-looking accomplishment summary. Used
++# only to pick an icon/kind for real model text — never to invent new text.
++_PLAN_LEAD_PATTERN = re.compile(
++    r"^(i'?ll|i will|let'?s|now let'?s|next[, ]|next i'?ll|going to|then i'?ll|first,? i'?ll|i'?m going to)\b",
++    re.IGNORECASE,
++)
++
++
++def _classify_note_kind(text: str) -> str:
++    """'plan' for a forward-looking next-step sentence (dot icon), 'note' for a
++    backward-looking accomplishment sentence (clock icon). Pure text heuristic
++    over the model's own words — it never changes or fabricates the text."""
++    return "plan" if _PLAN_LEAD_PATTERN.match(text.strip()) else "note"
++
++
++def _split_explanation_into_notes(explanation: str) -> List[dict]:
+     """Break the model's own explanation into short note bullets — real content
+-    from the model, not synthesized narration — for the activity feed's clock-icon
+-    lines (e.g. 'Architected CSS styling and engineered component rendering logic.')."""
++    from the model, not synthesized narration — for the activity feed's
++    clock-icon (accomplishment) and dot-icon (next-step) lines, e.g.
++    'Architected CSS styling and engineered component rendering logic.' vs
++    'I'll add the activity feed section right before the diff box.'"""
+     if not explanation:
+         return []
+     # Prefer existing bullet/numbered lines if the model already wrote them.
+     bullet_lines = [ln.strip(" -*\t") for ln in explanation.splitlines() if re.match(r"^\s*([-*]|\d+[.)])\s+\S", ln)]
+     if bullet_lines:
+-        return [b for b in bullet_lines if b][:6]
+-    # Otherwise split into sentences and keep the short, concrete ones.
+-    sentences = re.split(r"(?<=[.!?])\s+", explanation.strip())
+-    notes = [s.strip() for s in sentences if 8 <= len(s.strip()) <= 160]
+-    return notes[:4]
++        raw_notes = [b for b in bullet_lines if b][:6]
++    else:
++        # Otherwise split into sentences and keep the short, concrete ones.
++        sentences = re.split(r"(?<=[.!?])\s+", explanation.strip())
++        raw_notes = [s.strip() for s in sentences if 8 <= len(s.strip()) <= 160][:4]
++    return [{"kind": _classify_note_kind(n), "text": n} for n in raw_notes]
+ 
+ 
+ def _diff_file(old_content: str, new_content: str) -> tuple[int, int, list]:
+@@ -800,14 +819,18 @@ def build_turn_activities(files: dict, code: str, language: str, explanation: st
+     """Build a Claude-Code-style activity trace for one Code-mode turn, using only
+     real signal already available: a genuine per-file diff against what this same
+     session generated last turn (difflib), plus the model's own explanation text
+-    split into short notes. No fabricated tool calls or command counts are added —
+-    'commands' stays 0 (and so hidden by the frontend) because Code mode never
+-    actually runs a shell command; only real view/edit/note rows are ever included."""
++    split into short plan/note bullets. No step here is fabricated: the one
++    'command' row this emits is a literal 'diff -u <file>' label for a diff that
++    the server actually computed via difflib — functionally the same operation
++    the shell command performs — never a fake tool call Code mode didn't run.
++    'commands' only counts that real operation, so it stays 0 on turns with no
++    prior version to diff against (new files) or no edits at all."""
+     activities: list = []
+     all_files = dict(files) if files else ({"": code} if code else {})
+ 
+     edited_count = 0
+     viewed_count = 0
++    command_count = 0
+ 
+     for filename, new_content in all_files.items():
+         display_name = filename or (f"generated.{language}" if language else "generated code")
+@@ -818,6 +841,10 @@ def build_turn_activities(files: dict, code: str, language: str, explanation: st
+             activities.append({"kind": "view", "text": f"Read {display_name}"})
+             viewed_count += 1
+             additions, deletions, diff_lines = _diff_file(old_content, new_content)
++            # The line above is a real diff computation (difflib), not narration —
++            # label it as the shell-equivalent command it actually performs.
++            activities.append({"kind": "command", "text": f"diff -u {display_name}"})
++            command_count += 1
+             activities.append({
+                 "kind": "edit",
+                 "file": display_name,
+@@ -833,7 +860,7 @@ def build_turn_activities(files: dict, code: str, language: str, explanation: st
+             viewed_count += 1
+         else:
+             # Brand new file — nothing to diff against, so it's edit-only with no
+-            # view row, since that reflects what actually happened.
++            # view/command row, since that reflects what actually happened.
+             new_lines = new_content.splitlines()
+             activities.append({
+                 "kind": "edit",
+@@ -847,10 +874,10 @@ def build_turn_activities(files: dict, code: str, language: str, explanation: st
+ 
+     notes = _split_explanation_into_notes(explanation)
+     for note in notes:
+-        activities.append({"kind": "note", "text": note})
++        activities.append({"kind": note["kind"], "text": note["text"]})
+ 
+     summary = {
+-        "commands": 0,
++        "commands": command_count,
+         "files_edited": edited_count,
+         "files_viewed": viewed_count,
+         "notes": len(notes),
+diff --git a/frontend/index.html b/frontend/index.html
+index ba197f1..d91e77b 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -193,6 +193,8 @@
+         .response-workflow-row.note .response-workflow-icon { color:#8b949e; }
+         .response-workflow-row.edit .response-workflow-icon { color:#79c0ff; }
+         .response-workflow-row.view .response-workflow-icon { color:#8b949e; }
++        .response-workflow-row.plan .response-workflow-icon { color:#8b949e; }
++        .response-workflow-row.command .response-workflow-icon { color:#d2a8ff; }
+         .response-workflow-row.working .response-workflow-icon { color:var(--accent); }
+         .response-workflow-note-text { color:var(--text-primary); font-weight:600; }
+         .response-workflow-note-text code { font:12px 'Courier New', Courier, monospace; background:var(--bg-hover); border:1px solid var(--border-color); border-radius:4px; padding:1px 5px; color:var(--text-primary); font-weight:400; }
+@@ -201,6 +203,7 @@
+         .response-workflow-del { color:#f85149; font:12.5px 'Courier New', Courier, monospace; margin-left:4px; }
+         .response-workflow-plain { color:var(--text-secondary); }
+         .response-workflow-plain code { font:12px 'Courier New', Courier, monospace; background:var(--bg-hover); border:1px solid var(--border-color); border-radius:4px; padding:1px 5px; color:var(--text-primary); }
++        .response-workflow-command-text { color:#d2a8ff; font:12.5px 'Courier New', Courier, monospace; }
+         .code-mode-message .message-prose,
+         .code-mode-message .message-prose p { font-weight:600; color:var(--text-primary); }
+ 
+@@ -1569,6 +1572,13 @@
+                 edit: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.6 1.6 0 0 1 2.3 2.3L5.5 13 2 14l1-3.5 8.5-8Z"/></svg>',
+                 view: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 2 5.5 4.5 8M11.5 3 14 5.5 11.5 8M9.5 2.5l-3 8"/></svg>',
+                 note: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="6"/><path d="M8 5v3l2 1.5"/></svg>',
++                // Forward-looking "here's what I'll do next" bullet — a plain dot,
++                // deliberately lighter-weight than the note clock so accomplishment
++                // (note) and next-step (plan) rows read differently at a glance.
++                plan: '<svg viewBox="0 0 16 16" fill="currentColor"><circle cx="8" cy="8" r="3"/></svg>',
++                // Real server-side operation (currently: an actual diff computation),
++                // shown the same way a terminal/tool-call row reads in Claude Code.
++                command: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M4 6.5 6.5 8.5 4 10.5M8 10.5h3.5"/></svg>',
+             };
+             const FILE_ICON = {
+                 code: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 2 5.5 4.5 8M11.5 3 14 5.5 11.5 8M9.5 2.5l-3 8"/></svg>',
+@@ -1624,6 +1634,16 @@
+                     } else if (activity.kind === 'note') {
+                         text.className = 'response-workflow-note-text';
+                         text.innerHTML = inlineBackticks(activity.text || '');
++                    } else if (activity.kind === 'plan') {
++                        // Forward-looking "next step" bullet — same inline-backtick
++                        // handling as a note, just muted instead of bold.
++                        text.className = 'response-workflow-plain';
++                        text.innerHTML = inlineBackticks(activity.text || '');
++                    } else if (activity.kind === 'command') {
++                        // A real server-side operation (e.g. "diff -u file.html") —
++                        // shown verbatim, monospaced, like terminal output.
++                        text.className = 'response-workflow-command-text';
++                        text.textContent = activity.text || '';
+                     } else {
+                         text.className = 'response-workflow-plain';
+                         text.innerHTML = inlineBackticks(activity.text || '');
+diff --git a/frontend/thinking-indicator-live-preview.html b/frontend/thinking-indicator-live-preview.html
+deleted file mode 100644
+index 87ed9d0..0000000
+--- a/frontend/thinking-indicator-live-preview.html
++++ /dev/null
+@@ -1,1483 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="en">
+-<head>
+-    <meta charset="UTF-8">
+-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+-    <title>Maximus</title>
+-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
+-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+-    <style>
+-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+-        :root { --bg-main:#212121; --bg-sidebar:#171717; --bg-input:#2f2f2f; --bg-hover:#2f2f2f; --text-primary:#ececec; --text-secondary:#b4b4b4; --accent:#10a37f; --border-color:rgba(255,255,255,0.1); --transition-bezier:cubic-bezier(0.2,0.8,0.2,1); }
+-        * { box-sizing:border-box; margin:0; padding:0; font-family:'Inter',sans-serif; }
+-        body { background-color:var(--bg-main); color:var(--text-primary); display:flex; height:100vh; overflow:hidden; }
+-
+-        /* ============== SPLASH SCREEN ============== */
+-        .splash-screen { position:fixed; inset:0; background-color:var(--bg-main); z-index:9999; display:flex; flex-direction:column; align-items:center; justify-content:center; transition:opacity 0.7s var(--transition-bezier), visibility 0.7s; }
+-        .splash-screen.hidden { opacity:0; visibility:hidden; }
+-        .splash-logo-container { width:84px; height:84px; margin-bottom:28px; opacity:0; transform:scale(0.6); animation:splashEnter 0.7s cubic-bezier(0.34,1.56,0.64,1) 0.1s forwards; }
+-        .splash-logo { width:100%; height:100%; color:var(--text-primary); }
+-        .splash-logo path { stroke-dasharray:60; stroke-dashoffset:60; animation:splashDraw 1s ease-out 0.2s forwards, splashBreathe 2.2s ease-in-out 1.3s infinite; }
+-        @keyframes splashEnter { to { opacity:1; transform:scale(1); } }
+-        @keyframes splashDraw { to { stroke-dashoffset:0; } }
+-        @keyframes splashBreathe { 0%,100% { transform:scale(1); opacity:1; } 50% { transform:scale(1.06); opacity:0.75; } }
+-        .splash-text { font-size:16px; font-weight:500; letter-spacing:4px; color:var(--text-secondary); text-transform:uppercase; opacity:0; transform:translateY(8px); animation:splashTextIn 0.6s var(--transition-bezier) 0.55s forwards; }
+-        @keyframes splashTextIn { to { opacity:0.9; transform:translateY(0); } }
+-        .splash-dots { display:flex; gap:6px; margin-top:18px; opacity:0; animation:splashTextIn 0.5s var(--transition-bezier) 0.8s forwards; }
+-        .splash-dots span { width:5px; height:5px; border-radius:50%; background-color:var(--text-secondary); animation:splashDotPulse 1.2s ease-in-out infinite; }
+-        .splash-dots span:nth-child(2) { animation-delay:0.15s; }
+-        .splash-dots span:nth-child(3) { animation-delay:0.3s; }
+-        @keyframes splashDotPulse { 0%,80%,100% { opacity:0.25; transform:scale(0.85); } 40% { opacity:1; transform:scale(1.15); } }
+-
+-        /* ============== SIDEBAR ============== */
+-        .sidebar { width:260px; background-color:var(--bg-sidebar); display:flex; flex-direction:column; padding:10px; border-right:1px solid var(--border-color); transition:width 0.3s var(--transition-bezier), padding 0.3s var(--transition-bezier), opacity 0.3s var(--transition-bezier); overflow-x:hidden; white-space:nowrap; flex-shrink:0; }
+-        .sidebar.collapsed { width:0; padding-left:0; padding-right:0; border-right:none; opacity:0; }
+-        .sidebar-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; gap:10px; }
+-        .icon-btn { background:transparent; border:none; color:var(--text-secondary); cursor:pointer; padding:8px; border-radius:6px; display:flex; align-items:center; justify-content:center; transition:background 0.2s ease, color 0.2s ease, transform 0.15s ease; }
+-        .icon-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
+-        .icon-btn:active { transform:scale(0.92); }
+-        .new-chat-btn { flex:1; display:flex; align-items:center; justify-content:space-between; padding:10px 12px; background-color:transparent; color:var(--text-primary); border:1px solid var(--border-color); border-radius:8px; cursor:pointer; font-size:14px; font-weight:500; transition:background 0.2s ease, transform 0.15s ease; }
+-        .new-chat-btn:hover { background-color:var(--bg-hover); }
+-        .new-chat-btn:active { transform:scale(0.98); }
+-        .history-list { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:5px; }
+-        .history-item { padding:12px; border-radius:8px; cursor:pointer; font-size:14px; overflow:hidden; text-overflow:ellipsis; color:var(--text-secondary); transition:background 0.2s, color 0.2s; }
+-        .history-item:hover { background-color:var(--bg-hover); color:var(--text-primary); }
+-        .sidebar-settings { margin-top:auto; padding-top:16px; border-top:1px solid var(--border-color); display:flex; flex-direction:column; gap:12px; }
+-        .settings-panel { display:flex; flex-direction:column; gap:12px; animation:fadeInSettings 0.25s ease; }
+-        @keyframes fadeInSettings { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
+-        .settings-panel[hidden] { display:none; }
+-        .sidebar-setting-item { display:flex; justify-content:space-between; align-items:center; color:var(--text-secondary); font-size:13px; gap:10px; }
+-        .sidebar-setting-item input[type="number"] { width:50px; background-color:var(--bg-main); color:var(--text-primary); border:1px solid transparent; padding:4px 8px; border-radius:6px; outline:none; transition:background 0.2s, border-color 0.2s; }
+-        .sidebar-setting-item input[type="number"]:hover, .sidebar-setting-item input[type="number"]:focus { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); }
+-        .sidebar-setting-item input[type="checkbox"] { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; }
+-        .sidebar-setting-item select { background-color:var(--bg-main); color:var(--text-primary); border:1px solid transparent; padding:4px 8px; border-radius:6px; outline:none; font-size:13px; cursor:pointer; transition:background 0.2s, border-color 0.2s; max-width:150px; }
+-        .sidebar-setting-item select:hover, .sidebar-setting-item select:focus { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); }
+-
+-        /* ============== HEADER + MODE TOGGLE ============== */
+-        .main-content { flex:1; display:flex; flex-direction:column; position:relative; min-width:0; }
+-        .header { height:60px; display:flex; align-items:center; justify-content:space-between; padding:0 16px; z-index:10; }
+-        .header-left { display:flex; align-items:center; gap:12px; }
+-        .sidebar-toggle-main { display:none; opacity:0; transform:scale(0.8); transition:opacity 0.3s var(--transition-bezier), transform 0.3s var(--transition-bezier); }
+-        .sidebar.collapsed ~ .main-content .sidebar-toggle-main { display:flex; opacity:1; transform:scale(1); }
+-
+-        .mode-toggle { display:flex; align-items:center; background-color:var(--bg-input); border-radius:999px; padding:3px; position:relative; }
+-        .mode-toggle button { position:relative; z-index:1; border:none; background:transparent; color:var(--text-secondary); font-size:13px; font-weight:500; padding:7px 16px; border-radius:999px; cursor:pointer; transition:color 0.25s ease; display:flex; align-items:center; gap:6px; }
+-        .mode-toggle button svg { width:14px; height:14px; }
+-        .mode-toggle button.active { color:var(--bg-main); }
+-        .mode-toggle-pill { position:absolute; top:3px; left:3px; height:calc(100% - 6px); width:calc(50% - 3px); background-color:var(--text-primary); border-radius:999px; transition:transform 0.3s var(--transition-bezier); z-index:0; }
+-        .mode-toggle.code-active .mode-toggle-pill { transform:translateX(100%); }
+-
+-        /* ============== CHAT AREA (simplified) ============== */
+-        .chat-container { flex:1; overflow-y:auto; display:flex; flex-direction:column; align-items:center; scroll-behavior:smooth; }
+-        .chat-content { width:100%; max-width:760px; padding:20px; display:flex; flex-direction:column; gap:26px; padding-bottom:150px; }
+-        .opening-scene { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; width:100%; text-align:center; padding:0 20px; }
+-        .mono-logo-container { margin-bottom:20px; opacity:0; transform:scale(0.85) translateY(15px); animation:popFadeIn 0.6s var(--transition-bezier) forwards; }
+-        .mono-logo { width:56px; height:56px; color:var(--text-primary); }
+-        .swirl-spin { animation:spin 3s linear infinite; }
+-        .opening-title { font-size:24px; font-weight:600; margin-bottom:10px; opacity:0; transform:translateY(12px); animation:slideFadeIn 0.6s var(--transition-bezier) 0.1s forwards; transition:opacity 0.2s ease; }
+-        .opening-subtitle { color:var(--text-secondary); font-size:14px; opacity:0; transform:translateY(12px); animation:slideFadeIn 0.6s var(--transition-bezier) 0.2s forwards; transition:opacity 0.2s ease; }
+-        @keyframes popFadeIn { to { opacity:1; transform:scale(1) translateY(0); } }
+-        @keyframes slideFadeIn { to { opacity:1; transform:translateY(0); } }
+-
+-        .message-row { display:flex; width:100%; opacity:0; transform:translateY(10px); animation:slideFadeIn 0.4s var(--transition-bezier) forwards; }
+-        .message-row.user { justify-content:flex-end; }
+-        .message-row.assistant { justify-content:flex-start; }
+-        .message-bubble { max-width:88%; padding:14px 18px; font-size:15px; line-height:1.6; }
+-        .user .message-bubble { background-color:var(--bg-input); border-radius:20px 20px 6px 20px; white-space:pre-wrap; }
+-
+-        /* Simplified assistant message: no repeated title per bubble, just a small quiet avatar */
+-        .assistant .message-bubble { background-color:transparent; border-radius:8px; color:var(--text-primary); display:flex; gap:12px; padding-left:0; align-items:flex-start; }
+-        .assistant-avatar { flex-shrink:0; width:26px; height:26px; padding:5px; border-radius:50%; border:1px solid var(--border-color); color:var(--text-secondary); margin-top:2px; }
+-        .assistant-body { flex:1; min-width:0; display:flex; flex-direction:column; gap:10px; }
+-
+-        .message-text { word-break:break-word; }
+-        .message-text p { margin-bottom:12px; }
+-        .message-text p:last-child { margin-bottom:0; }
+-        .message-text h1, .message-text h2, .message-text h3, .message-text h4 { margin:18px 0 8px 0; font-weight:600; color:#fff; }
+-        .message-text h1 { font-size:1.4em; }
+-        .message-text h2 { font-size:1.25em; }
+-        .message-text h3 { font-size:1.1em; }
+-        .message-text ul, .message-text ol { margin:10px 0; padding-left:22px; }
+-        .message-text li { margin-bottom:6px; }
+-        .message-text table { width:100%; border-collapse:collapse; margin:14px 0; background-color:rgba(0,0,0,0.15); border-radius:8px; overflow:hidden; display:block; overflow-x:auto; }
+-        .message-text th, .message-text td { border:1px solid var(--border-color); padding:9px 13px; text-align:left; }
+-        .message-text th { background-color:rgba(255,255,255,0.05); font-weight:600; }
+-
+-        /* Links inside an assistant answer — plain browser blue/underline would clash
+-           with the dark theme, so style them to match the accent color instead. Applies
+-           to every link in a message, including the "Sources" list appended below when
+-           Chat Mode's web search runs for a turn (see build_web_sources_markdown in
+-           app.py) — no separate class needed since regular Markdown links use the same
+-           look. */
+-        .message-text a { color:var(--accent); text-decoration:none; border-bottom:1px solid transparent; transition:border-color 0.15s ease; word-break:break-word; }
+-        .message-text a:hover { border-bottom-color:var(--accent); }
+-
+-        /* The "---" divider + "Sources"/"Images" heading that Chat Mode appends after a
+-           turn that used web search. Just a lighter horizontal rule and slightly muted
+-           section labels — the links/list themselves reuse the existing ol/li styles above. */
+-        .message-text hr { border:none; border-top:1px solid var(--border-color); margin:18px 0 14px 0; }
+-
+-        /* Image thumbnails from Chat Mode's web image search render as plain <img> tags
+-           inside a paragraph (via Markdown ![]()) — without sizing, a raw search-result
+-           image could be arbitrarily large and blow out the whole chat bubble. Capped to
+-           a small, consistent thumbnail, laid out in a wrapping row, each one clickable
+-           through to its source (the surrounding <a>, already produced by
+-           build_web_sources_markdown). */
+-        .message-text p:has(> a > img), .message-text p:has(> img) { display:flex; flex-wrap:wrap; gap:10px; margin:10px 0; }
+-        .message-text img { max-width:150px; max-height:110px; width:auto; height:auto; object-fit:cover; border-radius:10px; border:1px solid var(--border-color); background-color:var(--bg-input); display:block; transition:opacity 0.15s ease, border-color 0.15s ease; }
+-        .message-text a:has(> img) { border-bottom:none; line-height:0; }
+-        .message-text a:has(> img):hover img { opacity:0.85; border-color:rgba(255,255,255,0.3); }
+-
+-        .message-text .code-card { margin:14px 0; border-radius:10px; overflow:hidden; border:1px solid var(--border-color); }
+-        .message-text .code-card-header { display:flex; justify-content:space-between; align-items:center; background-color:#2a2a2a; padding:8px 16px; font-size:12px; color:var(--text-secondary); border-bottom:1px solid var(--border-color); }
+-        .message-text .code-card-lang { font-family:'Courier New', Courier, monospace; text-transform:lowercase; }
+-        .message-text .artifact-tabs { display:flex; gap:2px; }
+-        .message-text .artifact-tab { background:transparent; border:none; color:var(--text-secondary); font-size:12px; padding:4px 10px; border-radius:6px; cursor:pointer; transition:background 0.2s, color 0.2s; }
+-        .message-text .artifact-tab:hover { color:var(--text-primary); }
+-        .message-text .artifact-tab.active { background-color:var(--bg-input); color:var(--text-primary); }
+-        .message-text .artifact-preview { background-color:#ffffff; padding:24px; display:flex; align-items:center; justify-content:center; overflow:auto; }
+-        .message-text .artifact-preview svg { max-width:100%; height:auto; }
+-        .message-text .artifact-preview.code-preview-frame { padding:0; display:block; }
+-        .message-text .code-preview-frame iframe { width:100%; min-height:360px; border:none; display:block; background:#fff; }
+-        .message-text .code-card [hidden] { display:none !important; }
+-        .message-text .artifact-chip { display:flex; align-items:center; gap:12px; margin:14px 0; padding:10px 14px; border:1px solid var(--border-color); border-radius:12px; background-color:#262626; cursor:pointer; transition:background 0.2s ease, border-color 0.2s ease; max-width:320px; }
+-        .message-text .artifact-chip:hover { background-color:#2d2d2d; border-color:rgba(255,255,255,0.18); }
+-        .message-text .artifact-chip-icon { flex-shrink:0; width:34px; height:34px; border-radius:8px; background-color:rgba(16,163,127,0.15); color:var(--accent); display:flex; align-items:center; justify-content:center; }
+-        .message-text .artifact-chip-icon svg { width:18px; height:18px; }
+-        .message-text .artifact-chip-info { flex:1; min-width:0; }
+-        .message-text .artifact-chip-title { font-size:13.5px; font-weight:500; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+-        .message-text .artifact-chip-meta { font-size:12px; color:var(--text-secondary); margin-top:2px; }
+-        .message-text .artifact-chip-btn { flex-shrink:0; background-color:var(--text-primary); color:var(--bg-main); border:none; border-radius:999px; font-size:12.5px; font-weight:600; padding:6px 14px; cursor:pointer; pointer-events:none; }
+-        /* Small live-fill box shown INSIDE the chat message while code is being generated —
+-           the chat-visible counterpart to the canvas stream. Fixed height with internal
+-           scroll: it never grows the chat bubble no matter how large the file gets, it just
+-           tails the latest lines like a small log window. Replaced by .artifact-chip once
+-           the file is complete (see the code_result handler). */
+-        .message-text .inline-code-stream { margin:14px 0; border:1px solid var(--border-color); border-radius:12px; overflow:hidden; background-color:#111; max-width:560px; }
+-        .message-text .inline-code-stream-header { display:flex; align-items:center; gap:8px; padding:8px 12px; background-color:#1c1c1c; border-bottom:1px solid var(--border-color); }
+-        .message-text .inline-code-stream-header svg { width:14px; height:14px; color:var(--accent); flex-shrink:0; }
+-        .message-text .inline-code-stream-filename { font-size:12.5px; font-weight:500; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+-        .message-text .inline-code-stream-status { font-size:11.5px; color:var(--text-secondary); margin-left:auto; flex-shrink:0; display:flex; align-items:center; gap:6px; }
+-        .message-text .inline-code-stream-status .dot { width:6px; height:6px; border-radius:50%; background-color:var(--accent); animation:inlineStreamPulse 1s ease-in-out infinite; }
+-        @keyframes inlineStreamPulse { 0%,100% { opacity:0.3; } 50% { opacity:1; } }
+-        .message-text .inline-code-stream-body { margin:0; padding:10px 14px; max-height:320px; overflow:auto; }
+-        .message-text .inline-code-stream-body code { font-size:12.5px; line-height:1.6; font-family:'Courier New', Courier, monospace; color:var(--text-secondary); white-space:pre; }
+-        .message-text .copy-btn { display:flex; align-items:center; gap:6px; background:transparent; border:none; color:var(--text-secondary); font-size:12px; cursor:pointer; padding:4px 8px; border-radius:6px; transition:background 0.2s, color 0.2s; }
+-        .message-text .copy-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
+-        .message-text .copy-btn svg { width:14px; height:14px; }
+-        .message-text pre { background-color:#111; padding:16px; overflow-x:auto; margin:0; border:none; border-radius:0; }
+-        .message-text code { font-family:'Courier New', Courier, monospace; background-color:rgba(255,255,255,0.1); padding:2px 6px; border-radius:4px; font-size:0.9em; }
+-        .message-text pre code { background-color:transparent; padding:0; font-size:0.9em; border:none; }
+-        .message-text blockquote { border-left:4px solid var(--accent); padding-left:12px; color:var(--text-secondary); margin:12px 0; }
+-
+-        .thinking-block { margin-top:2px; }
+-        .thinking-toggle { background:none; border:none; padding:0; font-size:13px; font-family:inherit; color:var(--text-secondary); cursor:pointer; }
+-        .thinking-toggle:hover { color:var(--text-primary); text-decoration:underline; }
+-        .thinking-toggle.shimmer {
+-            background-image: linear-gradient(
+-                90deg,
+-                var(--text-secondary) 0%,
+-                var(--text-secondary) 35%,
+-                var(--text-primary) 50%,
+-                var(--text-secondary) 65%,
+-                var(--text-secondary) 100%
+-            );
+-            background-size: 200% 100%;
+-            background-clip: text;
+-            -webkit-background-clip: text;
+-            -webkit-text-fill-color: transparent;
+-            animation: thinkingShimmer 1.6s linear infinite;
+-        }
+-        @keyframes thinkingShimmer {
+-            0% { background-position: 200% 0; }
+-            100% { background-position: -200% 0; }
+-        }
+-        .thinking-content { display:none; margin:10px 0 10px 12px; padding-left:22px; border-left:1px solid var(--border-color); font-size:14px; line-height:1.6; color:var(--text-secondary); }
+-        .thinking-content.expanded { display:block; }
+-        .thought-item { position: relative; margin-bottom: 14px; }
+-        .thought-item:last-child { margin-bottom: 0; }
+-        .thought-bullet { position: absolute; left: -26.5px; top: 8px; width: 8px; height: 8px; background-color: #555; border-radius: 50%; z-index: 1; }
+-        .thought-icon-wrapper { position: absolute; left: -34px; top: 0px; width: 24px; height: 24px; background-color: var(--bg-main); display: flex; align-items: center; justify-content: center; z-index: 2; }
+-        .thought-icon-wrapper svg { width: 20px; height: 20px; color: var(--text-secondary); }
+-        .thought-content { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
+-        .thought-content.expanded { -webkit-line-clamp: unset; }
+-        .show-more-btn { background: none; border: none; color: var(--text-primary); cursor: pointer; font-size: 12px; padding: 4px 0; margin-top: 2px; display: none; opacity: 0.7; }
+-        .show-more-btn:hover { opacity: 1; text-decoration: underline; }
+-        .spinner { width:14px; height:14px; border:2px solid var(--text-secondary); border-top:2px solid transparent; border-radius:50%; animation:spin 1s linear infinite; }
+-        @keyframes spin { 0%{transform:rotate(0deg);} 100%{transform:rotate(360deg);} }
+-
+-        /* ============== INPUT ============== */
+-        .input-container { position:absolute; bottom:0; left:0; width:100%; padding:22px; background:linear-gradient(180deg, rgba(33,33,33,0) 0%, var(--bg-main) 40%); display:flex; justify-content:center; }
+-        .input-box { width:100%; max-width:760px; background-color:var(--bg-input); border-radius:22px; border:1px solid var(--border-color); display:flex; align-items:flex-end; padding:11px 15px; box-shadow:0 4px 20px rgba(0,0,0,0.15); transition:border-color 0.25s ease, box-shadow 0.25s ease; }
+-        .input-box:focus-within { border-color:rgba(255,255,255,0.3); box-shadow:0 4px 24px rgba(0,0,0,0.22); }
+-        .input-box textarea { flex:1; background:transparent; border:none; color:var(--text-primary); font-size:15.5px; resize:none; outline:none; max-height:200px; padding:8px 4px; line-height:1.5; }
+-        .input-box textarea::placeholder { color:var(--text-secondary); }
+-        .send-btn { background:var(--text-primary); color:var(--bg-main); border:none; border-radius:50%; width:34px; height:34px; display:flex; align-items:center; justify-content:center; cursor:pointer; transition:opacity 0.2s, transform 0.2s var(--transition-bezier); margin-left:10px; margin-bottom:3px; }
+-        .send-btn:hover:not(:disabled) { transform:scale(1.06); }
+-        .send-btn:active:not(:disabled) { transform:scale(0.94); }
+-        .send-btn:disabled { opacity:0.3; cursor:not-allowed; }
+-        .send-btn svg { width:17px; height:17px; }
+-
+-        /* Floating "jump to latest" button — only shown once the user has scrolled
+-           up away from the bottom during a response, exactly like ChatGPT. Clicking
+-           it (or scrolling back down manually) re-engages auto-scroll. */
+-        .scroll-to-bottom-btn { position:absolute; left:50%; bottom:130px; transform:translateX(-50%) translateY(10px); width:36px; height:36px; border-radius:50%; background-color:var(--bg-input); border:1px solid var(--border-color); color:var(--text-primary); display:flex; align-items:center; justify-content:center; cursor:pointer; box-shadow:0 4px 14px rgba(0,0,0,0.25); opacity:0; pointer-events:none; transition:opacity 0.2s ease, transform 0.2s var(--transition-bezier); z-index:5; }
+-        .scroll-to-bottom-btn.visible { opacity:1; pointer-events:auto; transform:translateX(-50%) translateY(0); }
+-        .scroll-to-bottom-btn svg { width:16px; height:16px; }
+-
+-        /* Nexus-spark indicator. Container is a fixed 30px inline slot; the inner
+-           .logo-container is kept at its original authored 280x280 box and scaled
+-           down with a CSS transform, so every value below (blur radii, stroke
+-           widths, keyframe %, easing curves, colors) is byte-for-byte what was
+-           provided — nothing was hand-tuned for the smaller size, only shrunk. */
+-        .thinking-indicator { display:inline-flex; width:30px; height:30px; vertical-align:middle; margin-left:4px; overflow:hidden; }
+-        .thinking-indicator .logo-container { position:relative; width:280px; height:280px; display:flex; justify-content:center; align-items:center; transform:scale(0.107); transform-origin:center; }
+-        .thinking-indicator .ai-svg { width:100%; height:100%; overflow:visible; filter:drop-shadow(0 0 30px rgba(139,92,246,0.2)); transition:filter 0.5s ease; }
+-        .thinking-indicator .spark-group { transform-origin:50px 50px; transition:all 0.5s cubic-bezier(0.4,0,0.2,1); }
+-        .thinking-indicator .core-dot { transform-origin:50px 50px; transition:all 0.5s cubic-bezier(0.4,0,0.2,1); }
+-        @keyframes think-spin-primary { 0% { transform:rotate(0deg) scale(0.8); } 50% { transform:rotate(180deg) scale(1.1); } 100% { transform:rotate(360deg) scale(0.8); } }
+-        @keyframes think-spin-secondary { 0% { transform:rotate(45deg) scale(1.1); } 50% { transform:rotate(-135deg) scale(0.8); } 100% { transform:rotate(-315deg) scale(1.1); } }
+-        @keyframes think-core { 0%, 100% { transform:scale(0.5); opacity:0.5; } 50% { transform:scale(1.5); opacity:1; } }
+-        @keyframes listen-pulse-primary { 0%, 100% { transform:rotate(45deg) scale(0.95); } 50% { transform:rotate(45deg) scale(1.15); } }
+-        @keyframes listen-pulse-secondary { 0%, 100% { transform:rotate(0deg) scale(0.85); } 50% { transform:rotate(0deg) scale(1.05); } }
+-        @keyframes listen-core { 0%, 100% { transform:scale(1); opacity:0.9; } 25% { transform:scale(1.4); opacity:1; } 50% { transform:scale(1.2); opacity:0.9; } 75% { transform:scale(1.4); opacity:1; } }
+-        .thinking-indicator .state-thinking .ai-svg { filter:drop-shadow(0 0 50px rgba(236,72,153,0.4)); }
+-        .thinking-indicator .state-thinking .spark-primary { animation:think-spin-primary 3s cubic-bezier(0.68,-0.55,0.265,1.55) infinite; }
+-        .thinking-indicator .state-thinking .spark-secondary { animation:think-spin-secondary 4s cubic-bezier(0.68,-0.55,0.265,1.55) infinite; }
+-        .thinking-indicator .state-thinking .core-dot { animation:think-core 1.5s ease-in-out infinite; fill:#ec4899; }
+-        .thinking-indicator .state-listening .ai-svg { filter:drop-shadow(0 0 40px rgba(56,189,248,0.4)); }
+-        .thinking-indicator .state-listening .spark-primary { animation:listen-pulse-primary 2s ease-in-out infinite; }
+-        .thinking-indicator .state-listening .spark-secondary { animation:listen-pulse-secondary 2s ease-in-out infinite 0.2s; }
+-        .thinking-indicator .state-listening .core-dot { animation:listen-core 2s ease-in-out infinite; fill:#38bdf8; }
+-
+-        /* Smooth cross-fade when swapping between Chat / Code content */
+-        .mode-fade-out { animation:modeFadeOut 0.15s ease forwards; }
+-        .mode-fade-in { animation:modeFadeIn 0.25s ease forwards; }
+-        @keyframes modeFadeOut { to { opacity:0; transform:translateY(4px); } }
+-        @keyframes modeFadeIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
+-
+-        /* ============== CODE CANVAS ==============
+-           A dedicated split-panel that appears next to the chat column, only
+-           ever used in Code mode. It is a plain flex sibling of .main-content,
+-           so it never touches Chat mode's markup, state, or event handlers. */
+-        .canvas-panel { flex:1 1 0; min-width:0; display:flex; flex-direction:column; background-color:#181818; border-left:1px solid var(--border-color); animation:canvasSlideIn 0.25s var(--transition-bezier); }
+-        .canvas-panel[hidden] { display:none; }
+-        @keyframes canvasSlideIn { from { opacity:0; transform:translateX(14px); } to { opacity:1; transform:translateX(0); } }
+-        .canvas-header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 14px; border-bottom:1px solid var(--border-color); flex-shrink:0; }
+-        .canvas-header-left { display:flex; align-items:center; gap:8px; min-width:0; }
+-        .canvas-header-left svg { width:16px; height:16px; color:var(--text-secondary); flex-shrink:0; }
+-        .canvas-title { font-size:13px; font-weight:500; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+-        .canvas-header-right { display:flex; align-items:center; gap:4px; flex-shrink:0; }
+-        .canvas-tabs { display:flex; align-items:center; background-color:var(--bg-input); border-radius:999px; padding:3px; margin-right:6px; }
+-        .canvas-tabs button { border:none; background:transparent; color:var(--text-secondary); font-size:12.5px; font-weight:500; padding:6px 14px; border-radius:999px; cursor:pointer; transition:background 0.2s ease, color 0.2s ease; }
+-        .canvas-tabs button.active { background-color:var(--text-primary); color:var(--bg-main); }
+-        .canvas-icon-btn { background:transparent; border:none; color:var(--text-secondary); cursor:pointer; padding:6px; border-radius:6px; display:flex; align-items:center; justify-content:center; transition:background 0.2s ease, color 0.2s ease; }
+-        .canvas-icon-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
+-        .canvas-icon-btn svg { width:16px; height:16px; }
+-        .canvas-body { flex:1; min-height:0; position:relative; }
+-        .canvas-view { width:100%; height:100%; overflow:auto; }
+-        .canvas-view[hidden] { display:none; }
+-        .canvas-view iframe { width:100%; height:100%; border:none; display:block; background:#fff; }
+-        #canvasCodeView pre { margin:0; padding:20px; min-height:100%; background-color:#111; }
+-        #canvasCodeView code { font-size:13px; line-height:1.65; font-family:'Courier New', Courier, monospace; }
+-    </style>
+-</head>
+-<body>
+-    <div class="splash-screen" id="splashScreen">
+-        <div class="splash-logo-container">
+-            <svg class="splash-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+-                <path d="M12 12c-1.657 0-3 1.343-3 3 0 1.657 1.343 3 3 3 3.314 0 6-2.686 6-6 0-3.314-2.686-6-6-6-4.97 0-9 4.03-9 9 0 4.97 4.03 9 9 9"></path>
+-            </svg>
+-        </div>
+-        <div class="splash-text">Maximus</div>
+-        <div class="splash-dots"><span></span><span></span><span></span></div>
+-    </div>
+-
+-    <div class="sidebar" id="sidebar">
+-        <div class="sidebar-header">
+-            <button class="icon-btn" onclick="toggleSidebar()" title="Close sidebar">
+-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+-                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+-                    <line x1="9" y1="3" x2="9" y2="21"></line>
+-                </svg>
+-            </button>
+-            <button class="new-chat-btn" onclick="startNewChat()">
+-                <span>New session</span>
+-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+-                    <path d="M12 5v14M5 12h14"></path>
+-                </svg>
+-            </button>
+-        </div>
+-        <div class="history-list" id="historyList"></div>
+-        <div class="sidebar-settings">
+-            <!-- Chat mode settings -->
+-            <div class="settings-panel" id="chatSettings">
+-                <div class="sidebar-setting-item">
+-                    <label title="Model">Model</label>
+-                    <select id="modelType">
+-                        <option value="fast">Horus</option>
+-                        <option value="balanced" selected>Osiris</option>
+-                        <option value="reasoning">Amun-Ra</option>
+-                    </select>
+-                </div>
+-                <div class="sidebar-setting-item">
+-                    <label title="Model Temperature">Temperature</label>
+-                    <input type="number" id="tempSetting" value="0.7" step="0.1" min="0" max="1">
+-                </div>
+-                <div class="sidebar-setting-item">
+-                    <label title="Maximum Goal Iterations">Max Iterations</label>
+-                    <input type="number" id="iterSetting" value="2" min="1" max="10">
+-                </div>
+-                <div class="sidebar-setting-item">
+-                    <label title="Stream Response Tokens">Stream Response</label>
+-                    <input type="checkbox" id="streamSetting" checked>
+-                </div>
+-            </div>
+-
+-            <!-- Code mode settings (no temperature) -->
+-            <div class="settings-panel" id="codeSettings" hidden>
+-                <div class="sidebar-setting-item">
+-                    <label title="Model">Model</label>
+-                    <select id="codeModel">
+-                        <option value="kimi" selected>Kimi K2.6</option>
+-                        <option value="glm">GLM 5.2</option>
+-                        <option value="kimik2.6">Kimi K2.6 (Thinking)</option>
+-                    </select>
+-                </div>
+-                <div class="sidebar-setting-item">
+-                    <label title="Reasoning Depth">Reasoning</label>
+-                    <select id="codeReasoningLevel">
+-                        <option value="low">Low</option>
+-                        <option value="medium" selected>Medium</option>
+-                        <option value="high">High</option>
+-                        <option value="max">Max</option>
+-                    </select>
+-                </div>
+-                <div class="sidebar-setting-item">
+-                    <label title="Stream Response Tokens">Stream Response</label>
+-                    <input type="checkbox" id="codeStreamSetting" checked>
+-                </div>
+-            </div>
+-        </div>
+-    </div>
+-
+-    <div class="main-content">
+-        <div class="header">
+-            <div class="header-left">
+-                <button class="icon-btn sidebar-toggle-main" onclick="toggleSidebar()" title="Open sidebar">
+-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+-                        <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+-                        <line x1="9" y1="3" x2="9" y2="21"></line>
+-                    </svg>
+-                </button>
+-            </div>
+-            <div class="mode-toggle" id="modeToggle">
+-                <div class="mode-toggle-pill"></div>
+-                <button type="button" class="active" data-mode="chat" onclick="switchMode('chat')">
+-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"></path></svg>
+-                    Chat
+-                </button>
+-                <button type="button" data-mode="code" onclick="switchMode('code')">
+-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+-                    Code
+-                </button>
+-            </div>
+-            <div style="width:36px"></div>
+-        </div>
+-
+-        <div class="chat-container" id="chatContainer">
+-            <div class="opening-scene" id="openingScene">
+-                <div class="mono-logo-container">
+-                    <svg class="mono-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
+-                        <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+-                        <polyline points="2 12 12 17 22 12"></polyline>
+-                        <polyline points="2 17 12 22 22 17"></polyline>
+-                    </svg>
+-                </div>
+-                <h1 class="opening-title" id="openingTitle">How can I help you achieve your goal?</h1>
+-                <p class="opening-subtitle" id="openingSubtitle">Execution destroys all excuses</p>
+-            </div>
+-            <div class="chat-content" id="chatContent" style="display: none;"></div>
+-        </div>
+-
+-        <button type="button" class="scroll-to-bottom-btn" id="scrollToBottomBtn" onclick="jumpToBottom()" title="Scroll to latest">
+-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><polyline points="19 12 12 19 5 12"></polyline></svg>
+-        </button>
+-
+-        <div class="input-container">
+-            <div class="input-box">
+-                <textarea id="userInput" rows="1" placeholder="Describe your objective..." oninput="autoResize(this)" onkeydown="handleEnter(event)"></textarea>
+-                <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+-                        <line x1="12" y1="19" x2="12" y2="5"></line>
+-                        <polyline points="5 12 12 5 19 12"></polyline>
+-                    </svg>
+-                </button>
+-            </div>
+-        </div>
+-    </div>
+-
+-    <!-- ================= CODE CANVAS =================
+-         Split panel that opens next to the chat only while in Code mode,
+-         showing the generated file with a Code/Preview toggle — same
+-         pattern as Gemini/ChatGPT Canvas. Chat mode never touches this. -->
+-    <div class="canvas-panel" id="codeCanvas" hidden>
+-        <div class="canvas-header">
+-            <div class="canvas-header-left">
+-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+-                <span class="canvas-title" id="canvasTitle">Code</span>
+-            </div>
+-            <div class="canvas-header-right">
+-                <div class="canvas-tabs" id="canvasTabs">
+-                    <button type="button" data-tab="preview" id="canvasPreviewTabBtn">Preview</button>
+-                    <button type="button" data-tab="code">Code</button>
+-                </div>
+-                <button class="canvas-icon-btn" id="canvasOpenNewTabBtn" title="Open preview in new tab">
+-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+-                </button>
+-                <button class="canvas-icon-btn" id="canvasDownloadBtn" title="Download">
+-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+-                </button>
+-                <button class="canvas-icon-btn" id="canvasCopyBtn" title="Copy code">
+-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+-                </button>
+-                <button class="canvas-icon-btn" id="canvasCloseBtn" title="Close">
+-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+-                </button>
+-            </div>
+-        </div>
+-        <div class="canvas-body">
+-            <div class="canvas-view" id="canvasPreviewView">
+-                <iframe id="canvasPreviewFrame" sandbox="allow-scripts allow-same-origin allow-forms allow-modals"></iframe>
+-            </div>
+-            <div class="canvas-view" id="canvasCodeView" hidden>
+-                <pre><code id="canvasCode"></code></pre>
+-            </div>
+-        </div>
+-    </div>
+-
+-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+-    <script src="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.js"></script>
+-    <script src="https://cdn.jsdelivr.net/npm/marked-katex-extension/lib/index.umd.js"></script>
+-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+-    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.5/purify.min.js"></script>
+-
+-    <script>
+-        marked.use(markedKatex({ throwOnError: false }));
+-
+-        // marked-katex-extension only recognizes $...$ and $$...$$ delimiters.
+-        // A lot of model output uses the LaTeX-style \( ... \) and \[ ... \]
+-        // delimiters instead, which silently fail to render without this.
+-        // Converting them to $ / $$ before handing text to marked() fixes that.
+-        function normalizeMathDelimiters(text) {
+-            if (!text) return text;
+-            return text
+-                .replace(/\\\[([\s\S]*?)\\\]/g, (_, expr) => `$$${expr}$$`)
+-                .replace(/\\\(([\s\S]*?)\\\)/g, (_, expr) => `$${expr}$`);
+-        }
+-
+-        // Nexus-spark indicator (replaces the old 8-petal flower). Shown wherever
+-        // the old blinking text cursor used to appear while a response streams.
+-        // Used identically by both Chat mode and Code mode.
+-        //
+-        // This is a DOM-node factory, not a plain string, because the indicator
+-        // now needs to survive being reclassed between "thinking" and "listening"
+-        // mid-turn (see the assistant_message handler below) — if it were baked
+-        // into the HTML string that setProse() re-parses on every streamed token,
+-        // its CSS animation would restart from frame 0 on every single token.
+-        // Gradient/filter ids get a unique suffix per instance so two indicators
+-        // (e.g. an old one mid-removal, a new one for the next turn) never clash.
+-        let thinkingIndicatorInstanceCount = 0;
+-        function createThinkingIndicator(state) {
+-            thinkingIndicatorInstanceCount++;
+-            const uid = `ti${thinkingIndicatorInstanceCount}`;
+-            const wrapper = document.createElement('span');
+-            wrapper.className = 'thinking-indicator';
+-            wrapper.innerHTML = `<div class="logo-container state-${state}">
+-        <svg class="ai-svg" viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+-            <defs>
+-                <linearGradient id="grad-primary-${uid}" x1="0%" y1="0%" x2="100%" y2="100%">
+-                    <stop offset="0%" stop-color="#8b5cf6" />
+-                    <stop offset="50%" stop-color="#6366f1" />
+-                    <stop offset="100%" stop-color="#06b6d4" />
+-                </linearGradient>
+-                <linearGradient id="grad-secondary-${uid}" x1="100%" y1="0%" x2="0%" y2="100%">
+-                    <stop offset="0%" stop-color="#ec4899" />
+-                    <stop offset="50%" stop-color="#f43f5e" />
+-                    <stop offset="100%" stop-color="#f59e0b" />
+-                </linearGradient>
+-                <filter id="glow-${uid}" x="-20%" y="-20%" width="140%" height="140%">
+-                    <feGaussianBlur stdDeviation="3" result="blur" />
+-                    <feComposite in="SourceGraphic" in2="blur" operator="over" />
+-                </filter>
+-            </defs>
+-            <circle cx="50" cy="50" r="35" fill="url(#grad-primary-${uid})" opacity="0.1" filter="blur(10px)" class="core-dot"/>
+-            <g class="spark-group spark-secondary">
+-                <path d="M 50 12 Q 50 50 88 50 Q 50 50 50 88 Q 50 50 12 50 Q 50 50 50 12 Z"
+-                      fill="none" stroke="url(#grad-secondary-${uid})" stroke-width="1.5" opacity="0.8" />
+-                <path d="M 50 15 Q 50 50 85 50 Q 50 50 50 85 Q 50 50 15 50 Q 50 50 50 15 Z"
+-                      fill="url(#grad-secondary-${uid})" opacity="0.3" style="mix-blend-mode: screen;" />
+-            </g>
+-            <g class="spark-group spark-primary">
+-                <path d="M 50 5 Q 50 50 95 50 Q 50 50 50 95 Q 50 50 5 50 Q 50 50 50 5 Z"
+-                      fill="url(#grad-primary-${uid})" filter="url(#glow-${uid})" opacity="0.9" />
+-                <path d="M 50 15 Q 50 50 85 50 Q 50 50 50 85 Q 50 50 15 50 Q 50 50 50 15 Z"
+-                      fill="none" stroke="#ffffff" stroke-width="0.5" opacity="0.5" />
+-            </g>
+-            <circle cx="50" cy="50" r="4.5" fill="#ffffff" class="core-dot" filter="url(#glow-${uid})" />
+-        </svg>
+-    </div>`;
+-            return wrapper;
+-        }
+-
+-        // Switches an existing indicator node's state in place (rather than
+-        // recreating it) so the CSS transitions already defined on .spark-group /
+-        // .core-dot / .ai-svg (0.5s) actually get to play between states.
+-        function setThinkingIndicatorState(indicatorEl, state) {
+-            const logo = indicatorEl && indicatorEl.querySelector('.logo-container');
+-            if (!logo) return;
+-            logo.classList.remove('state-thinking', 'state-listening');
+-            logo.classList.add(`state-${state}`);
+-        }
+-
+-        // Maps a language to whatever markup is needed to actually see something
+-        // rendered in a sandboxed iframe. Used only for Code Mode "show_preview" results.
+-        function buildPreviewDoc(language, code) {
+-            const lang = (language || '').trim().toLowerCase();
+-            const safeCode = code || '';
+-
+-            if (lang.includes('html')) {
+-                return safeCode;
+-            }
+-            if (lang.includes('css')) {
+-                return `<!DOCTYPE html><html><head><style>${safeCode}</style></head><body style="font-family:sans-serif;padding:20px;"><h1>Heading</h1><p>Sample paragraph text to preview your CSS against.</p><button>Sample Button</button>
+-<script>
+-// ---- PREVIEW-ONLY MOCK BACKEND (not part of your real app) ----
+-// Intercepts fetch() to your API and fakes an SSE stream identical in
+-// shape to your real backend: status -> assistant_message chunks -> end.
+-(function(){
+-    const realFetch = window.fetch;
+-    window.fetch = async function(url, opts) {
+-        if (typeof url === 'string' && (url.includes('/chat') || url.includes('/code-chat'))) {
+-            const encoder = new TextEncoder();
+-            const events = [
+-                {type:'status', label:'Understanding request', detail:'', step:'plan'},
+-                {type:'status', label:'Planning response', detail:'', step:'plan'},
+-            ];
+-            const answer = "Here's the new indicator wired to your real SSE events — thinking while waiting, listening while the text streams in, then it disappears once the turn ends.";
+-            const words = answer.split(' ');
+-            let chunks = [];
+-            for (const e of events) chunks.push(`data: ${JSON.stringify(e)}\n\n`);
+-            for (let i = 0; i < words.length; i++) {
+-                chunks.push(`data: ${JSON.stringify({assistant_message: (i?' ':'') + words[i]})}\n\n`);
+-            }
+-            const stream = new ReadableStream({
+-                async start(controller) {
+-                    for (const c of chunks) {
+-                        await new Promise(r => setTimeout(r, c.includes('status') ? 500 : 90));
+-                        controller.enqueue(encoder.encode(c));
+-                    }
+-                    controller.close();
+-                }
+-            });
+-            return new Response(stream, { status: 200, headers: {'Content-Type':'text/event-stream'} });
+-        }
+-        return realFetch(url, opts);
+-    };
+-})();
+-</script>
+-</body></html>`;
+-            }
+-            if (lang.includes('jsx') || lang.includes('tsx') || lang.includes('react')) {
+-                return `<!DOCTYPE html><html><head>
+-                    <script src="https://unpkg.com/react@18/umd/react.development.js"><\/script>
+-                    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"><\/script>
+-                    <script src="https://unpkg.com/@babel/standalone/babel.min.js"><\/script>
+-                </head><body><div id="root"></div>
+-                <script type="text/babel">
+-                    ${safeCode}
+-                    try {
+-                        const rootEl = document.getElementById('root');
+-                        const Comp = typeof App !== 'undefined' ? App : (typeof default1 !== 'undefined' ? default1 : null);
+-                        if (Comp) { ReactDOM.createRoot(rootEl).render(React.createElement(Comp)); }
+-                    } catch (e) { document.getElementById('root').innerText = 'Preview error: ' + e.message; }
+-                <\/script></body></html>`;
+-            }
+-            // Plain JS or anything else frontend-ish: run inside a minimal page.
+-            return `<!DOCTYPE html><html><body>
+-                <script>${safeCode}<\/script>
+-            </body></html>`;
+-        }
+-
+-        function highlightCode(el) {
+-            el.querySelectorAll('pre code').forEach(codeEl => {
+-                hljs.highlightElement(codeEl);
+-                const pre = codeEl.parentElement;
+-                if (pre.parentElement.classList.contains('code-card')) return;
+-                if (pre.classList.contains('inline-code-stream-body')) return;
+-
+-                const langClass = [...codeEl.classList].find(c => c.startsWith('language-'));
+-                const lang = langClass ? langClass.replace('language-', '') : 'text';
+-                const isSvg = lang === 'svg' || codeEl.textContent.trim().startsWith('<svg');
+-
+-                const card = document.createElement('div');
+-                card.className = 'code-card';
+-                card.dataset.lang = lang;
+-                const header = document.createElement('div');
+-                header.className = 'code-card-header';
+-
+-                const copyBtnHtml = `
+-                    <button class="copy-btn" type="button">
+-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+-                        <span>Copy</span>
+-                    </button>
+-                `;
+-
+-                let previewDiv = null;
+-
+-                if (isSvg) {
+-                    header.innerHTML = `
+-                        <div class="artifact-tabs">
+-                            <button class="artifact-tab active" type="button" data-tab="preview">Preview</button>
+-                            <button class="artifact-tab" type="button" data-tab="code">Code</button>
+-                        </div>
+-                        ${copyBtnHtml}
+-                    `;
+-                    previewDiv = document.createElement('div');
+-                    previewDiv.className = 'artifact-preview';
+-                    previewDiv.innerHTML = DOMPurify.sanitize(codeEl.textContent, { USE_PROFILES: { svg: true, svgFilters: true } });
+-                    pre.hidden = true;
+-
+-                    const tabs = header.querySelectorAll('.artifact-tab');
+-                    tabs.forEach(tab => {
+-                        tab.addEventListener('click', () => {
+-                            tabs.forEach(t => t.classList.remove('active'));
+-                            tab.classList.add('active');
+-                            const showPreview = tab.dataset.tab === 'preview';
+-                            previewDiv.hidden = !showPreview;
+-                            pre.hidden = showPreview;
+-                        });
+-                    });
+-                } else {
+-                    header.innerHTML = `<span class="code-card-lang">${lang}</span>${copyBtnHtml}`;
+-                }
+-
+-                const copyBtn = header.querySelector('.copy-btn');
+-                const copyLabel = copyBtn.querySelector('span');
+-                copyBtn.addEventListener('click', () => {
+-                    navigator.clipboard.writeText(codeEl.textContent);
+-                    copyLabel.textContent = 'Copied!';
+-                    setTimeout(() => { copyLabel.textContent = 'Copy'; }, 1500);
+-                });
+-
+-                pre.parentNode.insertBefore(card, pre);
+-                card.appendChild(header);
+-                if (previewDiv) card.appendChild(previewDiv);
+-                card.appendChild(pre);
+-            });
+-        }
+-
+-        // ================= INLINE CODE STREAM (chat-visible counterpart to the canvas) =================
+-        // Renders directly inside the assistant's message bubble, as a sibling of .message-prose,
+-        // so re-rendering the prose on every streamed token never wipes it out. This box exists
+-        // ONLY to show code being written live, token by token, while it streams. The instant
+-        // generation finishes it's removed — the finished file lives in the canvas panel (and the
+-        // artifact chip below), exactly as before this box existed.
+-
+-        // Called the moment code_start / code_file_start arrives — creates the box with a
+-        // pulsing "Writing code…" status in the header and an empty body ready to be filled.
+-        function startInlineCodeStream(container, language, filename) {
+-            const card = document.createElement('div');
+-            card.className = 'inline-code-stream';
+-            card.innerHTML = `
+-                <div class="inline-code-stream-header">
+-                    <span class="inline-code-stream-filename">${filename || friendlyLangLabel(language) || 'Code'}</span>
+-                    <span class="inline-code-stream-status"><span class="dot"></span>Writing code…</span>
+-                </div>
+-                <pre class="inline-code-stream-body"><code></code></pre>
+-            `;
+-            container.appendChild(card);
+-            return { card, codeEl: card.querySelector('code'), bodyEl: card.querySelector('.inline-code-stream-body'), language };
+-        }
+-
+-        // Called on every code_delta — appends the new text and keeps the box scrolled to the
+-        // latest line, like a small typewriter tailing the file as it's generated.
+-        function appendInlineCodeStream(state, delta) {
+-            if (!state || !delta) return;
+-            state.codeEl.textContent += delta;
+-            state.bodyEl.scrollTop = state.bodyEl.scrollHeight;
+-        }
+-
+-        // Called once a file is done streaming (next file starting, or the whole response
+-        // complete) — just removes the live box. Nothing about the finished code is rendered
+-        // here; updateCodeCanvas() + appendArtifactChip() (called separately) take over.
+-        function removeInlineCodeStream(state) {
+-            if (state && state.card) state.card.remove();
+-        }
+-
+-        // ================= CODE CANVAS =================
+-        // Everything below only runs when Code mode calls updateCodeCanvas().
+-        // Nothing here is invoked from the Chat mode code path.
+-
+-        function friendlyLangLabel(language) {
+-            const lang = (language || '').trim();
+-            if (!lang) return 'Code';
+-            const known = { html: 'HTML', css: 'CSS', javascript: 'JavaScript', js: 'JavaScript', jsx: 'JSX', tsx: 'TSX', json: 'JSON', python: 'Python', py: 'Python' };
+-            return known[lang.toLowerCase()] || (lang.charAt(0).toUpperCase() + lang.slice(1));
+-        }
+-
+-        function fileExtensionFor(language) {
+-            const map = { html: 'html', css: 'css', javascript: 'js', js: 'js', jsx: 'jsx', tsx: 'tsx', typescript: 'ts', python: 'py', py: 'py', json: 'json' };
+-            return map[(language || '').trim().toLowerCase()] || 'txt';
+-        }
+-
+-        // Live-fills the code canvas as code_delta events arrive, the same way the
+-        // thinking panel fills token-by-token — never touches the chat bubble. The panel
+-        // itself has a fixed height with internal scrolling (see .canvas-view CSS), so this
+-        // only ever scrolls the code view; it can't make the box grow.
+-        function startCodeCanvasStream(language, filename) {
+-            streamingActive = true;
+-            canvasTitle.textContent = filename || friendlyLangLabel(language) || 'Code';
+-            canvasCodeEl.textContent = '';
+-            canvasCodeEl.className = `language-${(language || 'plaintext').toLowerCase()}`;
+-            canvasCodeEl.removeAttribute('data-highlighted');
+-            document.getElementById('canvasPreviewTabBtn').style.display = 'none'; // no preview until the file is complete
+-            setCanvasTab('code');
+-            codeCanvas.hidden = false;
+-        }
+-
+-        function appendCodeCanvasStream(delta) {
+-            if (!delta) return;
+-            canvasCodeEl.textContent += delta;
+-            const view = document.getElementById('canvasCodeView');
+-            view.scrollTop = view.scrollHeight; // keep the "typewriter" pinned to the latest line
+-        }
+-
+-        // Called from Code mode's sendMessage() the moment a code_result arrives
+-        // (streaming) or a non-streaming response with code comes back. Stores the
+-        // result on modes.code and renders it only if Code mode is currently visible.
+-        function updateCodeCanvas(language, code, showPreview) {
+-            if (!code) return;
+-            streamingActive = false;
+-            modes.code.canvas = {
+-                open: true,
+-                language: language || '',
+-                code: code,
+-                showPreview: !!showPreview,
+-                tab: showPreview ? 'preview' : 'code'
+-            };
+-            if (currentMode === 'code') renderCodeCanvas();
+-        }
+-
+-        function renderCodeCanvas() {
+-            const state = modes.code.canvas;
+-            if (!state || !state.open) { codeCanvas.hidden = true; return; }
+-
+-            canvasTitle.textContent = `${friendlyLangLabel(state.language)}${state.showPreview ? ' Preview' : ''}`;
+-            canvasCodeEl.textContent = state.code;
+-            canvasCodeEl.className = `language-${(state.language || 'plaintext').toLowerCase()}`;
+-            canvasCodeEl.removeAttribute('data-highlighted');
+-            hljs.highlightElement(canvasCodeEl);
+-
+-            document.getElementById('canvasPreviewTabBtn').style.display = state.showPreview ? '' : 'none';
+-            if (state.showPreview) {
+-                canvasPreviewFrame.srcdoc = buildPreviewDoc(state.language, state.code);
+-            }
+-
+-            setCanvasTab(state.showPreview ? state.tab : 'code');
+-            codeCanvas.hidden = false;
+-        }
+-
+-        function setCanvasTab(tab) {
+-            if (modes.code.canvas) modes.code.canvas.tab = tab;
+-            document.querySelectorAll('#canvasTabs button').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === tab));
+-            document.getElementById('canvasPreviewView').hidden = tab !== 'preview';
+-            document.getElementById('canvasCodeView').hidden = tab !== 'code';
+-        }
+-
+-        document.querySelectorAll('#canvasTabs button').forEach(btn => {
+-            btn.addEventListener('click', () => setCanvasTab(btn.dataset.tab));
+-        });
+-
+-        document.getElementById('canvasCloseBtn').addEventListener('click', () => {
+-            if (modes.code.canvas) modes.code.canvas.open = false;
+-            codeCanvas.hidden = true;
+-        });
+-
+-        document.getElementById('canvasDownloadBtn').addEventListener('click', () => {
+-            const state = modes.code.canvas;
+-            if (!state || !state.code) return;
+-            const blob = new Blob([state.code], { type: 'text/plain' });
+-            const url = URL.createObjectURL(blob);
+-            const a = document.createElement('a');
+-            a.href = url;
+-            a.download = `code.${fileExtensionFor(state.language)}`;
+-            a.click();
+-            URL.revokeObjectURL(url);
+-        });
+-
+-        document.getElementById('canvasCopyBtn').addEventListener('click', () => {
+-            const state = modes.code.canvas;
+-            if (!state || !state.code) return;
+-            navigator.clipboard.writeText(state.code);
+-            const btn = document.getElementById('canvasCopyBtn');
+-            const original = btn.title;
+-            btn.title = 'Copied!';
+-            setTimeout(() => { btn.title = original; }, 1200);
+-        });
+-
+-        document.getElementById('canvasOpenNewTabBtn').addEventListener('click', () => {
+-            const state = modes.code.canvas;
+-            if (!state || !state.showPreview) return;
+-            const win = window.open('', '_blank');
+-            if (!win) return;
+-            win.document.open();
+-            win.document.write(buildPreviewDoc(state.language, state.code));
+-            win.document.close();
+-        });
+-
+-        // Removes the fenced code block from Code mode's answer text before it's shown
+-        // in the chat bubble — the code itself now lives only in the Canvas panel,
+-        // the chat bubble just gets the explanation plus a small chip to open it.
+-        function stripCodeFence(text) {
+-            if (!text) return text;
+-            return text.replace(/```[\w+#.-]*\n[\s\S]*?```/, '').trim();
+-        }
+-
+-        // Small "open the artifact" chip, shown in place of the removed code block.
+-        // Clicking it (re)opens the Canvas panel — this is the ONLY other way besides
+-        // auto-open to bring the panel back after the user has closed it with X.
+-        function appendArtifactChip(container, language, code) {
+-            if (!code) return;
+-            const chip = document.createElement('div');
+-            chip.className = 'artifact-chip';
+-            const fileName = `code.${fileExtensionFor(language)}`;
+-            const timestamp = new Date().toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+-            chip.innerHTML = `
+-                <div class="artifact-chip-icon">
+-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+-                </div>
+-                <div class="artifact-chip-info">
+-                    <div class="artifact-chip-title">${fileName}</div>
+-                    <div class="artifact-chip-meta">${timestamp}</div>
+-                </div>
+-                <button type="button" class="artifact-chip-btn">Open</button>
+-            `;
+-            chip.addEventListener('click', () => {
+-                if (modes.code.canvas) modes.code.canvas.open = true;
+-                renderCodeCanvas();
+-            });
+-            container.appendChild(chip);
+-        }
+-
+-        const API_BASE = 'https://ailoops.onrender.com';
+-
+-        function generateUUID() {
+-            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+-                var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+-                return v.toString(16);
+-            });
+-        }
+-
+-        // ---------- Mode state: Chat and Code keep fully independent
+-        // sessions, transcripts, and opening-scene text. Switching modes
+-        // just swaps which one is visible; nothing is destroyed. ----------
+-        const MODE_COPY = {
+-            chat: { title: 'How can I help you achieve your goal?', subtitle: 'Execution destroys all excuses', placeholder: 'Describe your objective...' },
+-            code: { title: 'What do you want to build?', subtitle: 'Code with reasoning, previewed instantly', placeholder: 'Describe the code you need...' }
+-        };
+-        const modes = {
+-            chat: { sessionId: generateUUID(), html: '', hasMessages: false },
+-            code: { sessionId: generateUUID(), html: '', hasMessages: false,
+-                // Canvas is Code-mode-only state: the last generated file, whether
+-                // it's live-previewable, which tab is active, and whether the user
+-                // has closed it. Chat mode has no equivalent and never reads this.
+-                canvas: { open: false, language: '', code: '', showPreview: false, tab: 'code' }
+-            }
+-        };
+-        let currentMode = 'chat';
+-        let isWaitingForResponse = false;
+-        // Whether the view should keep auto-scrolling as new content streams in.
+-        // True as long as the user is at (or near) the bottom; false the instant
+-        // they scroll up to read something — same as ChatGPT, so a streaming
+-        // answer never yanks them back down against their will.
+-        let isPinnedToBottom = true;
+-
+-        const sidebar = document.getElementById('sidebar');
+-        const chatContainer = document.getElementById('chatContainer');
+-        const chatContent = document.getElementById('chatContent');
+-        const scrollToBottomBtn = document.getElementById('scrollToBottomBtn');
+-        const openingScene = document.getElementById('openingScene');
+-        const openingTitle = document.getElementById('openingTitle');
+-        const openingSubtitle = document.getElementById('openingSubtitle');
+-        const userInput = document.getElementById('userInput');
+-        const sendBtn = document.getElementById('sendBtn');
+-        const modeToggle = document.getElementById('modeToggle');
+-        const chatSettings = document.getElementById('chatSettings');
+-        const codeSettings = document.getElementById('codeSettings');
+-        const codeCanvas = document.getElementById('codeCanvas');
+-        const canvasTitle = document.getElementById('canvasTitle');
+-        const canvasCodeEl = document.getElementById('canvasCode');
+-        let streamingActive = false; // true while code_delta events are live-filling the canvas
+-        const canvasPreviewFrame = document.getElementById('canvasPreviewFrame');
+-
+-        function toggleSidebar() { sidebar.classList.toggle('collapsed'); }
+-
+-        function autoResize(textarea) {
+-            textarea.style.height = 'auto';
+-            textarea.style.height = (textarea.scrollHeight) + 'px';
+-            if (textarea.value === '') textarea.style.height = 'auto';
+-        }
+-
+-        function handleEnter(e) {
+-            if (e.key === 'Enter' && !e.shiftKey) {
+-                e.preventDefault();
+-                sendMessage();
+-            }
+-        }
+-
+-        function refreshOpeningSceneVisibility() {
+-            const state = modes[currentMode];
+-            if (state.hasMessages) {
+-                openingScene.style.display = 'none';
+-                chatContent.style.display = 'flex';
+-            } else {
+-                openingScene.style.display = 'flex';
+-                chatContent.style.display = 'none';
+-            }
+-        }
+-
+-        function switchMode(mode) {
+-            if (mode === currentMode || isWaitingForResponse) return;
+-
+-            // Persist the current mode's transcript before swapping.
+-            modes[currentMode].html = chatContent.innerHTML;
+-
+-            currentMode = mode;
+-            modeToggle.classList.toggle('code-active', mode === 'code');
+-            modeToggle.querySelectorAll('button').forEach(btn => {
+-                btn.classList.toggle('active', btn.dataset.mode === mode);
+-            });
+-
+-            chatSettings.hidden = mode !== 'chat';
+-            codeSettings.hidden = mode !== 'code';
+-
+-            // Canvas only ever exists in Code mode: show it if a result is
+-            // already sitting there (and the user hasn't closed it), otherwise
+-            // make sure it's hidden. Chat mode always takes this "else" branch.
+-            if (mode === 'code') { renderCodeCanvas(); } else { codeCanvas.hidden = true; }
+-
+-            const copy = MODE_COPY[mode];
+-            openingTitle.style.opacity = 0;
+-            openingSubtitle.style.opacity = 0;
+-            setTimeout(() => {
+-                openingTitle.textContent = copy.title;
+-                openingSubtitle.textContent = copy.subtitle;
+-                openingTitle.style.opacity = 1;
+-                openingSubtitle.style.opacity = 1;
+-            }, 150);
+-            userInput.placeholder = copy.placeholder;
+-
+-            chatContent.classList.add('mode-fade-out');
+-            setTimeout(() => {
+-                chatContent.innerHTML = modes[mode].html;
+-                refreshOpeningSceneVisibility();
+-                chatContent.classList.remove('mode-fade-out');
+-                chatContent.classList.add('mode-fade-in');
+-                scrollToBottom(true);
+-                setTimeout(() => chatContent.classList.remove('mode-fade-in'), 260);
+-            }, 150);
+-        }
+-
+-        function startNewChat() {
+-            modes[currentMode].sessionId = generateUUID();
+-            modes[currentMode].html = '';
+-            modes[currentMode].hasMessages = false;
+-
+-            if (currentMode === 'code') {
+-                modes.code.canvas = { open: false, language: '', code: '', showPreview: false, tab: 'code' };
+-                codeCanvas.hidden = true;
+-            }
+-
+-            chatContent.innerHTML = '';
+-            refreshOpeningSceneVisibility();
+-
+-            userInput.value = '';
+-            autoResize(userInput);
+-            userInput.focus();
+-
+-            const historyList = document.getElementById('historyList');
+-            const item = document.createElement('div');
+-            item.className = 'history-item';
+-            item.textContent = currentMode === 'code' ? 'New Code Session' : 'New Objective';
+-            historyList.prepend(item);
+-        }
+-
+-        function appendMessage(role, text) {
+-            modes[currentMode].hasMessages = true;
+-            openingScene.style.display = 'none';
+-            chatContent.style.display = 'flex';
+-
+-            const row = document.createElement('div');
+-            row.className = `message-row ${role}`;
+-            const bubble = document.createElement('div');
+-            bubble.className = 'message-bubble';
+-
+-            if (role === 'assistant') {
+-                const avatar = document.createElement('svg');
+-                avatar.setAttribute('class', 'assistant-avatar');
+-                avatar.setAttribute('viewBox', '0 0 24 24');
+-                avatar.setAttribute('fill', 'none');
+-                avatar.setAttribute('stroke', 'currentColor');
+-                avatar.setAttribute('stroke-width', '1.5');
+-                avatar.setAttribute('stroke-linecap', 'round');
+-                avatar.setAttribute('stroke-linejoin', 'round');
+-                avatar.innerHTML = `
+-                    <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+-                    <polyline points="2 12 12 17 22 12"></polyline>
+-                    <polyline points="2 17 12 22 22 17"></polyline>
+-                `;
+-
+-                const body = document.createElement('div');
+-                body.className = 'assistant-body';
+-
+-                const contentDiv = document.createElement('div');
+-                contentDiv.className = 'message-text';
+-                // Prose lives in its own child so re-rendering it (every streamed token
+-                // re-runs marked.parse on the whole thing) never wipes out sibling
+-                // elements appended directly to .message-text — the inline code-stream
+-                // box and the artifact chip both rely on surviving those re-renders.
+-                contentDiv.innerHTML = `<div class="message-prose">${text ? marked.parse(normalizeMathDelimiters(text)) : ''}</div>`;
+-                if (text) highlightCode(contentDiv.querySelector('.message-prose'));
+-
+-                // Thinking block starts EMPTY and expanded. It is only ever populated
+-                // with real 'status' events from the backend (planner/executor/etc),
+-                // and it stays open + growing until the first actual answer token
+-                // arrives — exactly like Claude: think first, then answer.
+-                // Identical wiring is used for both Chat mode and Code mode.
+-                const statusDiv = document.createElement('div');
+-                statusDiv.className = 'thinking-block';
+-                statusDiv.style.display = 'none'; // hidden until we actually get a thought
+-                statusDiv.innerHTML = `
+-                    <button type="button" class="thinking-toggle">Thinking</button>
+-                    <div class="thinking-content expanded"></div>
+-                `;
+-                statusDiv.querySelector('.thinking-toggle').addEventListener('click', () => {
+-                    statusDiv.querySelector('.thinking-content').classList.toggle('expanded');
+-                });
+-
+-                body.appendChild(statusDiv);
+-                body.appendChild(contentDiv);
+-                bubble.appendChild(avatar);
+-                bubble.appendChild(body);
+-            } else {
+-                bubble.innerText = text;
+-            }
+-
+-            row.appendChild(bubble);
+-            chatContent.appendChild(row);
+-            scrollToBottom(true); // new message = always jump down and re-pin
+-
+-            return role === 'assistant' ? bubble : null;
+-        }
+-
+-        // distance (px) from the true bottom that still counts as "at the bottom" —
+-        // gives a little slack so a stray sub-pixel scroll doesn't unpin the view
+-        const SCROLL_BOTTOM_THRESHOLD = 80;
+-
+-        // Auto-scroll during streaming, but ONLY while the user is already pinned
+-        // to the bottom. If they've scrolled up — e.g. to re-read something while
+-        // the thinking/answer keeps streaming in — this becomes a no-op instead of
+-        // yanking them back down, matching ChatGPT's behavior. Pass force=true for
+-        // moments that should always jump (sending a message, clicking the button).
+-        function scrollToBottom(force = false) {
+-            if (!force && !isPinnedToBottom) return;
+-            chatContainer.scrollTop = chatContainer.scrollHeight;
+-            isPinnedToBottom = true;
+-            scrollToBottomBtn.classList.remove('visible');
+-        }
+-
+-        // Wired to the floating jump button.
+-        function jumpToBottom() {
+-            scrollToBottom(true);
+-        }
+-
+-        // Tracks whether the user has manually scrolled away from the bottom, and
+-        // shows/hides the floating jump button accordingly.
+-        chatContainer.addEventListener('scroll', () => {
+-            const distanceFromBottom = chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight;
+-            isPinnedToBottom = distanceFromBottom <= SCROLL_BOTTOM_THRESHOLD;
+-            scrollToBottomBtn.classList.toggle('visible', !isPinnedToBottom && modes[currentMode].hasMessages);
+-        });
+-
+-        // Updates just the .message-prose child of a message-text container, creating it if
+-        // needed. Unlike assigning textContainer.innerHTML directly (the old approach), this
+-        // never touches other children — so an inline-code-stream card appended alongside the
+-        // prose survives every re-render of the streamed answer text.
+-        function setProse(container, html) {
+-            let prose = container.querySelector('.message-prose');
+-            if (!prose) {
+-                prose = document.createElement('div');
+-                prose.className = 'message-prose';
+-                container.insertBefore(prose, container.firstChild);
+-            }
+-            prose.innerHTML = html;
+-            return prose;
+-        }
+-
+-        async function sendMessage() {
+-            const text = userInput.value.trim();
+-            if (!text || isWaitingForResponse) return;
+-
+-            const mode = currentMode;
+-            appendMessage('user', text);
+-            userInput.value = '';
+-            autoResize(userInput);
+-            sendBtn.disabled = true;
+-            isWaitingForResponse = true;
+-
+-            let apiUrl, payload, useStream;
+-
+-            if (mode === 'chat') {
+-                const modelType = document.getElementById('modelType').value;
+-                const temp = parseFloat(document.getElementById('tempSetting').value);
+-                const maxIters = parseInt(document.getElementById('iterSetting').value);
+-                useStream = document.getElementById('streamSetting').checked;
+-                apiUrl = `${API_BASE}/chat`;
+-                payload = {
+-                    message: text,
+-                    session_id: modes.chat.sessionId,
+-                    model_type: modelType,
+-                    stream: useStream,
+-                    temperature: temp,
+-                    max_iterations: maxIters
+-                };
+-            } else {
+-                const codeModel = document.getElementById('codeModel').value;
+-                const reasoningLevel = document.getElementById('codeReasoningLevel').value;
+-                useStream = document.getElementById('codeStreamSetting').checked;
+-                apiUrl = `${API_BASE}/code-chat`;
+-                payload = {
+-                    message: text,
+-                    session_id: modes.code.sessionId,
+-                    model: codeModel,
+-                    reasoning_level: reasoningLevel,
+-                    stream: useStream
+-                    // No temperature — Code Mode intentionally omits it; backend applies its own default.
+-                };
+-            }
+-
+-            const assistantBubble = appendMessage('assistant', '');
+-            const textContainer = assistantBubble.querySelector('.message-text');
+-            const thinkingBlock = assistantBubble.querySelector('.thinking-block');
+-            const thinkingToggle = thinkingBlock.querySelector('.thinking-toggle');
+-            const thinkingContent = thinkingBlock.querySelector('.thinking-content');
+-            const thinkingStartTime = Date.now();
+-
+-            let thinkingDone = false;      // true once the model has moved on to answering
+-            let answerStarted = false;     // true once the first answer token has arrived
+-            let thinkingFinalized = false; // true once "Thought for Ns" has been set for good
+-            let liveThoughtEl = null;      // growing text node for the raw token-by-token reasoning stream (Code Mode)
+-            let inlineCodeState = null;    // the in-chat Claude-style code card currently being filled (Code Mode)
+-            let lastThoughtStep = null;    // step name of the most recently rendered thought bubble
+-            let lastThoughtContentEl = null; // its .thought-content node, so a repeat 'thinking'
+-                                              // heartbeat can update it in place instead of piling
+-                                              // up duplicate "Still working on it..." bubbles
+-
+-            // Icons mapping for different thought types
+-            const thoughtIcons = {
+-                'web': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>`,
+-                'search': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>`,
+-                'error': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>`,
+-                'success': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>`,
+-                'plan': `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect><line x1="16" y1="2" x2="16" y2="6"></line><line x1="8" y1="2" x2="8" y2="6"></line><line x1="3" y1="10" x2="21" y2="10"></line><path d="M9 16l2 2 4-4"></path></svg>`,
+-                'default': `<div class="thought-bullet"></div>`
+-            };
+-
+-            function getIconForLabel(label, detail) {
+-                const t = ((label || '') + ' ' + (detail || '')).toLowerCase();
+-                if (t.includes('plan')) return thoughtIcons['plan'];
+-                if (t.includes('search')) return thoughtIcons['search'];
+-                if (t.includes('fetch') || t.includes('web') || t.includes('url') || t.includes('http')) return thoughtIcons['web'];
+-                if (t.includes('fail') || t.includes('error') || t.includes('unable')) return thoughtIcons['error'];
+-                if (t.includes('finish') || t.includes('success') || t.includes('complete') || t.includes('done')) return thoughtIcons['success'];
+-                if (t.includes('writing') || t.includes('code')) return thoughtIcons['plan'];
+-                return thoughtIcons['default'];
+-            }
+-
+-            // Real backend progress event (planner / executor / reflector / evaluator,
+-            // or the Code Mode equivalents). Reveals the block on the first thought
+-            // and keeps it expanded while it grows. Shared by both modes.
+-            function addThought(label, detail, step) {
+-                if (thinkingDone) return;
+-                thinkingBlock.style.display = 'block';
+-                thinkingToggle.textContent = label || 'Thinking';
+-                thinkingToggle.classList.add('shimmer');
+-
+-                // A 'thinking' step is a spinner_tick heartbeat — the backend hasn't
+-                // finished anything new, it's just cycling the status word so the UI
+-                // doesn't look frozen while one node call runs long. If the previous
+-                // bubble was ALSO a heartbeat (no real step landed in between), update
+-                // that same bubble's text instead of appending another identical
+-                // "Still working on it..." line — this is exactly how Claude's own
+-                // status indicator behaves: one line updating in place, not a growing
+-                // stack of duplicates. A genuinely new step always gets its own bubble.
+-                if (step === 'thinking' && lastThoughtStep === 'thinking' && lastThoughtContentEl) {
+-                    lastThoughtContentEl.textContent = detail || label || '';
+-                    scrollToBottom();
+-                    return;
+-                }
+-
+-                const item = document.createElement('div');
+-                item.className = 'thought-item';
+-
+-                const icon = getIconForLabel(label, detail);
+-                if (icon.includes('svg')) {
+-                    item.innerHTML = `<div class="thought-icon-wrapper">${icon}</div>`;
+-                } else {
+-                    item.innerHTML = icon; // bullet
+-                }
+-
+-                const content = document.createElement('div');
+-                content.className = 'thought-content';
+-                content.textContent = detail || label || '';
+-                item.appendChild(content);
+-
+-                const showMore = document.createElement('button');
+-                showMore.className = 'show-more-btn';
+-                showMore.textContent = 'Show more';
+-                item.appendChild(showMore);
+-
+-                thinkingContent.appendChild(item);
+-
+-                setTimeout(() => {
+-                    if (content.scrollHeight > content.clientHeight) {
+-                        showMore.style.display = 'block';
+-                        showMore.onclick = () => {
+-                            const isExpanded = content.classList.toggle('expanded');
+-                            showMore.textContent = isExpanded ? 'Show less' : 'Show more';
+-                        };
+-                    }
+-                }, 0);
+-
+-                lastThoughtStep = step || null;
+-                lastThoughtContentEl = content;
+-
+-                scrollToBottom();
+-            }
+-
+-            // Genuine token-by-token reasoning stream (Code Mode only, before the plan/
+-            // execute loop starts). Creates one growing thought bubble that fills in as
+-            // 'thinking' delta events arrive, instead of the discrete per-node bubbles
+-            // addThought() creates for 'status' events. Returns the text node to append to.
+-            function startLiveThought() {
+-                if (thinkingDone) return null;
+-                thinkingBlock.style.display = 'block';
+-                thinkingToggle.textContent = 'Thinking';
+-                thinkingToggle.classList.add('shimmer');
+-                thinkingContent.classList.add('expanded');
+-
+-                const item = document.createElement('div');
+-                item.className = 'thought-item';
+-                item.innerHTML = `<div class="thought-icon-wrapper">${thoughtIcons['default']}</div>`;
+-
+-                const content = document.createElement('div');
+-                content.className = 'thought-content expanded';
+-                item.appendChild(content);
+-
+-                thinkingContent.appendChild(item);
+-                scrollToBottom();
+-                return content;
+-            }
+-
+-            function appendLiveThought(delta) {
+-                if (!liveThoughtEl || !delta) return;
+-                liveThoughtEl.textContent += delta;
+-                scrollToBottom();
+-            }
+-
+-            // Called the moment the answer actually starts streaming. Switches the main
+-            // toggle from a shimmering "Thinking" to a shimmering "Answering" and
+-            // collapses the thought log, but doesn't settle the final label yet.
+-            function startAnswering() {
+-                if (thinkingDone) return;
+-                thinkingDone = true;
+-                if (!thinkingContent.childElementCount) return;
+-                thinkingToggle.textContent = 'Answering';
+-                thinkingToggle.classList.add('shimmer');
+-                thinkingContent.classList.remove('expanded');
+-            }
+-
+-            // Called once the response is fully done (stream ended, or non-streaming
+-            // reply received). Settles the main toggle into "Thought for Ns" and stops
+-            // the shimmer for good, Claude-style. Same behavior for both modes.
+-            function finishThinking() {
+-                if (thinkingFinalized) return;
+-                thinkingFinalized = true;
+-                thinkingDone = true;
+-                if (!thinkingContent.childElementCount) {
+-                    thinkingBlock.remove();
+-                    return;
+-                }
+-                const seconds = Math.max(1, Math.round((Date.now() - thinkingStartTime) / 1000));
+-                thinkingToggle.textContent = `Thought for ${seconds}s`;
+-                thinkingToggle.classList.remove('shimmer');
+-                thinkingContent.classList.remove('expanded');
+-            }
+-
+-            let assistantFullText = '';
+-            let codeResult = null; // { code, language, show_preview } — Code Mode only
+-
+-            // Lives outside .message-prose so setProse() re-parsing the prose HTML
+-            // on every streamed token never touches it — see createThinkingIndicator.
+-            let indicatorEl = null;
+-            if (useStream) {
+-                setProse(textContainer, '');
+-                indicatorEl = createThinkingIndicator('thinking');
+-                textContainer.appendChild(indicatorEl);
+-            }
+-
+-            try {
+-                const response = await fetch(apiUrl, {
+-                    method: 'POST',
+-                    headers: { 'Content-Type': 'application/json' },
+-                    body: JSON.stringify(payload)
+-                });
+-
+-                if (!response.ok) throw new Error('Network response was not ok');
+-
+-                if (useStream) {
+-                    const reader = response.body.getReader();
+-                    const decoder = new TextDecoder();
+-                    let buffer = '';
+-
+-                    while (true) {
+-                        const { value, done } = await reader.read();
+-                        if (done) break;
+-
+-                        buffer += decoder.decode(value, { stream: true });
+-
+-                        const events = buffer.split('\n\n');
+-                        buffer = events.pop();
+-
+-                        for (const event of events) {
+-                            const line = event.trim();
+-                            if (!line.startsWith('data:')) continue;
+-
+-                            const jsonStr = line.slice(5).trim();
+-                            try {
+-                                const parsed = JSON.parse(jsonStr);
+-                                if (parsed.type === 'thinking_start') {
+-                                    liveThoughtEl = startLiveThought();
+-                                } else if (parsed.type === 'thinking') {
+-                                    appendLiveThought(parsed.delta);
+-                                } else if (parsed.type === 'thinking_done') {
+-                                    // Real per-node status bubbles (understanding/planning/etc.)
+-                                    // follow right after this — nothing else to do here.
+-                                } else if (parsed.type === 'status') {
+-                                    addThought(parsed.label, parsed.detail, parsed.step);
+-                                } else if (parsed.type === 'code_start') {
+-                                    startCodeCanvasStream(parsed.language, '');
+-                                    inlineCodeState = startInlineCodeStream(textContainer, parsed.language, '');
+-                                } else if (parsed.type === 'code_file_start') {
+-                                    // Multi-file builds: the previous file's box is done being
+-                                    // "live" — remove it before starting the next file's.
+-                                    removeInlineCodeStream(inlineCodeState);
+-                                    startCodeCanvasStream(parsed.language, parsed.filename);
+-                                    inlineCodeState = startInlineCodeStream(textContainer, parsed.language, parsed.filename);
+-                                } else if (parsed.type === 'code_delta') {
+-                                    appendCodeCanvasStream(parsed.delta);
+-                                    appendInlineCodeStream(inlineCodeState, parsed.delta);
+-                                } else if (parsed.type === 'code_result') {
+-                                    codeResult = parsed;
+-                                } else if (parsed.type === 'message_reset') {
+-                                    // The backend started a fresh answer draft (another planning
+-                                    // iteration ran) — what's streamed so far is stale, so clear
+-                                    // the bubble instead of appending the new draft onto it.
+-                                    assistantFullText = '';
+-                                    setProse(textContainer, '');
+-                                    if (indicatorEl) indicatorEl.remove();
+-                                    indicatorEl = createThinkingIndicator('thinking');
+-                                    textContainer.appendChild(indicatorEl);
+-                                } else if (parsed.assistant_message) {
+-                                    if (!answerStarted) {
+-                                        answerStarted = true;
+-                                        finishThinking(); // collapse thoughts the instant the answer begins
+-                                        // First real content token — hand off from "thinking" to
+-                                        // "listening" on the *same* node so the transition plays.
+-                                        if (indicatorEl) setThinkingIndicatorState(indicatorEl, 'listening');
+-                                    }
+-                                    assistantFullText += parsed.assistant_message;
+-                                    // In Code mode, never let a fenced code block render inside the
+-                                    // chat bubble while it's still streaming in — it belongs in the
+-                                    // code canvas (via code_result below), not typed out as raw text.
+-                                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : assistantFullText;
+-                                    setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)));
+-                                    if (indicatorEl) textContainer.appendChild(indicatorEl);
+-                                    scrollToBottom();
+-                                }
+-                            } catch (e) {
+-                                console.error('Failed to parse SSE chunk:', jsonStr, e);
+-                            }
+-                        }
+-                    }
+-
+-                    if (mode === 'code' && codeResult && codeResult.code) {
+-                        setProse(textContainer, marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText))));
+-                        highlightCode(textContainer);
+-                        // Generation is done — the live box's job is over. The finished file
+-                        // goes to the canvas + chip, same as before this box existed.
+-                        removeInlineCodeStream(inlineCodeState);
+-                        appendArtifactChip(textContainer, codeResult.language, codeResult.code);
+-                        updateCodeCanvas(codeResult.language, codeResult.code, codeResult.show_preview);
+-                    } else {
+-                        removeInlineCodeStream(inlineCodeState);
+-                        setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
+-                        highlightCode(textContainer);
+-                    }
+-
+-                } else {
+-                    const data = await response.json();
+-                    assistantFullText = data.response;
+-                    if (mode === 'code' && data.code) {
+-                        setProse(textContainer, marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText))));
+-                        highlightCode(textContainer);
+-                        // Non-streaming response: the full code arrives in one shot, so there's
+-                        // no "live" phase to show — go straight to the chip, as before.
+-                        appendArtifactChip(textContainer, data.language, data.code);
+-                        updateCodeCanvas(data.language, data.code, data.show_preview);
+-                    } else {
+-                        setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
+-                        highlightCode(textContainer);
+-                    }
+-                }
+-
+-                finishThinking(); // no-op if already collapsed when the answer started
+-
+-            } catch (error) {
+-                console.error('Error:', error);
+-                thinkingBlock.remove();
+-                textContainer.innerHTML = `<span style="color: var(--text-secondary)">Make sure your Python FastAPI backend is running.</span>`;
+-            } finally {
+-                sendBtn.disabled = false;
+-                isWaitingForResponse = false;
+-                userInput.focus();
+-                const cursor = textContainer.querySelector('.thinking-indicator');
+-                if (cursor) cursor.remove();
+-                modes[mode].html = chatContent.innerHTML;
+-            }
+-        }
+-
+-        window.onload = () => {
+-            setTimeout(() => {
+-                const splash = document.getElementById('splashScreen');
+-                if (splash) {
+-                    splash.classList.add('hidden');
+-                    setTimeout(() => splash.style.display = 'none', 700);
+-                }
+-                document.getElementById('userInput').focus();
+-            }, 1500);
+-        };
+-    </script>
+-</body>
+-</html>
