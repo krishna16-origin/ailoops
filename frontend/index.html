@@ -243,6 +243,8 @@
         .response-canvas-diff-line.del { color:#ffc1bc; background:rgba(248,81,73,.12); }
         .response-canvas-diff-line.context { color:#8b949e; }
         .response-canvas-empty { padding:16px; color:#7d8590; font:12px/1.5 'Courier New', Courier, monospace; }
+        .response-canvas-code-pre { margin:0; padding:14px 16px; color:#c9d1d9; font:12px/1.55 'Courier New', Courier, monospace; white-space:pre; overflow-x:auto; }
+        .response-canvas-code-pre code { background:none; padding:0; }
         .response-canvas-preview { display:none; height:420px; background:#fff; }
         .response-canvas-preview.active { display:block; }
         .response-canvas-preview iframe { width:100%; height:100%; border:0; display:block; background:#fff; }
@@ -1670,32 +1672,29 @@
 
             function renderCanvasBody() {
                 if (!canvasEl) return;
-                const diffEl = canvasEl.querySelector('.response-canvas-diff');
+                const codeEl = canvasEl.querySelector('.response-canvas-diff'); // repurposed: plain code pane, not a colored diff
                 const previewEl = canvasEl.querySelector('.response-canvas-preview');
                 if (canvasActiveTab === '__preview__') {
-                    diffEl.hidden = true;
+                    codeEl.hidden = true;
                     previewEl.classList.add('active');
                     const doc = buildPreviewDoc();
                     previewEl.querySelector('iframe').srcdoc = doc || '<p style="font:13px sans-serif;color:#888;padding:16px;">Nothing to preview yet.</p>';
                     return;
                 }
                 previewEl.classList.remove('active');
-                diffEl.hidden = false;
+                codeEl.hidden = false;
                 const file = canvasFiles.get(canvasActiveTab);
-                diffEl.replaceChildren();
-                if (!file || !file.diffLines || !file.diffLines.length) {
-                    const empty = document.createElement('div');
-                    empty.className = 'response-canvas-empty';
-                    empty.textContent = file && file.streaming ? 'Generating…' : (file && file.content ? file.content : 'No changes yet.');
-                    diffEl.appendChild(empty);
-                    return;
+                codeEl.replaceChildren();
+                const pre = document.createElement('pre');
+                pre.className = 'response-canvas-code-pre';
+                const code = document.createElement('code');
+                code.className = `language-${(file && file.language ? file.language : 'plaintext').toLowerCase()}`;
+                code.textContent = file && file.content ? file.content : (file && file.streaming ? 'Generating…' : 'No content yet.');
+                pre.appendChild(code);
+                codeEl.appendChild(pre);
+                if (window.hljs && file && file.content) {
+                    try { window.hljs.highlightElement(code); } catch (e) { /* non-fatal */ }
                 }
-                file.diffLines.forEach((line) => {
-                    const div = document.createElement('div');
-                    div.className = `response-canvas-diff-line ${line.type}`;
-                    div.textContent = (line.type === 'add' ? '+ ' : line.type === 'del' ? '- ' : '  ') + line.text;
-                    diffEl.appendChild(div);
-                });
             }
 
             function openCanvasTab(filename) {
@@ -1739,12 +1738,9 @@
                         });
                     });
                 }
-                if (canvasFiles.size) {
-                    canvasEl.hidden = false;
-                    if (canvasActiveTab === null) canvasActiveTab = Array.from(canvasFiles.keys())[0];
-                    renderCanvasTabs();
-                    renderCanvasBody();
-                }
+                // Data is populated so the canvas is *ready* the moment the user clicks a
+                // file card or an edited-file row — but it stays hidden until they do.
+                // No auto-opening after a response.
             }
 
             function downloadTextFile(filename, content) {
@@ -1787,6 +1783,11 @@
             function renderFileCards(result = {}) {
                 if (!fileCardsEl) return;
                 const hasFiles = result.files && Object.keys(result.files).length > 0;
+                const statsByFile = new Map(
+                    (Array.isArray(result.activities) ? result.activities : [])
+                        .filter(a => a.kind === 'edit')
+                        .map(a => [a.filename !== undefined ? a.filename : '', { additions: a.additions || 0, deletions: a.deletions || 0 }])
+                );
                 const entries = hasFiles
                     ? Object.entries(result.files).map(([filename, content]) => ({
                         filename,
@@ -1805,13 +1806,18 @@
                 entries.forEach((entry) => {
                     const extension = (entry.filename.split('.').pop() || '').toLowerCase();
                     const isCode = CODE_EXTENSIONS.has(extension) || CODE_EXTENSIONS.has((entry.language || '').toLowerCase());
+                    const stats = statsByFile.get(entry.canvasKey);
+                    const statsHtml = stats
+                        ? (stats.additions ? `<span class="response-workflow-add">+${stats.additions}</span>` : '') +
+                          (stats.deletions ? `<span class="response-workflow-del">-${stats.deletions}</span>` : '')
+                        : '';
                     const card = document.createElement('div');
                     card.className = 'response-file-card';
                     card.innerHTML = `
                         <span class="response-file-card-icon">${isCode ? FILE_ICON.code : FILE_ICON.plain}</span>
                         <span class="response-file-card-meta">
                             <div class="response-file-card-name"></div>
-                            <div class="response-file-card-type">${isCode ? `Code · ${extension.toUpperCase()}` : extension.toUpperCase()}</div>
+                            <div class="response-file-card-type">${isCode ? `Code · ${extension.toUpperCase()}` : extension.toUpperCase()}${statsHtml}</div>
                         </span>
                         <button type="button" class="response-file-card-download">Download</button>
                     `;
@@ -1821,7 +1827,8 @@
                         downloadTextFile(entry.filename, entry.content);
                     });
                     // Clicking the card body (anywhere but Download) opens this file
-                    // in the diff/preview canvas below.
+                    // in the preview canvas below — the canvas is only ever shown on
+                    // this kind of explicit click, never automatically.
                     card.addEventListener('click', () => openCanvasTab(entry.canvasKey));
                     listEl.appendChild(card);
                 });
