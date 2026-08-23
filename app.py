@@ -87,20 +87,6 @@ def get_thinking_config(level: str) -> dict:
     return THINKING_LEVELS[normalize_thinking_level(level)]
 
 
-def scaled_llm_timeout(max_tokens: int) -> float:
-    """HTTP/stream timeout scaled to the completion's own max_tokens budget, instead
-    of one flat number shared by every thinking/effort tier. A flat 90s timeout
-    silently truncates any completion that genuinely needs more than 90s of
-    generation time — the bigger the max_tokens budget (i.e. the higher the
-    effort/thinking level), the more likely it is to get killed mid-stream, which
-    is exactly backwards: higher effort should reliably finish, not fail more
-    often. 45 tokens/sec is a conservative sustained decode-speed floor; a fixed
-    30s buffer covers connection setup and the initial <think> block before any
-    visible text streams out. The 90s floor keeps small completions (e.g. the
-    capped-4000-token plan call) from getting an unnecessarily short timeout."""
-    return max(90.0, 30.0 + max_tokens / 45.0)
-
-
 def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     """Create the selected Chat-mode model (Horus/Osiris/Amun-Ra). Code mode uses
     its own get_code_llm() with an independent fast/medium/strong tier set."""
@@ -110,10 +96,11 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
         model_name = "deepseek-ai/deepseek-v4-pro"
     elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
-    # Chat mode's "max" thinking level allows up to 40,000 tokens (see
-    # THINKING_LEVELS) — the same flat-90s truncation bug that hit Code mode
-    # applies here too once thinking level climbs, so this now scales as well.
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=scaled_llm_timeout(max_tokens))
+    # timeout=None: no HTTP/stream time limit. A fixed number here — flat or
+    # scaled to max_tokens — still eventually truncates a completion that
+    # legitimately needs longer, which is exactly the bug that was hitting
+    # higher thinking/effort levels. Let generation run as long as it needs to.
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=None)
 
 
 # Three distinct Code-mode models, one per UI tier (Flash / Minimax M3 / Nemotron
@@ -148,15 +135,13 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
     # model never opens a <think> block, additional_kwargs['reasoning_content'] stays
     # empty, and nothing streams to the thinking pane.
     #
-    # THIS IS THE FIX for "higher effort writes then stops mid-build": max_tokens
-    # scales from 16,000 (low) up to 65,536 (max) across CODE_THINKING_LEVELS, but
-    # this used to pass a flat timeout=90 for every tier. A 65,536-token completion
-    # cannot physically finish generating in 90 seconds, so the client cut the
-    # stream off mid-file well before the model was done — only "low" reliably fit
-    # inside 90s, which is why lower effort "worked" and higher effort kept failing
-    # partway through. scaled_llm_timeout() sizes the timeout to the actual budget
-    # instead, so every tier gets enough time to complete, not just the smallest one.
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=scaled_llm_timeout(max_tokens))
+    # timeout=None: no HTTP/stream time limit, on purpose — code generation should
+    # run to completion no matter how long it takes, rather than being cut off by
+    # a fixed ceiling (flat or scaled) once effort/thinking level climbs. The whole
+    # multi-step run this call sits inside is also unbounded now (see
+    # run_code_agent_once / stream_code_agent below) so nothing above this call
+    # re-imposes a limit either.
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=None)
 
 
 def strip_thinking(text: str) -> str:
@@ -690,22 +675,14 @@ THINK_BUDGET_FRACTION = 0.55       # same guard as before: abort a turn if the
 THINK_CHARS_PER_TOKEN = 4          # model is still "thinking" past this share
                                     # of budget with no visible answer yet.
 
+# No wall-clock ceiling on the whole multi-step agent run either (see
+# run_code_agent_once / stream_code_agent below, which now pass timeout=None to
+# asyncio.wait_for). This used to be a flat CODE_GENERATION_TIMEOUT = 420.0 for
+# every effort tier — that was the SECOND place a fixed limit could cut a build
+# off mid-stream, on top of the per-call LLM timeout above. Generation now runs
+# for as long as it actually takes, with MAX_AGENT_STEPS still bounding the
+# number of tool-call turns so the loop itself can't run forever.
 
-def code_run_timeout(reasoning_level: str) -> float:
-    """Ceiling for the ENTIRE multi-step agent run (plan call + up to
-    MAX_AGENT_STEPS tool-call turns) — this used to be a flat CODE_GENERATION_TIMEOUT
-    = 420.0 for every effort tier. That was the SECOND place the same bug hit:
-    even after a single call is given enough time to finish (scaled_llm_timeout),
-    this outer asyncio.wait_for() wrapper would still cancel the whole run mid-
-    stream if the total across steps passed 420s — which "high"/"extra"/"max"
-    effort, with their much larger per-call token budgets, do easily. Scales with
-    the same per-tier token budget as the individual calls: the always-capped
-    4000-token plan call, plus headroom for 3 full-size agent turns — enough for
-    a real multi-file build without waiting out a worst-case, rarely-hit 8-step run."""
-    config = get_code_thinking_config(reasoning_level)
-    plan_timeout = scaled_llm_timeout(min(config["max_tokens"], 4000))
-    step_timeout = scaled_llm_timeout(config["max_tokens"])
-    return plan_timeout + 3 * step_timeout
 
 VALID_ACTIONS = {"read_file", "edit_file", "create_file", "delete_file", "final"}
 
@@ -1280,9 +1257,10 @@ class _NullEmitter:
 # Public entry points
 # ---------------------------------------------------------------------------
 async def run_code_agent_once(request: Any, session: dict) -> dict:
-    """Non-streaming: run the full agent loop and return the final result dict."""
+    """Non-streaming: run the full agent loop and return the final result dict.
+    No timeout — let generation run for as long as it actually takes."""
     result, transcript = await asyncio.wait_for(
-        _run_agent(request, session, _NullEmitter()), timeout=code_run_timeout(request.reasoning_level)
+        _run_agent(request, session, _NullEmitter()), timeout=None
     )
     return result
 
@@ -1301,8 +1279,9 @@ async def stream_code_agent(request: Any, session: dict, session_id: str):
     code_file_diff, code_result, message_reset, ERROR) the current frontend
     already knows how to render."""
     queue: asyncio.Queue = asyncio.Queue()
-    run_timeout = code_run_timeout(request.reasoning_level)
-    task = asyncio.create_task(asyncio.wait_for(_run_agent(request, session, _QueueEmitter(queue)), timeout=run_timeout))
+    # No timeout here either — the heartbeat loop below keeps the SSE connection
+    # alive with periodic AGENT_HEARTBEAT frames for however long generation runs.
+    task = asyncio.create_task(asyncio.wait_for(_run_agent(request, session, _QueueEmitter(queue)), timeout=None))
 
     emitted_content = False
     did_reset = False
@@ -1323,13 +1302,15 @@ async def stream_code_agent(request: Any, session: dict, session_id: str):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         result, transcript = await task
     except asyncio.TimeoutError:
+        # No timeout is set on the run itself anymore — kept only as a defensive
+        # fallback in case of unexpected cancellation.
         result = {
-            "response": "That response timed out. Try again, or a lower reasoning effort.",
+            "response": "Something interrupted that build. Please try again.",
             "code": "", "language": "", "files": {}, "file_languages": {}, "show_preview": False,
         }
         yield f'data: {json.dumps({"type": "message_reset"}, ensure_ascii=False)}\n\n'
         did_reset = True
-        yield f'data: {json.dumps({"type": "ERROR", "message": "timeout"}, ensure_ascii=False)}\n\n'
+        yield f'data: {json.dumps({"type": "ERROR", "message": "interrupted"}, ensure_ascii=False)}\n\n'
     except Exception as exc:
         print(f"[{session_id}] Code agent failed: {exc}")
         result = {
@@ -1403,9 +1384,11 @@ async def code_chat(request: CodeChatRequest):
     try:
         result = await run_code_agent_once(request, session)
     except asyncio.TimeoutError:
-        print(f"[{request.session_id}] Code agent timed out after {code_run_timeout(request.reasoning_level):.0f}s.")
+        # No timeout is set on the run itself anymore, so this path is not expected
+        # to fire in normal operation — kept only as a defensive fallback.
+        print(f"[{request.session_id}] Code agent run did not complete (unexpected cancellation).")
         result = {
-            "response": "That response timed out. Try again, or a lower reasoning effort.",
+            "response": "Something interrupted that build. Please try again.",
             "code": "", "language": "", "files": {}, "file_languages": {}, "show_preview": False,
         }
     except Exception as exc:
