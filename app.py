@@ -113,8 +113,8 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
 # NVIDIA's current text LLM-APIs catalog and use the standard synchronous
 # chat-completions interface, matching what ChatNVIDIA expects.
 CODE_MODEL_MAP = {
-    "fast": "deepseek-ai/deepseek-v4-flash",
-    "medium": "minimaxai/minimax-m3",
+    "fast": "google/gemma-4-31b-it",
+    "medium": "meta/muse-glimmer-30b",
     "strong": "nvidia/nemotron-3-ultra-550b-a55b",
 }
 DEFAULT_CODE_MODEL = "medium"
