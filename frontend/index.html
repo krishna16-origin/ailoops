@@ -890,7 +890,7 @@
             scrollToBottom();
         }
 
-        const API_BASE = location.origin;
+        const API_BASE = 'https://ailoops.onrender.com';
 
         function generateUUID() {
             return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -2105,7 +2105,7 @@
             } catch (error) {
                 console.error('Error:', error);
                 thinkingBlock.remove();
-                textContainer.innerHTML = `<span style="color: var(--text-secondary)">Make sure your Python FastAPI backend is running.</span>`;
+                textContainer.innerHTML = `<span style="color: var(--text-secondary)">Could not reach the backend: ${DOMPurify.sanitize(error.message || String(error))}</span>`;
             } finally {
                 sendBtn.disabled = false;
                 isWaitingForResponse = false;
