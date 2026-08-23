@@ -1369,6 +1369,9 @@
                                               // up duplicate "Still working on it..." bubbles
             let liveThoughtEl = null;      // the .thought-live-content node currently receiving the
                                             // model's own live <think> trace, token by token
+            let currentStreamFileKey = null; // which file's canvas panel is currently receiving
+                                              // live code_delta content (set by code_file_start,
+                                              // cleared once its code_file_diff lands)
 
             // Icons mapping for different thought types
             const thoughtIcons = {
@@ -1984,14 +1987,22 @@
                                     }
                                 } else if (parsed.type === 'RETRY' || parsed.type === 'ERROR') {
                                     addThought(parsed.type === 'ERROR' ? 'Code generation error' : 'Retrying', parsed.message || parsed.reason || '', parsed.type.toLowerCase());
-                                } else if (parsed.type === 'code_start' || parsed.type === 'code_delta') {
-                                    // Raw code text is not visualized live in the chat bubble itself —
-                                    // it belongs in the diff/preview canvas (below), populated by
-                                    // code_file_start / code_file_diff instead.
+                                } else if (parsed.type === 'code_start') {
+                                    // No-op: code_file_start (below) is what creates the tab.
+                                } else if (parsed.type === 'code_delta' && mode === 'code') {
+                                    // Live file content, streamed as the model generates it.
+                                    // Append to whatever's already in the panel rather than
+                                    // replacing it, so the pane fills in smoothly instead of
+                                    // jumping once at the very end of the turn.
+                                    const key = currentStreamFileKey || '';
+                                    const existing = canvasFiles.get(key);
+                                    const nextContent = (existing && existing.content ? existing.content : '') + (parsed.text || '');
+                                    upsertCanvasFile(key, { content: nextContent, streaming: true });
                                 } else if (parsed.type === 'code_file_start' && mode === 'code') {
                                     // A new file just started streaming: show its tab immediately with
                                     // a spinner, before any diff/counts are known yet.
                                     const key = parsed.filename || '';
+                                    currentStreamFileKey = key;
                                     upsertCanvasFile(key, { language: parsed.language || '', streaming: true });
                                     // Also grow the activity feed itself live — an "Editing <file>…"
                                     // row appears the instant the file starts, exactly like a Claude
@@ -2010,6 +2021,7 @@
                                     // the diff/preview panel) update live, file by file, instead of
                                     // only once at the very end of the turn.
                                     const key = parsed.filename || '';
+                                    if (currentStreamFileKey === key) currentStreamFileKey = null;
                                     upsertCanvasFile(key, {
                                         language: parsed.language || '',
                                         additions: parsed.additions || 0,
