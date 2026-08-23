@@ -890,7 +890,7 @@
             scrollToBottom();
         }
 
-        const API_BASE = 'https://ailoops.onrender.com';
+        const API_BASE = location.origin.includes('onrender.com') ? 'https://ailoops.onrender.com' : location.origin;
 
         function generateUUID() {
             return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -1188,7 +1188,7 @@
                 contentDiv.className = 'message-text';
                 // Prose is kept in its own child so streamed updates do not replace
                 // the Code mode diff box or the thinking panel.
-                contentDiv.innerHTML = `<div class="message-prose">${text ? marked.parse(normalizeMathDelimiters(text)) : ''}</div>`;
+                contentDiv.innerHTML = `<div class="message-prose">${text ? DOMPurify.sanitize(marked.parse(normalizeMathDelimiters(text))) : ''}</div>`;
                 if (text) highlightCode(contentDiv.querySelector('.message-prose'));
 
                 // Thinking block starts EMPTY and expanded. It is only ever populated
@@ -1301,7 +1301,7 @@
                 prose.className = 'message-prose';
                 container.insertBefore(prose, container.firstChild);
             }
-            prose.innerHTML = html;
+            prose.innerHTML = DOMPurify.sanitize(html);
             return prose;
         }
 
@@ -1971,6 +1971,17 @@
                                     // Claude.ai instead of a synthesized step-by-step log.
                                 } else if (parsed.type === 'thought') {
                                     appendLiveThought(parsed.text);
+                                } else if (parsed.type === 'plan_created' && mode === 'code') {
+                                    // Claude-like plan: show steps early in the activity feed before edits stream
+                                    if (workflowEl && Array.isArray(parsed.steps) && parsed.steps.length) {
+                                        workflowEl.hidden = false;
+                                        const listEl = workflowEl.querySelector('.response-workflow-list');
+                                        parsed.steps.forEach((stepText) => {
+                                            const row = createWorkflowRow({ kind: 'plan', text: stepText });
+                                            listEl.appendChild(row);
+                                        });
+                                        scrollToBottom();
+                                    }
                                 } else if (parsed.type === 'RETRY' || parsed.type === 'ERROR') {
                                     addThought(parsed.type === 'ERROR' ? 'Code generation error' : 'Retrying', parsed.message || parsed.reason || '', parsed.type.toLowerCase());
                                 } else if (parsed.type === 'code_start' || parsed.type === 'code_delta') {
