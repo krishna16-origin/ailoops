@@ -154,17 +154,7 @@ Typography should communicate the product/story.
 
 Define colors as tokens instead of scattering arbitrary values throughout the code.
 
-Example:
 
-:root {
-  --bg: #08090b;
-  --surface: #101216;
-  --surface-elevated: #16191f;
-  --text: #f4f4f5;
-  --muted: #9298a3;
-  --line: rgba(255,255,255,.12);
-  --accent: #8cff00;
-}
 
 Then use those tokens consistently.
 
