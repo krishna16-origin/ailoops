@@ -51,7 +51,7 @@ CODE_THINKING_DEPTH_INSTRUCTIONS = {
     "medium": "Plan briefly: pick one concrete approach, note file layout and key edge cases in a few sentences, commit, then write code. State each point once — do not second-guess yourself or explore alternatives you won't use.",
     "high": "Plan once: name the architecture, data flow, and edge cases in a short list. Choose the strongest option the first time you consider it — do not revisit earlier decisions or narrate discarded alternatives. Then write the full implementation.",
     "extra": "Plan thoroughly but linearly: list the real trade-offs once, pick an approach, and move on immediately. Never re-open a decision already made, and never write phrases like 'actually, let me reconsider' — every sentence should move the plan forward, not restate it.",
-    "max": "Plan like a principal engineer under a deadline: weigh each real architectural option once, commit, and write the plan as a forward-moving list, never a stream-of-consciousness. The instant the plan is complete, stop thinking and write the full implementation — reasoning longer than necessary risks the response timing out before any code is produced.",
+    "max": "Plan like a principal engineer working through a genuinely hard problem: weigh each real architectural option fully, question your own assumptions, consider edge cases, and verify the plan before committing. Write the plan as a forward-moving list, never a stream-of-consciousness — but take the space this tier affords you. Once the plan is solid, write the full implementation.",
 }
 
 # Code output needs a much bigger completion budget than a chat answer — a
@@ -87,6 +87,20 @@ def get_thinking_config(level: str) -> dict:
     return THINKING_LEVELS[normalize_thinking_level(level)]
 
 
+def scaled_llm_timeout(max_tokens: int) -> float:
+    """HTTP/stream timeout scaled to the completion's own max_tokens budget, instead
+    of one flat number shared by every thinking/effort tier. A flat 90s timeout
+    silently truncates any completion that genuinely needs more than 90s of
+    generation time — the bigger the max_tokens budget (i.e. the higher the
+    effort/thinking level), the more likely it is to get killed mid-stream, which
+    is exactly backwards: higher effort should reliably finish, not fail more
+    often. 45 tokens/sec is a conservative sustained decode-speed floor; a fixed
+    30s buffer covers connection setup and the initial <think> block before any
+    visible text streams out. The 90s floor keeps small completions (e.g. the
+    capped-4000-token plan call) from getting an unnecessarily short timeout."""
+    return max(90.0, 30.0 + max_tokens / 45.0)
+
+
 def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     """Create the selected Chat-mode model (Horus/Osiris/Amun-Ra). Code mode uses
     its own get_code_llm() with an independent fast/medium/strong tier set."""
@@ -96,7 +110,10 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
         model_name = "deepseek-ai/deepseek-v4-pro"
     elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
+    # Chat mode's "max" thinking level allows up to 40,000 tokens (see
+    # THINKING_LEVELS) — the same flat-90s truncation bug that hit Code mode
+    # applies here too once thinking level climbs, so this now scales as well.
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=scaled_llm_timeout(max_tokens))
 
 
 # Three distinct Code-mode models, one per UI tier (Flash / Minimax M3 / Nemotron
@@ -130,7 +147,16 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
     # .with_thinking_mode(enabled=True)); see generate_code_once(). Without it, the
     # model never opens a <think> block, additional_kwargs['reasoning_content'] stays
     # empty, and nothing streams to the thinking pane.
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=90)
+    #
+    # THIS IS THE FIX for "higher effort writes then stops mid-build": max_tokens
+    # scales from 16,000 (low) up to 65,536 (max) across CODE_THINKING_LEVELS, but
+    # this used to pass a flat timeout=90 for every tier. A 65,536-token completion
+    # cannot physically finish generating in 90 seconds, so the client cut the
+    # stream off mid-file well before the model was done — only "low" reliably fit
+    # inside 90s, which is why lower effort "worked" and higher effort kept failing
+    # partway through. scaled_llm_timeout() sizes the timeout to the actual budget
+    # instead, so every tier gets enough time to complete, not just the smallest one.
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=scaled_llm_timeout(max_tokens))
 
 
 def strip_thinking(text: str) -> str:
@@ -658,12 +684,28 @@ def resolve_code_model_key(model: str) -> str:
 # Tunables
 # ---------------------------------------------------------------------------
 MAX_AGENT_STEPS = 8                # hard cap on tool-call turns per user message
-CODE_GENERATION_TIMEOUT = 420.0    # whole multi-step run; wraps every step
 CODE_MAX_FILE_CHARS = 20000        # per-file cap on what the model may write
 CODE_READ_CHAR_LIMIT = 8000        # how much of a file is handed back on read_file
 THINK_BUDGET_FRACTION = 0.55       # same guard as before: abort a turn if the
 THINK_CHARS_PER_TOKEN = 4          # model is still "thinking" past this share
                                     # of budget with no visible answer yet.
+
+
+def code_run_timeout(reasoning_level: str) -> float:
+    """Ceiling for the ENTIRE multi-step agent run (plan call + up to
+    MAX_AGENT_STEPS tool-call turns) — this used to be a flat CODE_GENERATION_TIMEOUT
+    = 420.0 for every effort tier. That was the SECOND place the same bug hit:
+    even after a single call is given enough time to finish (scaled_llm_timeout),
+    this outer asyncio.wait_for() wrapper would still cancel the whole run mid-
+    stream if the total across steps passed 420s — which "high"/"extra"/"max"
+    effort, with their much larger per-call token budgets, do easily. Scales with
+    the same per-tier token budget as the individual calls: the always-capped
+    4000-token plan call, plus headroom for 3 full-size agent turns — enough for
+    a real multi-file build without waiting out a worst-case, rarely-hit 8-step run."""
+    config = get_code_thinking_config(reasoning_level)
+    plan_timeout = scaled_llm_timeout(min(config["max_tokens"], 4000))
+    step_timeout = scaled_llm_timeout(config["max_tokens"])
+    return plan_timeout + 3 * step_timeout
 
 VALID_ACTIONS = {"read_file", "edit_file", "create_file", "delete_file", "final"}
 
@@ -723,9 +765,69 @@ def _security_block() -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Skills — extra reference material injected into Code Mode ONLY when the
+# request actually matches, instead of living in rules.txt (which would inject
+# it into every single message, chat or code, 3D or not). Add more skills the
+# same way: a trigger-keyword check + a condensed, actionable content block.
+# ---------------------------------------------------------------------------
+_SKILL_3D_TRIGGERS = (
+    "3d website", "3d site", "3d web", "3d landing", "3d portfolio",
+    "3d experience", "3d scene", "three.js", "threejs", "babylon.js",
+    "babylonjs", "webgl site", "webgl website", "webgl experience",
+)
+
+
+def _wants_3d_skill(text: str) -> bool:
+    """True only when the request is actually asking for a 3D/WebGL website —
+    a stray '3d' inside an unrelated word won't match since every trigger here
+    is a multi-word phrase or a specific library name."""
+    low = (text or "").lower()
+    return any(trigger in low for trigger in _SKILL_3D_TRIGGERS)
+
+
+# Condensed from a longer research report on real-time 3D websites. Kept to the
+# parts an LLM code agent writing plain HTML/CSS/JS files can actually act on —
+# framework choice, motion/design language, and performance/accessibility/SEO
+# rules. Deliberately drops the report's case-study catalog, its multi-month
+# learning roadmap, and its course/community links: none of that helps a model
+# generating code in a single pass, and would just burn context.
+SKILL_3D_WEBSITE = """3D WEBSITE SKILL — apply only because this request is for a 3D / WebGL / Three.js / immersive website.
+
+Framework choice:
+- Default to Three.js (MIT, load via ES module import from a CDN like unpkg/jsdelivr) — most flexible and best-supported option for a single-page/static build.
+- Reach for Babylon.js only if the request explicitly needs built-in physics, a full scene GUI, or heavy built-in post-processing.
+- Do not pull in a full game engine (Unity WebGL) or a proprietary SaaS embed (Spline) unless the user explicitly asks for it — both add unnecessary weight or lock-in for a website.
+- Pair Three.js with GSAP + ScrollTrigger for choreographed motion, and native IntersectionObserver for simple reveals — same libraries already called for in the motion-system rules above.
+
+Assets — there is no art pipeline (no Blender/Substance/Draco/KTX2) available here, so:
+- Prefer procedural/primitive geometry (spheres, boxes, torus, custom BufferGeometry, particle systems, extrusions) and code-driven materials/shaders over requiring model files that don't exist.
+- If a real model is genuinely needed and none is supplied, say so and offer a primitive-based placeholder — never fabricate a fake model URL or silently assume an asset exists.
+- If the user does supply or link a model, only rely on glTF/GLB (the open, PBR-capable, web-native format) — never expect FBX/OBJ/USD to just work in-browser without conversion.
+- Keep triangle counts and texture sizes modest by construction (procedural geometry, small canvas-generated or CDN placeholder textures), since there's no runtime compression step available.
+
+Cinematic design & motion — apply the visual-language and motion-system rules above, tuned for 3D:
+- Restrained, low-to-medium saturation palette; soft directional lighting over flat ambient; avoid neon/garish colors.
+- Compose with rule-of-thirds and off-center focal objects; use foreground elements for parallax depth.
+- Camera moves must be slow and purposeful — gentle pans/dolly, never a sudden jolt or uncontrolled shake.
+- Ease-out on entrances, ease-in on exits; major transitions ~300-600ms; avoid perfectly linear motion.
+- Give moving objects anticipation and a slight overshoot/settle rather than a flat linear tween.
+- Small idle motion (gentle float/breathing) is fine; constant busy motion everywhere is not.
+
+Performance, accessibility, SEO — non-negotiable for any 3D build:
+- Render the real headline, body copy, nav, and CTAs as actual HTML first, outside/behind the canvas — the WebGL layer is a progressive enhancement, not the only source of content. Crawlers and non-JS clients see nothing inside a <canvas>.
+- Put a <noscript> fallback with the core headline/summary/CTA inside the canvas container.
+- Label the <canvas> with aria-label/role, and keep primary navigation and calls-to-action as normal HTML controls, never 3D-only interactions.
+- Respect prefers-reduced-motion: reduce — disable or simplify camera moves, parallax, and non-essential animation loops (same reduced-motion rule already required above).
+- Cap devicePixelRatio (Math.min(devicePixelRatio, 2)), pause the render loop when the canvas is off-screen or the tab is hidden, and clean up the renderer/geometries/materials/textures plus any requestAnimationFrame/ScrollTrigger instances on teardown (same WebGL performance and animation-lifecycle rules already required above).
+- On low-power devices or very small viewports, prefer a lighter fallback (fewer particles, lower-res canvas, or a static hero image) over forcing the full scene — 3D must never block the page from being usable."""
+
+
 def build_plan_messages(history: List[BaseMessage], file_store: Dict[str, str], reasoning_level: str) -> List[BaseMessage]:
+    latest_text = history[-1].content if history else ""
+    skill_block = ("\n\n" + SKILL_3D_WEBSITE) if _wants_3d_skill(latest_text) else ""
     system_text = (
-        build_constitution_block() + "\n\n"
+        build_constitution_block() + skill_block + "\n\n"
         "You are the planning stage of an autonomous coding agent. You do not write code here — only a plan.\n"
         "Given the user's latest request and the files that already exist in this project, write 2-5 short "
         "numbered steps describing what you're about to do (which files to read, create, edit, or delete, "
@@ -753,12 +855,13 @@ def parse_plan(text: str) -> List[str]:
 # ---------------------------------------------------------------------------
 # Agent loop: system prompt + turn parsing
 # ---------------------------------------------------------------------------
-def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], plan_steps: List[str], step_number: int) -> str:
+def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], plan_steps: List[str], step_number: int, latest_user_text: str = "") -> str:
     level_key = normalize_thinking_level(reasoning_level)
     depth = CODE_THINKING_DEPTH_INSTRUCTIONS[level_key]
     plan_block = "\n".join(f"{i+1}. {s}" for i, s in enumerate(plan_steps)) if plan_steps else "(no plan steps given)"
+    skill_block = ("\n\n" + SKILL_3D_WEBSITE) if _wants_3d_skill(latest_user_text) else ""
     return (
-        build_constitution_block() + "\n\n"
+        build_constitution_block() + skill_block + "\n\n"
         "You are an autonomous coding agent working in a loop, one tool call per turn. You do not have "
         "filesystem or shell access outside these tools — never claim to have run, saved, or previewed "
         "anything except through them.\n\n"
@@ -800,7 +903,8 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
 
 def build_agent_messages(history: List[BaseMessage], transcript: List[BaseMessage], file_store: Dict[str, str],
                           plan_steps: List[str], reasoning_level: str, step_number: int) -> List[BaseMessage]:
-    messages: List[BaseMessage] = [SystemMessage(content=build_agent_system_text(reasoning_level, file_store, plan_steps, step_number))]
+    latest_user_text = history[-1].content if history else ""
+    messages: List[BaseMessage] = [SystemMessage(content=build_agent_system_text(reasoning_level, file_store, plan_steps, step_number, latest_user_text))]
     messages.extend(trim_memory(history, limit=6))
     messages.extend(transcript)
     return messages
@@ -1178,7 +1282,7 @@ class _NullEmitter:
 async def run_code_agent_once(request: Any, session: dict) -> dict:
     """Non-streaming: run the full agent loop and return the final result dict."""
     result, transcript = await asyncio.wait_for(
-        _run_agent(request, session, _NullEmitter()), timeout=CODE_GENERATION_TIMEOUT
+        _run_agent(request, session, _NullEmitter()), timeout=code_run_timeout(request.reasoning_level)
     )
     return result
 
@@ -1197,7 +1301,8 @@ async def stream_code_agent(request: Any, session: dict, session_id: str):
     code_file_diff, code_result, message_reset, ERROR) the current frontend
     already knows how to render."""
     queue: asyncio.Queue = asyncio.Queue()
-    task = asyncio.create_task(asyncio.wait_for(_run_agent(request, session, _QueueEmitter(queue)), timeout=CODE_GENERATION_TIMEOUT))
+    run_timeout = code_run_timeout(request.reasoning_level)
+    task = asyncio.create_task(asyncio.wait_for(_run_agent(request, session, _QueueEmitter(queue)), timeout=run_timeout))
 
     emitted_content = False
     did_reset = False
@@ -1298,7 +1403,7 @@ async def code_chat(request: CodeChatRequest):
     try:
         result = await run_code_agent_once(request, session)
     except asyncio.TimeoutError:
-        print(f"[{request.session_id}] Code agent timed out after {CODE_GENERATION_TIMEOUT:.0f}s.")
+        print(f"[{request.session_id}] Code agent timed out after {code_run_timeout(request.reasoning_level):.0f}s.")
         result = {
             "response": "That response timed out. Try again, or a lower reasoning effort.",
             "code": "", "language": "", "files": {}, "file_languages": {}, "show_preview": False,
