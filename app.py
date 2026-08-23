@@ -1,5 +1,4 @@
 import os
-import os
 import json
 import re
 import difflib
@@ -602,9 +601,17 @@ async def generate_response_once(request: "ChatRequest", session: dict, progress
 
 
 
-# Serve the unchanged frontend directory separately from the consolidated backend.
-
 app = FastAPI(title="AI Assistant")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Static frontend served after middleware so CORS headers apply correctly.
 app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
 
 
@@ -612,16 +619,6 @@ app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="front
 @app.head("/")
 async def serve_frontend():
     return FileResponse("frontend/index.html")
-
-
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 
 class ChatRequest(BaseModel):
@@ -916,6 +913,27 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     plus the richer 'diffs'/'plan' fields)."""
     file_store: Dict[str, str] = session.setdefault("code_files", {})
     history: List[BaseMessage] = session["messages"]
+    # DEMO fallback when NVIDIA_API_KEY is missing — still streams a full Claude-like trace so the UI can be demoed
+    if not os.getenv("NVIDIA_API_KEY") or (os.getenv("NVIDIA_API_KEY") or "").strip().lower() in ("demo", ""):
+        demo_steps = ["Create index.html with dark glass hero and responsive grid", "Add styles and preview-ready layout", "Finalize and prepare download"]
+        await emit({"type": "plan_created", "steps": demo_steps})
+        await emit({"type": "thought", "text": "Demo mode: NVIDIA_API_KEY not set — streaming a sample build to showcase the live workflow. "})
+        await asyncio.sleep(0.3)
+        demo_filename = "index.html"
+        demo_content = """<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Demo — Dark Glass SaaS</title><style>:root{--bg:#08090b;--surface:#101216;--text:#f4f4f5;--muted:#9298a3;--line:rgba(255,255,255,.12);--accent:#8cff00}*{box-sizing:border-box;margin:0;padding:0;font-family:Inter,system-ui}body{background:var(--bg);color:var(--text);line-height:1.6}.hero{padding:80px 24px;text-align:center;border-bottom:1px solid var(--line)}.hero h1{font-size:42px;margin-bottom:12px}.hero p{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;max-width:1000px;margin:40px auto;padding:0 24px}.card{background:rgba(255,255,255,.055);border:1px solid var(--line);backdrop-filter:blur(12px);border-radius:16px;padding:20px}</style></head><body><section class=hero><h1>Demo Build — Code Mode</h1><p>Live Claude-like workflow: Thinking → Plan → Edited files → Preview</p></section><section class=grid><div class=card><h3>Glass UI</h3><p>Blur + subtle border</p></div><div class=card><h3>Responsive</h3><p>Grid collapses on mobile</p></div><div class=card><h3>Live Preview</h3><p>Rendered in canvas iframe</p></div></section></body></html>"""
+        await emit({"type": "code_file_start", "filename": demo_filename, "language": "html"})
+        await asyncio.sleep(0.4)
+        old = file_store.get(demo_filename, "")
+        additions, deletions, diff_lines = diff_file(old, demo_content)
+        file_store[demo_filename] = demo_content
+        diff_id = "diff_1"
+        await emit({"type": "file_created", "file": demo_filename, "additions": additions, "deletions": deletions, "diff_id": diff_id})
+        await emit({"type": "code_file_diff", "filename": demo_filename, "language": "html", "additions": additions, "deletions": deletions, "diff_lines": diff_lines, "content": demo_content})
+        await emit({"type": "diff_created", "diff_id": diff_id, "file": demo_filename, "diff_lines": diff_lines, "additions": additions, "deletions": deletions})
+        await emit({"type": "artifact_created", "files": [demo_filename]})
+        await emit({"type": "complete"})
+        activities_demo = [{"kind": "plan", "text": s} for s in demo_steps] + [{"kind": "edit", "file": demo_filename, "filename": demo_filename, "additions": additions, "deletions": deletions, "diff_lines": diff_lines}]
+        return {"response": "Demo build complete — set NVIDIA_API_KEY in .env for real generation. This sample shows the full live workflow.", "code": demo_content, "language": "html", "files": {demo_filename: demo_content}, "file_languages": {demo_filename: "html"}, "show_preview": True, "activities": activities_demo, "activity_summary": {"commands": 1, "files_edited": 1, "files_viewed": 0, "notes": len(demo_steps)}, "plan": demo_steps, "diffs": [{"diff_id": diff_id, "file": demo_filename, "additions": additions, "deletions": deletions, "diff_lines": diff_lines}]}, []
     reasoning_level = request.reasoning_level
     model_key = resolve_code_model_key(request.model)
     config = get_code_thinking_config(reasoning_level)
