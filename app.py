@@ -113,8 +113,8 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
 # NVIDIA's current text LLM-APIs catalog and use the standard synchronous
 # chat-completions interface, matching what ChatNVIDIA expects.
 CODE_MODEL_MAP = {
-    "fast": "google/gemma-4-31b-it",
-    "medium": "meta/muse-glimmer-30b",
+    "fast": "deepseek-ai/deepseek-v4-flash",
+    "medium": "minimaxai/minimax-m3",
     "strong": "nvidia/nemotron-3-ultra-550b-a55b",
 }
 DEFAULT_CODE_MODEL = "medium"
@@ -669,8 +669,16 @@ def resolve_code_model_key(model: str) -> str:
 # Tunables
 # ---------------------------------------------------------------------------
 MAX_AGENT_STEPS = 8                # hard cap on tool-call turns per user message
-CODE_MAX_FILE_CHARS = 20000        # per-file cap on what the model may write
-CODE_READ_CHAR_LIMIT = 8000        # how much of a file is handed back on read_file
+# CODE_MAX_FILE_CHARS was 20000 — far below what a single legitimate file (e.g. a
+# full CSS design system, or a data-heavy component) can need, and far below what
+# the model's own max_tokens budget (up to 65536 tokens, ~4 chars/token) already
+# allows for a turn. Hitting the old cap didn't just clip the display — it sliced
+# the file mid-statement and saved that broken, truncated text as the file's real
+# content, so a subsequent read_file / edit_file or the live preview saw invalid
+# code. Raised to a value that only acts as a last-resort safety backstop against
+# a truly runaway completion, not a routine limit that fires on normal output.
+CODE_MAX_FILE_CHARS = 200000       # per-file cap on what the model may write
+CODE_READ_CHAR_LIMIT = 40000       # how much of a file is handed back on read_file
 THINK_BUDGET_FRACTION = 0.55       # same guard as before: abort a turn if the
 THINK_CHARS_PER_TOKEN = 4          # model is still "thinking" past this share
                                     # of budget with no visible answer yet.
@@ -1167,7 +1175,17 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                         "additions": additions, "deletions": deletions})
             await emit({"type": "activity_complete", "action": act, "file": path})
 
-            transcript.append(AIMessage(content=raw))
+            # Keep the THOUGHT (useful, tiny) but drop the file body from what gets
+            # replayed into future steps — file_store already has the authoritative
+            # content, reachable cheaply via read_file if the model needs it again.
+            # Without this, every subsequent step in the same run re-sends every
+            # file written so far as prompt context: turn 4 re-pays for turns 1-3's
+            # full file bodies, turn 5 re-pays for 1-4's, etc. That cost scales with
+            # both MAX_AGENT_STEPS and CODE_MAX_FILE_CHARS, and was the real source
+            # of wasted tokens — not the completion-side max_tokens ceiling, which
+            # is just a cap and isn't spent unless the model actually generates
+            # that much.
+            transcript.append(AIMessage(content=f"THOUGHT: {thought}\nACTION: {action}\nPATH: {path}"))
             transcript.append(HumanMessage(content=f"TOOL RESULT: {path} saved ({additions} additions, {deletions} deletions)."))
             continue
 
@@ -1290,6 +1308,20 @@ async def stream_code_agent(request: Any, session: dict, session_id: str):
         async for event in _forward_with_heartbeat(task, queue):
             etype = event.get("type")
             if etype == "agent_message":
+                # Per-turn "what I'm about to do" narration — belongs in the
+                # activity/thinking panel, never in the main answer bubble.
+                # Forward it under its own event type so the frontend can
+                # route it correctly (see the matching frontend fix).
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            elif etype == "final_message":
+                # This is the REAL, user-facing answer for the turn. It used
+                # to be sent only as a bare 'final_message' event that the
+                # frontend had no handler for (silently dropped), while
+                # agent_message's short THOUGHT text was sent on this
+                # 'message'/assistant_message channel instead — swapping
+                # which text the user actually saw as the reply. Send the
+                # real answer on the channel the frontend renders as the
+                # visible response.
                 emitted_content = True
                 text = event.get("text", "")
                 if text:
@@ -1298,7 +1330,7 @@ async def stream_code_agent(request: Any, session: dict, session_id: str):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             elif etype in ("plan_created", "activity_start", "activity_complete", "activity_error",
                            "file_read", "file_created", "file_edited", "file_deleted",
-                           "diff_created", "artifact_created", "final_message", "complete"):
+                           "diff_created", "artifact_created", "complete"):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         result, transcript = await task
     except asyncio.TimeoutError:
