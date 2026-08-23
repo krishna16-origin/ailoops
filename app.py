@@ -844,49 +844,77 @@ def parse_agent_turn(raw: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Live stream watcher: fires exactly one cosmetic, best-effort early ping —
-# a legacy 'code_file_start' event the moment the partial stream reveals this
-# turn is an edit_file/create_file for a known path, so the frontend's per-
-# file tab can appear before the full diff is ready. Deliberately does
-# nothing else (no thought streaming, no activity_start) so there is exactly
-# one source of truth for every other event: the main loop, once it parses
-# the COMPLETE response with parse_agent_turn(). A watcher that never fires
-# (unusual formatting, non-streaming mode) is harmless — the frontend already
-# creates the file tab defensively when code_file_diff arrives with no prior
-# code_file_start.
+# Live stream watcher, two phases:
+#   1. "locating" — buffers text until the partial stream reveals an
+#      edit_file/create_file ACTION, a PATH, and the opening code fence, then
+#      fires a legacy 'code_file_start' event so the frontend's per-file tab
+#      appears immediately.
+#   2. "streaming" — every token after that is file content. It's forwarded
+#      live as 'code_delta' events so the panel fills in smoothly as the
+#      model generates it, instead of staying empty until the whole turn
+#      finishes. Stops the moment the closing ``` fence appears (anything
+#      after that, like the next turn's explanation text, isn't file content).
+#      The main loop's parse_agent_turn() on the COMPLETE response remains the
+#      single source of truth for the final content/diff (code_file_diff),
+#      so a watcher that misfires or never fires is harmless either way — the
+#      frontend already creates the file tab defensively when code_file_diff
+#      arrives with no prior code_file_start.
 # ---------------------------------------------------------------------------
-_ACTION_LINE_RE = re.compile(r"ACTION:\s*(?P<action>\w+)", re.IGNORECASE)
+_ACTION_LINE_RE = re.compile(r"ACTION:\s*(?P<action>\w+)\s*\n", re.IGNORECASE)
 _PATH_LINE_RE = re.compile(r"PATH:\s*(?P<path>[^\n]+)\n", re.IGNORECASE)
 _FENCE_OPEN_RE = re.compile(r"```(?P<lang>[A-Za-z0-9_+#.-]*)[ \t]*\n")
 
 
 def make_agent_stream_watcher(progress):
-    state = {"buffer": "", "done": False}
+    state = {"buffer": "", "locating": True, "done": False}
 
     async def watcher(text: str) -> None:
         if state["done"] or not text:
             return
         state["buffer"] += text
-        if len(state["buffer"]) > 4000:
-            # No header ever this large — give up watching this turn rather
-            # than let the buffer grow for the rest of a long file body.
+
+        if state["locating"]:
+            if len(state["buffer"]) > 4000:
+                # No header ever this large — give up watching this turn rather
+                # than let the buffer grow for the rest of a long file body.
+                state["done"] = True
+                return
+            am = _ACTION_LINE_RE.search(state["buffer"])
+            if not am:
+                return
+            action = am.group("action").lower()
+            if action not in ("edit_file", "create_file"):
+                state["done"] = True
+                return
+            pm = _PATH_LINE_RE.search(state["buffer"])
+            fm = _FENCE_OPEN_RE.search(state["buffer"])
+            if not pm or not fm:
+                return
+            path = pm.group("path").strip().strip("`")
+            language = (fm.group("lang") or "text").lower()
+            await publish_event(progress, {"type": "code_file_start", "filename": path, "language": language})
+            # Whatever arrived after the opening fence in this same chunk is
+            # already file content — carry it straight into phase 2 so no
+            # tokens are lost between spotting the header and streaming.
+            state["buffer"] = state["buffer"][fm.end():]
+            state["locating"] = False
+            if not state["buffer"]:
+                return
+
+        # Streaming phase: hold back a couple of trailing chars each time, in
+        # case a closing ``` fence lands split across this chunk and the next.
+        close_idx = state["buffer"].find("```")
+        if close_idx != -1:
+            content = state["buffer"][:close_idx]
+            if content:
+                await publish_event(progress, {"type": "code_delta", "text": content})
             state["done"] = True
             return
-        am = _ACTION_LINE_RE.search(state["buffer"])
-        if not am:
-            return
-        action = am.group("action").lower()
-        if action not in ("edit_file", "create_file"):
-            state["done"] = True
-            return
-        pm = _PATH_LINE_RE.search(state["buffer"])
-        fm = _FENCE_OPEN_RE.search(state["buffer"])
-        if not pm or not fm:
-            return
-        path = pm.group("path").strip().strip("`")
-        language = (fm.group("lang") or "text").lower()
-        await publish_event(progress, {"type": "code_file_start", "filename": path, "language": language})
-        state["done"] = True
+        hold_back = min(len(state["buffer"]), 2)
+        send_len = len(state["buffer"]) - hold_back
+        if send_len > 0:
+            await publish_event(progress, {"type": "code_delta", "text": state["buffer"][:send_len]})
+            state["buffer"] = state["buffer"][send_len:]
 
     return watcher
 
@@ -1182,7 +1210,7 @@ async def stream_code_agent(request: Any, session: dict, session_id: str):
                 text = event.get("text", "")
                 if text:
                     yield f"data: {json.dumps({'type': 'message', 'assistant_message': text, 'conversation_id': session_id, 'session_id': session_id}, ensure_ascii=False)}\n\n"
-            elif etype in ("code_file_start", "code_file_diff", "AGENT_HEARTBEAT"):
+            elif etype in ("code_file_start", "code_delta", "code_file_diff", "AGENT_HEARTBEAT"):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             elif etype in ("plan_created", "activity_start", "activity_complete", "activity_error",
                            "file_read", "file_created", "file_edited", "file_deleted",
