@@ -1974,6 +1974,13 @@
                                     // Claude.ai instead of a synthesized step-by-step log.
                                 } else if (parsed.type === 'thought') {
                                     appendLiveThought(parsed.text);
+                                } else if (parsed.type === 'agent_message' && mode === 'code') {
+                                    // Per-turn "what I'm about to do" narration from the
+                                    // code agent — goes in the activity/thinking panel,
+                                    // never in the main answer bubble (that's the
+                                    // 'message'/assistant_message branch below, which now
+                                    // only carries the real final_message answer).
+                                    if (parsed.text) addThought(parsed.text, parsed.text, 'note');
                                 } else if (parsed.type === 'plan_created' && mode === 'code') {
                                     // Claude-like plan: show steps early in the activity feed before edits stream
                                     if (workflowEl && Array.isArray(parsed.steps) && parsed.steps.length) {
