@@ -101,8 +101,16 @@ paper/minimal
 futuristic technical
 agency/grid
 product-focused
+warm/organic
+retro-modern
+neo-brutalist print
+luxury/editorial-serif
+playful/toylike
+monochrome-graphic
 
 Do not mix several visual languages unless the combination is intentional.
+
+Do not default to the same visual language every time. Before picking one, briefly consider at least 2-3 candidates from the list above that could fit the purpose/audience, and choose deliberately based on the project's content, industry, and tone rather than habit. If the last few builds in this conversation used "dark glass" or "clean SaaS," actively favor a different direction unless the user's brand or request specifically calls for continuity.
 
 4. Layout system
 
@@ -154,11 +162,33 @@ Typography should communicate the product/story.
 
 Define colors as tokens instead of scattering arbitrary values throughout the code.
 
-
-
 Then use those tokens consistently.
 
 Accent colors should communicate hierarchy or state, not decorate every element.
+
+Do not default to the same palette on every build. Never reach for blue/purple gradients, teal-on-navy, or indigo/violet accents as the automatic default — these are the most overused "AI-generated" combinations. Before choosing colors, pick a palette strategy deliberately based on the project, for example:
+
+monochromatic (one hue, varied in lightness/saturation)
+analogous (neighboring hues)
+complementary or split-complementary
+triadic
+warm neutral / earthy (clay, sand, olive, rust)
+cool neutral / muted (stone, sage, slate)
+jewel tones (emerald, amber, burgundy, deep teal)
+duotone (two strong colors, minimal middle ground)
+high-contrast mono + single accent (black/white/off-white + one deliberate accent)
+saturated/vibrant (when the brand calls for energy)
+pastel/soft (when the brand calls for approachability)
+
+Derive the palette from the product's purpose, industry, and audience, not from habit. A fintech dashboard, a children's app, a fashion brand, and a developer tool should not converge on the same colors.
+
+Within a single conversation, actively vary the palette strategy across different builds/projects. If a prior build in this session used a dark-navy-plus-purple system, the next unrelated build should not reuse that same hue family or gradient direction unless the user is iterating on the same project or explicitly asked to match existing branding.
+
+Always define at least: a background scale (2-3 steps), a text scale (primary/secondary/muted), one or two accent colors tied to specific meaning (primary action, success, warning, error), and border/divider colors — as tokens, not ad hoc hex codes sprinkled through markup.
+
+Avoid faded, washed-out, low-saturation palettes as the default. Unless the brand/content explicitly calls for a soft, pastel, or muted mood, prefer confident, saturated color: rich jewel tones, punchy brights, deep saturated darks, bold high-contrast combinations. Build multi-color systems rather than one washed-out hue doing all the work — typically a primary, a secondary, and one or two supporting accents that are visibly distinct from each other, not just tints/shades of the same dull gray-blue.
+
+Quick self-check: if every color in the palette could pass for "off-white," "light gray," or "dusty blue-gray," the palette is too faded — increase saturation and contrast before finalizing.
 
 7. Glass UI
 
@@ -697,6 +727,44 @@ Before considering a website finished:
 [ ] Mobile checked
 [ ] Final visual inspection completed
 
+31. Variation & anti-repetition rule
+
+Treat every new build (a new project, or an unrelated feature within the same project) as a fresh creative decision, not a template to reuse from the last output.
+
+Before generating, briefly decide and vary, on purpose, across builds:
+
+art direction (see section 3 — do not repeat the last one used)
+color palette strategy (see section 6 — do not repeat the last hue family/gradient)
+layout composition (asymmetric grid vs. split vs. framed vs. editorial vs. full-bleed — do not default to the same one)
+typography pairing (do not always reach for the same display/body combination)
+corner and border treatment (sharp vs. soft vs. mixed — do not default to rounded-everything)
+
+Exceptions — do NOT vary for the sake of varying when:
+
+the user is iterating on/continuing the same project (match existing tokens, direction, and components)
+the user gives explicit brand guidelines, a reference, or existing design system to follow
+the user explicitly asks to reuse a previous style
+
+When in doubt about whether a request is a continuation or a new project, prefer continuity within the same file/codebase and prefer variation across clearly separate/unrelated requests.
+
+The goal is that two different builds produced in this tool should not visually look like they came from the same template with the text swapped out.
+
+32. Awwwards-tier design bar
+
+When the user asks to build something that stands out, or references "awwwards," "award-winning," "best in class," "top tier," or similar, raise the craft bar above the general baseline in sections 3-31:
+
+Study the visual grammar of Awwwards/FWA/CSSDA-tier sites (via the reference skills where available): a strong single point of view per project, oversized confident typography, deliberately chosen imagery, layered depth, considered micro-interactions, and one or two clear "hero moments" the page is built around — not twenty competing effects.
+
+Include at least one deliberate signature detail per build, appropriate to the product: a custom cursor, an unusual navigation pattern, a distinctive page transition, a textured/grain layer, an unexpected scroll behavior, or a bold color moment. Award-tier work is remembered for one or two specific craft decisions, not generic polish everywhere.
+
+Push color further than a "safe" SaaS palette — use multiple confident colors together (not just one hue plus neutrals), strong contrast, and deliberate color blocking, while still keeping text contrast accessible (see section 27).
+
+Push typography — mix a distinctive display treatment (unusual weight, spacing, size, or typeface pairing) with a clean, restrained body face. Scale should feel intentional and specific to this project, not a generic "big header, medium subhead, small body" default.
+
+Motion should feel premium: eased, staged, and choreographed (see sections 10-11) — not default browser transitions or effects added for their own sake.
+
+Do not sacrifice usability, performance, or accessibility for spectacle. The best award-tier sites are fast and functional as well as visually bold — the craft is in balancing both, not choosing one over the other.
+
 
 
 
@@ -890,8 +958,3 @@ TEST
 VISUAL / FUNCTIONAL VERIFICATION
     ↓
 ITERATE
-
-
-
-
-
