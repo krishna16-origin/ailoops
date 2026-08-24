@@ -103,28 +103,35 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=None)
 
 
-# Three distinct Code-mode models, one per UI tier (Flash / Minimax M3 / Nemotron
-# Ultra). Earlier today these were all collapsed onto one shared model string that
-# was guessed at repeatedly (z-ai/glm-5.2, then moonshotai/kimi-k2.6) without
-# verifying it against NVIDIA's actual catalog — kimi-k2.6 in particular is listed
-# under NVIDIA's Visual Models catalog rather than its plain-text LLM APIs catalog,
-# and 404s for accounts without that entitlement, which is why nothing was
-# generating or streaming. All three models below are confirmed present in
-# NVIDIA's current text LLM-APIs catalog and use the standard synchronous
-# chat-completions interface, matching what ChatNVIDIA expects.
+# Code-mode models — Claude-like picker (code mode only). All models except
+# gemma are Strong tier for long-horizon tasks (full 48k-65k budget). Only
+# gemma stays Fast. Keys match frontend CODE_MODEL_CATALOG values; aliases
+# "fast"/"medium"/"strong" kept for backward compat.
 CODE_MODEL_MAP = {
+    # Fast — only Gemma
+    "gemma": "google/gemma-4-31b-it",
     "fast": "google/gemma-4-31b-it",
+    # Strong — long-horizon capable (all use large completion budget)
+    "glimmer": "meta/muse-glimmer-30b",
     "medium": "meta/muse-glimmer-30b",
+    "ultra": "nvidia/nemotron-3-ultra-550b-a55b",
     "strong": "nvidia/nemotron-3-ultra-550b-a55b",
+    "laguna": "poolside/laguna-xs-2.1",
+    "super": "nvidia/nemotron-3-super-120b-a12b",
+    "step-flash": "stepfun-ai/step-3.7-flash",
 }
-DEFAULT_CODE_MODEL = "medium"
+DEFAULT_CODE_MODEL = "glimmer"
 
 
 def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     """Create the selected Code-mode model. Code mode has its own fast/medium/strong
     tiers, kept separate from Chat mode's Horus/Osiris/Amun-Ra models in get_llm()
-    so the two never collide on the same key."""
+    so the two never collide on the same key. All models except gemma/fast are
+    Strong tier — they keep the full max_tokens budget for long-horizon tasks."""
     model_type_clean = (model_type or DEFAULT_CODE_MODEL).strip().lower()
+    # Gemma is the only Fast model — cap its budget so it stays fast even if UI sends Max
+    if model_type_clean in ("gemma", "fast"):
+        max_tokens = min(max_tokens, 32000)
     model_name = CODE_MODEL_MAP.get(model_type_clean, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
     # IMPORTANT: none of deepseek-v4-flash, minimax-m3, or nemotron-3-ultra-550b-a55b
     # are in langchain_nvidia_ai_endpoints' default-thinking model list (only
