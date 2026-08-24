@@ -1185,6 +1185,8 @@
                 </button>
             `).join('');
                 pickerMoreModelsRow.hidden = true;
+                if (pickerMorePanel) pickerMorePanel.hidden = true;
+                document.getElementById('pickerMainDivider').style.display = 'none';
             }
         }
 
@@ -1241,7 +1243,8 @@
         }
 
         function showMoreModelsScreen() {
-            // Claude-like flyout: keep main panel visible, open side panel
+            if (currentMode !== 'code') return;
+            // Claude-like flyout: keep main panel visible, open side panel - code mode only
             pickerScreenMain.hidden = false;
             pickerScreenLevel.hidden = true;
             renderMoreModelList();
