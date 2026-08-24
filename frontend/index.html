@@ -10,7 +10,9 @@
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
         :root { --bg-main:#212121; --bg-sidebar:#171717; --bg-input:#2f2f2f; --bg-hover:#2f2f2f; --text-primary:#ececec; --text-secondary:#b4b4b4; --accent:#10a37f; --border-color:rgba(255,255,255,0.1); --transition-bezier:cubic-bezier(0.2,0.8,0.2,1); }
         * { box-sizing:border-box; margin:0; padding:0; font-family:'Inter',sans-serif; }
-        body { background-color:var(--bg-main); color:var(--text-primary); display:flex; height:100vh; overflow:hidden; }
+        html { -webkit-text-size-adjust:100%; }
+        body { background-color:var(--bg-main); color:var(--text-primary); display:flex; height:100vh; height:100dvh; min-height:100vh; min-height:100dvh; overflow:hidden; -webkit-tap-highlight-color:transparent; }
+        @supports (height:100dvh) { body { height:100dvh; min-height:100dvh; } }
 
         /* ============== SPLASH SCREEN ============== */
         .splash-screen { position:fixed; inset:0; background-color:var(--bg-main); z-index:9999; display:flex; flex-direction:column; align-items:center; justify-content:center; transition:opacity 0.7s var(--transition-bezier), visibility 0.7s; }
@@ -47,8 +49,19 @@
         @keyframes splashShimmer { 0% { left:-160%; } 55%,100% { left:160%; } }
 
         /* ============== SIDEBAR ============== */
-        .sidebar { width:260px; background-color:var(--bg-sidebar); display:flex; flex-direction:column; padding:10px; border-right:1px solid var(--border-color); transition:width 0.3s var(--transition-bezier), padding 0.3s var(--transition-bezier), opacity 0.3s var(--transition-bezier); overflow-x:hidden; white-space:nowrap; flex-shrink:0; }
+        .sidebar { width:260px; background-color:var(--bg-sidebar); display:flex; flex-direction:column; padding:10px; border-right:1px solid var(--border-color); transition:width 0.3s var(--transition-bezier), padding 0.3s var(--transition-bezier), opacity 0.3s var(--transition-bezier), transform 0.3s var(--transition-bezier); overflow-x:hidden; white-space:nowrap; flex-shrink:0; }
         .sidebar.collapsed { width:0; padding-left:0; padding-right:0; border-right:none; opacity:0; }
+        .sidebar-backdrop { display:none; }
+        @media (max-width:768px) {
+            .sidebar { position:fixed; inset:0 auto 0 0; width:min(280px, 85vw); max-width:85vw; z-index:45; transform:translateX(0); transition:transform 0.3s var(--transition-bezier), visibility 0.3s; box-shadow:4px 0 24px rgba(0,0,0,0.35); }
+            .sidebar.collapsed { width:min(280px, 85vw); max-width:85vw; padding:10px; border-right:1px solid var(--border-color); opacity:1; transform:translateX(-100%); visibility:hidden; pointer-events:none; }
+            .sidebar-backdrop { position:fixed; inset:0; background:rgba(0,0,0,0.5); backdrop-filter:blur(2px); -webkit-backdrop-filter:blur(2px); z-index:44; opacity:0; visibility:hidden; pointer-events:none; transition:opacity 0.3s var(--transition-bezier), visibility 0.3s; display:block; }
+            .sidebar-backdrop:not([hidden]) { opacity:1; visibility:visible; pointer-events:auto; }
+            .sidebar-backdrop[hidden] { opacity:0; visibility:hidden; pointer-events:none; }
+        }
+        @media (min-width:769px) {
+            .sidebar-backdrop { display:none !important; }
+        }
         .sidebar-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; gap:10px; }
         .icon-btn { background:transparent; border:none; color:var(--text-secondary); cursor:pointer; padding:8px; border-radius:6px; display:flex; align-items:center; justify-content:center; transition:background 0.2s ease, color 0.2s ease, transform 0.15s ease; }
         .icon-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
@@ -430,6 +443,73 @@
         @keyframes modeFadeOut { to { opacity:0; transform:translateY(4px); } }
         @keyframes modeFadeIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
 
+        /* ============== RESPONSIVE: MOBILE + TABLET (<=768px) ============== */
+        @media (max-width: 768px) {
+            /* Header: keep toggle visible on mobile (drawer mode), tighten spacing */
+            .header { height:56px; padding:0 12px; }
+            .header-left { gap:8px; }
+            .sidebar-toggle-main { display:flex !important; opacity:1 !important; transform:scale(1) !important; }
+            .mode-toggle button { padding:6px 10px; font-size:12px; }
+            .mode-toggle button svg { width:13px; height:13px; }
+
+            /* Chat area */
+            .chat-container { -webkit-overflow-scrolling:touch; }
+            .chat-content { padding:16px 12px; padding-bottom:130px; gap:18px; max-width:100%; }
+            .opening-scene { padding:0 16px; }
+            .opening-title { font-size:20px; }
+            .opening-subtitle { font-size:13px; }
+            .message-bubble { max-width:92%; padding:12px 14px; font-size:14.5px; }
+            .assistant .message-bubble { gap:8px; }
+            .assistant-avatar { width:24px; height:24px; }
+
+            /* Input: safe-area, smaller padding, prevent iOS zoom */
+            .input-container { padding:10px 12px max(10px, env(safe-area-inset-bottom)); padding-bottom:max(10px, env(safe-area-inset-bottom)); }
+            .input-box { border-radius:18px; padding:10px 12px; max-width:100%; }
+            .input-box textarea { font-size:16px; max-height:120px; padding:6px 2px; }
+            .composer-toolbar { gap:8px; }
+            .model-picker-btn { font-size:12px; padding:5px 9px 5px 10px; }
+
+            /* Message content */
+            .message-text table { font-size:13px; }
+            .message-text .code-card-header { padding:6px 10px; }
+            .message-text pre { padding:12px; font-size:12px; }
+            .message-text img { max-width:110px; max-height:80px; }
+
+            /* Scroll button sits above shorter mobile input */
+            .scroll-to-bottom-btn { bottom:90px; }
+
+            /* Thinking panel */
+            .thought-live-content { max-height:180px; }
+        }
+
+        @media (max-width: 480px) {
+            .splash-glow { width:200px; height:200px; margin:-100px 0 0 -100px; }
+            .splash-logo-container { width:80px; height:80px; }
+            .header { gap:8px; }
+            .mode-toggle button { padding:5px 9px; font-size:11.5px; }
+            .chat-content { padding:12px 10px; padding-bottom:120px; }
+            .message-bubble { max-width:95%; font-size:14px; }
+            .input-box { padding:9px 10px; }
+            .response-file-card { padding:9px 10px; }
+            .response-file-card-name { font-size:12.5px; }
+        }
+
+        /* Picker + Canvas mobile fixes */
+        @media (max-width: 768px) {
+            .model-picker-panel-wrap { position:fixed; left:12px; right:12px; bottom:86px; top:auto; width:auto; max-width:none; flex-direction:column; align-items:stretch; gap:8px; z-index:46; }
+            .model-picker-panel-wrap .model-picker-panel { width:100%; max-width:none; left:auto; bottom:auto; }
+            .model-picker-panel { width:100%; max-width:none; }
+            .picker-more-panel { width:100%; max-width:none; max-height:50vh; max-height:50dvh; }
+            .picker-row { padding:12px 10px; }
+            .picker-model-row .picker-row-name { font-size:13px; }
+            .response-canvas-body { max-height:50vh; max-height:50dvh; }
+            .response-canvas-preview { height:50vh; height:50dvh; min-height:260px; }
+            .response-canvas-tabs { gap:1px; padding:6px 6px 0; }
+            .response-canvas-tab { padding:5px 8px; font-size:12px; }
+            .message-text table { display:block; width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+            .message-text pre { max-width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+        }
+
     </style>
 </head>
 <body>
@@ -513,6 +593,7 @@
             </div>
         </div>
     </div>
+    <div class="sidebar-backdrop" id="sidebarBackdrop" hidden onclick="toggleSidebar()"></div>
 
     <div class="main-content">
         <div class="header">
@@ -953,6 +1034,7 @@
         let isPinnedToBottom = true;
 
         const sidebar = document.getElementById('sidebar');
+        const sidebarBackdrop = document.getElementById('sidebarBackdrop');
         const chatContainer = document.getElementById('chatContainer');
         const chatContent = document.getElementById('chatContent');
         const scrollToBottomBtn = document.getElementById('scrollToBottomBtn');
@@ -964,7 +1046,13 @@
         const modeToggle = document.getElementById('modeToggle');
         const chatSettings = document.getElementById('chatSettings');
         const codeSettings = document.getElementById('codeSettings');
-        function toggleSidebar() { sidebar.classList.toggle('collapsed'); }
+        function syncSidebarBackdrop() {
+            if (!sidebarBackdrop) return;
+            const isMobile = window.innerWidth <= 768;
+            if (!isMobile) { sidebarBackdrop.hidden = true; return; }
+            sidebarBackdrop.hidden = sidebar.classList.contains('collapsed');
+        }
+        function toggleSidebar() { sidebar.classList.toggle('collapsed'); syncSidebarBackdrop(); }
 
         // ============== MODEL / EFFORT PICKER ==============
         // #modelType / #tempSetting / #codeModel / #codeReasoningLevel (down in the
@@ -2248,6 +2336,20 @@
             }
         }
 
+        function initResponsiveSidebar() {
+            if (window.innerWidth <= 768) {
+                sidebar.classList.add('collapsed');
+            }
+            syncSidebarBackdrop();
+        }
+        window.addEventListener('resize', syncSidebarBackdrop);
+        // Close drawer on Escape
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && window.innerWidth <= 768 && !sidebar.classList.contains('collapsed')) {
+                toggleSidebar();
+                closeModelPicker();
+            }
+        });
         window.onload = () => {
             setTimeout(() => {
                 const splash = document.getElementById('splashScreen');
@@ -2255,9 +2357,10 @@
                     splash.classList.add('hidden');
                     setTimeout(() => splash.style.display = 'none', 700);
                 }
-                document.getElementById('userInput').focus();
+                if (window.innerWidth > 768) document.getElementById('userInput').focus();
             }, 2100);
             updateModelPickerLabel();
+            initResponsiveSidebar();
         };
     </script>
 </body>
