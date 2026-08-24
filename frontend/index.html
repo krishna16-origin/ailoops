@@ -374,6 +374,24 @@
         .picker-level-row { font-size:14px; }
         .picker-badge { font-size:10px; color:var(--text-secondary); background-color:rgba(255,255,255,0.08); padding:2px 6px; border-radius:5px; margin-left:8px; }
 
+        /* Claude-like flyout for More models — code mode only. Appears to the right of the main panel like in the screenshot (Sonnet 5 > More models > Opus/Fable list). */
+        .model-picker-panel-wrap { position:absolute; left:0; bottom:calc(100% + 10px); display:flex; gap:8px; align-items:flex-end; z-index:30; }
+        .model-picker-panel-wrap[hidden] { display:none; }
+        .model-picker-panel-wrap .model-picker-panel { position:relative; left:auto; bottom:auto; }
+        .picker-more-panel { width:320px; background-color:#262626; border:1px solid var(--border-color); border-radius:14px; box-shadow:0 10px 38px rgba(0,0,0,0.45); padding:6px; animation:pickerPopIn 0.16s var(--transition-bezier); max-height:380px; overflow-y:auto; }
+        .picker-more-panel[hidden] { display:none; }
+        .picker-more-header { font-size:12px; font-weight:600; color:var(--text-secondary); letter-spacing:0.04em; text-transform:uppercase; padding:8px 10px 6px; }
+        .picker-more-item { display:flex; align-items:center; justify-content:space-between; width:100%; background:transparent; border:none; text-align:left; padding:9px 10px; border-radius:9px; cursor:pointer; transition:background 0.15s ease; }
+        .picker-more-item:hover { background-color:var(--bg-hover); }
+        .picker-more-item-left { display:flex; flex-direction:column; gap:2px; min-width:0; }
+        .picker-more-item-name { font-size:14px; font-weight:500; color:var(--text-primary); display:flex; align-items:center; gap:6px; }
+        .picker-more-item-desc { font-size:12px; color:var(--text-secondary); }
+        .picker-more-badges { display:flex; align-items:center; gap:6px; flex-shrink:0; }
+        .picker-badge-strong { font-size:10px; color:#a5b4fc; background:rgba(99,102,241,0.18); border:1px solid rgba(99,102,241,0.3); padding:2px 6px; border-radius:99px; font-weight:600; }
+        .picker-badge-fast { font-size:10px; color:var(--text-secondary); background:rgba(255,255,255,0.08); padding:2px 6px; border-radius:99px; }
+        .picker-badge-long { font-size:10px; color:#6ee7b7; background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.25); padding:2px 6px; border-radius:99px; }
+        .picker-more-check { color:var(--accent); flex-shrink:0; margin-left:8px; }
+
         /* Floating "jump to latest" button — only shown once the user has scrolled
            up away from the bottom during a response, exactly like ChatGPT. Clicking
            it (or scrolling back down manually) re-engages auto-scroll. */
@@ -550,16 +568,21 @@
                             <span id="modelPickerLevel">Medium</span>
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="6 9 12 15 18 9"></polyline></svg>
                         </button>
-                        <div class="model-picker-panel" id="modelPickerPanel" hidden>
+                        <div class="model-picker-panel-wrap" id="modelPickerWrap" hidden>
+                        <div class="model-picker-panel" id="modelPickerPanel">
                             <div class="picker-screen" id="pickerScreenMain">
                                 <div id="pickerModelList"></div>
-                                <div class="picker-divider"></div>
-                                <button type="button" class="picker-row picker-row-nav" onclick="showLevelScreen()">
+                                <div class="picker-divider" id="pickerMainDivider"></div>
+                                <button type="button" class="picker-row picker-row-nav" id="pickerEffortRow" onclick="showLevelScreen()">
                                     <span id="pickerLevelLabel">Temperature</span>
                                     <span class="picker-row-right">
                                         <span id="pickerLevelValue">Medium</span>
                                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="9 6 15 12 9 18"></polyline></svg>
                                     </span>
+                                </button>
+                                <button type="button" class="picker-row picker-row-nav" id="pickerMoreModelsRow" onclick="showMoreModelsScreen()" hidden>
+                                    <span>More models</span>
+                                    <span class="picker-row-right"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="9 6 15 12 9 18"></polyline></svg></span>
                                 </button>
                             </div>
                             <div class="picker-screen" id="pickerScreenLevel" hidden>
@@ -570,6 +593,11 @@
                                 <p class="picker-level-desc" id="pickerLevelDesc"></p>
                                 <div id="pickerLevelList"></div>
                             </div>
+                        </div>
+                        <div class="picker-more-panel" id="pickerMorePanel" hidden>
+                            <div class="picker-more-header">More models</div>
+                            <div id="pickerMoreModelList"></div>
+                        </div>
                         </div>
                     </div>
                     <button class="send-btn" id="sendBtn" onclick="sendMessage()">
@@ -600,9 +628,15 @@
                 <option value="max">Max</option>
             </select>
             <select id="codeModel">
+                <option value="gemma">Gemma-4</option>
                 <option value="fast">Gemma-4</option>
-                <option value="medium" selected>Muse Glimmer</option>
+                <option value="glimmer" selected>Muse Glimmer</option>
+                <option value="medium">Muse Glimmer</option>
+                <option value="ultra">Nemotron Ultra</option>
                 <option value="strong">Nemotron Ultra</option>
+                <option value="laguna">Laguna XS 2.1</option>
+                <option value="super">Nemotron Super</option>
+                <option value="step-flash">Step 3.7 Flash</option>
             </select>
             <select id="codeReasoningLevel">
                 <option value="low">Low</option>
@@ -936,6 +970,7 @@
         // #modelType / #tempSetting / #codeModel / #codeReasoningLevel (down in the
         // composer, hidden) remain the single source of truth sendMessage() reads —
         // this picker only renders their current state and writes back to them.
+        // Code mode uses Claude-like layout: main panel shows current model + Effort + More models flyout.
         const MODEL_OPTIONS = {
             chat: [
                 { value: 'fast', name: 'Horus', desc: 'Fastest for quick answers' },
@@ -948,6 +983,15 @@
                 { value: 'strong', name: 'Nemotron Ultra', desc: 'nvidia/nemotron-3-ultra-550b-a55b — strongest, best for hard problems' }
             ]
         };
+        // Claude-style catalog for Code mode only — all except Gemma are Strong + long-horizon
+        const CODE_MODEL_CATALOG = [
+            { value: 'gemma', name: 'Gemma 4', provider: 'Google', desc: 'Gemma-4 31B — fastest', strength: 'fast' },
+            { value: 'glimmer', name: 'Muse Glimmer', provider: 'Meta', desc: 'Most efficient for everyday tasks', strength: 'strong', longHorizon: true },
+            { value: 'ultra', name: 'Nemotron Ultra', provider: 'NVIDIA', desc: 'nvidia/nemotron-3-ultra-550b-a55b — strongest', strength: 'strong', longHorizon: true },
+            { value: 'laguna', name: 'Laguna XS 2.1', provider: 'Poolside', desc: 'poolside/laguna-xs-2.1 — long-horizon code', strength: 'strong', longHorizon: true },
+            { value: 'super', name: 'Nemotron Super', provider: 'NVIDIA', desc: 'nvidia/nemotron-3-super-120b-a12b — long context', strength: 'strong', longHorizon: true },
+            { value: 'step-flash', name: 'Step 3.7 Flash', provider: 'StepFun', desc: 'stepfun-ai/step-3.7-flash — fastest strong', strength: 'strong' }
+        ];
 
         const LEVEL_OPTIONS = {
             chat: {
@@ -977,10 +1021,14 @@
         const CHECK_ICON = '<svg class="picker-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" width="16" height="16"><polyline points="20 6 9 17 4 12"></polyline></svg>';
 
         const modelPicker = document.getElementById('modelPicker');
+        const modelPickerWrap = document.getElementById('modelPickerWrap');
         const modelPickerPanel = document.getElementById('modelPickerPanel');
+        const pickerMorePanel = document.getElementById('pickerMorePanel');
         const pickerScreenMain = document.getElementById('pickerScreenMain');
         const pickerScreenLevel = document.getElementById('pickerScreenLevel');
         const pickerModelList = document.getElementById('pickerModelList');
+        const pickerMoreModelList = document.getElementById('pickerMoreModelList');
+        const pickerMoreModelsRow = document.getElementById('pickerMoreModelsRow');
         const pickerLevelList = document.getElementById('pickerLevelList');
         const modelPickerLabel = document.getElementById('modelPickerLabel');
         const modelPickerLevel = document.getElementById('modelPickerLevel');
@@ -996,17 +1044,50 @@
         }
 
         function updateModelPickerLabel() {
-            const models = MODEL_OPTIONS[currentMode];
+            // Code mode uses CODE_MODEL_CATALOG, Chat uses MODEL_OPTIONS — keeps Claude-like names while chat unchanged
             const field = activeModelField();
-            const match = models.find(m => m.value === field.value);
-            modelPickerLabel.textContent = match ? match.name : models[0].name;
+            let match = null;
+            if (currentMode === 'code') {
+                match = CODE_MODEL_CATALOG.find(m => m.value === field.value);
+                // fallback to alias map for old keys (medium/strong/fast)
+                if (!match) {
+                    const aliasMap = { 'medium':'glimmer', 'strong':'ultra', 'fast':'gemma' };
+                    match = CODE_MODEL_CATALOG.find(m => m.value === (aliasMap[field.value] || ''));
+                }
+            } else {
+                const models = MODEL_OPTIONS[currentMode];
+                match = models.find(m => m.value === field.value);
+                if (!match) match = models[0];
+            }
+            modelPickerLabel.textContent = match ? match.name : (currentMode==='code' ? 'Muse Glimmer' : 'Osiris');
             modelPickerLevel.textContent = currentLevelLabel();
         }
 
         function renderModelList() {
-            const models = MODEL_OPTIONS[currentMode];
             const field = activeModelField();
-            pickerModelList.innerHTML = models.map(m => `
+            if (currentMode === 'code') {
+                // Claude-like: main panel shows ONLY current model (like Sonnet 5 row) + Effort + More models
+                let current = CODE_MODEL_CATALOG.find(m => m.value === field.value);
+                if (!current) {
+                    const aliasMap = { 'medium':'glimmer', 'strong':'ultra', 'fast':'gemma' };
+                    current = CODE_MODEL_CATALOG.find(m => m.value === (aliasMap[field.value] || 'glimmer')) || CODE_MODEL_CATALOG[1];
+                }
+                pickerModelList.innerHTML = `
+                <button type="button" class="picker-row picker-model-row" onclick="selectModel('${current.value}')">
+                    <span class="picker-row-text">
+                        <span class="picker-row-name">${escapeHtml(current.name)}</span>
+                        <span class="picker-row-desc">${escapeHtml(current.desc)}</span>
+                    </span>
+                    ${CHECK_ICON}
+                </button>`;
+                // Show More models row only in code mode
+                pickerMoreModelsRow.hidden = false;
+                document.getElementById('pickerMainDivider').style.display = 'block';
+                // Pre-render flyout list
+                renderMoreModelList();
+            } else {
+                const models = MODEL_OPTIONS[currentMode];
+                pickerModelList.innerHTML = models.map(m => `
                 <button type="button" class="picker-row picker-model-row" onclick="selectModel('${m.value}')">
                     <span class="picker-row-text">
                         <span class="picker-row-name">${escapeHtml(m.name)}</span>
@@ -1015,6 +1096,27 @@
                     ${field.value === m.value ? CHECK_ICON : ''}
                 </button>
             `).join('');
+                pickerMoreModelsRow.hidden = true;
+            }
+        }
+
+        function renderMoreModelList() {
+            const field = activeModelField();
+            pickerMoreModelList.innerHTML = CODE_MODEL_CATALOG.map(m => {
+                const isActive = field.value === m.value;
+                let badges = '';
+                if (m.strength === 'fast') badges += '<span class="picker-badge-fast">Fast</span>';
+                else badges += '<span class="picker-badge-strong">Strong</span>';
+                if (m.longHorizon) badges += '<span class="picker-badge-long">Long horizon</span>';
+                return `
+                <button type="button" class="picker-more-item" onclick="selectModel('${m.value}')">
+                    <span class="picker-more-item-left">
+                        <span class="picker-more-item-name">${escapeHtml(m.name)} ${badges}</span>
+                        <span class="picker-more-item-desc">${escapeHtml(m.desc)}</span>
+                    </span>
+                    ${isActive ? '<span class="picker-more-check">'+CHECK_ICON+'</span>' : ''}
+                </button>`;
+            }).join('');
         }
 
         function renderLevelRowSummary() {
@@ -1038,6 +1140,7 @@
         function showMainScreen() {
             pickerScreenLevel.hidden = true;
             pickerScreenMain.hidden = false;
+            if (pickerMorePanel) pickerMorePanel.hidden = true;
             renderModelList();
             renderLevelRowSummary();
         }
@@ -1045,17 +1148,27 @@
         function showLevelScreen() {
             pickerScreenMain.hidden = true;
             pickerScreenLevel.hidden = false;
+            if (pickerMorePanel) pickerMorePanel.hidden = true;
             renderLevelList();
         }
 
+        function showMoreModelsScreen() {
+            // Claude-like flyout: keep main panel visible, open side panel
+            pickerScreenMain.hidden = false;
+            pickerScreenLevel.hidden = true;
+            renderMoreModelList();
+            pickerMorePanel.hidden = false;
+        }
+
         function openModelPicker() {
-            modelPickerPanel.hidden = false;
+            modelPickerWrap.hidden = false;
             showMainScreen();
             document.addEventListener('click', handleOutsidePickerClick);
         }
 
         function closeModelPicker() {
-            modelPickerPanel.hidden = true;
+            modelPickerWrap.hidden = true;
+            if (pickerMorePanel) pickerMorePanel.hidden = true;
             document.removeEventListener('click', handleOutsidePickerClick);
         }
 
@@ -1065,7 +1178,7 @@
 
         function toggleModelPicker(e) {
             e.stopPropagation();
-            if (modelPickerPanel.hidden) openModelPicker(); else closeModelPicker();
+            if (modelPickerWrap.hidden) openModelPicker(); else closeModelPicker();
         }
 
         function selectModel(value) {
