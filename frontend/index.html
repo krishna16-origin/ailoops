@@ -2181,12 +2181,17 @@
                                 } else if (parsed.type === 'thought') {
                                     appendLiveThought(parsed.text);
                                 } else if (parsed.type === 'agent_message' && mode === 'code') {
-                                    // Per-turn "what I'm about to do" narration from the
-                                    // code agent — goes in the activity/thinking panel,
-                                    // never in the main answer bubble (that's the
-                                    // 'message'/assistant_message branch below, which now
-                                    // only carries the real final_message answer).
-                                    if (parsed.text) addThought(parsed.text, parsed.text, 'note');
+                                    // Claude-like: per-step THOUGHT (what I'll do next) goes to workflow, NOT thinking block.
+                                    // Thinking block is only for live reasoning (`thought` type).
+                                    if (parsed.text && workflowEl) {
+                                        workflowEl.hidden = false;
+                                        const listEl = workflowEl.querySelector('.response-workflow-list');
+                                        const t = parsed.text.trim();
+                                        const isPlan = /^(i'?ll|i will|let'?s|now let'?s|next[, ]|next i'?ll|going to|then i'?ll|first,? i'?ll|i'?m going to)\b/i.test(t);
+                                        const row = createWorkflowRow({ kind: isPlan ? 'plan' : 'note', text: parsed.text });
+                                        listEl.appendChild(row);
+                                        scrollToBottom();
+                                    }
                                 } else if (parsed.type === 'plan_created' && mode === 'code') {
                                     // Claude-like plan: show steps early in the activity feed before edits stream
                                     if (workflowEl && Array.isArray(parsed.steps) && parsed.steps.length) {
@@ -2325,6 +2330,18 @@
                                     const key = parsed.filename || '';
                                     if (currentStreamFileKey === key) currentStreamFileKey = null;
                                     upsertCanvasFile(key, { language: parsed.language || '', additions: parsed.additions || 0, deletions: parsed.deletions || 0, diffLines: parsed.diff_lines || [], content: parsed.content || '', streaming: false });
+                                } else if (parsed.type === 'thought') {
+                                    appendLiveThought(parsed.text);
+                                } else if (parsed.type === 'agent_message' && mode === 'code') {
+                                    if (parsed.text && workflowEl) {
+                                        workflowEl.hidden = false;
+                                        const listEl = workflowEl.querySelector('.response-workflow-list');
+                                        const t = parsed.text.trim();
+                                        const isPlan = /^(i'?ll|i will|let'?s|now let'?s|next[, ]|next i'?ll|going to|then i'?ll|first,? i'?ll|i'?m going to)\b/i.test(t);
+                                        const row = createWorkflowRow({ kind: isPlan ? 'plan' : 'note', text: parsed.text });
+                                        listEl.appendChild(row);
+                                        scrollToBottom();
+                                    }
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
                                 } else if (parsed.assistant_message) {
