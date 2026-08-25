@@ -168,18 +168,52 @@ WEB_SEARCH_MAX_RESULTS = 5
 WEB_IMAGE_SEARCH_MAX_RESULTS = 4
 
 
+def _detect_freshness_params(query: str) -> dict:
+    """Choose Tavily time_range/topic so 'latest/current' queries never return stale cached results."""
+    q = (query or "").lower()
+    params: dict = {}
+    # Very fresh intents -> day
+    if any(k in q for k in ("today", "right now", "rightnow", "weather", "live score", "stock price", "exchange rate")):
+        params["time_range"] = "day"
+    elif any(k in q for k in ("this week", "this-week", "past week", "latest news")):
+        params["time_range"] = "week"
+    elif any(k in q for k in ("latest", "current", "recent", "recently", "this month", "price", "cost", "release", "released")):
+        params["time_range"] = "month"
+    elif re.search(r"\b20[2-9]\d\b", q):
+        # Explicit year mentioned -> allow that year's window but still prefer fresh
+        params["time_range"] = "year"
+    # Topic routing for up-to-date verticals
+    if any(k in q for k in ("news", "headline", "breaking")):
+        params["topic"] = "news"
+    elif any(k in q for k in ("price", "cost", "stock", "exchange", "finance", "nasdaq", "nifty", "sensex", "crypto", "bitcoin")):
+        params["topic"] = "finance"
+    else:
+        params["topic"] = "general"
+    return params
+
+
 def _run_web_search_sync(query: str, max_results: int) -> list:
     if _tavily_client is None:
         return []
-    response = _tavily_client.search(query, max_results=max_results, search_depth="basic")
+    freshness = _detect_freshness_params(query)
+    # Use advanced depth so fresh recency ranking is respected; basic often returns older SEO pages.
+    # Enrich query with current date so the engine biases to 2026 results, not 2023/24 training data.
+    enriched_query = f"{query} (as of {get_current_datetime_str()})"
+    response = _tavily_client.search(
+        enriched_query,
+        max_results=max_results,
+        search_depth="advanced",
+        include_answer=False,
+        **freshness,
+    )
     return [
-        {"title": r.get("title", ""), "href": r.get("url", ""), "body": r.get("content", "")}
+        {"title": r.get("title", ""), "href": r.get("url", ""), "body": r.get("content", ""), "published_date": r.get("published_date", ""), "score": r.get("score", 0)}
         for r in (response.get("results") or [])
     ]
 
 
 async def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> tuple[str, list]:
-    """Perform one search attempt; failures return no search context."""
+    """Perform one search attempt; failures return no search context. Always biases to fresh results."""
     query = (query or "").strip()
     if not query or _tavily_client is None:
         return "", []
@@ -193,10 +227,15 @@ async def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> t
         return "", []
     if not results:
         return "", []
-    lines = [f"Web search results for '{query}' (current date/time: {get_current_datetime_str()}):"]
+    # Freshness-aware header so LLM knows these are 2026 results, not training data
+    freshness = _detect_freshness_params(query)
+    tr = freshness.get("time_range", "fresh")
+    lines = [f"Web search results for '{query}' (current date/time: {get_current_datetime_str()}, time_range={tr}, always prefer these over any outdated prior knowledge):"]
     for index, item in enumerate(results, start=1):
+        pub = item.get("published_date", "") or ""
+        pub_str = f" | Published: {pub}" if pub else ""
         lines.append(
-            f"{index}. {item.get('title', '')}\n"
+            f"{index}. {item.get('title', '')}{pub_str}\n"
             f"   {item.get('body', '')}\n"
             f"   Source: {item.get('href', '')}"
         )
@@ -206,12 +245,17 @@ async def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> t
 def _run_web_image_search_sync(query: str, max_results: int) -> list:
     if _tavily_client is None:
         return []
+    freshness = _detect_freshness_params(query)
+    # Keep images fresh too; don't send topic=finance to image search, only time_range
+    freshness.pop("topic", None)
+    enriched_query = f"{query} (as of {get_current_datetime_str()})"
     response = _tavily_client.search(
-        query,
+        enriched_query,
         max_results=max_results,
-        search_depth="basic",
+        search_depth="advanced",
         include_images=True,
         include_image_descriptions=True,
+        **freshness,
     )
     images = (response.get("images") or [])[:max_results]
     return [
@@ -235,10 +279,28 @@ async def web_image_search(query: str, max_results: int = WEB_IMAGE_SEARCH_MAX_R
 
 
 _WEB_SEARCH_KEYWORDS = (
-    "latest", "current", "currently", "today", "right now", "this week",
-    "this month", "this year", "recent", "recently", "up to date", "up-to-date",
-    "news", "release", "released", "price", "cost", "stock", "exchange rate", "weather",
+    "latest", "current", "currently", "today", "yesterday", "right now", "now", "this week",
+    "this month", "this year", "tomorrow", "recent", "recently", "up to date", "up-to-date",
+    "news", "headline", "headlines", "breaking", "update", "updates", "trending", "live",
+    "release", "released", "launch", "launched", "announcement", "schedule", "calendar",
+    "price", "cost", "rate", "value", "worth", "market", "trading", "stock", "share", "shares",
+    "exchange rate", "exchange", "nifty", "sensex", "nasdaq", "dow", "crypto", "bitcoin", "ethereum",
+    "weather", "forecast", "temperature", "climate",
+    "election", "government", "president", "prime minister", "minister", "governor", "ceo", "founder", "chief",
+    "score", "result", "results", "winner", "champion", "match", "game", "tournament", "olympics", "fifa", "world cup", "ipl",
 )
+
+# Additional regexes for dynamic factual queries that need fresh data even without explicit keyword
+_FRESH_FACT_PATTERNS = (
+    r"\bwho\s+is\s+(the\s+)?(current\s+)?(president|prime\s+minister|ceo|founder|king|queen|pope|chief|captain|coach|manager|owner)\b",
+    r"\bwhat\s+is\s+(the\s+)?current\b",
+    r"\bhow\s+much\s+is\b",
+    r"\bwhat'?s\s+the\s+price\b",
+    r"\b(is|are|does)\s+.*\bstill\b",
+    r"\bwho\s+won\b",
+    r"\bwhat\s+happened\b",
+)
+
 _EXPLICIT_SEARCH_PREFIXES = ("search:", "/search", "search for:", "websearch:", "web search:")
 _BARE_SEARCH_COMMANDS = {
     "websearch", "web search", "search", "do a web search", "please websearch",
@@ -256,7 +318,25 @@ def needs_web_search(message: str) -> bool:
         return True
     if any(keyword in text for keyword in _WEB_SEARCH_KEYWORDS):
         return True
-    return bool(re.search(r"\b20[2-9]\d\b", text))
+    if any(re.search(pat, text) for pat in _FRESH_FACT_PATTERNS):
+        return True
+    # Year mention like 2025/2026 etc needs fresh verify, not hallucinated training data
+    if re.search(r"\b20[2-9]\d\b", text):
+        return True
+    # Question about any year-sensitive fact (e.g., "who is the ...") with question mark and no static knowledge cue -> search
+    if text.endswith("?") and any(w in text for w in ("who", "what", "when", "where", "which", "how much", "how many")):
+        # Only trigger if question likely about changing fact, not static (photosynthesis etc.) — heuristic: contains year-ish or dynamic entity
+        # If question contains no static science keyword, bias to search for freshness
+        static_markers = ("photosynthesis", "define", "meaning of", "what is 2", "math", "formula")
+        if not any(m in text for m in static_markers):
+            # For broad questions, still prefer fresh if it could be time-sensitive; use light check: if question length < ~120 chars and not obviously static, search
+            # This ensures 'who is the president of usa' etc triggers
+            if len(text) < 150:
+                # Check if any dynamic entity present
+                dynamic_entities = ("president", "prime minister", "ceo", "king", "price", "cost", "stock", "score", "weather", "news", "current", "today")
+                if any(e in text for e in dynamic_entities):
+                    return True
+    return False
 
 
 def extract_search_query(message: str) -> str:
@@ -369,6 +449,7 @@ def build_messages(history: List[BaseMessage], thinking_level: str, search_text:
     level_key = normalize_thinking_level(thinking_level)
     config = THINKING_LEVELS[level_key]
     depth = THINKING_DEPTH_INSTRUCTIONS[level_key]
+    curr_dt = get_current_datetime_str()
     system_text = (
         build_constitution_block() + "\n\n"
         "You are a sharp, genuinely helpful assistant with real step-by-step reasoning ability.\n"
@@ -383,11 +464,14 @@ def build_messages(history: List[BaseMessage], thinking_level: str, search_text:
         "good-faith requests; decline anything intended to harm people, violate someone's privacy, or misuse "
         "private data.\n"
         f"Thinking level: {config['label']} — {config['description']}.\n"
-        f"Maximum completion budget: {config['max_tokens']} tokens.\n"
-        f"Current date and time: {get_current_datetime_str()}"
+        f"Current date and time: {curr_dt}. Today is 2026. All answers about current events, prices, news, schedules, people in roles, scores, or any time-sensitive fact MUST be up-to-date as of this date."
     )
     if search_text:
-        system_text += "\n\nUse the following web results only when relevant:\n" + search_text
+        system_text += (
+            "\n\nFRESH WEB SEARCH CONTEXT (up-to-date as of " + curr_dt + "):\n"
+            + search_text
+            + "\n\nCRITICAL: For any factual, time-sensitive, or current-information question (news, prices, stocks, weather, scores, schedules, who holds a role, etc.), you MUST answer SOLELY from the fresh Web Search Results above, NOT from your outdated training data and NOT from older conversation history. If conversation history contains an old price, old news, or old result that conflicts with the Web Search Results, ALWAYS prefer the Web Search Results. Never invent or hallucinate a current price/date/score. If the search results do not contain the answer, say you couldn't find up-to-date info rather than using stale data. Cite sources when you use them."
+        )
     return [SystemMessage(content=system_text), *history[-6:]]
 
 
@@ -1121,16 +1205,23 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         action = turn["action"]
         path = turn["path"]
 
-        if thought:
-            await emit({"type": "agent_message", "text": thought})
-            activities.append({"kind": _classify_note_kind(thought), "text": thought})
-
         if action == "final":
             final_text = turn["content"] or thought or "Done."
+            # Don't emit THOUGHT as live thought bullet for final turn — it would duplicate the answer (e.g., Hello!...).
+            # Keep it in activities for workflow history if distinct, but final answer streams as prose like Claude.
+            if thought:
+                activities.append({"kind": _classify_note_kind(thought), "text": thought})
+                # Only emit as workflow note if distinct from final answer, not as thinking bullet
+                if thought.strip() != final_text.strip():
+                    await emit({"type": "agent_message", "text": thought})
             await emit({"type": "final_message", "text": final_text})
             reached_final = True
             transcript.append(AIMessage(content=raw))
             break
+
+        if thought:
+            await emit({"type": "agent_message", "text": thought})
+            activities.append({"kind": _classify_note_kind(thought), "text": thought})
 
         if action == "read_file":
             existing = file_store.get(path)
