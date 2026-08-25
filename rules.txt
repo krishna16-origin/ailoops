@@ -79,7 +79,7 @@ No unnecessary effects — remove anything that doesn't improve the experience.
 
 
 ---------------------chat mode-------------------------
-understand the user request strongly.
+understand the user request provide best response .
 never hallucinate.
 
 
