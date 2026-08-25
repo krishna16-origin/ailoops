@@ -54,25 +54,12 @@ CODE_THINKING_DEPTH_INSTRUCTIONS = {
     "max": "Plan like a principal engineer working through a genuinely hard problem: weigh each real architectural option fully, question your own assumptions, consider edge cases, and verify the plan before committing. Write the plan as a forward-moving list, never a stream-of-consciousness — but take the space this tier affords you. Once the plan is solid, write the full implementation.",
 }
 
-# Code output needs a much bigger completion budget than a chat answer — a
-# multi-file build (e.g. a Three.js site with several JS/CSS files) can easily
-# run to tens of thousands of tokens of actual code, on top of the <think>
-# planning block. Reusing Chat mode's THINKING_LEVELS (medium=16000) here was
-# letting the model's own planning/explanation prose eat the entire budget
-# before it ever reached a FILE:/fenced code block — producing exactly the
-# "wrote a whole plan, then nothing" failure mode. Code mode gets its own,
-# larger ceiling per tier instead.
-CODE_THINKING_LEVELS = {
-    "low": {"label": "Low", "max_tokens": 16000, "description": "Quick, focused thinking"},
-    "medium": {"label": "Medium", "max_tokens": 32000, "description": "Balanced analysis"},
-    "high": {"label": "High", "max_tokens": 48000, "description": "Deep reasoning"},
-    "extra": {"label": "Extra", "max_tokens": 60000, "description": "Comprehensive analysis"},
-    "max": {"label": "Max", "max_tokens": 65536, "description": "Exhaustive reasoning"},  # NVIDIA's hard per-request ceiling
-}
+# Code mode uses same thinking budgets as Chat mode — normal, no extra long-horizon ceiling.
+CODE_THINKING_LEVELS = THINKING_LEVELS
 
 
 def get_code_thinking_config(level: str) -> dict:
-    """Like get_thinking_config(), but sized for Code mode's much larger completions."""
+    """Return thinking config for Code mode (normal — same as Chat)."""
     return CODE_THINKING_LEVELS[normalize_thinking_level(level)]
 
 
@@ -103,15 +90,10 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=None)
 
 
-# Code-mode models — Claude-like picker (code mode only). All models except
-# gemma are Strong tier for long-horizon tasks (full 48k-65k budget). Only
-# gemma stays Fast. Keys match frontend CODE_MODEL_CATALOG values; aliases
-# "fast"/"medium"/"strong" kept for backward compat.
+# Code-mode models — normal picker (no long-horizon tier, same budget as Chat)
 CODE_MODEL_MAP = {
-    # Fast — only Gemma
     "gemma": "google/gemma-4-31b-it",
     "fast": "google/gemma-4-31b-it",
-    # Strong — long-horizon capable (all use large completion budget)
     "glimmer": "meta/muse-glimmer-30b",
     "medium": "meta/muse-glimmer-30b",
     "ultra": "nvidia/nemotron-3-ultra-550b-a55b",
@@ -124,30 +106,9 @@ DEFAULT_CODE_MODEL = "glimmer"
 
 
 def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
-    """Create the selected Code-mode model. Code mode has its own fast/medium/strong
-    tiers, kept separate from Chat mode's Horus/Osiris/Amun-Ra models in get_llm()
-    so the two never collide on the same key. All models except gemma/fast are
-    Strong tier — they keep the full max_tokens budget for long-horizon tasks."""
+    """Create the selected Code-mode model (normal — same handling as Chat, no long-horizon special case)."""
     model_type_clean = (model_type or DEFAULT_CODE_MODEL).strip().lower()
-    # Gemma is the only Fast model — cap its budget so it stays fast even if UI sends Max
-    if model_type_clean in ("gemma", "fast"):
-        max_tokens = min(max_tokens, 32000)
     model_name = CODE_MODEL_MAP.get(model_type_clean, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
-    # IMPORTANT: none of deepseek-v4-flash, minimax-m3, or nemotron-3-ultra-550b-a55b
-    # are in langchain_nvidia_ai_endpoints' default-thinking model list (only
-    # nvidia/nemotron-3-nano-30b-a3b gets thinking on by default) — verified against
-    # the installed package's _statics.py model table. Thinking must be explicitly
-    # requested per call via the thinking_mode=True invocation kwarg (equivalent to
-    # .with_thinking_mode(enabled=True)); see generate_code_once(). Without it, the
-    # model never opens a <think> block, additional_kwargs['reasoning_content'] stays
-    # empty, and nothing streams to the thinking pane.
-    #
-    # timeout=None: no HTTP/stream time limit, on purpose — code generation should
-    # run to completion no matter how long it takes, rather than being cut off by
-    # a fixed ceiling (flat or scaled) once effort/thinking level climbs. The whole
-    # multi-step run this call sits inside is also unbounded now (see
-    # run_code_agent_once / stream_code_agent below) so nothing above this call
-    # re-imposes a limit either.
     return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=None)
 
 
