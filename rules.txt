@@ -81,7 +81,7 @@ No unnecessary effects — remove anything that doesn't improve the experience.
 ---------------------chat mode-------------------------
 understand the user request strongly.
 never hallucinate.
-use web search for when needed. like if user said 'new' in his input or asked for upto date results must use web search.
+
 
 --use web search for words that mentioned in user input
 latest
