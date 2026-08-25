@@ -970,11 +970,12 @@ def make_agent_stream_watcher(progress):
         state["buffer"] += text
 
         if state["locating"]:
-            if len(state["buffer"]) > 4000:
-                # No header ever this large — give up watching this turn rather
-                # than let the buffer grow for the rest of a long file body.
-                state["done"] = True
-                return
+            # Keep buffer bounded but never silently abort — a long THOUGHT block
+            # before ACTION can easily exceed 4k. Trim head while preserving tail
+            # so header is still found. This matches Claude's instant tab creation.
+            if len(state["buffer"]) > 12000:
+                # Keep last 8000 chars — enough to contain ACTION/PATH/FENCE
+                state["buffer"] = state["buffer"][-8000:]
             am = _ACTION_LINE_RE.search(state["buffer"])
             if not am:
                 return
@@ -982,9 +983,12 @@ def make_agent_stream_watcher(progress):
             if action not in ("edit_file", "create_file"):
                 state["done"] = True
                 return
-            pm = _PATH_LINE_RE.search(state["buffer"])
-            fm = _FENCE_OPEN_RE.search(state["buffer"])
-            if not pm or not fm:
+            # Enforce order: PATH must be after ACTION, fence after PATH
+            pm = _PATH_LINE_RE.search(state["buffer"], am.end())
+            if not pm:
+                return
+            fm = _FENCE_OPEN_RE.search(state["buffer"], pm.end())
+            if not fm:
                 return
             path = pm.group("path").strip().strip("`")
             language = (fm.group("lang") or "text").lower()
@@ -1419,6 +1423,11 @@ async def code_chat(request: CodeChatRequest):
         return StreamingResponse(
             stream_code_agent(request, session, request.session_id),
             media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
         )
     try:
         result = await run_code_agent_once(request, session)
@@ -1453,6 +1462,11 @@ async def chat(request: ChatRequest):
         return StreamingResponse(
             generate_stream(request, session, request.session_id),
             media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
         )
     thinking_steps = []
     try:
