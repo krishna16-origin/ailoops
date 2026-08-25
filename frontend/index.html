@@ -1071,14 +1071,14 @@
                 { value: 'strong', name: 'Nemotron Ultra', desc: 'nvidia/nemotron-3-ultra-550b-a55b — strongest, best for hard problems' }
             ]
         };
-        // Claude-style catalog for Code mode only — all except Gemma are Strong + long-horizon
+        // Normal catalog for Code mode — no long-horizon distinction
         const CODE_MODEL_CATALOG = [
             { value: 'gemma', name: 'Gemma 4', provider: 'Google', desc: 'Gemma-4 31B — fastest', strength: 'fast' },
-            { value: 'glimmer', name: 'Muse Glimmer', provider: 'Meta', desc: 'Most efficient for everyday tasks', strength: 'strong', longHorizon: true },
-            { value: 'ultra', name: 'Nemotron Ultra', provider: 'NVIDIA', desc: 'nvidia/nemotron-3-ultra-550b-a55b — strongest', strength: 'strong', longHorizon: true },
-            { value: 'laguna', name: 'Laguna XS 2.1', provider: 'Poolside', desc: 'poolside/laguna-xs-2.1 — long-horizon code', strength: 'strong', longHorizon: true },
-            { value: 'super', name: 'Nemotron Super', provider: 'NVIDIA', desc: 'nvidia/nemotron-3-super-120b-a12b — long context', strength: 'strong', longHorizon: true },
-            { value: 'step-flash', name: 'Step 3.7 Flash', provider: 'StepFun', desc: 'stepfun-ai/step-3.7-flash — fastest strong', strength: 'strong' }
+            { value: 'glimmer', name: 'Muse Glimmer', provider: 'Meta', desc: 'Most efficient for everyday tasks', strength: 'strong' },
+            { value: 'ultra', name: 'Nemotron Ultra', provider: 'NVIDIA', desc: 'nvidia/nemotron-3-ultra-550b-a55b — strongest', strength: 'strong' },
+            { value: 'laguna', name: 'Laguna XS 2.1', provider: 'Poolside', desc: 'poolside/laguna-xs-2.1', strength: 'strong' },
+            { value: 'super', name: 'Nemotron Super', provider: 'NVIDIA', desc: 'nvidia/nemotron-3-super-120b-a12b', strength: 'strong' },
+            { value: 'step-flash', name: 'Step 3.7 Flash', provider: 'StepFun', desc: 'stepfun-ai/step-3.7-flash', strength: 'strong' }
         ];
 
         const LEVEL_OPTIONS = {
@@ -1197,7 +1197,6 @@
                 let badges = '';
                 if (m.strength === 'fast') badges += '<span class="picker-badge-fast">Fast</span>';
                 else badges += '<span class="picker-badge-strong">Strong</span>';
-                if (m.longHorizon) badges += '<span class="picker-badge-long">Long horizon</span>';
                 return `
                 <button type="button" class="picker-more-item" onclick="selectModel('${m.value}')">
                     <span class="picker-more-item-left">
