@@ -1908,6 +1908,8 @@
                 const merged = Object.assign(existing, patch);
                 canvasFiles.set(key, merged);
                 if (canvasActiveTab === null) canvasActiveTab = key;
+                // Claude-like: show canvas immediately when file starts streaming, not only on click
+                if (canvasEl.hidden) canvasEl.hidden = false;
                 renderCanvasTabs();
                 if (canvasActiveTab === key) renderCanvasBody();
             }
@@ -2205,7 +2207,12 @@
                                     // Append to whatever's already in the panel rather than
                                     // replacing it, so the pane fills in smoothly instead of
                                     // jumping once at the very end of the turn.
-                                    const key = currentStreamFileKey || '';
+                                    let key = currentStreamFileKey;
+                                    if (key === null || key === undefined) {
+                                        const streamingKeys = Array.from(canvasFiles.entries()).filter(([,f])=>f.streaming).map(([k])=>k);
+                                        key = streamingKeys.length ? streamingKeys[streamingKeys.length-1] : '';
+                                    }
+                                    key = key || '';
                                     const existing = canvasFiles.get(key);
                                     const nextContent = (existing && existing.content ? existing.content : '') + (parsed.text || '');
                                     upsertCanvasFile(key, { content: nextContent, streaming: true });
@@ -2287,6 +2294,44 @@
                             } catch (e) {
                                 console.error('Failed to parse SSE chunk:', jsonStr, e);
                             }
+                        }
+                    }
+                    // Flush decoder and handle trailing event without final \n\n (Claude-like: never drop final message)
+                    try { buffer += decoder.decode(); } catch(e) {}
+                    if (buffer && buffer.trim()) {
+                        const trailingEvents = buffer.split('\n\n');
+                        for (const event of trailingEvents) {
+                            const line = event.trim();
+                            if (!line.startsWith('data:')) continue;
+                            const jsonStr = line.slice(5).trim();
+                            if (!jsonStr) continue;
+                            try {
+                                const parsed = JSON.parse(jsonStr);
+                                if (parsed.type === 'code_delta' && mode === 'code') {
+                                    let key = currentStreamFileKey;
+                                    if (key === null || key === undefined) {
+                                        const streamingKeys = Array.from(canvasFiles.entries()).filter(([,f])=>f.streaming).map(([k])=>k);
+                                        key = streamingKeys.length ? streamingKeys[streamingKeys.length-1] : '';
+                                    }
+                                    key = key || '';
+                                    const existing = canvasFiles.get(key);
+                                    const nextContent = (existing && existing.content ? existing.content : '') + (parsed.text || '');
+                                    upsertCanvasFile(key, { content: nextContent, streaming: true });
+                                } else if (parsed.type === 'code_file_start' && mode === 'code') {
+                                    const key = parsed.filename || '';
+                                    currentStreamFileKey = key;
+                                    upsertCanvasFile(key, { language: parsed.language || '', streaming: true });
+                                } else if (parsed.type === 'code_file_diff' && mode === 'code') {
+                                    const key = parsed.filename || '';
+                                    if (currentStreamFileKey === key) currentStreamFileKey = null;
+                                    upsertCanvasFile(key, { language: parsed.language || '', additions: parsed.additions || 0, deletions: parsed.deletions || 0, diffLines: parsed.diff_lines || [], content: parsed.content || '', streaming: false });
+                                } else if (parsed.type === 'code_result') {
+                                    codeResult = parsed;
+                                } else if (parsed.assistant_message) {
+                                    if (!answerStarted) { answerStarted = true; finishThinking(); if (indicatorEl) setThinkingIndicatorState(indicatorEl, 'listening'); }
+                                    assistantFullText += parsed.assistant_message;
+                                }
+                            } catch(e) { console.error('Failed trailing parse:', jsonStr, e); }
                         }
                     }
 
