@@ -313,19 +313,22 @@ _WEB_SEARCH_KEYWORDS = (
     # --- weather ---
     "weather", "forecast", "temperature", "climate",
     # --- people / orgs / roles that change over time ---
-    "election", "government", "president", "prime minister", "minister", "governor", "ceo", "founder", "chief",
+    "election", "government", "president", "prime minister", " pm ", "potus", "minister", "governor", "ceo", "founder", "chief",
     # --- sports ---
     "score", "result", "results", "winner", "champion", "match", "game", "tournament", "olympics", "fifa", "world cup", "ipl",
+    # --- current events / conflict (frequently asked without "news") ---
+    "war", "conflict", "crisis", "attack", "protest", "unrest", "invasion", "ceasefire", "sanctions", "strike",
+    "happening", "situation",
     # --- explicit verification / research asks (from rules.txt's search intent) ---
     "search", "look up", "lookup", "find", "check online", "verify", "research", "browse", "internet",
     "official", "source", "link", "url", "documentation", "docs", "github", "benchmark", "benchmarks",
-    "reviews", "review", "ratings", "rating", "compare", "comparison", "vs", "best", "top",
+    "reviews", "review", "ratings", "rating", "compare", "comparison", "vs", "better than", "best", "top",
     "near me", "nearby", "closest", "open now",
 )
 
 # Additional regexes for dynamic factual queries that need fresh data even without explicit keyword
 _FRESH_FACT_PATTERNS = (
-    r"\bwho\s+is\s+(the\s+)?(current\s+)?(president|prime\s+minister|ceo|founder|king|queen|pope|chief|captain|coach|manager|owner)\b",
+    r"\bwho\s+is\s+(the\s+)?(current\s+)?(president|prime\s+minister|pm|potus|ceo|founder|king|queen|pope|chief|captain|coach|manager|owner)\b",
     r"\bwhat\s+is\s+(the\s+)?current\b",
     r"\bhow\s+much\s+is\b",
     r"\bwhat'?s\s+the\s+price\b",
@@ -356,19 +359,19 @@ def needs_web_search(message: str) -> bool:
     # Year mention like 2025/2026 etc needs fresh verify, not hallucinated training data
     if re.search(r"\b20[2-9]\d\b", text):
         return True
-    # Question about any year-sensitive fact (e.g., "who is the ...") with question mark and no static knowledge cue -> search
-    if text.endswith("?") and any(w in text for w in ("who", "what", "when", "where", "which", "how much", "how many")):
-        # Only trigger if question likely about changing fact, not static (photosynthesis etc.) — heuristic: contains year-ish or dynamic entity
-        # If question contains no static science keyword, bias to search for freshness
+    # Question/statement about a role or topic that changes over time — used to require a
+    # trailing "?", which silently skipped the same request typed without one (e.g. "who is
+    # the pm of india", "how old is joe biden"). Wh-word no longer needs to be followed by "?".
+    if any(w in text for w in ("who is", "who's", "what is", "what's", "when is", "when did", "where is", "how old", "how many", "how much")):
         static_markers = ("photosynthesis", "define", "meaning of", "what is 2", "math", "formula")
-        if not any(m in text for m in static_markers):
-            # For broad questions, still prefer fresh if it could be time-sensitive; use light check: if question length < ~120 chars and not obviously static, search
-            # This ensures 'who is the president of usa' etc triggers
-            if len(text) < 150:
-                # Check if any dynamic entity present
-                dynamic_entities = ("president", "prime minister", "ceo", "king", "price", "cost", "stock", "score", "weather", "news", "current", "today")
-                if any(e in text for e in dynamic_entities):
-                    return True
+        if not any(m in text for m in static_markers) and len(text) < 150:
+            dynamic_entities = (
+                "president", "prime minister", "pm", "potus", "ceo", "king", "queen", "pope",
+                "price", "cost", "stock", "score", "weather", "news", "current", "today",
+                "age", "old is", "captain", "coach", "manager", "owner", "governor", "minister",
+            )
+            if any(e in text for e in dynamic_entities):
+                return True
     return False
 
 
