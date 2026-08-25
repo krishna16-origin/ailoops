@@ -163,7 +163,7 @@ def get_current_datetime_str() -> str:
     return datetime.now(timezone.utc).strftime("%A, %B %d, %Y, %I:%M %p UTC")
 
 
-WEB_SEARCH_TIMEOUT = 9.0
+WEB_SEARCH_TIMEOUT = 15.0
 WEB_SEARCH_MAX_RESULTS = 5
 WEB_IMAGE_SEARCH_MAX_RESULTS = 4
 
@@ -189,20 +189,25 @@ def _detect_freshness_params(query: str) -> dict:
         params["topic"] = "finance"
     else:
         params["topic"] = "general"
+    # Whenever a search is actually being run, always bias toward recent results
+    # by default. Leaving time_range unset lets Tavily rank by pure relevance,
+    # which regularly surfaces old/stale pages (e.g. a 2023 pricing page) ahead
+    # of anything current — this was a root cause of "not up to date" answers
+    # even when the search itself succeeded.
+    params.setdefault("time_range", "year")
     return params
 
 
-def _run_web_search_sync(query: str, max_results: int) -> list:
+def _run_web_search_sync(query: str, max_results: int, search_depth: str = "advanced") -> list:
     if _tavily_client is None:
         return []
     freshness = _detect_freshness_params(query)
-    # Use advanced depth so fresh recency ranking is respected; basic often returns older SEO pages.
     # Enrich query with current date so the engine biases to 2026 results, not 2023/24 training data.
     enriched_query = f"{query} (as of {get_current_datetime_str()})"
     response = _tavily_client.search(
         enriched_query,
         max_results=max_results,
-        search_depth="advanced",
+        search_depth=search_depth,
         include_answer=False,
         **freshness,
     )
@@ -213,18 +218,29 @@ def _run_web_search_sync(query: str, max_results: int) -> list:
 
 
 async def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> tuple[str, list]:
-    """Perform one search attempt; failures return no search context. Always biases to fresh results."""
+    """Perform a search attempt, with a fast fallback to basic depth if advanced
+    depth times out or errors — previously a single advanced-depth call had no
+    fallback, so any timeout/rate-limit/transient error silently produced zero
+    search context and the model fell back to stale training data."""
     query = (query or "").strip()
     if not query or _tavily_client is None:
         return "", []
+    results = []
     try:
         results = await asyncio.wait_for(
-            asyncio.to_thread(_run_web_search_sync, query, max_results),
+            asyncio.to_thread(_run_web_search_sync, query, max_results, "advanced"),
             timeout=WEB_SEARCH_TIMEOUT,
         )
     except Exception as exc:
-        print(f"Web search failed: {exc}")
-        return "", []
+        print(f"Web search (advanced) failed, retrying with basic depth: {exc}")
+        try:
+            results = await asyncio.wait_for(
+                asyncio.to_thread(_run_web_search_sync, query, max_results, "basic"),
+                timeout=WEB_SEARCH_TIMEOUT,
+            )
+        except Exception as exc2:
+            print(f"Web search (basic) failed: {exc2}")
+            return "", []
     if not results:
         return "", []
     # Freshness-aware header so LLM knows these are 2026 results, not training data
@@ -249,10 +265,15 @@ def _run_web_image_search_sync(query: str, max_results: int) -> list:
     # Keep images fresh too; don't send topic=finance to image search, only time_range
     freshness.pop("topic", None)
     enriched_query = f"{query} (as of {get_current_datetime_str()})"
+    # Basic depth on purpose: this runs concurrently with the main text search
+    # (asyncio.gather in chat_context_node) against the same Tavily key/rate
+    # limit. Two simultaneous "advanced" calls made both more likely to time
+    # out or get rate-limited — images are secondary, so give the text search
+    # priority and keep this one cheap and fast.
     response = _tavily_client.search(
         enriched_query,
         max_results=max_results,
-        search_depth="advanced",
+        search_depth="basic",
         include_images=True,
         include_image_descriptions=True,
         **freshness,
@@ -279,15 +300,27 @@ async def web_image_search(query: str, max_results: int = WEB_IMAGE_SEARCH_MAX_R
 
 
 _WEB_SEARCH_KEYWORDS = (
+    # --- time / recency cues ---
     "latest", "current", "currently", "today", "yesterday", "right now", "now", "this week",
     "this month", "this year", "tomorrow", "recent", "recently", "up to date", "up-to-date",
-    "news", "headline", "headlines", "breaking", "update", "updates", "trending", "live",
-    "release", "released", "launch", "launched", "announcement", "schedule", "calendar",
-    "price", "cost", "rate", "value", "worth", "market", "trading", "stock", "share", "shares",
+    "newest", "new version", "real-time", "real time", "live",
+    "news", "headline", "headlines", "breaking", "update", "updates", "trending",
+    "release", "released", "launch", "launched", "announcement", "schedule", "calendar", "version",
+    # --- money / markets ---
+    "price", "pricing", "cost", "rate", "value", "worth", "market", "trading", "stock", "share", "shares",
     "exchange rate", "exchange", "nifty", "sensex", "nasdaq", "dow", "crypto", "bitcoin", "ethereum",
+    "deal", "deals", "discount", "in stock", "availability", "available", "buy",
+    # --- weather ---
     "weather", "forecast", "temperature", "climate",
+    # --- people / orgs / roles that change over time ---
     "election", "government", "president", "prime minister", "minister", "governor", "ceo", "founder", "chief",
+    # --- sports ---
     "score", "result", "results", "winner", "champion", "match", "game", "tournament", "olympics", "fifa", "world cup", "ipl",
+    # --- explicit verification / research asks (from rules.txt's search intent) ---
+    "search", "look up", "lookup", "find", "check online", "verify", "research", "browse", "internet",
+    "official", "source", "link", "url", "documentation", "docs", "github", "benchmark", "benchmarks",
+    "reviews", "review", "ratings", "rating", "compare", "comparison", "vs", "best", "top",
+    "near me", "nearby", "closest", "open now",
 )
 
 # Additional regexes for dynamic factual queries that need fresh data even without explicit keyword
@@ -464,13 +497,27 @@ def build_messages(history: List[BaseMessage], thinking_level: str, search_text:
         "good-faith requests; decline anything intended to harm people, violate someone's privacy, or misuse "
         "private data.\n"
         f"Thinking level: {config['label']} — {config['description']}.\n"
-        f"Current date and time: {curr_dt}. Today is 2026. All answers about current events, prices, news, schedules, people in roles, scores, or any time-sensitive fact MUST be up-to-date as of this date."
+        f"Current date and time: {curr_dt}. Today is 2026. All answers about current events, prices, news, schedules, people in roles, scores, or any time-sensitive fact MUST be up-to-date as of this date.\n"
+        "You do not have your own live web-search tool to call in this mode — the backend already decided "
+        "whether a search was needed and, if so, ran it BEFORE you started answering. If search results appear "
+        "below, they are real and already fetched; if none appear, none were fetched for this turn.\n"
+        "ALWAYS give the user a real, substantive, best-effort answer. Never reply with a bare refusal, a bare "
+        "'I don't have real-time access', or 'I cannot verify this' with nothing else. If you have fresh search "
+        "results, lead with them. If you don't, answer from your own knowledge and add one short caveat that it "
+        "may not reflect the very latest developments — but still answer."
     )
     if search_text:
         system_text += (
-            "\n\nFRESH WEB SEARCH CONTEXT (up-to-date as of " + curr_dt + "):\n"
+            "\n\nFRESH WEB SEARCH CONTEXT (already fetched, up-to-date as of " + curr_dt + "):\n"
             + search_text
-            + "\n\nCRITICAL: For any factual, time-sensitive, or current-information question (news, prices, stocks, weather, scores, schedules, who holds a role, etc.), you MUST answer SOLELY from the fresh Web Search Results above, NOT from your outdated training data and NOT from older conversation history. If conversation history contains an old price, old news, or old result that conflicts with the Web Search Results, ALWAYS prefer the Web Search Results. Never invent or hallucinate a current price/date/score. If the search results do not contain the answer, say you couldn't find up-to-date info rather than using stale data. Cite sources when you use them."
+            + "\n\nCRITICAL: For any factual, time-sensitive, or current-information question (news, prices, stocks, "
+            "weather, scores, schedules, who holds a role, etc.), answer primarily from the fresh Web Search Results "
+            "above, NOT from your outdated training data and NOT from older conversation history. If conversation "
+            "history contains an old price, old news, or old result that conflicts with the Web Search Results, "
+            "ALWAYS prefer the Web Search Results. Never invent or hallucinate a current price/date/score. If the "
+            "results only partially cover the question, answer what they do cover from the results and fill any "
+            "remaining gap with your best general knowledge, clearly noting which part is which — do not simply "
+            "decline to answer. Cite sources when you use them."
         )
     return [SystemMessage(content=system_text), *history[-6:]]
 
