@@ -855,64 +855,92 @@ def _security_block() -> str:
 # ---------------------------------------------------------------------------
 # Skills — extra reference material injected into Code Mode ONLY when the
 # request actually matches, instead of living in rules.txt (which would inject
-# it into every single message, chat or code, 3D or not). Add more skills the
-# same way: a trigger-keyword check + a condensed, actionable content block.
+# it into every single message, chat or code, 3D or not).
+#
+# Skills are plain markdown files under SKILLS_DIR (./skills next to this
+# file). Each one needs a small frontmatter block plus condensed, actionable
+# body content:
+#
+#   ---
+#   name: gsap
+#   triggers: gsap, scrolltrigger, scroll animation, staggered reveal
+#   ---
+#   <the actual skill content the model can act on>
+#
+# To add a new skill or library, just drop a new .md file in skills/ — no
+# code changes needed here. Triggers are matched as case-insensitive
+# substrings against the user's latest message, same as the old hardcoded
+# 3D-only check this replaced (see skills/3d-website.md for that one).
 # ---------------------------------------------------------------------------
-_SKILL_3D_TRIGGERS = (
-    "3d website", "3d site", "3d web", "3d landing", "3d portfolio",
-    "3d experience", "3d scene", "three.js", "threejs", "babylon.js",
-    "babylonjs", "webgl site", "webgl website", "webgl experience",
-)
+SKILLS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+_MAX_SKILLS_PER_TURN = 4  # soft cap so a request matching many keywords at once can't blow up the prompt
+
+_skill_cache: Dict[str, Any] = {"cache_key": None, "skills": []}
 
 
-def _wants_3d_skill(text: str) -> bool:
-    """True only when the request is actually asking for a 3D/WebGL website —
-    a stray '3d' inside an unrelated word won't match since every trigger here
-    is a multi-word phrase or a specific library name."""
+def _parse_skill_file(path: str) -> Optional[dict]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    m = re.match(r"^-{3}\s*\n(?P<front>.*?)\n-{3}\s*\n(?P<body>.*)$", raw, re.DOTALL)
+    if not m:
+        return None
+    meta: Dict[str, str] = {}
+    for line in m.group("front").splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        meta[key.strip().lower()] = value.strip()
+    body = m.group("body").strip()
+    triggers = [t.strip().lower() for t in meta.get("triggers", "").split(",") if t.strip()]
+    if not triggers or not body:
+        return None
+    return {"name": meta.get("name") or os.path.splitext(os.path.basename(path))[0], "triggers": triggers, "body": body}
+
+
+def _load_skills() -> List[dict]:
+    """Load every skills/*.md file, cached until a file is added/edited/removed
+    so new skills are picked up without restarting the server."""
+    try:
+        names = sorted(n for n in os.listdir(SKILLS_DIR) if n.endswith(".md")) if os.path.isdir(SKILLS_DIR) else []
+    except OSError:
+        names = []
+    cache_key = tuple((n, _safe_mtime(os.path.join(SKILLS_DIR, n))) for n in names)
+    if _skill_cache["cache_key"] == cache_key:
+        return _skill_cache["skills"]
+    skills = [s for s in (_parse_skill_file(os.path.join(SKILLS_DIR, n)) for n in names) if s]
+    _skill_cache["cache_key"] = cache_key
+    _skill_cache["skills"] = skills
+    return skills
+
+
+def _safe_mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def _matching_skill_blocks(text: str) -> str:
+    """Concatenate the body of every skill whose trigger phrase appears in the
+    user's latest message (a stray '3d' inside an unrelated word won't match,
+    since triggers are written as multi-word phrases or specific library
+    names). Capped at _MAX_SKILLS_PER_TURN to keep the prompt bounded."""
     low = (text or "").lower()
-    return any(trigger in low for trigger in _SKILL_3D_TRIGGERS)
-
-
-# Condensed from a longer research report on real-time 3D websites. Kept to the
-# parts an LLM code agent writing plain HTML/CSS/JS files can actually act on —
-# framework choice, motion/design language, and performance/accessibility/SEO
-# rules. Deliberately drops the report's case-study catalog, its multi-month
-# learning roadmap, and its course/community links: none of that helps a model
-# generating code in a single pass, and would just burn context.
-SKILL_3D_WEBSITE = """3D WEBSITE SKILL — apply only because this request is for a 3D / WebGL / Three.js / immersive website.
-
-Framework choice:
-- Default to Three.js (MIT, load via ES module import from a CDN like unpkg/jsdelivr) — most flexible and best-supported option for a single-page/static build.
-- Reach for Babylon.js only if the request explicitly needs built-in physics, a full scene GUI, or heavy built-in post-processing.
-- Do not pull in a full game engine (Unity WebGL) or a proprietary SaaS embed (Spline) unless the user explicitly asks for it — both add unnecessary weight or lock-in for a website.
-- Pair Three.js with GSAP + ScrollTrigger for choreographed motion, and native IntersectionObserver for simple reveals — same libraries already called for in the motion-system rules above.
-
-Assets — there is no art pipeline (no Blender/Substance/Draco/KTX2) available here, so:
-- Prefer procedural/primitive geometry (spheres, boxes, torus, custom BufferGeometry, particle systems, extrusions) and code-driven materials/shaders over requiring model files that don't exist.
-- If a real model is genuinely needed and none is supplied, say so and offer a primitive-based placeholder — never fabricate a fake model URL or silently assume an asset exists.
-- If the user does supply or link a model, only rely on glTF/GLB (the open, PBR-capable, web-native format) — never expect FBX/OBJ/USD to just work in-browser without conversion.
-- Keep triangle counts and texture sizes modest by construction (procedural geometry, small canvas-generated or CDN placeholder textures), since there's no runtime compression step available.
-
-Cinematic design & motion — apply the visual-language and motion-system rules above, tuned for 3D:
-- Restrained, low-to-medium saturation palette; soft directional lighting over flat ambient; avoid neon/garish colors.
-- Compose with rule-of-thirds and off-center focal objects; use foreground elements for parallax depth.
-- Camera moves must be slow and purposeful — gentle pans/dolly, never a sudden jolt or uncontrolled shake.
-- Ease-out on entrances, ease-in on exits; major transitions ~300-600ms; avoid perfectly linear motion.
-- Give moving objects anticipation and a slight overshoot/settle rather than a flat linear tween.
-- Small idle motion (gentle float/breathing) is fine; constant busy motion everywhere is not.
-
-Performance, accessibility, SEO — non-negotiable for any 3D build:
-- Render the real headline, body copy, nav, and CTAs as actual HTML first, outside/behind the canvas — the WebGL layer is a progressive enhancement, not the only source of content. Crawlers and non-JS clients see nothing inside a <canvas>.
-- Put a <noscript> fallback with the core headline/summary/CTA inside the canvas container.
-- Label the <canvas> with aria-label/role, and keep primary navigation and calls-to-action as normal HTML controls, never 3D-only interactions.
-- Respect prefers-reduced-motion: reduce — disable or simplify camera moves, parallax, and non-essential animation loops (same reduced-motion rule already required above).
-- Cap devicePixelRatio (Math.min(devicePixelRatio, 2)), pause the render loop when the canvas is off-screen or the tab is hidden, and clean up the renderer/geometries/materials/textures plus any requestAnimationFrame/ScrollTrigger instances on teardown (same WebGL performance and animation-lifecycle rules already required above).
-- On low-power devices or very small viewports, prefer a lighter fallback (fewer particles, lower-res canvas, or a static hero image) over forcing the full scene — 3D must never block the page from being usable."""
+    matched = []
+    for skill in _load_skills():
+        if any(trigger in low for trigger in skill["triggers"]):
+            matched.append(skill["body"])
+        if len(matched) >= _MAX_SKILLS_PER_TURN:
+            break
+    return ("\n\n" + "\n\n".join(matched)) if matched else ""
 
 
 def build_plan_messages(history: List[BaseMessage], file_store: Dict[str, str], reasoning_level: str) -> List[BaseMessage]:
     latest_text = history[-1].content if history else ""
-    skill_block = ("\n\n" + SKILL_3D_WEBSITE) if _wants_3d_skill(latest_text) else ""
+    skill_block = _matching_skill_blocks(latest_text)
     system_text = (
         build_constitution_block() + skill_block + "\n\n"
         "You are the planning stage of an autonomous coding agent. You do not write code here — only a plan.\n"
@@ -946,7 +974,7 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
     level_key = normalize_thinking_level(reasoning_level)
     depth = CODE_THINKING_DEPTH_INSTRUCTIONS[level_key]
     plan_block = "\n".join(f"{i+1}. {s}" for i, s in enumerate(plan_steps)) if plan_steps else "(no plan steps given)"
-    skill_block = ("\n\n" + SKILL_3D_WEBSITE) if _wants_3d_skill(latest_user_text) else ""
+    skill_block = _matching_skill_blocks(latest_user_text)
     return (
         build_constitution_block() + skill_block + "\n\n"
         "You are an autonomous coding agent working in a loop, one tool call per turn. You do not have "
