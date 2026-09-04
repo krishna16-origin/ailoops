@@ -644,7 +644,7 @@
                 <div class="composer-toolbar">
                     <div class="model-picker" id="modelPicker">
                         <button type="button" class="model-picker-btn" id="modelPickerBtn" onclick="toggleModelPicker(event)">
-                            <span id="modelPickerLabel">Osiris</span>
+                            <span id="modelPickerLabel">Kimi K3</span>
                             <span class="model-picker-sep">&middot;</span>
                             <span id="modelPickerLevel">Medium</span>
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="6 9 12 15 18 9"></polyline></svg>
@@ -697,8 +697,8 @@
              now driven by the picker above instead of being shown directly. -->
         <div id="hiddenModelInputs" style="display:none" aria-hidden="true">
             <select id="modelType">
-                <option value="fast">Horus</option>
-                <option value="balanced" selected>Osiris</option>
+                <option value="fast">Deepseek V4 Pro</option>
+                <option value="balanced" selected>Kimi K3</option>
                 <option value="reasoning">Amun-Ra</option>
             </select>
             <select id="tempSetting">
@@ -711,13 +711,13 @@
             <select id="codeModel">
                 <option value="gemma">Gemma-4</option>
                 <option value="fast">Gemma-4</option>
-                <option value="glimmer" selected>Muse Glimmer</option>
-                <option value="medium">Muse Glimmer</option>
+                <option value="glimmer" selected>Kimi K3</option>
+                <option value="medium">Kimi K3</option>
                 <option value="ultra">Nemotron Ultra</option>
                 <option value="strong">Nemotron Ultra</option>
                 <option value="laguna">Laguna XS 2.1</option>
                 <option value="super">Nemotron Super</option>
-                <option value="step-flash">Step 3.7 Flash</option>
+                <option value="step-flash">Deepseek V4 Pro</option>
             </select>
             <select id="codeReasoningLevel">
                 <option value="low">Low</option>
@@ -1061,24 +1061,24 @@
         // Code mode uses Claude-like layout: main panel shows current model + Effort + More models flyout.
         const MODEL_OPTIONS = {
             chat: [
-                { value: 'fast', name: 'Horus', desc: 'Fastest for quick answers' },
-                { value: 'balanced', name: 'Osiris', desc: 'Most efficient for everyday tasks' },
+                { value: 'fast', name: 'Deepseek V4 Pro', desc: 'Fastest for quick answers' },
+                { value: 'balanced', name: 'Kimi K3', desc: 'Most efficient for everyday tasks' },
                 { value: 'reasoning', name: 'Amun-Ra', desc: 'For complex requests' }
             ],
             code: [
                 { value: 'fast', name: 'Gemma', desc: 'Gemma-4 — fastest, best for quick edits' },
-                { value: 'medium', name: 'Muse Glimmer', desc: 'MetaAI — balanced speed and quality' },
+                { value: 'medium', name: 'Kimi K3', desc: 'Moonshot AI — balanced speed and quality' },
                 { value: 'strong', name: 'Nemotron Ultra', desc: 'nvidia/nemotron-3-ultra-550b-a55b — strongest, best for hard problems' }
             ]
         };
         // Normal catalog for Code mode — no long-horizon distinction
         const CODE_MODEL_CATALOG = [
             { value: 'gemma', name: 'Gemma 4', provider: 'Google', desc: 'Gemma-4 31B — fastest', strength: 'fast' },
-            { value: 'glimmer', name: 'Muse Glimmer', provider: 'Meta', desc: 'Most efficient for everyday tasks', strength: 'strong' },
+            { value: 'glimmer', name: 'Kimi K3', provider: 'Moonshot AI', desc: 'Most efficient for everyday tasks', strength: 'strong' },
             { value: 'ultra', name: 'Nemotron Ultra', provider: 'NVIDIA', desc: 'nvidia/nemotron-3-ultra-550b-a55b — strongest', strength: 'strong' },
             { value: 'laguna', name: 'Laguna XS 2.1', provider: 'Poolside', desc: 'poolside/laguna-xs-2.1', strength: 'strong' },
             { value: 'super', name: 'Nemotron Super', provider: 'NVIDIA', desc: 'nvidia/nemotron-3-super-120b-a12b', strength: 'strong' },
-            { value: 'step-flash', name: 'Step 3.7 Flash', provider: 'StepFun', desc: 'stepfun-ai/step-3.7-flash', strength: 'strong' }
+            { value: 'step-flash', name: 'Deepseek V4 Pro', provider: 'DeepSeek', desc: 'deepseek-ai/deepseek-v4-pro', strength: 'strong' }
         ];
 
         const LEVEL_OPTIONS = {
@@ -1147,7 +1147,7 @@
                 match = models.find(m => m.value === field.value);
                 if (!match) match = models[0];
             }
-            modelPickerLabel.textContent = match ? match.name : (currentMode==='code' ? 'Muse Glimmer' : 'Osiris');
+            modelPickerLabel.textContent = match ? match.name : 'Kimi K3';
             modelPickerLevel.textContent = currentLevelLabel();
         }
 
