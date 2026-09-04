@@ -101,6 +101,7 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     # 3 successful builds. Nemotron keeps variable temperature.
     if _is_kimi_or_deepseek_model(model_name):
         temperature = 1.0
+    max_tokens = _clamp_max_tokens(model_name, max_tokens)
     # ChatNVIDIA uses this as the connect/read inactivity timeout. None does
     # not disable the client's default timeout; it leaves the default at 60s.
     # Kimi/DeepSeek reasoning calls can legitimately be quiet for longer while
@@ -134,14 +135,51 @@ def _is_kimi_or_deepseek_model(model_name: str) -> bool:
     return "kimi" in low or "deepseek" in low
 
 
-def _map_reasoning_effort(level: str) -> str:
-    """Map 5-level thinking scale to Kimi/DeepSeek 3-level reasoning_effort."""
+def _is_deepseek_model(model_name: str) -> bool:
+    return "deepseek" in (model_name or "").lower()
+
+
+def _is_kimi_model(model_name: str) -> bool:
+    return "kimi" in (model_name or "").lower()
+
+
+# NVIDIA NIM hard ceilings (docs.api.nvidia.com, 2026-08):
+#   deepseek-v4-pro-0813  max_tokens 1..16384, reasoning_effort: none|high|max
+#   moonshotai/kimi-k3    max_tokens 1..65536, reasoning_effort: low|high|max
+_DEEPSEEK_MAX_TOKENS = 16384
+_KIMI_MAX_TOKENS = 65536
+
+
+def _clamp_max_tokens(model_name: str, max_tokens: int) -> int:
+    """Clamp requested completion budget to the model's NVIDIA NIM limit."""
+    n = max(1, int(max_tokens or 1024))
+    if _is_deepseek_model(model_name):
+        return min(n, _DEEPSEEK_MAX_TOKENS)
+    if _is_kimi_model(model_name):
+        return min(n, _KIMI_MAX_TOKENS)
+    return n
+
+
+def _map_reasoning_effort(level: str, model_name: str = "") -> str:
+    """Map 5-level thinking scale to the effort enum the target model accepts.
+
+    Kimi K3 (NVIDIA + native): low | high | max
+    DeepSeek V4 Pro on NVIDIA NIM: none | high | max  (NOT "low" — invalid → 422)
+    """
     lvl = normalize_thinking_level(level)
+    if _is_deepseek_model(model_name):
+        # NVIDIA NIM DeepSeek rejects "low". Map the lowest tier to "none"
+        # (disable thinking) and keep high/max for deeper tiers.
+        if lvl == "low":
+            return "none"
+        if lvl in ("medium", "high"):
+            return "high"
+        return "max"
+    # Kimi K3 (and any other reasoning_effort consumer)
     if lvl == "low":
         return "low"
     if lvl in ("medium", "high"):
         return "high"
-    # extra / max -> max (best quality for code)
     return "max"
 
 
@@ -161,6 +199,7 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
     model_name = CODE_MODEL_MAP.get(model_type_clean, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
     if _is_kimi_or_deepseek_model(model_name):
         temperature = 1.0
+    max_tokens = _clamp_max_tokens(model_name, max_tokens)
     # The client timeout is an inactivity timeout for streaming, not a total
     # request limit. Keep it above the expected reasoning latency.
     return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=300)
@@ -752,8 +791,10 @@ async def chat_compose_node(request: "ChatRequest", state: dict, progress=None) 
     if _is_kimi_or_deepseek_model(_chat_model_name):
         # Kimi K3 / DeepSeek need reasoning_effort (always thinking) + fixed temperature=1.0
         # (enforced in get_llm). Nemotron keeps thinking_mode.
+        # Effort enum is model-specific (DeepSeek NVIDIA rejects "low").
         response = await invoke_model(
-            _chat_messages, llm, progress, reasoning_effort=_map_reasoning_effort(request.thinking_level)
+            _chat_messages, llm, progress,
+            reasoning_effort=_map_reasoning_effort(request.thinking_level, _chat_model_name),
         )
     else:
         response = await invoke_model(_chat_messages, llm, progress)
@@ -1258,7 +1299,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     # Kimi K3 / DeepSeek need reasoning_effort instead of thinking_mode; Nemotron keeps thinking_mode
     _code_model_name = CODE_MODEL_MAP.get(model_key, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
     _is_kd = _is_kimi_or_deepseek_model(_code_model_name)
-    _kd_effort = _map_reasoning_effort(reasoning_level) if _is_kd else None
+    _kd_effort = _map_reasoning_effort(reasoning_level, _code_model_name) if _is_kd else None
 
     # --- Plan phase -------------------------------------------------------
     # NOTE: floor 8000 (was 4000) — Kimi/DeepSeek thinking models need >=8000
