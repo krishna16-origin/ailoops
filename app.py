@@ -83,6 +83,12 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
         model_name = "deepseek-ai/deepseek-v4-pro-0813"
     elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
+    # Kimi K3 / DeepSeek V4 Pro via NVIDIA NIM require fixed temperature=1.0
+    # (platform.kimi.ai and docs.api.nvidia.com 2026-08-27). Passing 0.2/0.7
+    # returns 400 Bad Request — this was the regression that broke Kimi after
+    # 3 successful builds. Nemotron keeps variable temperature.
+    if _is_kimi_or_deepseek_model(model_name):
+        temperature = 1.0
     # ChatNVIDIA uses this as the connect/read inactivity timeout. None does
     # not disable the client's default timeout; it leaves the default at 60s.
     # Kimi/DeepSeek reasoning calls can legitimately be quiet for longer while
@@ -105,10 +111,34 @@ CODE_MODEL_MAP = {
 DEFAULT_CODE_MODEL = "glimmer"
 
 
+# --- Per-model compatibility helpers (minimal, non-invasive) ---
+# Kimi K3 and DeepSeek V4 Pro via NVIDIA NIM have fixed sampling params.
+# - temperature must be 1.0 (other values return 400) — verified 2026-08-27 docs
+# - Kimi K3 supports reasoning_effort low/high/max (always thinking), not thinking_mode
+# - DeepSeek V4 Pro supports chat_template_kwargs thinking + reasoning_effort
+# Nemotron is native NVIDIA and supports variable temperature + thinking_mode.
+def _is_kimi_or_deepseek_model(model_name: str) -> bool:
+    low = (model_name or "").lower()
+    return "kimi" in low or "deepseek" in low
+
+
+def _map_reasoning_effort(level: str) -> str:
+    """Map 5-level thinking scale to Kimi/DeepSeek 3-level reasoning_effort."""
+    lvl = normalize_thinking_level(level)
+    if lvl == "low":
+        return "low"
+    if lvl in ("medium", "high"):
+        return "high"
+    # extra / max -> max (best quality for code)
+    return "max"
+
+
 def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     """Create the selected Code-mode model (normal — same handling as Chat, no long-horizon special case)."""
     model_type_clean = (model_type or DEFAULT_CODE_MODEL).strip().lower()
     model_name = CODE_MODEL_MAP.get(model_type_clean, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
+    if _is_kimi_or_deepseek_model(model_name):
+        temperature = 1.0
     # The client timeout is an inactivity timeout for streaming, not a total
     # request limit. Keep it above the expected reasoning latency.
     return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=300)
@@ -1192,13 +1222,20 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     config = get_code_thinking_config(reasoning_level)
     llm = get_code_llm(model_key, 0.2, config["max_tokens"])
     max_think_chars = int(config["max_tokens"] * THINK_BUDGET_FRACTION * THINK_CHARS_PER_TOKEN)
+    # Kimi K3 / DeepSeek need reasoning_effort instead of thinking_mode; Nemotron keeps thinking_mode
+    _code_model_name = CODE_MODEL_MAP.get(model_key, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
+    _is_kd = _is_kimi_or_deepseek_model(_code_model_name)
+    _kd_effort = _map_reasoning_effort(reasoning_level) if _is_kd else None
 
     # --- Plan phase -------------------------------------------------------
     plan_steps: List[str] = []
     try:
         plan_messages = build_plan_messages(history, file_store, reasoning_level)
         plan_llm = get_code_llm(model_key, 0.2, min(config["max_tokens"], 4000))
-        plan_text = await invoke_model(plan_messages, plan_llm, None, thinking_mode=False)
+        if _is_kd:
+            plan_text = await invoke_model(plan_messages, plan_llm, None, reasoning_effort=_kd_effort)
+        else:
+            plan_text = await invoke_model(plan_messages, plan_llm, None, thinking_mode=False)
         plan_steps = parse_plan(plan_text)
     except Exception:
         plan_steps = []
@@ -1217,20 +1254,37 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
 
         malformed_retry_note = None
         try:
-            raw = await invoke_model(
-                agent_messages, llm, emit.queue,
-                on_answer_piece=watcher, thinking_mode=True, max_think_chars=max_think_chars,
-            )
+            if _is_kd:
+                raw = await invoke_model(
+                    agent_messages, llm, emit.queue,
+                    on_answer_piece=watcher, reasoning_effort=_kd_effort, max_think_chars=max_think_chars,
+                )
+            else:
+                raw = await invoke_model(
+                    agent_messages, llm, emit.queue,
+                    on_answer_piece=watcher, thinking_mode=True, max_think_chars=max_think_chars,
+                )
         except ThinkingBudgetExceeded:
-            raw = await invoke_model(
-                agent_messages + [SystemMessage(content=(
-                    "Stop planning. Respond immediately in the required THOUGHT/ACTION format with a single "
-                    "concrete action."
-                ))],
-                llm, emit.queue,
-                on_answer_piece=make_agent_stream_watcher(emit.queue),
-                thinking_mode=False,
-            )
+            if _is_kd:
+                raw = await invoke_model(
+                    agent_messages + [SystemMessage(content=(
+                        "Stop planning. Respond immediately in the required THOUGHT/ACTION format with a single "
+                        "concrete action."
+                    ))],
+                    llm, emit.queue,
+                    on_answer_piece=make_agent_stream_watcher(emit.queue),
+                    reasoning_effort=_kd_effort,
+                )
+            else:
+                raw = await invoke_model(
+                    agent_messages + [SystemMessage(content=(
+                        "Stop planning. Respond immediately in the required THOUGHT/ACTION format with a single "
+                        "concrete action."
+                    ))],
+                    llm, emit.queue,
+                    on_answer_piece=make_agent_stream_watcher(emit.queue),
+                    thinking_mode=False,
+                )
 
         turn = parse_agent_turn(raw)
         if turn is None:
@@ -1352,7 +1406,10 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 "You are out of tool-call turns. Respond now with ACTION: final and a short explanation of "
                 "what was accomplished."
             )))
-            raw = await invoke_model(wrap_messages, llm, None, thinking_mode=False)
+            if _is_kd:
+                raw = await invoke_model(wrap_messages, llm, None, reasoning_effort=_kd_effort)
+            else:
+                raw = await invoke_model(wrap_messages, llm, None, thinking_mode=False)
             turn = parse_agent_turn(raw)
             final_text = (turn or {}).get("content") or "Reached the step limit — here's what changed so far."
         except Exception:
