@@ -4,8 +4,19 @@ import re
 import difflib
 import asyncio
 import traceback
+import warnings
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
+
+# Silence the known-benign ChatNVIDIA registry warning for kimi-k3 /
+# deepseek-v4-pro-0813 ("type is unknown and inference may fail"). It fires on
+# every ChatNVIDIA(...) construction even when inference succeeds, and buries
+# the real error lines in deploy logs (e.g. Render).
+warnings.filterwarnings(
+    "ignore",
+    message=".*type is unknown and inference may fail.*",
+    category=UserWarning,
+)
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
