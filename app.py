@@ -3,6 +3,7 @@ import json
 import re
 import difflib
 import asyncio
+import traceback
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -205,11 +206,12 @@ async def _invoke_nvidia_endpoint(
 
     # Non-streaming path (progress is list or None)
     if not isinstance(progress, _asyncio.Queue):
-        # Also used for plan phase (progress=None)
+        # Also used for plan phase (progress=None) — send both max_* for compat across SDK versions
         resp = await client.chat.completions.create(
             model=model_name,
             messages=openai_messages,
             temperature=1.0,
+            max_tokens=max_tokens,
             max_completion_tokens=max_tokens,
             reasoning_effort=reasoning_effort,
             stream=False,
@@ -301,6 +303,7 @@ async def _invoke_nvidia_endpoint(
         model=model_name,
         messages=openai_messages,
         temperature=1.0,
+        max_tokens=max_tokens,
         max_completion_tokens=max_tokens,
         reasoning_effort=reasoning_effort,
         stream=True,
@@ -940,10 +943,19 @@ async def chat_compose_node(request: "ChatRequest", state: dict, progress=None) 
                 _chat_messages, _chat_model_name, config["max_tokens"], request.thinking_level, progress
             )
         except Exception as e:
-            # Fallback to ChatNVIDIA if endpoint fails (keeps Nemotron path working, surfaces real error)
+            import traceback
             print(f"Endpoint {_chat_model_name} failed, falling back to ChatNVIDIA: {e}")
+            traceback.print_exc()
             llm = get_llm(request.model_type, request.temperature, config["max_tokens"])
-            response = await invoke_model(_chat_messages, llm, progress)
+            # ChatNVIDIA fallback for kimi/deepseek needs reasoning_effort as well
+            try:
+                response = await invoke_model(
+                    _chat_messages, llm, progress, reasoning_effort=_map_reasoning_effort(request.thinking_level)
+                )
+            except Exception as e2:
+                print(f"Fallback ChatNVIDIA also failed for {_chat_model_name}: {e2}")
+                traceback.print_exc()
+                raise
     else:
         llm = get_llm(request.model_type, request.temperature, config["max_tokens"])
         response = await invoke_model(_chat_messages, llm, progress)
@@ -1801,6 +1813,7 @@ async def stream_code_agent(request: Any, session: dict, session_id: str):
         yield f'data: {json.dumps({"type": "ERROR", "message": "interrupted"}, ensure_ascii=False)}\n\n'
     except Exception as exc:
         print(f"[{session_id}] Code agent failed: {exc}")
+        traceback.print_exc()
         result = {
             "response": "I could not generate code right now. Please try again.",
             "code": "", "language": "", "files": {}, "file_languages": {}, "show_preview": False,
@@ -1858,6 +1871,7 @@ async def generate_stream(request: ChatRequest, session: dict, session_id: str):
             yield f"data: {json.dumps({'type': 'message', 'assistant_message': final_response, 'conversation_id': session_id, 'session_id': session_id})}\n\n"
     except Exception as exc:
         print(f"[{session_id}] Response generation failed: {exc}")
+        traceback.print_exc()
         final_response = "I could not generate a response right now. Please try again."
         yield f"data: {json.dumps({'type': 'message', 'assistant_message': final_response, 'conversation_id': session_id, 'session_id': session_id})}\n\n"
     reasoning_content = "\n".join(
@@ -1893,6 +1907,7 @@ async def code_chat(request: CodeChatRequest):
         }
     except Exception as exc:
         print(f"[{request.session_id}] Code agent failed: {exc}")
+        traceback.print_exc()
         result = {
             "response": "I could not generate code right now. Please try again.",
             "code": "",
@@ -1925,6 +1940,7 @@ async def chat(request: ChatRequest):
         response = await generate_response_once(request, session, thinking_steps)
     except Exception as exc:
         print(f"[{request.session_id}] Response generation failed: {exc}")
+        traceback.print_exc()
         response = "I could not generate a response right now. Please try again."
     reasoning_content = "\n".join(
         event.get("detail", "") for event in thinking_steps if event.get("detail")
