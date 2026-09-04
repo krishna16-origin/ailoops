@@ -83,11 +83,11 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
         model_name = "deepseek-ai/deepseek-v4-pro-0813"
     elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
-    # timeout=None: no HTTP/stream time limit. A fixed number here — flat or
-    # scaled to max_tokens — still eventually truncates a completion that
-    # legitimately needs longer, which is exactly the bug that was hitting
-    # higher thinking/effort levels. Let generation run as long as it needs to.
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=None)
+    # ChatNVIDIA uses this as the connect/read inactivity timeout. None does
+    # not disable the client's default timeout; it leaves the default at 60s.
+    # Kimi/DeepSeek reasoning calls can legitimately be quiet for longer while
+    # still making progress, so use a generous inactivity window.
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=300)
 
 
 # Code-mode models — normal picker (no long-horizon tier, same budget as Chat)
@@ -109,7 +109,9 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
     """Create the selected Code-mode model (normal — same handling as Chat, no long-horizon special case)."""
     model_type_clean = (model_type or DEFAULT_CODE_MODEL).strip().lower()
     model_name = CODE_MODEL_MAP.get(model_type_clean, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=None)
+    # The client timeout is an inactivity timeout for streaming, not a total
+    # request limit. Keep it above the expected reasoning latency.
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=300)
 
 
 def strip_thinking(text: str) -> str:
