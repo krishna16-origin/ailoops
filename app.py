@@ -142,6 +142,28 @@ def _map_reasoning_effort(level: str) -> str:
 _NVIDIA_ENDPOINT_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 
 
+def _raise_endpoint_error(model_name: str, exc: Exception):
+    """Re-raise endpoint errors with actionable messages for 401/403/400."""
+    msg = str(exc).lower()
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    # openai SDK errors carry .status_code
+    try:
+        from openai import AuthenticationError, PermissionDeniedError, BadRequestError
+        if isinstance(exc, AuthenticationError):
+            raise RuntimeError(f"{model_name}: 401 invalid NVIDIA_API_KEY — check key, expiry, credits") from exc
+        if isinstance(exc, PermissionDeniedError):
+            raise RuntimeError(f"{model_name}: 403 key not entitled to this model (Kimi K3 gated trial) — enable it on build.nvidia.com or use Nemotron") from exc
+        if isinstance(exc, BadRequestError):
+            raise RuntimeError(f"{model_name}: 400 bad request — {exc}") from exc
+    except ImportError:
+        pass
+    if status == 401 or "401" in msg or "unauthorized" in msg:
+        raise RuntimeError(f"{model_name}: 401 invalid NVIDIA_API_KEY — check key, expiry, credits") from exc
+    if status == 403 or "403" in msg or "permission" in msg or "entitled" in msg:
+        raise RuntimeError(f"{model_name}: 403 key not entitled to this model (Kimi K3 gated trial) — enable it on build.nvidia.com or use Nemotron") from exc
+    raise exc
+
+
 def _to_openai_messages(messages: List[BaseMessage]) -> List[dict]:
     """Convert LangChain messages to OpenAI dicts, preserving Kimi's reasoning_content for multi-turn."""
     out: List[dict] = []
@@ -157,18 +179,28 @@ def _to_openai_messages(messages: List[BaseMessage]) -> List[dict]:
             role = getattr(m, "type", "user") or "user"
             if role not in ("system", "user", "assistant"):
                 role = "user"
-        content = getattr(m, "content", "") or ""
-        msg_dict: dict = {"role": role, "content": _coerce_model_text(content)}
+        content = _coerce_model_text(getattr(m, "content", "") or "")
         # Preserve Kimi's reasoning_content for multi-turn (required by docs)
         rc = ""
         try:
             rc = _extract_reasoning(m) or (getattr(m, "additional_kwargs", {}) or {}).get("reasoning_content", "")
+            rc = _coerce_model_text(rc) if rc else ""
         except Exception:
             rc = ""
-        if role == "assistant" and rc:
-            # OpenAI-compatible field used by both Kimi and DeepSeek via NVIDIA
+        # Skip empty user/system messages (400 on strict APIs); keep assistant
+        # turns that carry reasoning_content even if content is empty.
+        if not content.strip() and not (role == "assistant" and rc.strip()):
+            continue
+        msg_dict: dict = {"role": role, "content": content}
+        if role == "assistant" and rc.strip():
+            # OpenAI-compatible field used by both Kimi and DeepSeek via NVIDIA.
+            # Extra keys in message dicts are passed through by the openai SDK.
             msg_dict["reasoning_content"] = rc
         out.append(msg_dict)
+    # Guard: never send empty message list (400). Fall back to last user text.
+    if not out and messages:
+        last = _coerce_model_text(getattr(messages[-1], "content", "") or "") or "Hello"
+        out = [{"role": "user", "content": last}]
     return out
 
 
@@ -204,18 +236,37 @@ async def _invoke_nvidia_endpoint(
 
     client = AsyncOpenAI(base_url=_NVIDIA_ENDPOINT_URL, api_key=api_key, timeout=300.0)
 
+    async def _create_chat(**kwargs):
+        """Create chat completion, falling back to extra_body for old openai SDKs
+        that don't accept reasoning_effort as a top-level kwarg."""
+        try:
+            return await client.chat.completions.create(**kwargs)
+        except TypeError as te:
+            # Old SDK: move reasoning_effort into extra_body
+            if "reasoning_effort" in kwargs and "reasoning_effort" in str(te):
+                kwargs = dict(kwargs)
+                effort = kwargs.pop("reasoning_effort")
+                extra = dict(kwargs.pop("extra_body", {}) or {})
+                extra["reasoning_effort"] = effort
+                kwargs["extra_body"] = extra
+                return await client.chat.completions.create(**kwargs)
+            raise
+
     # Non-streaming path (progress is list or None)
     if not isinstance(progress, _asyncio.Queue):
-        # Also used for plan phase (progress=None) — send both max_* for compat across SDK versions
-        resp = await client.chat.completions.create(
-            model=model_name,
-            messages=openai_messages,
-            temperature=1.0,
-            max_tokens=max_tokens,
-            max_completion_tokens=max_tokens,
-            reasoning_effort=reasoning_effort,
-            stream=False,
-        )
+        # NOTE: send ONLY max_completion_tokens — sending both max_tokens and
+        # max_completion_tokens together returns 400 on OpenAI-compatible APIs.
+        try:
+            resp = await _create_chat(
+                model=model_name,
+                messages=openai_messages,
+                temperature=1.0,
+                max_completion_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                stream=False,
+            )
+        except Exception as e:
+            _raise_endpoint_error(model_name, e)
         choice = resp.choices[0] if resp.choices else None
         msg = getattr(choice, "message", None) if choice else None
         reasoning = getattr(msg, "reasoning_content", "") or (getattr(msg, "reasoning", "") if msg else "")
@@ -299,15 +350,18 @@ async def _invoke_nvidia_endpoint(
                 buffer = buffer[idx + len(tag):]
                 in_thought = False
 
-    stream = await client.chat.completions.create(
-        model=model_name,
-        messages=openai_messages,
-        temperature=1.0,
-        max_tokens=max_tokens,
-        max_completion_tokens=max_tokens,
-        reasoning_effort=reasoning_effort,
-        stream=True,
-    )
+    # NOTE: ONLY max_completion_tokens — sending both max_tokens + max_completion_tokens = 400.
+    try:
+        stream = await _create_chat(
+            model=model_name,
+            messages=openai_messages,
+            temperature=1.0,
+            max_completion_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            stream=True,
+        )
+    except Exception as e:
+        _raise_endpoint_error(model_name, e)
     async for chunk in stream:
         # OpenAI SDK: chunk.choices[0].delta
         try:
@@ -1463,6 +1517,9 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     _kd_effort = _map_reasoning_effort(reasoning_level) if _is_kd else None
 
     # --- Plan phase -------------------------------------------------------
+    # NOTE: floor 8000 (was 4000) — Kimi/DeepSeek thinking models need >=8000
+    # tokens to return full reasoning_content + content without truncation.
+    _plan_tokens = max(8000, min(config["max_tokens"], 8000))
     plan_steps: List[str] = []
     try:
         plan_messages = build_plan_messages(history, file_store, reasoning_level)
@@ -1470,11 +1527,11 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             # Direct endpoint for Kimi/DeepSeek (ChatNVIDIA has unknown type for these)
             try:
                 plan_text = await _invoke_nvidia_endpoint(
-                    plan_messages, _code_model_name, min(config["max_tokens"], 4000), reasoning_level, None
+                    plan_messages, _code_model_name, _plan_tokens, reasoning_level, None
                 )
             except Exception as e:
                 print(f"Plan endpoint failed for {_code_model_name}, fallback to ChatNVIDIA: {e}")
-                plan_llm = get_code_llm(model_key, 0.2, min(config["max_tokens"], 4000))
+                plan_llm = get_code_llm(model_key, 0.2, _plan_tokens)
                 plan_text = await invoke_model(plan_messages, plan_llm, None, reasoning_effort=_kd_effort)
         else:
             plan_llm = get_code_llm(model_key, 0.2, min(config["max_tokens"], 4000))
@@ -1872,6 +1929,8 @@ async def generate_stream(request: ChatRequest, session: dict, session_id: str):
     except Exception as exc:
         print(f"[{session_id}] Response generation failed: {exc}")
         traceback.print_exc()
+        # Surface short actionable error to UI (no keys/tokens), keep generic fallback
+        yield f"data: {json.dumps({'type': 'ERROR', 'message': str(exc)[:500]})}\n\n"
         final_response = "I could not generate a response right now. Please try again."
         yield f"data: {json.dumps({'type': 'message', 'assistant_message': final_response, 'conversation_id': session_id, 'session_id': session_id})}\n\n"
     reasoning_content = "\n".join(
