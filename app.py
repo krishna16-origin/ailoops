@@ -133,6 +133,210 @@ def _map_reasoning_effort(level: str) -> str:
     return "max"
 
 
+# --- Direct NVIDIA endpoint for Kimi K3 / DeepSeek (bypass ChatNVIDIA registry) ---
+# ChatNVIDIA warns "type is unknown and inference may fail" for these two models
+# on older langchain-nvidia-ai-endpoints versions. Using AsyncOpenAI directly
+# to https://integrate.api.nvidia.com/v1 guarantees correct payload and is
+# the canonical example on build.nvidia.com.
+_NVIDIA_ENDPOINT_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+
+
+def _to_openai_messages(messages: List[BaseMessage]) -> List[dict]:
+    """Convert LangChain messages to OpenAI dicts, preserving Kimi's reasoning_content for multi-turn."""
+    out: List[dict] = []
+    for m in messages:
+        role = "user"
+        if isinstance(m, SystemMessage):
+            role = "system"
+        elif isinstance(m, AIMessage):
+            role = "assistant"
+        elif isinstance(m, HumanMessage):
+            role = "user"
+        else:
+            role = getattr(m, "type", "user") or "user"
+            if role not in ("system", "user", "assistant"):
+                role = "user"
+        content = getattr(m, "content", "") or ""
+        msg_dict: dict = {"role": role, "content": _coerce_model_text(content)}
+        # Preserve Kimi's reasoning_content for multi-turn (required by docs)
+        rc = ""
+        try:
+            rc = _extract_reasoning(m) or (getattr(m, "additional_kwargs", {}) or {}).get("reasoning_content", "")
+        except Exception:
+            rc = ""
+        if role == "assistant" and rc:
+            # OpenAI-compatible field used by both Kimi and DeepSeek via NVIDIA
+            msg_dict["reasoning_content"] = rc
+        out.append(msg_dict)
+    return out
+
+
+async def _invoke_nvidia_endpoint(
+    messages: List[BaseMessage],
+    model_name: str,
+    max_tokens: int,
+    reasoning_level: str,
+    progress=None,
+    on_answer_piece=None,
+    max_think_chars: Optional[int] = None,
+) -> str:
+    """Direct endpoint for kimi-k3 / deepseek-v4-pro via NVIDIA NIM.
+
+    Mirrors invoke_model's streaming contract: publish_thought for
+    reasoning_content and on_answer_piece/publish_token for final content,
+    with ThinkingBudgetExceeded guard. Uses temperature=1.0 (fixed for these
+    models) and reasoning_effort mapped from reasoning_level.
+    """
+    import asyncio as _asyncio
+
+    try:
+        from openai import AsyncOpenAI
+    except ImportError as e:
+        raise RuntimeError("openai package required for Kimi/DeepSeek endpoint. pip install openai") from e
+
+    api_key = os.getenv("NVIDIA_API_KEY")
+    if not api_key or api_key.strip().lower() in ("", "demo"):
+        raise RuntimeError("NVIDIA_API_KEY not set for endpoint")
+
+    reasoning_effort = _map_reasoning_effort(reasoning_level)
+    openai_messages = _to_openai_messages(messages)
+
+    client = AsyncOpenAI(base_url=_NVIDIA_ENDPOINT_URL, api_key=api_key, timeout=300.0)
+
+    # Non-streaming path (progress is list or None)
+    if not isinstance(progress, _asyncio.Queue):
+        # Also used for plan phase (progress=None)
+        resp = await client.chat.completions.create(
+            model=model_name,
+            messages=openai_messages,
+            temperature=1.0,
+            max_completion_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            stream=False,
+        )
+        choice = resp.choices[0] if resp.choices else None
+        msg = getattr(choice, "message", None) if choice else None
+        reasoning = getattr(msg, "reasoning_content", "") or (getattr(msg, "reasoning", "") if msg else "")
+        if isinstance(reasoning, list):
+            reasoning = "".join([str(x) for x in reasoning])
+        reasoning = reasoning or ""
+        if reasoning and isinstance(progress, list):
+            progress.append({"step": "reasoning", "label": "Thinking", "detail": reasoning.strip()})
+        content = getattr(msg, "content", "") or ""
+        content = _coerce_model_text(content)
+        answer_text = strip_thinking(content).strip()
+        if max_think_chars is not None and not answer_text and len(reasoning) > max_think_chars:
+            raise ThinkingBudgetExceeded(
+                f"Model produced {len(reasoning)} chars of reasoning (budget {max_think_chars}) without visible answer."
+            )
+        return answer_text
+
+    # Streaming path (Queue)
+    full = ""
+    buffer = ""
+    in_thought = False
+    answer_started = False
+    think_chars = 0
+    reasoning_seen = False
+
+    OPEN_TAGS = ("<think>", "<thinking>")
+    CLOSE_TAGS = ("</think>", "</thinking>")
+    max_tag_len = max(len(t) for t in OPEN_TAGS + CLOSE_TAGS)
+
+    def check_think_budget():
+        if max_think_chars is not None and not answer_started and think_chars > max_think_chars:
+            raise ThinkingBudgetExceeded(
+                f"Model produced {think_chars} chars of reasoning (budget {max_think_chars}) without visible answer yet."
+            )
+
+    async def emit_answer(text: str):
+        nonlocal answer_started
+        if not text:
+            return
+        answer_started = True
+        if on_answer_piece is not None:
+            await on_answer_piece(text)
+        else:
+            await publish_token(progress, text)
+
+    async def drain(flush_all: bool):
+        nonlocal buffer, in_thought, think_chars
+        while True:
+            if not in_thought:
+                positions = [buffer.find(t) for t in OPEN_TAGS if t in buffer]
+                idx = min(positions) if positions else -1
+                if idx == -1:
+                    hold_back = 0 if flush_all else min(len(buffer), max_tag_len - 1)
+                    send_len = len(buffer) - hold_back
+                    if send_len > 0:
+                        await emit_answer(buffer[:send_len])
+                        buffer = buffer[send_len:]
+                    return
+                if idx:
+                    await emit_answer(buffer[:idx])
+                tag = next(t for t in OPEN_TAGS if buffer[idx:].startswith(t))
+                buffer = buffer[idx + len(tag):]
+                in_thought = True
+            else:
+                positions = [buffer.find(t) for t in CLOSE_TAGS if t in buffer]
+                idx = min(positions) if positions else -1
+                if idx == -1:
+                    hold_back = 0 if flush_all else min(len(buffer), max_tag_len - 1)
+                    send_len = len(buffer) - hold_back
+                    if send_len > 0:
+                        if not reasoning_seen:
+                            await publish_thought(progress, buffer[:send_len])
+                            think_chars += send_len
+                        buffer = buffer[send_len:]
+                    return
+                if idx:
+                    if not reasoning_seen:
+                        await publish_thought(progress, buffer[:idx])
+                        think_chars += idx
+                tag = next(t for t in CLOSE_TAGS if buffer[idx:].startswith(t))
+                buffer = buffer[idx + len(tag):]
+                in_thought = False
+
+    stream = await client.chat.completions.create(
+        model=model_name,
+        messages=openai_messages,
+        temperature=1.0,
+        max_completion_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        stream=True,
+    )
+    async for chunk in stream:
+        # OpenAI SDK: chunk.choices[0].delta
+        try:
+            choice = chunk.choices[0] if chunk.choices else None
+            delta = getattr(choice, "delta", None) if choice else None
+        except Exception:
+            delta = None
+        reasoning_piece = ""
+        if delta is not None:
+            reasoning_piece = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None) or ""
+            if isinstance(reasoning_piece, list):
+                reasoning_piece = "".join([str(x) for x in reasoning_piece])
+            reasoning_piece = _coerce_model_text(reasoning_piece) if reasoning_piece else ""
+        if reasoning_piece:
+            reasoning_seen = True
+            await publish_thought(progress, reasoning_piece)
+            think_chars += len(reasoning_piece)
+            check_think_budget()
+        piece = ""
+        if delta is not None:
+            piece = getattr(delta, "content", None) or ""
+            piece = _coerce_model_text(piece) if piece else ""
+        if not piece:
+            continue
+        full += piece
+        buffer += piece
+        await drain(flush_all=False)
+        check_think_budget()
+    await drain(flush_all=True)
+    return strip_thinking(full).strip()
+
+
 def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     """Create the selected Code-mode model (normal — same handling as Chat, no long-horizon special case)."""
     model_type_clean = (model_type or DEFAULT_CODE_MODEL).strip().lower()
@@ -722,8 +926,27 @@ async def chat_context_node(state: dict, progress=None) -> dict:
 async def chat_compose_node(request: "ChatRequest", state: dict, progress=None) -> dict:
     config = state["config"]
     await publish_progress(progress, "chat_compose_node", "chat_compose_node", f"Invoking the model with {config['label']} thinking and a {config['max_tokens']}-token budget.")
-    llm = get_llm(request.model_type, request.temperature, config["max_tokens"])
-    response = await invoke_model(build_messages(state["history"], request.thinking_level, state["search_text"]), llm, progress)
+    # Route Kimi K3 / DeepSeek via direct NVIDIA endpoint (bypass ChatNVIDIA which warns unknown type)
+    _mt = (request.model_type or "balanced").strip().lower()
+    _chat_model_name = "moonshotai/kimi-k3"
+    if _mt == "fast":
+        _chat_model_name = "deepseek-ai/deepseek-v4-pro-0813"
+    elif _mt == "reasoning":
+        _chat_model_name = "nvidia/nemotron-3-ultra-550b-a55b"
+    _chat_messages = build_messages(state["history"], request.thinking_level, state["search_text"])
+    if _is_kimi_or_deepseek_model(_chat_model_name):
+        try:
+            response = await _invoke_nvidia_endpoint(
+                _chat_messages, _chat_model_name, config["max_tokens"], request.thinking_level, progress
+            )
+        except Exception as e:
+            # Fallback to ChatNVIDIA if endpoint fails (keeps Nemotron path working, surfaces real error)
+            print(f"Endpoint {_chat_model_name} failed, falling back to ChatNVIDIA: {e}")
+            llm = get_llm(request.model_type, request.temperature, config["max_tokens"])
+            response = await invoke_model(_chat_messages, llm, progress)
+    else:
+        llm = get_llm(request.model_type, request.temperature, config["max_tokens"])
+        response = await invoke_model(_chat_messages, llm, progress)
     state["response"] = response or "I apologize, I encountered an issue formulating my answer."
     return state
 
@@ -1231,13 +1454,22 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     plan_steps: List[str] = []
     try:
         plan_messages = build_plan_messages(history, file_store, reasoning_level)
-        plan_llm = get_code_llm(model_key, 0.2, min(config["max_tokens"], 4000))
         if _is_kd:
-            plan_text = await invoke_model(plan_messages, plan_llm, None, reasoning_effort=_kd_effort)
+            # Direct endpoint for Kimi/DeepSeek (ChatNVIDIA has unknown type for these)
+            try:
+                plan_text = await _invoke_nvidia_endpoint(
+                    plan_messages, _code_model_name, min(config["max_tokens"], 4000), reasoning_level, None
+                )
+            except Exception as e:
+                print(f"Plan endpoint failed for {_code_model_name}, fallback to ChatNVIDIA: {e}")
+                plan_llm = get_code_llm(model_key, 0.2, min(config["max_tokens"], 4000))
+                plan_text = await invoke_model(plan_messages, plan_llm, None, reasoning_effort=_kd_effort)
         else:
+            plan_llm = get_code_llm(model_key, 0.2, min(config["max_tokens"], 4000))
             plan_text = await invoke_model(plan_messages, plan_llm, None, thinking_mode=False)
         plan_steps = parse_plan(plan_text)
-    except Exception:
+    except Exception as e:
+        print(f"Plan phase failed for {_code_model_name}: {e}")
         plan_steps = []
     await emit({"type": "plan_created", "steps": plan_steps})
 
@@ -1255,10 +1487,19 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         malformed_retry_note = None
         try:
             if _is_kd:
-                raw = await invoke_model(
-                    agent_messages, llm, emit.queue,
-                    on_answer_piece=watcher, reasoning_effort=_kd_effort, max_think_chars=max_think_chars,
-                )
+                try:
+                    raw = await _invoke_nvidia_endpoint(
+                        agent_messages, _code_model_name, config["max_tokens"], reasoning_level,
+                        emit.queue, watcher, max_think_chars,
+                    )
+                except ThinkingBudgetExceeded:
+                    raise
+                except Exception as e:
+                    print(f"Endpoint main failed for {_code_model_name}, fallback to ChatNVIDIA: {e}")
+                    raw = await invoke_model(
+                        agent_messages, llm, emit.queue,
+                        on_answer_piece=watcher, reasoning_effort=_kd_effort, max_think_chars=max_think_chars,
+                    )
             else:
                 raw = await invoke_model(
                     agent_messages, llm, emit.queue,
@@ -1266,15 +1507,26 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 )
         except ThinkingBudgetExceeded:
             if _is_kd:
-                raw = await invoke_model(
-                    agent_messages + [SystemMessage(content=(
-                        "Stop planning. Respond immediately in the required THOUGHT/ACTION format with a single "
-                        "concrete action."
-                    ))],
-                    llm, emit.queue,
-                    on_answer_piece=make_agent_stream_watcher(emit.queue),
-                    reasoning_effort=_kd_effort,
-                )
+                try:
+                    raw = await _invoke_nvidia_endpoint(
+                        agent_messages + [SystemMessage(content=(
+                            "Stop planning. Respond immediately in the required THOUGHT/ACTION format with a single "
+                            "concrete action."
+                        ))],
+                        _code_model_name, config["max_tokens"], reasoning_level,
+                        emit.queue, make_agent_stream_watcher(emit.queue),
+                    )
+                except Exception as e:
+                    print(f"Endpoint retry failed for {_code_model_name}, fallback to ChatNVIDIA: {e}")
+                    raw = await invoke_model(
+                        agent_messages + [SystemMessage(content=(
+                            "Stop planning. Respond immediately in the required THOUGHT/ACTION format with a single "
+                            "concrete action."
+                        ))],
+                        llm, emit.queue,
+                        on_answer_piece=make_agent_stream_watcher(emit.queue),
+                        reasoning_effort=_kd_effort,
+                    )
             else:
                 raw = await invoke_model(
                     agent_messages + [SystemMessage(content=(
@@ -1407,7 +1659,11 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 "what was accomplished."
             )))
             if _is_kd:
-                raw = await invoke_model(wrap_messages, llm, None, reasoning_effort=_kd_effort)
+                try:
+                    raw = await _invoke_nvidia_endpoint(wrap_messages, _code_model_name, config["max_tokens"], reasoning_level, None)
+                except Exception as e:
+                    print(f"Endpoint wrap failed for {_code_model_name}, fallback to ChatNVIDIA: {e}")
+                    raw = await invoke_model(wrap_messages, llm, None, reasoning_effort=_kd_effort)
             else:
                 raw = await invoke_model(wrap_messages, llm, None, thinking_mode=False)
             turn = parse_agent_turn(raw)
