@@ -75,9 +75,9 @@ def get_thinking_config(level: str) -> dict:
 
 
 def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
-    """Create the selected Chat-mode model (Horus/Osiris/Amun-Ra). Code mode uses
+    """Create the selected Chat-mode model (Deepseek V4 Pro/Kimi K3/Amun-Ra). Code mode uses
     its own get_code_llm() with an independent fast/medium/strong tier set."""
-    model_name = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+    model_name = "moonshotai/kimi-k3"
     model_type_clean = (model_type or "balanced").strip().lower()
     if model_type_clean == "fast":
         model_name = "deepseek-ai/deepseek-v4-pro"
@@ -94,13 +94,13 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
 CODE_MODEL_MAP = {
     "gemma": "google/gemma-4-31b-it",
     "fast": "google/gemma-4-31b-it",
-    "glimmer": "meta/muse-glimmer-30b",
-    "medium": "meta/muse-glimmer-30b",
+    "glimmer": "moonshotai/kimi-k3",
+    "medium": "moonshotai/kimi-k3",
     "ultra": "nvidia/nemotron-3-ultra-550b-a55b",
     "strong": "nvidia/nemotron-3-ultra-550b-a55b",
     "laguna": "poolside/laguna-xs-2.1",
     "super": "nvidia/nemotron-3-super-120b-a12b",
-    "step-flash": "stepfun-ai/step-3.7-flash",
+    "step-flash": "deepseek-ai/deepseek-v4-pro",
 }
 DEFAULT_CODE_MODEL = "glimmer"
 
