@@ -80,14 +80,14 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     model_name = "moonshotai/kimi-k3"
     model_type_clean = (model_type or "balanced").strip().lower()
     if model_type_clean == "fast":
-        model_name = "deepseek-ai/deepseek-v4-pro"
+        model_name = "deepseek-ai/deepseek-v4-pro-0813"
     elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
     # timeout=None: no HTTP/stream time limit. A fixed number here — flat or
     # scaled to max_tokens — still eventually truncates a completion that
     # legitimately needs longer, which is exactly the bug that was hitting
     # higher thinking/effort levels. Let generation run as long as it needs to.
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=None)
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=None)
 
 
 # Code-mode models — normal picker (no long-horizon tier, same budget as Chat)
@@ -100,7 +100,7 @@ CODE_MODEL_MAP = {
     "strong": "nvidia/nemotron-3-ultra-550b-a55b",
     "laguna": "poolside/laguna-xs-2.1",
     "super": "nvidia/nemotron-3-super-120b-a12b",
-    "step-flash": "deepseek-ai/deepseek-v4-pro",
+    "step-flash": "deepseek-ai/deepseek-v4-pro-0813",
 }
 DEFAULT_CODE_MODEL = "glimmer"
 
@@ -109,7 +109,7 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
     """Create the selected Code-mode model (normal — same handling as Chat, no long-horizon special case)."""
     model_type_clean = (model_type or DEFAULT_CODE_MODEL).strip().lower()
     model_name = CODE_MODEL_MAP.get(model_type_clean, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_tokens=max_tokens, timeout=None)
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=None)
 
 
 def strip_thinking(text: str) -> str:
@@ -750,7 +750,7 @@ class ClearSessionRequest(BaseModel):
 class CodeChatRequest(BaseModel):
     message: str
     session_id: str
-    model: str = DEFAULT_CODE_MODEL  # "medium" — normalized against CODE_MODEL_MAP by resolve_code_model_key()
+    model: str = DEFAULT_CODE_MODEL  # normalized against CODE_MODEL_MAP by resolve_code_model_key()
     reasoning_level: str = DEFAULT_THINKING_LEVEL
     stream: bool = False
 
@@ -1525,9 +1525,13 @@ async def generate_stream(request: ChatRequest, session: dict, session_id: str):
     task = asyncio.create_task(generate_response_once(request, session, progress_queue))
     final_response = ""
     emitted_content = False
+    reasoning_events = []
     try:
         async for event in forward_live_events(task, progress_queue, session_id):
-            if event["type"] in ("status", "thought"):
+            if event["type"] == "thought":
+                reasoning_events.append(event)
+                yield f"data: {json.dumps(event)}\n\n"
+            elif event["type"] == "status":
                 yield f"data: {json.dumps(event)}\n\n"
             elif event["type"] == "token":
                 emitted_content = True
@@ -1541,8 +1545,11 @@ async def generate_stream(request: ChatRequest, session: dict, session_id: str):
         print(f"[{session_id}] Response generation failed: {exc}")
         final_response = "I could not generate a response right now. Please try again."
         yield f"data: {json.dumps({'type': 'message', 'assistant_message': final_response, 'conversation_id': session_id, 'session_id': session_id})}\n\n"
-    session["messages"].append(AIMessage(content=final_response))
-
+    reasoning_content = "\n".join(
+        event.get("text", "") for event in reasoning_events if event.get("text")
+    ).strip()
+    assistant_kwargs = {"reasoning_content": reasoning_content} if reasoning_content else {}
+    session["messages"].append(AIMessage(content=final_response, additional_kwargs=assistant_kwargs))
 
 @app.post("/code-chat")
 async def code_chat(request: CodeChatRequest):
@@ -1604,7 +1611,11 @@ async def chat(request: ChatRequest):
     except Exception as exc:
         print(f"[{request.session_id}] Response generation failed: {exc}")
         response = "I could not generate a response right now. Please try again."
-    session["messages"].append(AIMessage(content=response))
+    reasoning_content = "\n".join(
+        event.get("detail", "") for event in thinking_steps if event.get("detail")
+    ).strip()
+    assistant_kwargs = {"reasoning_content": reasoning_content} if reasoning_content else {}
+    session["messages"].append(AIMessage(content=response, additional_kwargs=assistant_kwargs))
     config = get_thinking_config(request.thinking_level)
     return {
         "response": response,
