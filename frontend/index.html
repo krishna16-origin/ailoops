@@ -374,6 +374,9 @@
         .picker-screen[hidden] { display:none; }
         .picker-row { display:flex; align-items:center; justify-content:space-between; width:100%; background:transparent; border:none; text-align:left; padding:9px 10px; border-radius:9px; cursor:pointer; color:var(--text-primary); transition:background 0.15s ease; }
         .picker-row:hover { background-color:var(--bg-hover); }
+        .picker-workflow-row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:9px 10px; border-bottom:1px solid var(--border-color); }
+        .picker-workflow-option { border:1px solid var(--border-color); border-radius:7px; padding:5px 9px; background:transparent; color:var(--text-secondary); cursor:pointer; font-size:12px; }
+        .picker-workflow-option.active { background:var(--accent); border-color:var(--accent); color:#fff; }
         .picker-row-nav { font-size:13.5px; }
         .picker-row-right { display:flex; align-items:center; gap:6px; color:var(--text-secondary); font-size:13px; }
         .picker-divider { height:1px; background-color:var(--border-color); margin:6px 6px; }
@@ -652,6 +655,16 @@
                         <div class="model-picker-panel-wrap" id="modelPickerWrap" hidden>
                         <div class="model-picker-panel" id="modelPickerPanel">
                             <div class="picker-screen" id="pickerScreenMain">
+                                <div class="picker-workflow-row" id="pickerWorkflowRow" hidden>
+                                    <span class="picker-row-text">
+                                        <span class="picker-row-name">Workflow</span>
+                                        <span class="picker-row-desc">Plan first, or execute the saved plan directly</span>
+                                    </span>
+                                    <div style="display:flex;gap:4px;">
+                                        <button type="button" class="picker-workflow-option" data-workflow-mode="plan" onclick="selectWorkflowMode('plan')">Plan</button>
+                                        <button type="button" class="picker-workflow-option active" data-workflow-mode="build" onclick="selectWorkflowMode('build')">Build</button>
+                                    </div>
+                                </div>
                                 <div id="pickerModelList"></div>
                                 <div class="picker-divider" id="pickerMainDivider"></div>
                                 <button type="button" class="picker-row picker-row-nav" id="pickerEffortRow" onclick="showLevelScreen()">
@@ -718,6 +731,10 @@
                 <option value="laguna">Laguna XS 2.1</option>
                 <option value="super">Nemotron Super</option>
                 <option value="step-flash">Deepseek V4 Pro</option>
+            </select>
+            <select id="codeWorkflowMode">
+                <option value="plan">Plan</option>
+                <option value="build" selected>Build</option>
             </select>
             <select id="codeReasoningLevel">
                 <option value="low" selected>Low</option>
@@ -1120,6 +1137,8 @@
         const pickerLevelList = document.getElementById('pickerLevelList');
         const modelPickerLabel = document.getElementById('modelPickerLabel');
         const modelPickerLevel = document.getElementById('modelPickerLevel');
+        const pickerWorkflowRow = document.getElementById('pickerWorkflowRow');
+        const codeWorkflowMode = document.getElementById('codeWorkflowMode');
 
         function activeModelField() { return currentMode === 'code' ? document.getElementById('codeModel') : document.getElementById('modelType'); }
         function activeLevelField() { return currentMode === 'code' ? document.getElementById('codeReasoningLevel') : document.getElementById('tempSetting'); }
@@ -1149,6 +1168,17 @@
             }
             modelPickerLabel.textContent = match ? match.name : 'Kimi K3';
             modelPickerLevel.textContent = currentLevelLabel();
+            if (pickerWorkflowRow) {
+                pickerWorkflowRow.hidden = currentMode !== 'code';
+                pickerWorkflowRow.querySelectorAll('[data-workflow-mode]').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.workflowMode === codeWorkflowMode.value);
+                });
+            }
+        }
+
+        function selectWorkflowMode(value) {
+            codeWorkflowMode.value = value === 'plan' ? 'plan' : 'build';
+            updateModelPickerLabel();
         }
 
         function renderModelList() {
@@ -1188,6 +1218,8 @@
                 if (pickerMorePanel) pickerMorePanel.hidden = true;
                 document.getElementById('pickerMainDivider').style.display = 'none';
             }
+            if (pickerWorkflowRow) pickerWorkflowRow.hidden = currentMode !== 'code';
+            updateModelPickerLabel();
         }
 
         function renderMoreModelList() {
@@ -1544,6 +1576,7 @@
                     session_id: modes.code.sessionId,
                     model: codeModel,
                     reasoning_level: reasoningLevel,
+                    mode: document.getElementById('codeWorkflowMode').value,
                     stream: useStream
                     // No temperature — Code Mode intentionally omits it; backend applies its own default.
                 };

@@ -892,6 +892,7 @@ class CodeChatRequest(BaseModel):
     session_id: str
     model: str = DEFAULT_CODE_MODEL  # normalized against CODE_MODEL_MAP by resolve_code_model_key()
     reasoning_level: str = DEFAULT_THINKING_LEVEL
+    mode: str = "build"  # plan stores a plan only; build executes it directly
     stream: bool = False
 
 
@@ -900,6 +901,11 @@ def resolve_code_model_key(model: str) -> str:
     """Normalize a requested Code-mode model name to a valid CODE_MODEL_MAP key."""
     key = (model or DEFAULT_CODE_MODEL).strip().lower()
     return key if key in CODE_MODEL_MAP else DEFAULT_CODE_MODEL
+
+
+def normalize_code_workflow_mode(mode: str) -> str:
+    """Normalize the explicit Code-mode workflow choice."""
+    return "plan" if (mode or "build").strip().lower() == "plan" else "build"
 
 
 
@@ -1110,9 +1116,9 @@ def parse_plan(text: str) -> List[str]:
 # ---------------------------------------------------------------------------
 # Agent loop: system prompt + turn parsing
 # ---------------------------------------------------------------------------
-def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], plan_steps: List[str], step_number: int, latest_user_text: str = "") -> str:
+def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], plan_steps: List[str], step_number: int, latest_user_text: str = "", workflow_mode: str = "build") -> str:
     level_key = normalize_thinking_level(reasoning_level)
-    depth = CODE_THINKING_DEPTH_INSTRUCTIONS[level_key]
+    depth = "Execute the supplied plan directly; do not plan, deliberate, or explore alternatives again."
     plan_block = "\n".join(f"{i+1}. {s}" for i, s in enumerate(plan_steps)) if plan_steps else "(no plan steps given)"
     skill_block = _matching_skill_blocks(latest_user_text)
     return (
@@ -1151,6 +1157,8 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
         f"- {depth}\n"
         + _security_block() + "\n"
         f"Current date and time: {get_current_datetime_str()}\n\n"
+        "BUILD MODE: Execute the supplied plan directly. Do not create a new plan, revise the plan, or "
+        "think through a second approach. Use the required ACTION format immediately.\n\n"
         f"PLAN FOR THIS REQUEST:\n{plan_block}\n\n"
         f"EXISTING PROJECT FILES (names only — use read_file to see contents):\n{_file_listing(file_store)}"
     )
@@ -1304,6 +1312,45 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     plus the richer 'diffs'/'plan' fields)."""
     file_store: Dict[str, str] = session.setdefault("code_files", {})
     history: List[BaseMessage] = session["messages"]
+    workflow_mode = normalize_code_workflow_mode(getattr(request, "mode", "build"))
+
+    # Plan mode is deliberately side-effect free: it may inspect the project
+    # through the model context, but it never enters the file-editing loop.
+    if workflow_mode == "plan":
+        model_key = resolve_code_model_key(request.model)
+        config = get_code_thinking_config(request.reasoning_level)
+        model_name = CODE_MODEL_MAP.get(model_key, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
+        llm = get_code_llm(model_key, 0.2, _model_thinking_budget(model_name, request.reasoning_level, config["max_tokens"]))
+        plan_steps: List[str] = []
+        if not os.getenv("NVIDIA_API_KEY") or (os.getenv("NVIDIA_API_KEY") or "").strip().lower() in ("demo", ""):
+            plan_steps = [
+                "Inspect the existing project files and identify the smallest set of files that must change.",
+                "Implement the requested behavior while preserving unrelated functionality.",
+                "Validate the result and report the files and checks needed for the build.",
+            ]
+        else:
+            plan_messages = build_plan_messages(history, file_store, request.reasoning_level)
+            if _is_kimi_or_deepseek_model(model_name):
+                plan_text = await invoke_model(
+                    plan_messages, llm, None,
+                    reasoning_effort=_map_reasoning_effort(request.reasoning_level, model_name),
+                )
+            else:
+                plan_text = await invoke_model(plan_messages, llm, None, thinking_mode=True)
+            plan_steps = parse_plan(plan_text)
+        session["pending_plan"] = plan_steps
+        await emit({"type": "plan_created", "steps": plan_steps, "mode": "plan"})
+        response = "Plan ready. Switch to Build to execute this plan without creating another plan."
+        await emit({"type": "final_message", "text": response})
+        await emit({"type": "complete"})
+        return {
+            "response": response,
+            "code": "", "language": "", "files": {}, "file_languages": {},
+            "show_preview": False, "activities": [{"kind": "plan", "text": step} for step in plan_steps],
+            "activity_summary": {"commands": 0, "files_edited": 0, "files_viewed": 0, "notes": len(plan_steps)},
+            "plan": plan_steps, "diffs": [],
+        }, []
+
     # DEMO fallback when NVIDIA_API_KEY is missing — still streams a full Claude-like trace so the UI can be demoed
     if not os.getenv("NVIDIA_API_KEY") or (os.getenv("NVIDIA_API_KEY") or "").strip().lower() in ("demo", ""):
         demo_steps = ["Create index.html with dark glass hero and responsive grid", "Add styles and preview-ready layout", "Finalize and prepare download"]
@@ -1331,31 +1378,21 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     # Kimi K3 / DeepSeek need reasoning_effort instead of thinking_mode; Nemotron keeps thinking_mode
     _code_model_name = CODE_MODEL_MAP.get(model_key, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
     _is_kd = _is_kimi_or_deepseek_model(_code_model_name)
-    _kd_effort = _map_reasoning_effort(reasoning_level, _code_model_name) if _is_kd else None
+    # Build is an execution pass, not another reasoning/planning pass. DeepSeek
+    # supports the explicit none value; Kimi's lowest accepted effort is low.
+    _kd_effort = ("none" if _is_deepseek_model(_code_model_name) else "low") if _is_kd else None
     _code_budget = _model_thinking_budget(_code_model_name, reasoning_level, config["max_tokens"])
     llm = get_code_llm(model_key, 0.2, _code_budget)
     max_think_chars = int(_code_budget * THINK_BUDGET_FRACTION * THINK_CHARS_PER_TOKEN)
 
-    plan_steps: List[str] = []
-    # A separate planning request doubles the wait before the first file edit.
-    # Kimi/DeepSeek still use their selected reasoning_effort in the actual
-    # coding call, but think and write in one pass at every effort level.
-    _fast_reasoning_model = _is_kd
-    if not _fast_reasoning_model:
-        _plan_tokens = min(config["max_tokens"], 8000)
-        try:
-            plan_messages = build_plan_messages(history, file_store, reasoning_level)
-            if _is_kd:
-                plan_llm = get_code_llm(model_key, 0.2, _plan_tokens)
-                plan_text = await invoke_model(plan_messages, plan_llm, None, reasoning_effort=_kd_effort)
-            else:
-                plan_llm = get_code_llm(model_key, 0.2, min(config["max_tokens"], 4000))
-                plan_text = await invoke_model(plan_messages, plan_llm, None, thinking_mode=False)
-            plan_steps = parse_plan(plan_text)
-        except Exception as e:
-            print(f"Plan phase failed for {_code_model_name}: {e}")
-            plan_steps = []
-    await emit({"type": "plan_created", "steps": plan_steps})
+    # Build mode never invokes the planner. It executes the latest plan created
+    # in this session; if none exists, the user's request is treated as the
+    # already-approved instruction rather than being planned again.
+    plan_steps: List[str] = list(session.get("pending_plan") or [])
+    if not plan_steps:
+        plan_steps = ["Execute the user's request directly using the existing project files."]
+    session["pending_plan"] = []
+    await emit({"type": "plan_created", "steps": plan_steps, "mode": "build"})
 
     activities: List[dict] = []
     diffs: List[dict] = []
@@ -1384,7 +1421,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             else:
                 raw = await invoke_model(
                     agent_messages, llm, emit.queue,
-                    on_answer_piece=watcher, thinking_mode=True, max_think_chars=max_think_chars,
+                    on_answer_piece=watcher, thinking_mode=False, max_think_chars=max_think_chars,
                 )
         except ThinkingBudgetExceeded:
             if _is_kd:

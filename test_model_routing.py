@@ -43,6 +43,17 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertNotIn("deepseek-ai/deepseek-v4-pro'", frontend.read_text(encoding="utf-8"))
         self.assertIn("deepseek-ai/deepseek-v4-pro-0813", frontend.read_text(encoding="utf-8"))
 
+    def test_code_workflow_modes_are_explicit_and_build_is_default(self):
+        self.assertEqual(app.normalize_code_workflow_mode("plan"), "plan")
+        self.assertEqual(app.normalize_code_workflow_mode("build"), "build")
+        self.assertEqual(app.normalize_code_workflow_mode("unknown"), "build")
+        self.assertEqual(app.CodeChatRequest(message="x", session_id="s").mode, "build")
+        frontend = pathlib.Path(__file__).with_name("frontend") / "index.html"
+        html = frontend.read_text(encoding="utf-8")
+        self.assertIn('data-workflow-mode="plan"', html)
+        self.assertIn('data-workflow-mode="build"', html)
+        self.assertIn("mode: document.getElementById('codeWorkflowMode').value", html)
+
     def test_deepseek_rejects_low_effort_maps_to_none(self):
         self.assertEqual(
             app._map_reasoning_effort("low", "deepseek-ai/deepseek-v4-pro-0813"),
