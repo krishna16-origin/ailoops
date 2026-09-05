@@ -40,13 +40,13 @@ if not os.getenv("TAVILY_API_KEY"):
 _tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY")) if os.getenv("TAVILY_API_KEY") else None
 
 THINKING_LEVELS = {
-    "low": {"label": "Low", "max_tokens": 8000, "description": "Quick, focused thinking"},
+    "low": {"label": "Low", "max_tokens": 4000, "description": "Quick, focused thinking"},
     "medium": {"label": "Medium", "max_tokens": 16000, "description": "Balanced analysis"},
     "high": {"label": "High", "max_tokens": 24000, "description": "Deep reasoning"},
     "extra": {"label": "Extra", "max_tokens": 32000, "description": "Comprehensive analysis"},
     "max": {"label": "Max", "max_tokens": 40000, "description": "Exhaustive reasoning"},
 }
-DEFAULT_THINKING_LEVEL = "medium"
+DEFAULT_THINKING_LEVEL = "low"
 
 # ChatNVIDIA builds both requests and aiohttp clients. A zero timeout disables
 # aiohttp reads but is invalid for requests, so use a long valid transport
@@ -1310,10 +1310,10 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     _kd_effort = _map_reasoning_effort(reasoning_level, _code_model_name) if _is_kd else None
 
     # --- Plan phase -------------------------------------------------------
-    # NOTE: floor 8000 (was 4000) — Kimi/DeepSeek thinking models need >=8000
-    # tokens to return full reasoning_content + content without truncation.
+    # Keep the default plan short so Kimi/DeepSeek feel like normal fast models.
+    # Higher user-selected reasoning levels still receive the larger plan budget.
     # API-key-only: plan goes through ChatNVIDIA like everything else.
-    _plan_tokens = max(8000, min(config["max_tokens"], 8000))
+    _plan_tokens = 2000 if normalize_thinking_level(reasoning_level) == "low" else min(config["max_tokens"], 8000)
     plan_steps: List[str] = []
     try:
         plan_messages = build_plan_messages(history, file_store, reasoning_level)

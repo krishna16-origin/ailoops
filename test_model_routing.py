@@ -17,6 +17,14 @@ class ModelRoutingTests(unittest.TestCase):
         llm = app.get_code_llm("step-flash", 0.2, 128)
         self.assertEqual(llm.model, "deepseek-ai/deepseek-v4-pro-0813")
 
+    def test_fast_defaults_are_low_and_short(self):
+        self.assertEqual(app.DEFAULT_THINKING_LEVEL, "low")
+        self.assertEqual(app.THINKING_LEVELS["low"]["max_tokens"], 4000)
+        frontend = pathlib.Path(__file__).with_name("frontend") / "index.html"
+        html = frontend.read_text(encoding="utf-8")
+        self.assertIn('<select id="tempSetting">\n                <option value="low" selected>', html)
+        self.assertIn('<select id="codeReasoningLevel">\n                <option value="low" selected>', html)
+
     def test_deepseek_and_kimi_use_long_stream_inactivity_timeout(self):
         for llm in (
             app.get_llm("balanced", 0.2, 128),
