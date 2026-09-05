@@ -48,6 +48,11 @@ THINKING_LEVELS = {
 }
 DEFAULT_THINKING_LEVEL = "medium"
 
+# ChatNVIDIA builds both requests and aiohttp clients. A zero timeout disables
+# aiohttp reads but is invalid for requests, so use a long valid transport
+# window for models that may spend a long time thinking before their next chunk.
+LONG_GENERATION_TRANSPORT_TIMEOUT = 24 * 60 * 60
+
 # How hard the model is asked to actually reason inside its own <think> block at
 # each level — this is what makes "Max" genuinely think longer and deeper than
 # "Low", not just a bigger token ceiling with the same shallow pass.
@@ -102,11 +107,11 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     if _is_kimi_or_deepseek_model(model_name):
         temperature = 1.0
     max_tokens = _clamp_max_tokens(model_name, max_tokens)
-    # ChatNVIDIA uses this as the connect/read inactivity timeout. None does
-    # not disable the client's default timeout; it leaves the default at 60s.
-    # Kimi/DeepSeek reasoning calls can legitimately be quiet for longer while
-    # still making progress, so use a generous inactivity window.
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=300)
+    # ChatNVIDIA uses this as a connect/read inactivity timeout, not a total
+    # agent runtime. Keep Kimi/DeepSeek open for a full day while they think or
+    # produce a large completion; the agent still has its MAX_AGENT_STEPS bound.
+    transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_kimi_or_deepseek_model(model_name) else 300
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=transport_timeout)
 
 
 # Code-mode models — normal picker (no long-horizon tier, same budget as Chat)
@@ -200,9 +205,12 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
     if _is_kimi_or_deepseek_model(model_name):
         temperature = 1.0
     max_tokens = _clamp_max_tokens(model_name, max_tokens)
-    # The client timeout is an inactivity timeout for streaming, not a total
-    # request limit. Keep it above the expected reasoning latency.
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=300)
+    # DeepSeek/Kimi can spend a long time in reasoning before the next stream
+    # chunk. Use the long cross-client-safe window so code generation is not
+    # interrupted; the agent loop remains bounded by MAX_AGENT_STEPS and the
+    # frontend receives heartbeat events.
+    transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_kimi_or_deepseek_model(model_name) else 300
+    return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=transport_timeout)
 
 
 def strip_thinking(text: str) -> str:

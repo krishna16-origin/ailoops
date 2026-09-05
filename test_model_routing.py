@@ -17,14 +17,18 @@ class ModelRoutingTests(unittest.TestCase):
         llm = app.get_code_llm("step-flash", 0.2, 128)
         self.assertEqual(llm.model, "deepseek-ai/deepseek-v4-pro-0813")
 
-    def test_model_factories_use_long_stream_timeout(self):
+    def test_deepseek_and_kimi_use_long_stream_inactivity_timeout(self):
         for llm in (
             app.get_llm("balanced", 0.2, 128),
             app.get_llm("fast", 0.2, 128),
             app.get_code_llm("medium", 0.2, 128),
             app.get_code_llm("step-flash", 0.2, 128),
         ):
-            self.assertEqual(llm._client.timeout, 300)
+            self.assertEqual(llm._client.timeout, app.LONG_GENERATION_TRANSPORT_TIMEOUT)
+
+    def test_non_reasoning_models_keep_transport_timeout(self):
+        self.assertEqual(app.get_llm("reasoning", 0.2, 128)._client.timeout, 300)
+        self.assertEqual(app.get_code_llm("gemma", 0.2, 128)._client.timeout, 300)
 
     def test_frontend_has_no_stale_deepseek_id(self):
         frontend = pathlib.Path(__file__).with_name("frontend") / "index.html"
