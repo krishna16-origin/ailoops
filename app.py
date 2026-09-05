@@ -153,6 +153,7 @@ def _is_kimi_model(model_name: str) -> bool:
 #   moonshotai/kimi-k3    max_tokens 1..65536, reasoning_effort: low|high|max
 _DEEPSEEK_MAX_TOKENS = 16384
 _KIMI_MAX_TOKENS = 65536
+_KIMI_MIN_TOKENS = 8000
 
 
 def _clamp_max_tokens(model_name: str, max_tokens: int) -> int:
@@ -161,7 +162,10 @@ def _clamp_max_tokens(model_name: str, max_tokens: int) -> int:
     if _is_deepseek_model(model_name):
         return min(n, _DEEPSEEK_MAX_TOKENS)
     if _is_kimi_model(model_name):
-        return min(n, _KIMI_MAX_TOKENS)
+        # Kimi's reasoning endpoint rejects completion budgets below 8000,
+        # even when the requested effort is Low. This is a protocol minimum,
+        # not a promise that the model will spend all 8000 tokens.
+        return max(_KIMI_MIN_TOKENS, min(n, _KIMI_MAX_TOKENS))
     return n
 
 
@@ -1339,6 +1343,12 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
 
     for step in range(1, MAX_AGENT_STEPS + 1):
         agent_messages = build_agent_messages(history, transcript, file_store, plan_steps, reasoning_level, step)
+        if _is_kd:
+            agent_messages.append(SystemMessage(content=(
+                "FAST CODE EXECUTION: Think internally, then write exactly one short THOUGHT sentence. "
+                "Immediately follow it with the required ACTION and complete file content. Do not add a "
+                "planning essay, alternatives, status update, or extra explanation before the code action."
+            )))
         watcher = make_agent_stream_watcher(emit.queue)
 
         malformed_retry_note = None

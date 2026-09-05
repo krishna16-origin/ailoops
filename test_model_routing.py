@@ -79,6 +79,10 @@ class ModelRoutingTests(unittest.TestCase):
         llm2 = app.get_code_llm("glimmer", 0.2, 40000)
         self.assertEqual(llm2.max_tokens, 40000)  # under cap
 
+    def test_kimi_budget_meets_reasoning_endpoint_minimum(self):
+        self.assertEqual(app.get_llm("balanced", 0.2, 4000).max_tokens, 8000)
+        self.assertEqual(app.get_code_llm("glimmer", 0.2, 4000).max_tokens, 8000)
+
     def test_kimi_and_deepseek_force_temperature_1(self):
         for llm in (
             app.get_llm("balanced", 0.2, 128),
