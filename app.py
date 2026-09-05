@@ -1309,24 +1309,25 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     _is_kd = _is_kimi_or_deepseek_model(_code_model_name)
     _kd_effort = _map_reasoning_effort(reasoning_level, _code_model_name) if _is_kd else None
 
-    # --- Plan phase -------------------------------------------------------
-    # Keep the default plan short so Kimi/DeepSeek feel like normal fast models.
-    # Higher user-selected reasoning levels still receive the larger plan budget.
-    # API-key-only: plan goes through ChatNVIDIA like everything else.
-    _plan_tokens = 2000 if normalize_thinking_level(reasoning_level) == "low" else min(config["max_tokens"], 8000)
     plan_steps: List[str] = []
-    try:
-        plan_messages = build_plan_messages(history, file_store, reasoning_level)
-        if _is_kd:
-            plan_llm = get_code_llm(model_key, 0.2, _plan_tokens)
-            plan_text = await invoke_model(plan_messages, plan_llm, None, reasoning_effort=_kd_effort)
-        else:
-            plan_llm = get_code_llm(model_key, 0.2, min(config["max_tokens"], 4000))
-            plan_text = await invoke_model(plan_messages, plan_llm, None, thinking_mode=False)
-        plan_steps = parse_plan(plan_text)
-    except Exception as e:
-        print(f"Plan phase failed for {_code_model_name}: {e}")
-        plan_steps = []
+    # Kimi's separate planning request was doubling the time before the first
+    # file edit. At Low effort, start the agent directly; higher effort levels
+    # retain the explicit plan for complex builds.
+    _fast_kimi = _is_kimi_model(_code_model_name) and normalize_thinking_level(reasoning_level) == "low"
+    if not _fast_kimi:
+        _plan_tokens = min(config["max_tokens"], 8000)
+        try:
+            plan_messages = build_plan_messages(history, file_store, reasoning_level)
+            if _is_kd:
+                plan_llm = get_code_llm(model_key, 0.2, _plan_tokens)
+                plan_text = await invoke_model(plan_messages, plan_llm, None, reasoning_effort=_kd_effort)
+            else:
+                plan_llm = get_code_llm(model_key, 0.2, min(config["max_tokens"], 4000))
+                plan_text = await invoke_model(plan_messages, plan_llm, None, thinking_mode=False)
+            plan_steps = parse_plan(plan_text)
+        except Exception as e:
+            print(f"Plan phase failed for {_code_model_name}: {e}")
+            plan_steps = []
     await emit({"type": "plan_created", "steps": plan_steps})
 
     activities: List[dict] = []
