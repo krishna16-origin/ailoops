@@ -362,6 +362,7 @@
 
         /* ============== MODEL / EFFORT PICKER (input-attached, ChatGPT/Claude-style) ============== */
         .composer-toolbar { display:flex; align-items:center; justify-content:space-between; margin-top:6px; padding-top:2px; }
+        .composer-toolbar-left { display:flex; align-items:center; gap:8px; }
         .model-picker { position:relative; }
         .model-picker-btn { display:flex; align-items:center; gap:6px; background:transparent; border:1px solid var(--border-color); color:var(--text-primary); font-size:13px; font-weight:500; padding:6px 10px 6px 12px; border-radius:999px; cursor:pointer; transition:background 0.2s ease, border-color 0.2s ease; }
         .model-picker-btn:hover { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); }
@@ -374,10 +375,24 @@
         .picker-screen[hidden] { display:none; }
         .picker-row { display:flex; align-items:center; justify-content:space-between; width:100%; background:transparent; border:none; text-align:left; padding:9px 10px; border-radius:9px; cursor:pointer; color:var(--text-primary); transition:background 0.15s ease; }
         .picker-row:hover { background-color:var(--bg-hover); }
-        .picker-workflow-row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:9px 10px; border-bottom:1px solid var(--border-color); }
-        .picker-workflow-option { border:1px solid var(--border-color); border-radius:7px; padding:5px 9px; background:transparent; color:var(--text-secondary); cursor:pointer; font-size:12px; }
-        .picker-workflow-option.active { background:var(--accent); border-color:var(--accent); color:#fff; }
         .picker-row-nav { font-size:13.5px; }
+
+        /* ============== WORKFLOW PICKER (Plan / Build) — Code mode only.
+           Its own standalone picker in the composer toolbar, separate from
+           the model picker above. Hidden entirely in Chat mode. ============== */
+        .workflow-picker { position:relative; }
+        .workflow-picker[hidden] { display:none; }
+        .workflow-picker-btn { display:flex; align-items:center; gap:6px; background:transparent; border:1px solid var(--border-color); color:var(--text-primary); font-size:13px; font-weight:500; padding:6px 10px 6px 12px; border-radius:999px; cursor:pointer; transition:background 0.2s ease, border-color 0.2s ease; }
+        .workflow-picker-btn:hover { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); }
+        .workflow-picker-btn svg { color:var(--text-secondary); flex-shrink:0; }
+        .workflow-picker-panel { position:absolute; left:0; bottom:calc(100% + 10px); width:220px; background-color:#262626; border:1px solid var(--border-color); border-radius:14px; box-shadow:0 10px 38px rgba(0,0,0,0.45); padding:6px; z-index:30; animation:pickerPopIn 0.16s var(--transition-bezier); }
+        .workflow-picker-panel[hidden] { display:none; }
+        .workflow-picker-option { display:flex; align-items:center; justify-content:space-between; width:100%; background:transparent; border:none; text-align:left; padding:9px 10px; border-radius:9px; cursor:pointer; color:var(--text-primary); transition:background 0.15s ease; }
+        .workflow-picker-option:hover { background-color:var(--bg-hover); }
+        .workflow-picker-option .picker-row-text { display:flex; flex-direction:column; gap:2px; }
+        .workflow-picker-option .picker-row-name { font-size:14px; font-weight:500; color:var(--text-primary); }
+        .workflow-picker-option .picker-row-desc { font-size:12px; color:var(--text-secondary); }
+        .workflow-picker-check { color:var(--accent); flex-shrink:0; margin-left:8px; display:flex; }
         .picker-row-right { display:flex; align-items:center; gap:6px; color:var(--text-secondary); font-size:13px; }
         .picker-divider { height:1px; background-color:var(--border-color); margin:6px 6px; }
         .picker-model-row .picker-row-text { display:flex; flex-direction:column; gap:2px; }
@@ -470,7 +485,8 @@
             .input-box { border-radius:18px; padding:10px 12px; max-width:100%; }
             .input-box textarea { font-size:16px; max-height:120px; padding:6px 2px; }
             .composer-toolbar { gap:8px; }
-            .model-picker-btn { font-size:12px; padding:5px 9px 5px 10px; }
+            .composer-toolbar-left { gap:6px; }
+            .model-picker-btn, .workflow-picker-btn { font-size:12px; padding:5px 9px 5px 10px; }
 
             /* Message content */
             .message-text table { font-size:13px; }
@@ -502,6 +518,7 @@
             .model-picker-panel-wrap { position:fixed; left:12px; right:12px; bottom:86px; top:auto; width:auto; max-width:none; flex-direction:column; align-items:stretch; gap:8px; z-index:46; }
             .model-picker-panel-wrap .model-picker-panel { width:100%; max-width:none; left:auto; bottom:auto; }
             .model-picker-panel { width:100%; max-width:none; }
+            .workflow-picker-panel { position:fixed; left:12px; right:12px; bottom:86px; top:auto; width:auto; max-width:none; z-index:46; }
             .picker-more-panel { width:100%; max-width:none; max-height:50vh; max-height:50dvh; }
             .picker-row { padding:12px 10px; }
             .picker-model-row .picker-row-name { font-size:13px; }
@@ -645,6 +662,7 @@
             <div class="input-box">
                 <textarea id="userInput" rows="1" placeholder="Describe your objective..." oninput="autoResize(this)" onkeydown="handleEnter(event)"></textarea>
                 <div class="composer-toolbar">
+                    <div class="composer-toolbar-left">
                     <div class="model-picker" id="modelPicker">
                         <button type="button" class="model-picker-btn" id="modelPickerBtn" onclick="toggleModelPicker(event)">
                             <span id="modelPickerLabel">Kimi K3</span>
@@ -655,16 +673,6 @@
                         <div class="model-picker-panel-wrap" id="modelPickerWrap" hidden>
                         <div class="model-picker-panel" id="modelPickerPanel">
                             <div class="picker-screen" id="pickerScreenMain">
-                                <div class="picker-workflow-row" id="pickerWorkflowRow" hidden>
-                                    <span class="picker-row-text">
-                                        <span class="picker-row-name">Workflow</span>
-                                        <span class="picker-row-desc">Plan first, or execute the saved plan directly</span>
-                                    </span>
-                                    <div style="display:flex;gap:4px;">
-                                        <button type="button" class="picker-workflow-option" data-workflow-mode="plan" onclick="selectWorkflowMode('plan')">Plan</button>
-                                        <button type="button" class="picker-workflow-option active" data-workflow-mode="build" onclick="selectWorkflowMode('build')">Build</button>
-                                    </div>
-                                </div>
                                 <div id="pickerModelList"></div>
                                 <div class="picker-divider" id="pickerMainDivider"></div>
                                 <button type="button" class="picker-row picker-row-nav" id="pickerEffortRow" onclick="showLevelScreen()">
@@ -694,6 +702,31 @@
                         </div>
                         </div>
                     </div>
+                    <!-- Workflow picker (Plan / Build) — Code mode only. A separate,
+                         standalone picker next to the model picker, not nested inside it. -->
+                    <div class="workflow-picker" id="workflowPicker" hidden>
+                        <button type="button" class="workflow-picker-btn" id="workflowPickerBtn" onclick="toggleWorkflowPicker(event)">
+                            <span id="workflowPickerLabel">Build</span>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                        </button>
+                        <div class="workflow-picker-panel" id="workflowPickerPanel" hidden>
+                            <button type="button" class="workflow-picker-option" data-workflow-mode="plan" onclick="selectWorkflowMode('plan')">
+                                <span class="picker-row-text">
+                                    <span class="picker-row-name">Plan</span>
+                                    <span class="picker-row-desc">Draft a plan before writing code</span>
+                                </span>
+                                <span class="workflow-picker-check"></span>
+                            </button>
+                            <button type="button" class="workflow-picker-option" data-workflow-mode="build" onclick="selectWorkflowMode('build')">
+                                <span class="picker-row-text">
+                                    <span class="picker-row-name">Build</span>
+                                    <span class="picker-row-desc">Execute directly and write code</span>
+                                </span>
+                                <span class="workflow-picker-check"></span>
+                            </button>
+                        </div>
+                    </div>
+                    </div>
                     <button class="send-btn" id="sendBtn" onclick="sendMessage()">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                             <line x1="12" y1="19" x2="12" y2="5"></line>
@@ -715,8 +748,8 @@
                 <option value="reasoning">Amun-Ra</option>
             </select>
             <select id="tempSetting">
-                <option value="low" selected>Low</option>
-                <option value="medium">Medium</option>
+                <option value="low">Low</option>
+                <option value="medium" selected>Medium</option>
                 <option value="high">High</option>
                 <option value="extra">Extra</option>
                 <option value="max">Max</option>
@@ -737,8 +770,8 @@
                 <option value="build" selected>Build</option>
             </select>
             <select id="codeReasoningLevel">
-                <option value="low" selected>Low</option>
-                <option value="medium">Medium</option>
+                <option value="low">Low</option>
+                <option value="medium" selected>Medium</option>
                 <option value="high">High</option>
                 <option value="extra">Extra</option>
                 <option value="max">Max</option>
@@ -1137,8 +1170,17 @@
         const pickerLevelList = document.getElementById('pickerLevelList');
         const modelPickerLabel = document.getElementById('modelPickerLabel');
         const modelPickerLevel = document.getElementById('modelPickerLevel');
-        const pickerWorkflowRow = document.getElementById('pickerWorkflowRow');
         const codeWorkflowMode = document.getElementById('codeWorkflowMode');
+
+        // Standalone workflow (Plan / Build) picker — separate from the model picker.
+        const workflowPicker = document.getElementById('workflowPicker');
+        const workflowPickerBtn = document.getElementById('workflowPickerBtn');
+        const workflowPickerPanel = document.getElementById('workflowPickerPanel');
+        const workflowPickerLabel = document.getElementById('workflowPickerLabel');
+        const WORKFLOW_OPTIONS = {
+            plan: { label: 'Plan' },
+            build: { label: 'Build' }
+        };
 
         function activeModelField() { return currentMode === 'code' ? document.getElementById('codeModel') : document.getElementById('modelType'); }
         function activeLevelField() { return currentMode === 'code' ? document.getElementById('codeReasoningLevel') : document.getElementById('tempSetting'); }
@@ -1168,17 +1210,47 @@
             }
             modelPickerLabel.textContent = match ? match.name : 'Kimi K3';
             modelPickerLevel.textContent = currentLevelLabel();
-            if (pickerWorkflowRow) {
-                pickerWorkflowRow.hidden = currentMode !== 'code';
-                pickerWorkflowRow.querySelectorAll('[data-workflow-mode]').forEach(btn => {
-                    btn.classList.toggle('active', btn.dataset.workflowMode === codeWorkflowMode.value);
-                });
-            }
+        }
+
+        // Keeps the standalone Plan/Build picker in sync: visible only in Code
+        // mode, label + checkmark reflecting the current selection.
+        function updateWorkflowPicker() {
+            if (!workflowPicker) return;
+            workflowPicker.hidden = currentMode !== 'code';
+            const value = codeWorkflowMode.value === 'plan' ? 'plan' : 'build';
+            workflowPickerLabel.textContent = WORKFLOW_OPTIONS[value].label;
+            workflowPickerPanel.querySelectorAll('[data-workflow-mode]').forEach(btn => {
+                const isActive = btn.dataset.workflowMode === value;
+                btn.classList.toggle('active', isActive);
+                const check = btn.querySelector('.workflow-picker-check');
+                if (check) check.innerHTML = isActive ? CHECK_ICON : '';
+            });
         }
 
         function selectWorkflowMode(value) {
             codeWorkflowMode.value = value === 'plan' ? 'plan' : 'build';
-            updateModelPickerLabel();
+            updateWorkflowPicker();
+            closeWorkflowPicker();
+        }
+
+        function openWorkflowPicker() {
+            closeModelPicker();
+            workflowPickerPanel.hidden = false;
+            document.addEventListener('click', handleOutsideWorkflowPickerClick);
+        }
+
+        function closeWorkflowPicker() {
+            workflowPickerPanel.hidden = true;
+            document.removeEventListener('click', handleOutsideWorkflowPickerClick);
+        }
+
+        function handleOutsideWorkflowPickerClick(e) {
+            if (!workflowPicker.contains(e.target)) closeWorkflowPicker();
+        }
+
+        function toggleWorkflowPicker(e) {
+            e.stopPropagation();
+            if (workflowPickerPanel.hidden) openWorkflowPicker(); else closeWorkflowPicker();
         }
 
         function renderModelList() {
@@ -1218,8 +1290,8 @@
                 if (pickerMorePanel) pickerMorePanel.hidden = true;
                 document.getElementById('pickerMainDivider').style.display = 'none';
             }
-            if (pickerWorkflowRow) pickerWorkflowRow.hidden = currentMode !== 'code';
             updateModelPickerLabel();
+            updateWorkflowPicker();
         }
 
         function renderMoreModelList() {
@@ -1283,6 +1355,7 @@
         }
 
         function openModelPicker() {
+            closeWorkflowPicker();
             modelPickerWrap.hidden = false;
             showMainScreen();
             document.addEventListener('click', handleOutsidePickerClick);
@@ -1354,7 +1427,9 @@
             chatSettings.hidden = mode !== 'chat';
             codeSettings.hidden = mode !== 'code';
             closeModelPicker();
+            closeWorkflowPicker();
             updateModelPickerLabel();
+            updateWorkflowPicker();
 
             const copy = MODE_COPY[mode];
             openingTitle.style.opacity = 0;
@@ -2445,6 +2520,7 @@
             if (e.key === 'Escape' && window.innerWidth <= 768 && !sidebar.classList.contains('collapsed')) {
                 toggleSidebar();
                 closeModelPicker();
+                closeWorkflowPicker();
             }
         });
         window.onload = () => {
@@ -2457,6 +2533,7 @@
                 if (window.innerWidth > 768) document.getElementById('userInput').focus();
             }, 2100);
             updateModelPickerLabel();
+            updateWorkflowPicker();
             initResponsiveSidebar();
         };
     </script>
