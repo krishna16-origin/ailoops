@@ -1310,11 +1310,11 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     _kd_effort = _map_reasoning_effort(reasoning_level, _code_model_name) if _is_kd else None
 
     plan_steps: List[str] = []
-    # Kimi's separate planning request was doubling the time before the first
-    # file edit. At Low effort, start the agent directly; higher effort levels
-    # retain the explicit plan for complex builds.
-    _fast_kimi = _is_kimi_model(_code_model_name) and normalize_thinking_level(reasoning_level) == "low"
-    if not _fast_kimi:
+    # A separate planning request doubles the wait before the first file edit.
+    # Kimi/DeepSeek still use their selected reasoning_effort in the actual
+    # coding call, but think and write in one pass at every effort level.
+    _fast_reasoning_model = _is_kd
+    if not _fast_reasoning_model:
         _plan_tokens = min(config["max_tokens"], 8000)
         try:
             plan_messages = build_plan_messages(history, file_store, reasoning_level)
