@@ -154,6 +154,27 @@ def _is_kimi_model(model_name: str) -> bool:
 _DEEPSEEK_MAX_TOKENS = 16384
 _KIMI_MAX_TOKENS = 65536
 _KIMI_MIN_TOKENS = 8000
+_KIMI_EFFORT_BUDGETS = {
+    "low": 8000,
+    "medium": 12000,
+    "high": 16000,
+    "extra": 24000,
+    "max": 32000,
+}
+
+
+def _model_thinking_budget(model_name: str, level: str, requested: int) -> int:
+    """Return the completion budget for a model/effort pair.
+
+    Kimi's reasoning endpoint requires at least 8,000 max tokens, but the
+    larger global budgets made ordinary Kimi requests unnecessarily slow. Keep
+    every Kimi tier below the 32,000-token maximum requested by the product.
+    """
+    n = max(1, int(requested or 1024))
+    if _is_kimi_model(model_name):
+        n = min(n, _KIMI_EFFORT_BUDGETS[normalize_thinking_level(level)])
+        return max(_KIMI_MIN_TOKENS, n)
+    return n
 
 
 def _clamp_max_tokens(model_name: str, max_tokens: int) -> int:
@@ -799,7 +820,8 @@ async def chat_compose_node(request: "ChatRequest", state: dict, progress=None) 
     # ChatNVIDIA, which reads NVIDIA_API_KEY from the environment. No custom endpoints.
     _chat_model_name = _resolve_chat_model_name(request.model_type)
     _chat_messages = build_messages(state["history"], request.thinking_level, state["search_text"])
-    llm = get_llm(request.model_type, request.temperature, config["max_tokens"])
+    _chat_budget = _model_thinking_budget(_chat_model_name, request.thinking_level, config["max_tokens"])
+    llm = get_llm(request.model_type, request.temperature, _chat_budget)
     if _is_kimi_or_deepseek_model(_chat_model_name):
         # Kimi K3 / DeepSeek need reasoning_effort (always thinking) + fixed temperature=1.0
         # (enforced in get_llm). Nemotron keeps thinking_mode.
@@ -1306,12 +1328,13 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     reasoning_level = request.reasoning_level
     model_key = resolve_code_model_key(request.model)
     config = get_code_thinking_config(reasoning_level)
-    llm = get_code_llm(model_key, 0.2, config["max_tokens"])
-    max_think_chars = int(config["max_tokens"] * THINK_BUDGET_FRACTION * THINK_CHARS_PER_TOKEN)
     # Kimi K3 / DeepSeek need reasoning_effort instead of thinking_mode; Nemotron keeps thinking_mode
     _code_model_name = CODE_MODEL_MAP.get(model_key, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
     _is_kd = _is_kimi_or_deepseek_model(_code_model_name)
     _kd_effort = _map_reasoning_effort(reasoning_level, _code_model_name) if _is_kd else None
+    _code_budget = _model_thinking_budget(_code_model_name, reasoning_level, config["max_tokens"])
+    llm = get_code_llm(model_key, 0.2, _code_budget)
+    max_think_chars = int(_code_budget * THINK_BUDGET_FRACTION * THINK_CHARS_PER_TOKEN)
 
     plan_steps: List[str] = []
     # A separate planning request doubles the wait before the first file edit.

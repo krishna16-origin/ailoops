@@ -83,6 +83,14 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(app.get_llm("balanced", 0.2, 4000).max_tokens, 8000)
         self.assertEqual(app.get_code_llm("glimmer", 0.2, 4000).max_tokens, 8000)
 
+    def test_kimi_effort_budgets_are_capped_below_32000(self):
+        expected = {"low": 8000, "medium": 12000, "high": 16000, "extra": 24000, "max": 32000}
+        for level, budget in expected.items():
+            self.assertEqual(
+                app._model_thinking_budget("moonshotai/kimi-k3", level, 40000),
+                budget,
+            )
+
     def test_kimi_and_deepseek_force_temperature_1(self):
         for llm in (
             app.get_llm("balanced", 0.2, 128),
