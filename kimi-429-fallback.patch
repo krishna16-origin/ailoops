@@ -1,0 +1,286 @@
+diff --git a/app.py b/app.py
+index 28353df..dbad519 100644
+--- a/app.py
++++ b/app.py
+@@ -50,6 +50,21 @@ DEFAULT_THINKING_LEVEL = "low"
+ 
+ KIMI_MODEL = "moonshotai/kimi-k3"
+ 
++# NVIDIA's build.nvidia.com API catalog is a free trial/evaluation endpoint,
++# not a paid production tier. Its per-model capacity for large, in-demand
++# models like Kimi K3 and DeepSeek is shared across every developer using the
++# catalog worldwide, and multiple independent reports (NVIDIA's own developer
++# forum, e.g. "Kimi K2.6 is rate limited to 30 requests per hour") confirm
++# these specific models can return persistent 429s even for a single caller
++# making just a handful of requests, well below the account's advertised
++# per-minute limit, and even after the normal exponential-backoff retries in
++# invoke_model() are exhausted. Retrying harder doesn't fix a capacity ceiling
++# on NVIDIA's side, so when a long-running reasoning model still 429s after
++# every retry we fall back to a smaller, far less contended model instead of
++# surfacing a raw error to the user.
++FALLBACK_MODEL = "google/gemma-4-31b-it"
++FALLBACK_MAX_TOKENS = 8192
++
+ # ChatNVIDIA builds both requests and aiohttp clients. A zero timeout disables
+ # aiohttp reads but is invalid for requests, so use a long valid transport
+ # window for models that may spend a long time thinking before their next chunk.
+@@ -120,6 +135,15 @@ def _get_chat_nvidia_client(model_name: str, temperature: float, max_tokens: int
+     return client
+ 
+ 
++def _get_fallback_llm(max_tokens: int) -> ChatNVIDIA:
++    """Backup model used when Kimi/DeepSeek keep 429ing after every retry.
++    Gemma is a much smaller, GA model on the same NIM catalog and is not
++    subject to the same capacity-driven rate limiting as the big reasoning
++    models, so it's a safe last resort to still give the user an answer."""
++    capped = max(1, min(int(max_tokens or 1024), FALLBACK_MAX_TOKENS))
++    return _get_chat_nvidia_client(FALLBACK_MODEL, 0.7, capped, 300)
++
++
+ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
+     """Create the selected Chat-mode model (Deepseek / Nemotron / Kimi)."""
+     model_name = KIMI_MODEL
+@@ -691,7 +715,7 @@ class ThinkingBudgetExceeded(Exception):
+     waiting out the full generation timeout for nothing."""
+ 
+ 
+-async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None, thinking_mode: Optional[bool] = None, reasoning_effort: Optional[str] = None, max_think_chars: Optional[int] = None) -> str:
++async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None, thinking_mode: Optional[bool] = None, reasoning_effort: Optional[str] = None, max_think_chars: Optional[int] = None, fallback_llm: Optional[ChatNVIDIA] = None) -> str:
+     """Invoke once. When a live queue is provided, stream BOTH the visible answer
+     ('token' events) and the model's own live reasoning trace ('thought' events) in
+     real time, exactly as the model produces them — mirroring Claude.ai's extended
+@@ -744,8 +768,16 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
+                         pass
+                     await asyncio.sleep(delay)
+                     continue
+-                raise
++                # Either not a 429, or a 429 with no retries left — stop looping
++                # so the code below gets a chance to fall back instead of the
++                # error propagating straight out of this except block.
++                break
+         if last_exc is not None:
++            if fallback_llm is not None and _is_429_error(last_exc):
++                print("[ChatNVIDIA] Primary model still 429 after retries; falling back to backup model")
++                if isinstance(progress, list):
++                    progress.append({"step": "retry", "label": "Switching model", "detail": "The primary model is rate-limited right now, so I switched to a backup model for this reply."})
++                return await invoke_model(messages, fallback_llm, progress, on_answer_piece, thinking_mode, reasoning_effort, max_think_chars, fallback_llm=None)
+             raise last_exc
+         reasoning = _extract_reasoning(result)
+         if reasoning and isinstance(progress, list):
+@@ -883,8 +915,18 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
+                     pass
+                 await asyncio.sleep(delay)
+                 continue
+-            raise
++            # Either not a 429, or a 429 with no retries left — stop looping
++            # so the fallback check below gets a chance to run instead of the
++            # error propagating straight out of this except block.
++            break
+     if last_exc is not None:
++        if fallback_llm is not None and _is_429_error(last_exc):
++            print("[ChatNVIDIA] Primary model still 429 after retries (stream); falling back to backup model")
++            try:
++                await publish_progress(progress, "retry", "Switching model", "The primary model is rate-limited right now, so I switched to a backup model for this reply.")
++            except Exception:
++                pass
++            return await invoke_model(messages, fallback_llm, progress, on_answer_piece, thinking_mode, reasoning_effort, max_think_chars, fallback_llm=None)
+         raise last_exc
+ 
+ 
+@@ -921,13 +963,15 @@ async def chat_compose_node(request: "ChatRequest", state: dict, progress=None)
+     _chat_messages = build_messages(state["history"], request.thinking_level, state["search_text"])
+     _chat_budget = _model_thinking_budget(_chat_model_name, request.thinking_level, config["max_tokens"])
+     llm = get_llm(request.model_type, request.temperature, _chat_budget)
++    _fallback = _get_fallback_llm(_chat_budget) if _is_long_running_reasoning_model(_chat_model_name) else None
+     if _is_deepseek_model(_chat_model_name):
+         response = await invoke_model(
+             _chat_messages, llm, progress,
+             reasoning_effort=_map_reasoning_effort(request.thinking_level, _chat_model_name),
++            fallback_llm=_fallback,
+         )
+     else:
+-        response = await invoke_model(_chat_messages, llm, progress)
++        response = await invoke_model(_chat_messages, llm, progress, fallback_llm=_fallback)
+     state["response"] = response or "I apologize, I encountered an issue formulating my answer."
+     return state
+ 
+@@ -1423,15 +1467,18 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
+             ]
+         else:
+             plan_messages = build_plan_messages(history, file_store, request.reasoning_level)
++            _plan_budget = _model_thinking_budget(model_name, request.reasoning_level, config["max_tokens"])
++            _plan_fallback = _get_fallback_llm(_plan_budget) if _is_long_running_reasoning_model(model_name) else None
+             if _is_deepseek_model(model_name):
+-                llm = get_code_llm(model_key, 0.2, _model_thinking_budget(model_name, request.reasoning_level, config["max_tokens"]))
++                llm = get_code_llm(model_key, 0.2, _plan_budget)
+                 plan_text = await invoke_model(
+                     plan_messages, llm, None,
+                     reasoning_effort=_map_reasoning_effort(request.reasoning_level, model_name),
++                    fallback_llm=_plan_fallback,
+                 )
+             else:
+-                llm = get_code_llm(model_key, 0.2, _model_thinking_budget(model_name, request.reasoning_level, config["max_tokens"]))
+-                plan_text = await invoke_model(plan_messages, llm, None, thinking_mode=True)
++                llm = get_code_llm(model_key, 0.2, _plan_budget)
++                plan_text = await invoke_model(plan_messages, llm, None, thinking_mode=True, fallback_llm=_plan_fallback)
+             plan_steps = parse_plan(plan_text)
+         session["pending_plan"] = plan_steps
+         await emit({"type": "plan_created", "steps": plan_steps, "mode": "plan"})
+@@ -1475,6 +1522,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
+     _kd_effort = "none" if _is_deepseek else None
+     _code_budget = _model_thinking_budget(_code_model_name, reasoning_level, config["max_tokens"])
+     llm = get_code_llm(model_key, 0.2, _code_budget)
++    _code_fallback = _get_fallback_llm(_code_budget) if _is_long_running_reasoning_model(_code_model_name) else None
+     max_think_chars = int(_code_budget * THINK_BUDGET_FRACTION * THINK_CHARS_PER_TOKEN)
+ 
+     # Build mode never invokes the planner. It executes the latest plan created
+@@ -1509,11 +1557,13 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
+                 raw = await invoke_model(
+                     agent_messages, llm, emit.queue,
+                     on_answer_piece=watcher, reasoning_effort=_kd_effort, max_think_chars=max_think_chars,
++                    fallback_llm=_code_fallback,
+                 )
+             else:
+                 raw = await invoke_model(
+                     agent_messages, llm, emit.queue,
+                     on_answer_piece=watcher, thinking_mode=False, max_think_chars=max_think_chars,
++                    fallback_llm=_code_fallback,
+                 )
+         except ThinkingBudgetExceeded:
+             if _is_deepseek:
+@@ -1525,6 +1575,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
+                     llm, emit.queue,
+                     on_answer_piece=make_agent_stream_watcher(emit.queue),
+                     reasoning_effort=_kd_effort,
++                    fallback_llm=_code_fallback,
+                 )
+             else:
+                 raw = await invoke_model(
+@@ -1535,6 +1586,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
+                     llm, emit.queue,
+                     on_answer_piece=make_agent_stream_watcher(emit.queue),
+                     thinking_mode=False,
++                    fallback_llm=_code_fallback,
+                 )
+ 
+         turn = parse_agent_turn(raw)
+@@ -1658,9 +1710,9 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
+                 "what was accomplished."
+             )))
+             if _is_deepseek:
+-                raw = await invoke_model(wrap_messages, llm, None, reasoning_effort=_kd_effort)
++                raw = await invoke_model(wrap_messages, llm, None, reasoning_effort=_kd_effort, fallback_llm=_code_fallback)
+             else:
+-                raw = await invoke_model(wrap_messages, llm, None, thinking_mode=False)
++                raw = await invoke_model(wrap_messages, llm, None, thinking_mode=False, fallback_llm=_code_fallback)
+             turn = parse_agent_turn(raw)
+             final_text = (turn or {}).get("content") or "Reached the step limit — here's what changed so far."
+         except Exception:
+diff --git a/test_model_routing.py b/test_model_routing.py
+index eb09b15..7b0f166 100644
+--- a/test_model_routing.py
++++ b/test_model_routing.py
+@@ -1,9 +1,47 @@
++import asyncio
+ import pathlib
+ import unittest
++import unittest.mock
++from unittest.mock import AsyncMock
++
++from langchain_core.messages import AIMessage
+ 
+ import app
+ 
+ 
++class Nvidia429Error(Exception):
++    """Mimics the shape of a real NVIDIA/OpenAI 429 error."""
++    status_code = 429
++
++
++class _FakeLLM:
++    """Minimal stand-in for ChatNVIDIA — enough for invoke_model()'s ainvoke/
++    astream calls without touching the network.
++
++    `attempts` is a list consumed one per call: an Exception instance to be
++    raised, or a string to be returned/yielded as content. Each entry is used
++    for exactly one ainvoke() call or one astream() iteration.
++    """
++
++    def __init__(self, attempts):
++        self._attempts = list(attempts)
++        self._calls = 0
++
++    async def ainvoke(self, messages, **kwargs):
++        self._calls += 1
++        outcome = self._attempts.pop(0)
++        if isinstance(outcome, Exception):
++            raise outcome
++        return AIMessage(content=outcome)
++
++    async def astream(self, messages, **kwargs):
++        self._calls += 1
++        outcome = self._attempts.pop(0)
++        if isinstance(outcome, Exception):
++            raise outcome
++        yield AIMessage(content=outcome)
++
++
+ class ModelRoutingTests(unittest.TestCase):
+     def test_chat_deepseek_uses_current_nvidia_id(self):
+         llm = app.get_llm("fast", 0.2, 128)
+@@ -112,5 +150,55 @@ class ModelRoutingTests(unittest.TestCase):
+             self.assertEqual(llm.temperature, 1.0)
+ 
+ 
++class KimiFallbackTests(unittest.IsolatedAsyncioTestCase):
++    """Covers the 429 fallback added to invoke_model(): once a model's own
++    retries are exhausted with a persistent 429 (the exact failure mode
++    reported for Kimi K3 on NVIDIA's free trial API catalog), invoke_model()
++    should hand off to the given fallback model instead of raising."""
++
++    async def asyncSetUp(self):
++        # invoke_model()'s backoff sleeps for real seconds between retries —
++        # skip that in tests so this suite stays fast.
++        patcher = unittest.mock.patch("app.asyncio.sleep", new=AsyncMock(return_value=None))
++        patcher.start()
++        self.addCleanup(patcher.stop)
++
++    async def test_non_streaming_falls_back_after_exhausting_429_retries(self):
++        primary = _FakeLLM([Nvidia429Error()] * 4)  # every retry 429s
++        fallback = _FakeLLM(["fallback answer"])
++        result = await app.invoke_model([], primary, fallback_llm=fallback)
++        self.assertEqual(result, "fallback answer")
++        self.assertEqual(primary._calls, 4)  # 1 try + 3 retries, all exhausted
++        self.assertEqual(fallback._calls, 1)
++
++    async def test_non_streaming_recovers_without_fallback_if_retry_succeeds(self):
++        primary = _FakeLLM([Nvidia429Error(), "primary answer"])
++        fallback = _FakeLLM(["should not be used"])
++        result = await app.invoke_model([], primary, fallback_llm=fallback)
++        self.assertEqual(result, "primary answer")
++        self.assertEqual(fallback._calls, 0)
++
++    async def test_non_streaming_raises_when_no_fallback_given(self):
++        primary = _FakeLLM([Nvidia429Error()] * 4)
++        with self.assertRaises(Nvidia429Error):
++            await app.invoke_model([], primary, fallback_llm=None)
++
++    async def test_streaming_falls_back_after_exhausting_429_retries(self):
++        primary = _FakeLLM([Nvidia429Error()] * 4)
++        fallback = _FakeLLM(["fallback stream answer"])
++        progress = asyncio.Queue()
++        result = await app.invoke_model([], primary, progress, fallback_llm=fallback)
++        self.assertEqual(result, "fallback stream answer")
++        self.assertEqual(fallback._calls, 1)
++
++    async def test_fallback_client_is_a_much_smaller_model(self):
++        # Guards the actual production wiring: the fallback must not be
++        # another large reasoning model prone to the same capacity limits.
++        fallback = app._get_fallback_llm(8000)
++        self.assertEqual(fallback.model, app.FALLBACK_MODEL)
++        self.assertNotIn("kimi", fallback.model.lower())
++        self.assertNotIn("deepseek", fallback.model.lower())
++
++
+ if __name__ == "__main__":
+     unittest.main()
