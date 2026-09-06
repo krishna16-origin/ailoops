@@ -91,6 +91,33 @@ def get_thinking_config(level: str) -> dict:
     return THINKING_LEVELS[normalize_thinking_level(level)]
 
 
+
+# langchain-nvidia-ai-endpoints ships a local registry of known model ids
+# (determine_model()). Nemotron/Gemma are in it, so building a ChatNVIDIA for
+# them resolves instantly with no network call. Kimi K3 and DeepSeek V4 Pro
+# are NOT in the installed package's registry (they shipped after this pip
+# version), so ChatNVIDIA._finalize() falls back to a LIVE GET /v1/models
+# call every single time one of those clients is constructed, just to check
+# the id is real. get_llm()/get_code_llm() used to build a brand-new
+# ChatNVIDIA per chat message, so every Kimi/DeepSeek message was secretly
+# costing 2 NVIDIA API calls (the /v1/models check + the actual completion)
+# instead of 1 — burning through NVIDIA's per-model rate limit twice as fast
+# and surfacing as 429 Too Many Requests specifically on those two models.
+# Caching the client per (model, temperature, max_tokens, timeout) combo
+# means that validation call only ever fires once per combo for the life of
+# the process, not once per message.
+_CHAT_NVIDIA_CLIENT_CACHE: Dict[Tuple[str, float, int, float], ChatNVIDIA] = {}
+
+
+def _get_chat_nvidia_client(model_name: str, temperature: float, max_tokens: int, transport_timeout: float) -> ChatNVIDIA:
+    key = (model_name, temperature, max_tokens, transport_timeout)
+    client = _CHAT_NVIDIA_CLIENT_CACHE.get(key)
+    if client is None:
+        client = ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=transport_timeout)
+        _CHAT_NVIDIA_CLIENT_CACHE[key] = client
+    return client
+
+
 def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     """Create the selected Chat-mode model (Deepseek V4 Pro/Kimi K3/Amun-Ra). Code mode uses
     its own get_code_llm() with an independent fast/medium/strong tier set."""
@@ -111,7 +138,7 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     # agent runtime. Keep Kimi/DeepSeek open for a full day while they think or
     # produce a large completion; the agent still has its MAX_AGENT_STEPS bound.
     transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_kimi_or_deepseek_model(model_name) else 300
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=transport_timeout)
+    return _get_chat_nvidia_client(model_name, temperature, max_tokens, transport_timeout)
 
 
 # Code-mode models — normal picker (no long-horizon tier, same budget as Chat)
@@ -235,7 +262,7 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
     # interrupted; the agent loop remains bounded by MAX_AGENT_STEPS and the
     # frontend receives heartbeat events.
     transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_kimi_or_deepseek_model(model_name) else 300
-    return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=transport_timeout)
+    return _get_chat_nvidia_client(model_name, temperature, max_tokens, transport_timeout)
 
 
 def strip_thinking(text: str) -> str:
