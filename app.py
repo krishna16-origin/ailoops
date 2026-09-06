@@ -51,6 +51,10 @@ DEFAULT_THINKING_LEVEL = "low"
 # Fresh Kimi K3 - without endpoint (NVIDIA host only)
 KIMI_MODEL = "moonshotai/kimi-k3"
 KIMI_API_BASE = "https://integrate.api.nvidia.com/v1"
+# Simple client-side throttling to avoid bursting Kimi's per-model rate limit (429)
+_LAST_KIMI_CALL_TS = 0.0
+_KIMI_MIN_INTERVAL = 0.8  # seconds between Kimi calls
+_KIMI_CALL_LOCK = asyncio.Lock()
 
 # ChatNVIDIA builds both requests and aiohttp clients. A zero timeout disables
 # aiohttp reads but is invalid for requests, so use a long valid transport
@@ -249,10 +253,42 @@ def _to_openai_messages(messages: List[BaseMessage]) -> List[Dict[str, Any]]:
     return out
 
 
+def _is_429_error(exc: Exception) -> bool:
+    """Detect 429 Too Many Requests from OpenAI / NVIDIA / ChatNVIDIA."""
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 429:
+        return True
+    msg = str(exc).lower()
+    return "429" in msg or "too many requests" in msg or "rate limit" in msg
+
+
+def _get_retry_delay(attempt: int, retry_after: Optional[str] = None) -> float:
+    """Exponential backoff with jitter, respect Retry-After header if present."""
+    if retry_after:
+        try:
+            # Retry-After may be seconds or HTTP-date; try parse as int seconds
+            return float(retry_after) + 0.2
+        except Exception:
+            pass
+    import random
+    base = min(2 ** attempt, 8)  # 1s,2s,4s,8s cap
+    return base + random.uniform(0, 0.5)
+
+
 def _raise_kimi_error(exc: Exception) -> None:
-    """Map OpenAI errors to RuntimeError with status code for UI."""
+    """Map OpenAI errors to RuntimeError with status code for UI. 429 is handled with friendly message."""
     status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
     msg = str(exc)
+    if status == 429 or "429" in msg:
+        # Extract Retry-After if available
+        retry_after = None
+        try:
+            headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
+            retry_after = headers.get("retry-after") or headers.get("Retry-After")
+        except Exception:
+            pass
+        hint = f" (retry after {retry_after}s)" if retry_after else ""
+        raise RuntimeError(f"Kimi 429 Too Many Requests - rate limit hit{hint}. Please wait a moment and try again. {msg}") from exc
     if status == 401 or "401" in msg or "unauthorized" in msg.lower():
         raise RuntimeError(f"Kimi 401 Unauthorized - check NVIDIA_API_KEY: {msg}") from exc
     if status:
@@ -271,6 +307,14 @@ async def _invoke_kimi_endpoint(
     """Invoke Kimi K3 without endpoint via OpenAI-compatible NVIDIA NIM."""
     import openai
     _, async_client = _get_kimi_openai_clients()
+    # Client-side throttling to reduce 429 bursts
+    global _LAST_KIMI_CALL_TS
+    async with _KIMI_CALL_LOCK:
+        now = asyncio.get_event_loop().time()
+        wait = _KIMI_MIN_INTERVAL - (now - _LAST_KIMI_CALL_TS)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _LAST_KIMI_CALL_TS = asyncio.get_event_loop().time()
     lvl = normalize_thinking_level(reasoning_level)
     effort = _map_reasoning_effort(lvl, KIMI_MODEL)
     budget = _model_thinking_budget(KIMI_MODEL, lvl, max_tokens)
@@ -354,56 +398,100 @@ async def _invoke_kimi_endpoint(
                     buffer = buffer[idx + len(tag):]
                     in_thought = False
 
-        # Try stream with top-level reasoning_effort, fallback to extra_body
-        stream = None
-        try:
+        # Streaming with 429 retry (covers both create and iteration)
+        last_exc = None
+        for attempt in range(4):
+            # Reset stream state on retry
+            if attempt > 0:
+                # Reset buffers for retry
+                buffer = ""
+                in_thought = False
+                reasoning_seen = False
+                full = ""
+                think_chars = 0
+                answer_started = False
+            stream = None
             try:
-                stream = await async_client.chat.completions.create(**create_kwargs, reasoning_effort=effort)
-            except TypeError as te:
-                if "reasoning_effort" in str(te):
-                    stream = await async_client.chat.completions.create(**create_kwargs, extra_body=extra_body)
-                else:
-                    raise
-        except Exception as exc:
-            _raise_kimi_error(exc)
-
-        try:
-            async for chunk in stream:
-                # reasoning_content may be in delta.reasoning_content or delta.content with tags
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta is None:
+                try:
+                    stream = await async_client.chat.completions.create(**create_kwargs, reasoning_effort=effort)
+                except TypeError as te:
+                    if "reasoning_effort" in str(te):
+                        stream = await async_client.chat.completions.create(**create_kwargs, extra_body=extra_body)
+                    else:
+                        raise
+                # Iterate stream (also retryable on 429)
+                async for chunk in stream:
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if delta is None:
+                        continue
+                    reasoning_piece = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None) or ""
+                    if reasoning_piece:
+                        reasoning_seen = True
+                        await publish_thought(progress, reasoning_piece)
+                        think_chars += len(reasoning_piece)
+                        _check_budget()
+                    piece = getattr(delta, "content", None) or ""
+                    if piece:
+                        full += piece
+                        buffer += piece
+                        await _drain(flush_all=False)
+                        _check_budget()
+                await _drain(flush_all=True)
+                return strip_thinking(full).strip()
+            except ThinkingBudgetExceeded:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if _is_429_error(exc) and attempt < 3:
+                    retry_after = None
+                    try:
+                        headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
+                        retry_after = headers.get("retry-after") or headers.get("Retry-After")
+                    except Exception:
+                        pass
+                    delay = _get_retry_delay(attempt, retry_after)
+                    print(f"[kimi] 429 hit during stream, retry {attempt+1}/3 after {delay:.1f}s")
+                    try:
+                        if isinstance(progress, asyncio.Queue):
+                            await progress.put({"type": "status", "step": "retry", "label": "Rate limited", "detail": f"Kimi rate limit during stream, retrying in {delay:.1f}s ({attempt+1}/3)..."})
+                    except Exception:
+                        pass
+                    await asyncio.sleep(delay)
                     continue
-                # Extract reasoning
-                reasoning_piece = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None) or ""
-                if reasoning_piece:
-                    reasoning_seen = True
-                    await publish_thought(progress, reasoning_piece)
-                    think_chars += len(reasoning_piece)
-                    _check_budget()
-                piece = getattr(delta, "content", None) or ""
-                if piece:
-                    full += piece
-                    buffer += piece
-                    await _drain(flush_all=False)
-                    _check_budget()
-            await _drain(flush_all=True)
-            return strip_thinking(full).strip()
-        except ThinkingBudgetExceeded:
-            raise
-        except Exception as exc:
-            _raise_kimi_error(exc)
+                _raise_kimi_error(exc)
+        if last_exc is not None:
+            _raise_kimi_error(last_exc)
     else:
-        # Non-streaming
-        try:
+        # Non-streaming with 429 retry
+        resp = None
+        last_exc = None
+        for attempt in range(4):
             try:
-                resp = await async_client.chat.completions.create(**{k: v for k, v in create_kwargs.items() if k != "stream"}, reasoning_effort=effort)
-            except TypeError as te:
-                if "reasoning_effort" in str(te):
-                    resp = await async_client.chat.completions.create(**{k: v for k, v in create_kwargs.items() if k != "stream"}, extra_body=extra_body)
-                else:
-                    raise
-        except Exception as exc:
-            _raise_kimi_error(exc)
+                try:
+                    resp = await async_client.chat.completions.create(**{k: v for k, v in create_kwargs.items() if k != "stream"}, reasoning_effort=effort)
+                except TypeError as te:
+                    if "reasoning_effort" in str(te):
+                        resp = await async_client.chat.completions.create(**{k: v for k, v in create_kwargs.items() if k != "stream"}, extra_body=extra_body)
+                    else:
+                        raise
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if _is_429_error(exc) and attempt < 3:
+                    retry_after = None
+                    try:
+                        headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
+                        retry_after = headers.get("retry-after") or headers.get("Retry-After")
+                    except Exception:
+                        pass
+                    delay = _get_retry_delay(attempt, retry_after)
+                    print(f"[kimi] 429 hit (non-stream), retry {attempt+1}/3 after {delay:.1f}s")
+                    await asyncio.sleep(delay)
+                    continue
+                _raise_kimi_error(exc)
+        if last_exc is not None and resp is None:
+            _raise_kimi_error(last_exc)
         # Parse reasoning + content
         try:
             msg = resp.choices[0].message if resp.choices else None
@@ -956,7 +1044,34 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
     if reasoning_effort:
         invoke_kwargs["reasoning_effort"] = reasoning_effort
     if not isinstance(progress, asyncio.Queue):
-        result = await llm.ainvoke(messages, **invoke_kwargs)
+        # 429 retry for non-streaming
+        last_exc = None
+        for attempt in range(4):
+            try:
+                result = await llm.ainvoke(messages, **invoke_kwargs)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if _is_429_error(exc) and attempt < 3:
+                    retry_after = None
+                    try:
+                        headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
+                        retry_after = headers.get("retry-after") or headers.get("Retry-After")
+                    except Exception:
+                        pass
+                    delay = _get_retry_delay(attempt, retry_after)
+                    print(f"[ChatNVIDIA] 429 hit (ainvoke), retry {attempt+1}/3 after {delay:.1f}s")
+                    try:
+                        if isinstance(progress, list):
+                            progress.append({"step": "retry", "label": "Rate limited", "detail": f"Rate limit hit, retrying in {delay:.1f}s ({attempt+1}/3)..."})
+                    except Exception:
+                        pass
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
         reasoning = _extract_reasoning(result)
         if reasoning and isinstance(progress, list):
             progress.append({"step": "reasoning", "label": "Thinking", "detail": reasoning.strip()})
@@ -1043,24 +1158,59 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
                 buffer = buffer[idx + len(tag):]
                 in_thought = False
 
-    async for chunk in llm.astream(messages, **invoke_kwargs):
-        reasoning_piece = _extract_reasoning(chunk)
-        if reasoning_piece:
-            reasoning_seen = True
-            await publish_thought(progress, reasoning_piece)
-            think_chars += len(reasoning_piece)
-            check_think_budget()
+    # Streaming with 429 retry on stream creation
+    last_exc = None
+    for attempt in range(4):
+        try:
+            # Reset state for retry
+            if attempt > 0:
+                # Clear partial state on retry
+                full = ""
+                buffer = ""
+                in_thought = False
+                answer_started = False
+                think_chars = 0
+                reasoning_seen = False
+            async for chunk in llm.astream(messages, **invoke_kwargs):
+                reasoning_piece = _extract_reasoning(chunk)
+                if reasoning_piece:
+                    reasoning_seen = True
+                    await publish_thought(progress, reasoning_piece)
+                    think_chars += len(reasoning_piece)
+                    check_think_budget()
 
-        piece = _coerce_model_text(getattr(chunk, "content", "") or "")
-        if not piece:
-            continue
-        full += piece
-        buffer += piece
-        await drain(flush_all=False)
-        check_think_budget()
+                piece = _coerce_model_text(getattr(chunk, "content", "") or "")
+                if not piece:
+                    continue
+                full += piece
+                buffer += piece
+                await drain(flush_all=False)
+                check_think_budget()
 
-    await drain(flush_all=True)
-    return strip_thinking(full).strip()
+            await drain(flush_all=True)
+            return strip_thinking(full).strip()
+        except ThinkingBudgetExceeded:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if _is_429_error(exc) and attempt < 3:
+                retry_after = None
+                try:
+                    headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
+                    retry_after = headers.get("retry-after") or headers.get("Retry-After")
+                except Exception:
+                    pass
+                delay = _get_retry_delay(attempt, retry_after)
+                print(f"[ChatNVIDIA] 429 hit (astream), retry {attempt+1}/3 after {delay:.1f}s")
+                try:
+                    await publish_progress(progress, "retry", "Rate limited", f"Rate limit hit, retrying in {delay:.1f}s ({attempt+1}/3)...")
+                except Exception:
+                    pass
+                await asyncio.sleep(delay)
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
 
 
 async def chat_understand_node(request: "ChatRequest", session: dict, progress=None) -> dict:
