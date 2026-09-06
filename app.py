@@ -156,27 +156,19 @@ _KIMI_MAX_TOKENS = 65536
 _KIMI_MIN_TOKENS = 8000
 _KIMI_EFFORT_BUDGETS = {
     "low": 8000,
-    "medium": 16000,
-    "high": 24000,
-    "extra": 40000,
-    "max": 65536,      # Kimi's actual NIM ceiling — was capped at 32000, which
-                        # meant "Max" reasoning still couldn't produce a file
-                        # anywhere near what the model is really able to in one
-                        # completion. The continuation logic above now handles
-                        # files even longer than this, but there's no reason to
-                        # force an extra round trip before that's needed.
+    "medium": 12000,
+    "high": 16000,
+    "extra": 24000,
+    "max": 32000,
 }
 
 
 def _model_thinking_budget(model_name: str, level: str, requested: int) -> int:
     """Return the completion budget for a model/effort pair.
 
-    Kimi's reasoning endpoint requires at least 8,000 max tokens. Lower tiers
-    stay well under the model's ceiling so ordinary requests stay fast; "max"
-    now goes all the way to Kimi's real 65,536-token NIM limit so a "Max"
-    reasoning request can actually use the model's full output budget for long
-    files instead of being cut short by a self-imposed cap (see
-    _KIMI_EFFORT_BUDGETS and continue_truncated_file for the rest of the fix).
+    Kimi's reasoning endpoint requires at least 8,000 max tokens, but the
+    larger global budgets made ordinary Kimi requests unnecessarily slow. Keep
+    every Kimi tier below the 32,000-token maximum requested by the product.
     """
     n = max(1, int(requested or 1024))
     if _is_kimi_model(model_name):
@@ -246,20 +238,12 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
     return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=transport_timeout)
 
 
-def strip_thinking(text: str, strip_result: bool = True) -> str:
+def strip_thinking(text: str) -> str:
     if not text:
         return text
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
-    # strip_result=False preserves leading/trailing whitespace exactly. Needed
-    # by the Code-mode agent loop: when a completion is cut off mid-file (see
-    # continue_truncated_file), the last characters of the response ARE a
-    # trailing newline that's semantically part of the file. A blanket
-    # .strip() here silently deletes it, so two stitched-together chunks land
-    # on the same line — e.g. "return 2" + "def c():" instead of "return 2\n"
-    # + "def c():" — corrupting the generated code. Every other caller keeps
-    # the old stripped behavior (the default).
-    return text.strip() if strip_result else text
+    return text.strip()
 
 
 def get_current_datetime_str() -> str:
@@ -668,31 +652,7 @@ class ThinkingBudgetExceeded(Exception):
     waiting out the full generation timeout for nothing."""
 
 
-# NVIDIA NIM hosts Kimi K3 as a partner/third-party model rather than a native
-# NVIDIA one, and partner-hosted models on NIM get their own, much tighter
-# per-key rate limit than native models like Nemotron — so it's the one that
-# runs out first under repeated use, surfacing as a raw "[429] Too Many
-# Requests" exception with no retry of its own. Kimi isn't broken; the call is
-# being rejected before it ever reaches the model. Retry with backoff instead
-# of failing the whole turn on the first 429 — most of these limits are
-# per-minute and clear within a few seconds.
-_RATE_LIMIT_MARKERS = ("429", "too many requests", "rate limit", "rate_limit")
-MAX_RATE_LIMIT_RETRIES = 4
-RATE_LIMIT_BACKOFF_BASE = 2.0  # seconds; doubles each attempt, plus jitter
-
-
-def _looks_like_rate_limit(exc: BaseException) -> bool:
-    text = str(exc).lower()
-    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
-
-
-async def _sleep_for_retry(attempt: int) -> None:
-    import random
-    delay = RATE_LIMIT_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 1)
-    await asyncio.sleep(delay)
-
-
-async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None, thinking_mode: Optional[bool] = None, reasoning_effort: Optional[str] = None, max_think_chars: Optional[int] = None, strip_result: bool = True) -> str:
+async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None, thinking_mode: Optional[bool] = None, reasoning_effort: Optional[str] = None, max_think_chars: Optional[int] = None) -> str:
     """Invoke once. When a live queue is provided, stream BOTH the visible answer
     ('token' events) and the model's own live reasoning trace ('thought' events) in
     real time, exactly as the model produces them — mirroring Claude.ai's extended
@@ -720,19 +680,12 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
     if reasoning_effort:
         invoke_kwargs["reasoning_effort"] = reasoning_effort
     if not isinstance(progress, asyncio.Queue):
-        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
-            try:
-                result = await llm.ainvoke(messages, **invoke_kwargs)
-                break
-            except Exception as exc:
-                if attempt >= MAX_RATE_LIMIT_RETRIES or not _looks_like_rate_limit(exc):
-                    raise
-                await _sleep_for_retry(attempt)
+        result = await llm.ainvoke(messages, **invoke_kwargs)
         reasoning = _extract_reasoning(result)
         if reasoning and isinstance(progress, list):
             progress.append({"step": "reasoning", "label": "Thinking", "detail": reasoning.strip()})
         content = _coerce_model_text(getattr(result, "content", "") or "")
-        answer_text = strip_thinking(content, strip_result=strip_result)
+        answer_text = strip_thinking(content).strip()
         if max_think_chars is not None and not answer_text and len(reasoning) > max_think_chars:
             raise ThinkingBudgetExceeded(
                 f"Model produced {len(reasoning)} chars of reasoning (budget {max_think_chars}) "
@@ -814,40 +767,24 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
                 buffer = buffer[idx + len(tag):]
                 in_thought = False
 
-    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
-        produced_any = False
-        try:
-            async for chunk in llm.astream(messages, **invoke_kwargs):
-                produced_any = True
-                reasoning_piece = _extract_reasoning(chunk)
-                if reasoning_piece:
-                    reasoning_seen = True
-                    await publish_thought(progress, reasoning_piece)
-                    think_chars += len(reasoning_piece)
-                    check_think_budget()
+    async for chunk in llm.astream(messages, **invoke_kwargs):
+        reasoning_piece = _extract_reasoning(chunk)
+        if reasoning_piece:
+            reasoning_seen = True
+            await publish_thought(progress, reasoning_piece)
+            think_chars += len(reasoning_piece)
+            check_think_budget()
 
-                piece = _coerce_model_text(getattr(chunk, "content", "") or "")
-                if not piece:
-                    continue
-                full += piece
-                buffer += piece
-                await drain(flush_all=False)
-                check_think_budget()
-            break
-        except ThinkingBudgetExceeded:
-            raise
-        except Exception as exc:
-            # Only safe to retry the whole stream from scratch if nothing was
-            # produced yet — a 429 on NIM partner-hosted models like Kimi K3
-            # fails before the first chunk, so this is the common case. If
-            # real content already streamed to the UI, retrying would
-            # duplicate it, so propagate instead.
-            if produced_any or attempt >= MAX_RATE_LIMIT_RETRIES or not _looks_like_rate_limit(exc):
-                raise
-            await _sleep_for_retry(attempt)
+        piece = _coerce_model_text(getattr(chunk, "content", "") or "")
+        if not piece:
+            continue
+        full += piece
+        buffer += piece
+        await drain(flush_all=False)
+        check_think_budget()
 
     await drain(flush_all=True)
-    return strip_thinking(full, strip_result=strip_result)
+    return strip_thinking(full).strip()
 
 
 async def chat_understand_node(request: "ChatRequest", session: dict, progress=None) -> dict:
@@ -993,23 +930,6 @@ CODE_READ_CHAR_LIMIT = 40000       # how much of a file is handed back on read_f
 THINK_BUDGET_FRACTION = 0.55       # same guard as before: abort a turn if the
 THINK_CHARS_PER_TOKEN = 4          # model is still "thinking" past this share
                                     # of budget with no visible answer yet.
-
-# THE ACTUAL "can't generate long code" bug: DeepSeek V4 Pro has a hard NVIDIA
-# NIM ceiling of 16384 completion tokens per call, and Kimi K3's own effort
-# budgets (see _KIMI_EFFORT_BUDGETS) top out well under its 65536 ceiling. Any
-# file whose content is longer than what fits in ONE completion gets cut off
-# mid-statement before the closing ``` fence the THOUGHT/ACTION/PATH parser
-# requires. Previously that meant parse_agent_turn() returned None for the
-# whole turn — the model's entire partial file body was thrown away and it was
-# told to "retry", so it started the same file from scratch, hit the same
-# ceiling, and looped until MAX_AGENT_STEPS ran out with nothing long ever
-# saved. Fixed by (1) parse_agent_turn() now keeps an opened-but-unclosed file
-# body instead of discarding it, and (2) continue_truncated_file() below asks
-# the model to resume writing raw content from exactly where it stopped,
-# repeating until the closing fence appears or this cap is spent, then the
-# stitched-together result is saved as one file. This is what actually lets a
-# file be longer than a single completion's token budget.
-MAX_FILE_CONTINUATIONS = 6         # extra resume calls allowed for one truncated file
 
 # No wall-clock ceiling on the whole multi-step agent run either (see
 # run_code_agent_once / stream_code_agent below, which now pass timeout=None to
@@ -1275,29 +1195,19 @@ def parse_agent_turn(raw: str) -> Optional[dict]:
         if not path:
             return None
         fence = _FENCE_RE.search(rest)
-        if fence:
-            content = fence.group("content")
-            if content.endswith("\n"):
-                content = content[:-1]
-            return {"thought": thought, "action": action, "path": path, "content": content, "truncated": False}
-        # No closing fence — almost always means the completion hit its own
-        # token ceiling mid-file, not that the model produced garbage. If it at
-        # least opened a fence, keep everything written after it instead of
-        # discarding the whole turn; the caller resumes generation from here
-        # (see continue_truncated_file) rather than making the model start the
-        # file over from scratch and hit the exact same ceiling again.
-        open_fence = _FENCE_OPEN_RE.search(rest)
-        if not open_fence:
+        if not fence:
             return None
-        content = rest[open_fence.end():]
-        return {"thought": thought, "action": action, "path": path, "content": content, "truncated": True}
+        content = fence.group("content")
+        if content.endswith("\n"):
+            content = content[:-1]
+        return {"thought": thought, "action": action, "path": path, "content": content}
     if action in ("read_file", "delete_file"):
         if not path:
             return None
-        return {"thought": thought, "action": action, "path": path, "content": None, "truncated": False}
+        return {"thought": thought, "action": action, "path": path, "content": None}
     # final
     explanation = rest.strip() or thought or "Done."
-    return {"thought": thought, "action": "final", "path": None, "content": explanation, "truncated": False}
+    return {"thought": thought, "action": "final", "path": None, "content": explanation}
 
 
 # ---------------------------------------------------------------------------
@@ -1378,90 +1288,6 @@ def make_agent_stream_watcher(progress):
             state["buffer"] = state["buffer"][send_len:]
 
     return watcher
-
-
-def make_continuation_stream_watcher(progress):
-    """Same streaming behavior as make_agent_stream_watcher's phase 2, but for
-    continuation calls that resume a truncated file body directly: there is no
-    THOUGHT/ACTION/PATH header or opening fence to locate first, because we are
-    already inside the file. Every token is file content until the closing
-    ``` fence appears."""
-    state = {"done": False, "buffer": ""}
-
-    async def watcher(text: str) -> None:
-        if state["done"] or not text:
-            return
-        state["buffer"] += text
-        close_idx = state["buffer"].find("```")
-        if close_idx != -1:
-            content = state["buffer"][:close_idx]
-            if content:
-                await publish_event(progress, {"type": "code_delta", "text": content})
-            state["done"] = True
-            return
-        hold_back = min(len(state["buffer"]), 2)
-        send_len = len(state["buffer"]) - hold_back
-        if send_len > 0:
-            await publish_event(progress, {"type": "code_delta", "text": state["buffer"][:send_len]})
-            state["buffer"] = state["buffer"][send_len:]
-
-    return watcher
-
-
-async def continue_truncated_file(
-    path: str,
-    accumulated: str,
-    llm: ChatNVIDIA,
-    is_kd: bool,
-    kd_effort: Optional[str],
-    agent_messages: List[BaseMessage],
-    raw_turn_text: str,
-    emit,
-) -> Tuple[str, bool]:
-    """Resume a create_file/edit_file body that hit the model's own completion
-    ceiling before its closing ``` fence appeared (DeepSeek's fixed 16384-token
-    NIM ceiling, or Kimi's effort-tier budgets — see _KIMI_EFFORT_BUDGETS).
-
-    Keeps everything already written and asks the model to continue writing
-    RAW file content — no new header, no new fence — picking up exactly where
-    it left off, repeating until a closing fence appears or
-    MAX_FILE_CONTINUATIONS resume calls are spent. This is what lets a file be
-    longer than any single completion's token budget instead of being silently
-    cut off or thrown away entirely.
-
-    Returns (final_content, still_truncated).
-    """
-    last_ai_text = raw_turn_text
-    for _ in range(MAX_FILE_CONTINUATIONS):
-        tail = accumulated[-4000:]
-        continue_messages = agent_messages + [
-            AIMessage(content=last_ai_text),
-            HumanMessage(content=(
-                f"TOOL RESULT: Your last response was cut off after {len(accumulated)} characters because it hit "
-                f"the generation limit — {path} is not finished yet. Continue writing the RAW remaining file "
-                f"content for {path}, starting exactly where you left off. Do not repeat any of what you already "
-                "wrote, do not restate THOUGHT/ACTION/PATH, and do not open a new ``` fence — you are still "
-                "inside the same file body. Output only the next part of the file. When the file is completely "
-                "finished, end your output with a closing ``` fence on its own line and nothing after it.\n\n"
-                f"The last part of what you already wrote was:\n---\n{tail}\n---"
-            )),
-        ]
-        watcher = make_continuation_stream_watcher(emit.queue)
-        # strip_result=False: this chunk is raw file content, not a formatted
-        # reply — a leading/trailing newline here is real file content, and
-        # losing it is exactly the merge-boundary bug this function exists to
-        # avoid (see strip_thinking's docstring note).
-        if is_kd:
-            cont_raw = await invoke_model(continue_messages, llm, emit.queue, on_answer_piece=watcher, reasoning_effort=kd_effort, strip_result=False)
-        else:
-            cont_raw = await invoke_model(continue_messages, llm, emit.queue, on_answer_piece=watcher, thinking_mode=False, strip_result=False)
-        close_idx = cont_raw.find("```")
-        if close_idx != -1:
-            accumulated += cont_raw[:close_idx]
-            return accumulated, False
-        accumulated += cont_raw
-        last_ai_text = cont_raw
-    return accumulated, True
 
 
 # ---------------------------------------------------------------------------
@@ -1591,13 +1417,11 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 raw = await invoke_model(
                     agent_messages, llm, emit.queue,
                     on_answer_piece=watcher, reasoning_effort=_kd_effort, max_think_chars=max_think_chars,
-                    strip_result=False,
                 )
             else:
                 raw = await invoke_model(
                     agent_messages, llm, emit.queue,
                     on_answer_piece=watcher, thinking_mode=False, max_think_chars=max_think_chars,
-                    strip_result=False,
                 )
         except ThinkingBudgetExceeded:
             if _is_kd:
@@ -1609,7 +1433,6 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                     llm, emit.queue,
                     on_answer_piece=make_agent_stream_watcher(emit.queue),
                     reasoning_effort=_kd_effort,
-                    strip_result=False,
                 )
             else:
                 raw = await invoke_model(
@@ -1620,7 +1443,6 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                     llm, emit.queue,
                     on_answer_piece=make_agent_stream_watcher(emit.queue),
                     thinking_mode=False,
-                    strip_result=False,
                 )
 
         turn = parse_agent_turn(raw)
@@ -1675,19 +1497,6 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
 
         if action in ("edit_file", "create_file"):
             content = turn["content"] or ""
-            if turn.get("truncated"):
-                content, still_truncated = await continue_truncated_file(
-                    path, content, llm, _is_kd, _kd_effort, agent_messages, raw, emit,
-                )
-                if still_truncated:
-                    await emit({
-                        "type": "activity_error", "action": "edit" if path in file_store else "create",
-                        "file": path,
-                        "message": (
-                            f"{path} is still generating after {MAX_FILE_CONTINUATIONS} continuation calls — "
-                            "saving what was produced so far. Ask to continue if it looks incomplete."
-                        ),
-                    })
             if len(content) > CODE_MAX_FILE_CHARS:
                 content = content[:CODE_MAX_FILE_CHARS] + "\n… output truncated …"
             old_content = file_store.get(path)
