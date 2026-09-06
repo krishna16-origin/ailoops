@@ -48,13 +48,7 @@ THINKING_LEVELS = {
 }
 DEFAULT_THINKING_LEVEL = "low"
 
-# Fresh Kimi K3 - without endpoint (NVIDIA host only)
 KIMI_MODEL = "moonshotai/kimi-k3"
-KIMI_API_BASE = "https://integrate.api.nvidia.com/v1"
-# Simple client-side throttling to avoid bursting Kimi's per-model rate limit (429)
-_LAST_KIMI_CALL_TS = 0.0
-_KIMI_MIN_INTERVAL = 0.8  # seconds between Kimi calls
-_KIMI_CALL_LOCK = asyncio.Lock()
 
 # ChatNVIDIA builds both requests and aiohttp clients. A zero timeout disables
 # aiohttp reads but is invalid for requests, so use a long valid transport
@@ -127,9 +121,7 @@ def _get_chat_nvidia_client(model_name: str, temperature: float, max_tokens: int
 
 
 def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
-    """Create the selected Chat-mode model (Deepseek / Nemotron). 
-    Kimi K3 is added freshly without endpoint via dedicated OpenAI client."""
-    # Fresh Kimi added without endpoint - balanced maps to Kimi
+    """Create the selected Chat-mode model (Deepseek / Nemotron / Kimi). Kimi now uses generic ChatNVIDIA flow."""
     model_name = KIMI_MODEL
     model_type_clean = (model_type or "balanced").strip().lower()
     if model_type_clean == "fast":
@@ -138,22 +130,15 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
     elif model_type_clean == "balanced":
         model_name = KIMI_MODEL
-    # Kimi K3 / DeepSeek V4 Pro via NVIDIA NIM require fixed temperature=1.0
-    # (platform.kimi.ai and docs.api.nvidia.com 2026-08-27). Passing 0.2/0.7
-    # returns 400 Bad Request — this was the regression that broke Kimi after
-    # 3 successful builds. Nemotron keeps variable temperature.
-    if _is_kimi_or_deepseek_model(model_name):
+    # DeepSeek via NVIDIA NIM requires fixed temperature=1.0; Kimi now treated like other models.
+    if _is_deepseek_model(model_name):
         temperature = 1.0
     max_tokens = _clamp_max_tokens(model_name, max_tokens)
-    # ChatNVIDIA uses this as a connect/read inactivity timeout, not a total
-    # agent runtime. Keep Kimi/DeepSeek open for a full day while they think or
-    # produce a large completion; the agent still has its MAX_AGENT_STEPS bound.
-    transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_kimi_or_deepseek_model(model_name) else 300
+    transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_deepseek_model(model_name) else 300
     return _get_chat_nvidia_client(model_name, temperature, max_tokens, transport_timeout)
 
 
 # Code-mode models — normal picker (no long-horizon tier, same budget as Chat)
-# Fresh Kimi added without endpoint (uses dedicated OpenAI client)
 CODE_MODEL_MAP = {
     "gemma": "google/gemma-4-31b-it",
     "fast": "google/gemma-4-31b-it",
@@ -168,89 +153,9 @@ CODE_MODEL_MAP = {
 DEFAULT_CODE_MODEL = "glimmer"
 
 
-# --- Per-model compatibility helpers (minimal, non-invasive) ---
-# Kimi K3 and DeepSeek V4 Pro via NVIDIA NIM have fixed sampling params.
-# - temperature must be 1.0 (other values return 400) — verified 2026-08-27 docs
-# - Kimi K3 supports reasoning_effort low/high/max (always thinking), not thinking_mode
-# - DeepSeek V4 Pro supports chat_template_kwargs thinking + reasoning_effort
-# Nemotron is native NVIDIA and supports variable temperature + thinking_mode.
-def _is_kimi_or_deepseek_model(model_name: str) -> bool:
-    low = (model_name or "").lower()
-    return "kimi" in low or "deepseek" in low
-
-
+# --- Per-model compatibility helpers ---
 def _is_deepseek_model(model_name: str) -> bool:
     return "deepseek" in (model_name or "").lower()
-
-
-def _is_kimi_model(model_name: str) -> bool:
-    return "kimi" in (model_name or "").lower()
-
-
-# --- Fresh Kimi K3 handling without endpoint (NVIDIA host only) ---
-# Removed old Kimi wiring and re-added here without any custom endpoint.
-# Kimi goes through the default hosted NIM (integrate.api.nvidia.com/v1) via
-# NVIDIA_API_KEY only, same as other models but without a per-model endpoint
-# override. Uses OpenAI-compatible client directly to avoid ChatNVIDIA registry
-# issues (kimi-k3 not in MODEL_TABLE) and to control reasoning_effort/max_tokens
-# precisely.
-KIMI_MODEL = "moonshotai/kimi-k3"
-KIMI_API_BASE = "https://integrate.api.nvidia.com/v1"
-_KIMI_OPENAI_CLIENT = None
-_KIMI_OPENAI_ASYNC_CLIENT = None
-
-
-def _get_kimi_openai_clients():
-    """Lazily create sync/async OpenAI clients for Kimi without endpoint."""
-    global _KIMI_OPENAI_CLIENT, _KIMI_OPENAI_ASYNC_CLIENT
-    if _KIMI_OPENAI_CLIENT is None:
-        try:
-            import openai
-        except ImportError as exc:
-            raise RuntimeError("openai package required for Kimi K3") from exc
-        api_key = os.getenv("NVIDIA_API_KEY")
-        if not api_key:
-            raise RuntimeError("NVIDIA_API_KEY not set for Kimi")
-        _KIMI_OPENAI_CLIENT = openai.OpenAI(base_url=KIMI_API_BASE, api_key=api_key, timeout=LONG_GENERATION_TRANSPORT_TIMEOUT)
-        _KIMI_OPENAI_ASYNC_CLIENT = openai.AsyncOpenAI(base_url=KIMI_API_BASE, api_key=api_key, timeout=LONG_GENERATION_TRANSPORT_TIMEOUT)
-    return _KIMI_OPENAI_CLIENT, _KIMI_OPENAI_ASYNC_CLIENT
-
-
-def _to_openai_messages(messages: List[BaseMessage]) -> List[Dict[str, Any]]:
-    """Convert LangChain BaseMessages to OpenAI chat messages, preserving reasoning."""
-    out: List[Dict[str, Any]] = []
-    for m in messages:
-        if isinstance(m, SystemMessage):
-            content = (m.content or "").strip()
-            if content:
-                out.append({"role": "system", "content": content})
-        elif isinstance(m, HumanMessage):
-            content = (m.content or "").strip()
-            if content:
-                out.append({"role": "user", "content": content})
-        elif isinstance(m, AIMessage):
-            content = (m.content or "").strip()
-            kwargs = getattr(m, "additional_kwargs", {}) or {}
-            reasoning = kwargs.get("reasoning_content") or kwargs.get("reasoning")
-            if reasoning:
-                # Preserve prior reasoning as assistant reasoning_content
-                if content:
-                    out.append({"role": "assistant", "content": content, "reasoning_content": reasoning})
-                else:
-                    # Keep reasoning even if content empty (avoids dropping context)
-                    out.append({"role": "assistant", "content": "", "reasoning_content": reasoning})
-            elif content:
-                out.append({"role": "assistant", "content": content})
-            # Skip empty assistant messages with no reasoning
-        else:
-            # Fallback for generic BaseMessage
-            content = getattr(m, "content", "") or ""
-            if content and content.strip():
-                role = getattr(m, "type", "user")
-                if role not in ("system", "user", "assistant"):
-                    role = "user"
-                out.append({"role": role, "content": content.strip()})
-    return out
 
 
 def _is_429_error(exc: Exception) -> bool:
@@ -275,300 +180,33 @@ def _get_retry_delay(attempt: int, retry_after: Optional[str] = None) -> float:
     return base + random.uniform(0, 0.5)
 
 
-def _raise_kimi_error(exc: Exception) -> None:
-    """Map OpenAI errors to RuntimeError with status code for UI. 429 is handled with friendly message."""
-    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
-    msg = str(exc)
-    if status == 429 or "429" in msg:
-        # Extract Retry-After if available
-        retry_after = None
-        try:
-            headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
-            retry_after = headers.get("retry-after") or headers.get("Retry-After")
-        except Exception:
-            pass
-        hint = f" (retry after {retry_after}s)" if retry_after else ""
-        raise RuntimeError(f"Kimi 429 Too Many Requests - rate limit hit{hint}. Please wait a moment and try again. {msg}") from exc
-    if status == 401 or "401" in msg or "unauthorized" in msg.lower():
-        raise RuntimeError(f"Kimi 401 Unauthorized - check NVIDIA_API_KEY: {msg}") from exc
-    if status:
-        raise RuntimeError(f"Kimi {status} error: {msg}") from exc
-    raise RuntimeError(str(exc)) from exc
-
-
-async def _invoke_kimi_endpoint(
-    messages: List[BaseMessage],
-    max_tokens: int,
-    reasoning_level: str,
-    progress=None,
-    on_answer_piece=None,
-    max_think_chars: Optional[int] = None,
-) -> str:
-    """Invoke Kimi K3 without endpoint via OpenAI-compatible NVIDIA NIM."""
-    import openai
-    _, async_client = _get_kimi_openai_clients()
-    # Client-side throttling to reduce 429 bursts
-    global _LAST_KIMI_CALL_TS
-    async with _KIMI_CALL_LOCK:
-        now = asyncio.get_event_loop().time()
-        wait = _KIMI_MIN_INTERVAL - (now - _LAST_KIMI_CALL_TS)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _LAST_KIMI_CALL_TS = asyncio.get_event_loop().time()
-    lvl = normalize_thinking_level(reasoning_level)
-    effort = _map_reasoning_effort(lvl, KIMI_MODEL)
-    budget = _model_thinking_budget(KIMI_MODEL, lvl, max_tokens)
-    clamped = _clamp_max_tokens(KIMI_MODEL, budget)
-    oai_messages = _to_openai_messages(messages)
-    # Kimi requires temperature 1.0 and max_completion_tokens >=8000
-    create_kwargs: Dict[str, Any] = {
-        "model": KIMI_MODEL,
-        "messages": oai_messages,
-        "max_completion_tokens": clamped,
-        "temperature": 1.0,
-        "stream": isinstance(progress, asyncio.Queue),
-    }
-    # reasoning_effort via extra_body for compatibility with older openai SDKs
-    # Try top-level first, fallback to extra_body on TypeError
-    extra_body = {"reasoning_effort": effort}
-    # Streaming path
-    if isinstance(progress, asyncio.Queue):
-        # Publish Kimi live thinking via reasoning_content when available
-        think_chars = 0
-        answer_started = False
-
-        async def _emit_answer(text: str):
-            nonlocal answer_started
-            if not text:
-                return
-            answer_started = True
-            if on_answer_piece:
-                await on_answer_piece(text)
-            else:
-                await publish_token(progress, text)
-
-        # Handle <think> fallback as well
-        OPEN_TAGS = ("<think>", "<thinking>")
-        CLOSE_TAGS = ("</think>", "</thinking>")
-        max_tag_len = max(len(t) for t in OPEN_TAGS + CLOSE_TAGS)
-        buffer = ""
-        in_thought = False
-        reasoning_seen = False
-        full = ""
-
-        def _check_budget():
-            if max_think_chars is not None and not answer_started and think_chars > max_think_chars:
-                raise ThinkingBudgetExceeded(f"Kimi produced {think_chars} chars of reasoning (budget {max_think_chars}) without visible answer")
-
-        async def _drain(flush_all: bool):
-            nonlocal buffer, in_thought, think_chars
-            while True:
-                if not in_thought:
-                    positions = [buffer.find(t) for t in OPEN_TAGS if t in buffer]
-                    idx = min(positions) if positions else -1
-                    if idx == -1:
-                        hold_back = 0 if flush_all else min(len(buffer), max_tag_len - 1)
-                        send_len = len(buffer) - hold_back
-                        if send_len > 0:
-                            await _emit_answer(buffer[:send_len])
-                            buffer = buffer[send_len:]
-                        return
-                    if idx:
-                        await _emit_answer(buffer[:idx])
-                    tag = next(t for t in OPEN_TAGS if buffer[idx:].startswith(t))
-                    buffer = buffer[idx + len(tag):]
-                    in_thought = True
-                else:
-                    positions = [buffer.find(t) for t in CLOSE_TAGS if t in buffer]
-                    idx = min(positions) if positions else -1
-                    if idx == -1:
-                        hold_back = 0 if flush_all else min(len(buffer), max_tag_len - 1)
-                        send_len = len(buffer) - hold_back
-                        if send_len > 0:
-                            if not reasoning_seen:
-                                await publish_thought(progress, buffer[:send_len])
-                                think_chars += send_len
-                            buffer = buffer[send_len:]
-                        return
-                    if idx:
-                        if not reasoning_seen:
-                            await publish_thought(progress, buffer[:idx])
-                            think_chars += idx
-                    tag = next(t for t in CLOSE_TAGS if buffer[idx:].startswith(t))
-                    buffer = buffer[idx + len(tag):]
-                    in_thought = False
-
-        # Streaming with 429 retry (covers both create and iteration)
-        last_exc = None
-        for attempt in range(4):
-            # Reset stream state on retry
-            if attempt > 0:
-                # Reset buffers for retry
-                buffer = ""
-                in_thought = False
-                reasoning_seen = False
-                full = ""
-                think_chars = 0
-                answer_started = False
-            stream = None
-            try:
-                try:
-                    stream = await async_client.chat.completions.create(**create_kwargs, reasoning_effort=effort)
-                except TypeError as te:
-                    if "reasoning_effort" in str(te):
-                        stream = await async_client.chat.completions.create(**create_kwargs, extra_body=extra_body)
-                    else:
-                        raise
-                # Iterate stream (also retryable on 429)
-                async for chunk in stream:
-                    delta = chunk.choices[0].delta if chunk.choices else None
-                    if delta is None:
-                        continue
-                    reasoning_piece = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None) or ""
-                    if reasoning_piece:
-                        reasoning_seen = True
-                        await publish_thought(progress, reasoning_piece)
-                        think_chars += len(reasoning_piece)
-                        _check_budget()
-                    piece = getattr(delta, "content", None) or ""
-                    if piece:
-                        full += piece
-                        buffer += piece
-                        await _drain(flush_all=False)
-                        _check_budget()
-                await _drain(flush_all=True)
-                return strip_thinking(full).strip()
-            except ThinkingBudgetExceeded:
-                raise
-            except Exception as exc:
-                last_exc = exc
-                if _is_429_error(exc) and attempt < 3:
-                    retry_after = None
-                    try:
-                        headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
-                        retry_after = headers.get("retry-after") or headers.get("Retry-After")
-                    except Exception:
-                        pass
-                    delay = _get_retry_delay(attempt, retry_after)
-                    print(f"[kimi] 429 hit during stream, retry {attempt+1}/3 after {delay:.1f}s")
-                    try:
-                        if isinstance(progress, asyncio.Queue):
-                            await progress.put({"type": "status", "step": "retry", "label": "Rate limited", "detail": f"Kimi rate limit during stream, retrying in {delay:.1f}s ({attempt+1}/3)..."})
-                    except Exception:
-                        pass
-                    await asyncio.sleep(delay)
-                    continue
-                _raise_kimi_error(exc)
-        if last_exc is not None:
-            _raise_kimi_error(last_exc)
-    else:
-        # Non-streaming with 429 retry
-        resp = None
-        last_exc = None
-        for attempt in range(4):
-            try:
-                try:
-                    resp = await async_client.chat.completions.create(**{k: v for k, v in create_kwargs.items() if k != "stream"}, reasoning_effort=effort)
-                except TypeError as te:
-                    if "reasoning_effort" in str(te):
-                        resp = await async_client.chat.completions.create(**{k: v for k, v in create_kwargs.items() if k != "stream"}, extra_body=extra_body)
-                    else:
-                        raise
-                last_exc = None
-                break
-            except Exception as exc:
-                last_exc = exc
-                if _is_429_error(exc) and attempt < 3:
-                    retry_after = None
-                    try:
-                        headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
-                        retry_after = headers.get("retry-after") or headers.get("Retry-After")
-                    except Exception:
-                        pass
-                    delay = _get_retry_delay(attempt, retry_after)
-                    print(f"[kimi] 429 hit (non-stream), retry {attempt+1}/3 after {delay:.1f}s")
-                    await asyncio.sleep(delay)
-                    continue
-                _raise_kimi_error(exc)
-        if last_exc is not None and resp is None:
-            _raise_kimi_error(last_exc)
-        # Parse reasoning + content
-        try:
-            msg = resp.choices[0].message if resp.choices else None
-            reasoning = getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None) or ""
-            content = getattr(msg, "content", None) or ""
-            if max_think_chars is not None and not strip_thinking(content).strip() and len(reasoning or "") > max_think_chars:
-                raise ThinkingBudgetExceeded(f"Kimi produced {len(reasoning)} chars of reasoning (budget {max_think_chars}) without visible answer")
-            if reasoning and isinstance(progress, list):
-                progress.append({"step": "reasoning", "label": "Thinking", "detail": reasoning.strip()})
-            return strip_thinking(content).strip()
-        except ThinkingBudgetExceeded:
-            raise
-        except Exception as exc:
-            _raise_kimi_error(exc)
-
-
 # NVIDIA NIM hard ceilings (docs.api.nvidia.com, 2026-08):
 #   deepseek-v4-pro-0813  max_tokens 1..16384, reasoning_effort: none|high|max
-#   moonshotai/kimi-k3    max_tokens 1..65536, reasoning_effort: low|high|max
 _DEEPSEEK_MAX_TOKENS = 16384
-_KIMI_MAX_TOKENS = 65536
-_KIMI_MIN_TOKENS = 8000
-_KIMI_EFFORT_BUDGETS = {
-    "low": 8000,
-    "medium": 12000,
-    "high": 16000,
-    "extra": 24000,
-    "max": 32000,
-}
 
 
 def _model_thinking_budget(model_name: str, level: str, requested: int) -> int:
-    """Return the completion budget for a model/effort pair.
-
-    Kimi's reasoning endpoint requires at least 8,000 max tokens, but the
-    larger global budgets made ordinary Kimi requests unnecessarily slow. Keep
-    every Kimi tier below the 32,000-token maximum requested by the product.
-    DeepSeek keeps original global budget (clamped later in _clamp_max_tokens).
-    """
-    lvl = normalize_thinking_level(level)
-    if _is_kimi_model(model_name):
-        # Use the per-effort budget directly - it already enforces the 8000
-        # minimum and the 32k product ceiling. Ignore the global
-        # THINKING_LEVELS value which exists for non-Kimi models.
-        return _KIMI_EFFORT_BUDGETS[lvl]
+    """Return the completion budget for a model/effort pair. Now generic for all models."""
     return max(1, int(requested or 1024))
 
 
 def _clamp_max_tokens(model_name: str, max_tokens: int) -> int:
-    """Clamp requested completion budget to the model's NVIDIA NIM hard limits.
-    This is a safety net - the main per-effort budget is set in
-    _model_thinking_budget(). Keep it here for any direct get_llm() calls."""
+    """Clamp requested completion budget to the model's NVIDIA NIM hard limits."""
     n = max(1, int(max_tokens or 1024))
     if _is_deepseek_model(model_name):
         return min(n, _DEEPSEEK_MAX_TOKENS)
-    if _is_kimi_model(model_name):
-        # Kimi's reasoning endpoint rejects <8000 even for Low. Hard floor.
-        return max(_KIMI_MIN_TOKENS, min(n, _KIMI_MAX_TOKENS))
     return n
 
 
 def _map_reasoning_effort(level: str, model_name: str = "") -> str:
-    """Map 5-level thinking scale to the effort enum the target model accepts.
-
-    Kimi K3 (NVIDIA + native): low | high | max
-    DeepSeek V4 Pro on NVIDIA NIM: none | high | max  (NOT "low" — invalid → 422)
-    """
+    """Map 5-level thinking scale to the effort enum the target model accepts."""
     lvl = normalize_thinking_level(level)
     if _is_deepseek_model(model_name):
-        # NVIDIA NIM DeepSeek rejects "low". Map the lowest tier to "none"
-        # (disable thinking) and keep high/max for deeper tiers.
         if lvl == "low":
             return "none"
         if lvl in ("medium", "high"):
             return "high"
         return "max"
-    # Kimi K3 (and any other reasoning_effort consumer)
     if lvl == "low":
         return "low"
     if lvl in ("medium", "high"):
@@ -583,22 +221,17 @@ def _resolve_chat_model_name(model_type: str) -> str:
         return "deepseek-ai/deepseek-v4-pro-0813"
     if model_type_clean == "reasoning":
         return "nvidia/nemotron-3-ultra-550b-a55b"
-    # Fresh Kimi without endpoint
     return KIMI_MODEL
 
 
 def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
-    """Create the selected Code-mode model (normal — same handling as Chat, no long-horizon special case)."""
+    """Create the selected Code-mode model (generic handling like other models)."""
     model_type_clean = (model_type or DEFAULT_CODE_MODEL).strip().lower()
     model_name = CODE_MODEL_MAP.get(model_type_clean, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
-    if _is_kimi_or_deepseek_model(model_name):
+    if _is_deepseek_model(model_name):
         temperature = 1.0
     max_tokens = _clamp_max_tokens(model_name, max_tokens)
-    # DeepSeek/Kimi can spend a long time in reasoning before the next stream
-    # chunk. Use the long cross-client-safe window so code generation is not
-    # interrupted; the agent loop remains bounded by MAX_AGENT_STEPS and the
-    # frontend receives heartbeat events.
-    transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_kimi_or_deepseek_model(model_name) else 300
+    transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_deepseek_model(model_name) else 300
     return _get_chat_nvidia_client(model_name, temperature, max_tokens, transport_timeout)
 
 
@@ -1244,21 +877,15 @@ async def chat_compose_node(request: "ChatRequest", state: dict, progress=None) 
     await publish_progress(progress, "chat_compose_node", "chat_compose_node", f"Invoking the model with {config['label']} thinking and a {config['max_tokens']}-token budget.")
     _chat_model_name = _resolve_chat_model_name(request.model_type)
     _chat_messages = build_messages(state["history"], request.thinking_level, state["search_text"])
-    # Fresh Kimi without endpoint uses dedicated OpenAI client
-    if _is_kimi_model(_chat_model_name):
-        response = await _invoke_kimi_endpoint(
-            _chat_messages, config["max_tokens"], request.thinking_level, progress
+    _chat_budget = _model_thinking_budget(_chat_model_name, request.thinking_level, config["max_tokens"])
+    llm = get_llm(request.model_type, request.temperature, _chat_budget)
+    if _is_deepseek_model(_chat_model_name):
+        response = await invoke_model(
+            _chat_messages, llm, progress,
+            reasoning_effort=_map_reasoning_effort(request.thinking_level, _chat_model_name),
         )
     else:
-        _chat_budget = _model_thinking_budget(_chat_model_name, request.thinking_level, config["max_tokens"])
-        llm = get_llm(request.model_type, request.temperature, _chat_budget)
-        if _is_deepseek_model(_chat_model_name):
-            response = await invoke_model(
-                _chat_messages, llm, progress,
-                reasoning_effort=_map_reasoning_effort(request.thinking_level, _chat_model_name),
-            )
-        else:
-            response = await invoke_model(_chat_messages, llm, progress)
+        response = await invoke_model(_chat_messages, llm, progress)
     state["response"] = response or "I apologize, I encountered an issue formulating my answer."
     return state
 
@@ -1516,10 +1143,8 @@ def build_plan_messages(history: List[BaseMessage], file_store: Dict[str, str], 
     skill_block = _matching_skill_blocks(latest_text)
     system_text = (
         build_constitution_block() + skill_block + "\n\n"
-        "You are the planning stage of an autonomous coding agent. You do not write code here — only a plan.\n"
-        "Given the user's latest request and the files that already exist in this project, write 2-5 short "
-        "numbered steps describing what you're about to do (which files to read, create, edit, or delete, "
-        "and why). Format: `1. ...`, `2. ...`. No preamble, no code, nothing beyond the numbered steps.\n"
+        "You are the planning stage of an autonomous coding agent. You do not write code here — only a BRIEF step-by-step plan.\n"
+        "Given the user's latest request and the files that already exist, write exactly 2-5 VERY BRIEF numbered steps, each 8-15 words, step-by-step in execution order (e.g. `1. Read index.html to check layout`, `2. Create styles.css with dark theme`, `3. Edit script.js to add interactivity`). Keep it concise — no preamble, no explanation, no code, only the numbered steps.\n"
         + _security_block() + "\n"
         f"Current date and time: {get_current_datetime_str()}\n\n"
         f"EXISTING PROJECT FILES:\n{_file_listing(file_store)}"
@@ -1756,12 +1381,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             ]
         else:
             plan_messages = build_plan_messages(history, file_store, request.reasoning_level)
-            if _is_kimi_model(model_name):
-                # Fresh Kimi without endpoint
-                plan_text = await _invoke_kimi_endpoint(
-                    plan_messages, config["max_tokens"], request.reasoning_level, None
-                )
-            elif _is_deepseek_model(model_name):
+            if _is_deepseek_model(model_name):
                 llm = get_code_llm(model_key, 0.2, _model_thinking_budget(model_name, request.reasoning_level, config["max_tokens"]))
                 plan_text = await invoke_model(
                     plan_messages, llm, None,
@@ -1809,13 +1429,10 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     model_key = resolve_code_model_key(request.model)
     config = get_code_thinking_config(reasoning_level)
     _code_model_name = CODE_MODEL_MAP.get(model_key, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
-    _is_kimi = _is_kimi_model(_code_model_name)
     _is_deepseek = _is_deepseek_model(_code_model_name)
-    _is_kd = _is_kimi or _is_deepseek
-    # Fresh Kimi without endpoint uses dedicated client; DeepSeek keeps reasoning_effort low/high
-    _kd_effort = ("none" if _is_deepseek else "low") if _is_kd else None
+    _kd_effort = "none" if _is_deepseek else None
     _code_budget = _model_thinking_budget(_code_model_name, reasoning_level, config["max_tokens"])
-    llm = None if _is_kimi else get_code_llm(model_key, 0.2, _code_budget)
+    llm = get_code_llm(model_key, 0.2, _code_budget)
     max_think_chars = int(_code_budget * THINK_BUDGET_FRACTION * THINK_CHARS_PER_TOKEN)
 
     # Build mode never invokes the planner. It executes the latest plan created
@@ -1836,7 +1453,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
 
     for step in range(1, MAX_AGENT_STEPS + 1):
         agent_messages = build_agent_messages(history, transcript, file_store, plan_steps, reasoning_level, step)
-        if _is_kd:
+        if _is_deepseek:
             agent_messages.append(SystemMessage(content=(
                 "FAST CODE EXECUTION: Think internally, then write exactly one short THOUGHT sentence. "
                 "Immediately follow it with the required ACTION and complete file content. Do not add a "
@@ -1846,13 +1463,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
 
         malformed_retry_note = None
         try:
-            if _is_kimi:
-                # Fresh Kimi without endpoint
-                raw = await _invoke_kimi_endpoint(
-                    agent_messages, config["max_tokens"], reasoning_level, emit.queue,
-                    on_answer_piece=watcher, max_think_chars=max_think_chars,
-                )
-            elif _is_deepseek:
+            if _is_deepseek:
                 raw = await invoke_model(
                     agent_messages, llm, emit.queue,
                     on_answer_piece=watcher, reasoning_effort=_kd_effort, max_think_chars=max_think_chars,
@@ -1863,16 +1474,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                     on_answer_piece=watcher, thinking_mode=False, max_think_chars=max_think_chars,
                 )
         except ThinkingBudgetExceeded:
-            if _is_kimi:
-                raw = await _invoke_kimi_endpoint(
-                    agent_messages + [SystemMessage(content=(
-                        "Stop planning. Respond immediately in the required THOUGHT/ACTION format with a single "
-                        "concrete action."
-                    ))],
-                    config["max_tokens"], reasoning_level, emit.queue,
-                    on_answer_piece=make_agent_stream_watcher(emit.queue),
-                )
-            elif _is_deepseek:
+            if _is_deepseek:
                 raw = await invoke_model(
                     agent_messages + [SystemMessage(content=(
                         "Stop planning. Respond immediately in the required THOUGHT/ACTION format with a single "
@@ -2013,9 +1615,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 "You are out of tool-call turns. Respond now with ACTION: final and a short explanation of "
                 "what was accomplished."
             )))
-            if _is_kimi:
-                raw = await _invoke_kimi_endpoint(wrap_messages, config["max_tokens"], reasoning_level, None)
-            elif _is_deepseek:
+            if _is_deepseek:
                 raw = await invoke_model(wrap_messages, llm, None, reasoning_effort=_kd_effort)
             else:
                 raw = await invoke_model(wrap_messages, llm, None, thinking_mode=False)
