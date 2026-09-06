@@ -455,6 +455,36 @@
         .thinking-indicator .state-listening .spark-secondary { animation:listen-pulse-secondary 2s ease-in-out infinite 0.2s; }
         .thinking-indicator .state-listening .core-dot { animation:listen-core 2s ease-in-out infinite; fill:#38bdf8; }
 
+        /* ============== CODE MODE: circular robot avatar (replaces spark) ==============
+           Header hero + every Code message's avatar circle. Same artwork as
+           ai_avatar.html; Chat's spark is never touched. */
+        .code-av-circle { border-radius:50%; overflow:hidden; position:relative; flex-shrink:0;
+            background:#0b0c10; border:1px solid var(--border-color);
+            display:inline-flex; align-items:center; justify-content:center; }
+        .code-av-circle[hidden] { display:none !important; }
+        .code-av-circle svg { display:block; width:100%; height:100%; overflow:hidden; }
+        #codeHeroAvatar { width:76px; height:76px; margin-bottom:18px;
+            box-shadow:0 0 24px rgba(0,229,255,0.18);
+            animation:popFadeIn 0.6s var(--transition-bezier) forwards; }
+        .opening-scene.code-mode .mono-logo-container { display:none; }
+        /* Code avatar reuses the existing .assistant-avatar slot — just reset its
+           padding so the robot fills the 26px circle (base .assistant-avatar has
+           padding:5px for the spark). */
+        .assistant-avatar.code-av-circle { padding:0; background:#0b0c10; }
+        .assistant-avatar.code-av-circle svg { width:100%; height:100%; }
+        .code-av-blink-l, .code-av-blink-r { transition:transform 0.12s cubic-bezier(0.4,0,0.2,1); }
+        .code-av-blink-l { transform-origin:245px 285px; }
+        .code-av-blink-r { transform-origin:355px 285px; }
+        .code-av-circle .is-blinking { transform:scaleY(0.05); }
+        @keyframes code-av-led-pulse { 0%,100% { opacity:0.4; transform:scale(1); } 50% { opacity:1; transform:scale(1.15); } }
+        .code-av-led { animation:code-av-led-pulse 4s infinite ease-in-out; transform-origin:300px 450px; }
+        .code-av-fly { position:fixed; z-index:60; border-radius:50%; overflow:hidden; background:#0b0c10;
+            border:1px solid var(--border-color); pointer-events:none; margin:0; box-shadow:none !important; filter:none !important;
+            transition:transform 0.55s var(--transition-bezier), width 0.55s var(--transition-bezier), height 0.55s var(--transition-bezier), opacity 0.55s ease; }
+        .code-av-fly svg, .code-av-fly [data-layer="head"] { filter:none !important; -webkit-filter:none !important; }
+        @media (max-width: 768px) { #codeHeroAvatar { width:64px; height:64px; margin-bottom:14px; } }
+        @media (prefers-reduced-motion: reduce) { .code-av-fly { transition:none; } #codeHeroAvatar { animation:none; } }
+
         /* Smooth cross-fade when swapping between Chat / Code content */
         .mode-fade-out { animation:modeFadeOut 0.15s ease forwards; }
         .mode-fade-in { animation:modeFadeIn 0.25s ease forwards; }
@@ -641,6 +671,7 @@
 
         <div class="chat-container" id="chatContainer">
             <div class="opening-scene" id="openingScene">
+                <div id="codeHeroAvatar" class="code-av-circle" hidden aria-hidden="true"></div>
                 <div class="mono-logo-container">
                     <svg class="mono-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round">
                         <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
@@ -918,6 +949,126 @@
             logo.classList.add(`state-${state}`);
         }
 
+        /* ============== CODE MODE: circular robot avatar (replaces spark) ==============
+           Same artwork as ai_avatar.html, adapted: per-instance UID-suffixed defs so
+           multiple circles (hero + one per Code message) never clash; data-layer
+           groups (not global IDs) so the shared cursor tracker can move each
+           instance independently; mini instances use a zoomed visor viewBox so the
+           eyes stay readable at 30px. Chat mode never calls any of this. */
+        let codeAvatarUid = 0;
+        function codeAvatarInnerSVG(uid, mini) {
+            const viewBox = mini ? '165 195 270 180' : '130 90 340 380';
+            return `<svg viewBox="${viewBox}" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">`
+            + `<defs>`
+            + `<radialGradient id="cavBg-${uid}" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#00e5ff" stop-opacity="0.12"/><stop offset="100%" stop-color="#00e5ff" stop-opacity="0"/></radialGradient>`
+            + `<linearGradient id="cavShell-${uid}" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#2d313b"/><stop offset="30%" stop-color="#1b1d24"/><stop offset="100%" stop-color="#0a0b0d"/></linearGradient>`
+            + `<linearGradient id="cavEdge-${uid}" x1="0%" y1="0%" x2="0%" y2="100%"><stop offset="0%" stop-color="#4e556b" stop-opacity="0.8"/><stop offset="100%" stop-color="#14161c" stop-opacity="0.2"/></linearGradient>`
+            + `<linearGradient id="cavGlare-${uid}" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#ffffff" stop-opacity="0.15"/><stop offset="40%" stop-color="#ffffff" stop-opacity="0"/></linearGradient>`
+            + `<filter id="cavGlow-${uid}" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="6" result="blur1"/><feGaussianBlur stdDeviation="12" result="blur2"/><feMerge><feMergeNode in="blur2"/><feMergeNode in="blur1"/><feMergeNode in="SourceGraphic"/></feMerge></filter>`
+            + `<filter id="cavShadow-${uid}" x="-20%" y="-10%" width="140%" height="140%"><feDropShadow dx="0" dy="25" stdDeviation="25" flood-color="#000000" flood-opacity="0.8"/></filter>`
+            + `<clipPath id="cavVisor-${uid}"><rect x="180" y="210" width="240" height="150" rx="75"/></clipPath>`
+            + `</defs>`
+            + `<circle cx="300" cy="300" r="280" fill="url(#cavBg-${uid})"/>`
+            + `<g data-layer="head" data-fx="4" data-fy="3" filter="url(#cavShadow-${uid})">`
+            + `<rect x="135" y="260" width="20" height="80" rx="10" fill="#12141a" stroke="#252933" stroke-width="1.5"/>`
+            + `<rect x="445" y="260" width="20" height="80" rx="10" fill="#12141a" stroke="#252933" stroke-width="1.5"/>`
+            + `<rect x="150" y="100" width="300" height="400" rx="150" fill="url(#cavShell-${uid})"/>`
+            + `<rect x="152" y="102" width="296" height="396" rx="148" fill="none" stroke="url(#cavEdge-${uid})" stroke-width="2"/>`
+            + `<path d="M 150 180 Q 300 160 450 180" fill="none" stroke="#000" stroke-width="3" opacity="0.6"/>`
+            + `<path d="M 150 420 Q 300 440 450 420" fill="none" stroke="#000" stroke-width="3" opacity="0.6"/>`
+            + `<g class="code-av-led"><circle cx="300" cy="450" r="4" fill="#00e5ff" filter="url(#cavGlow-${uid})"/><circle cx="300" cy="450" r="1.5" fill="#ffffff"/></g>`
+            + `<g data-layer="visor" data-fx="3" data-fy="2">`
+            + `<rect x="180" y="210" width="240" height="150" rx="75" fill="#030405" stroke="#16181f" stroke-width="2"/>`
+            + `<g data-layer="socket-left" data-fx="2.5" data-fy="2"><g class="code-av-blink-l"><rect x="215" y="240" width="60" height="90" rx="30" fill="#000000"/>`
+            + `<g data-layer="pupil-left" data-fx="6" data-fy="4.5"><circle cx="245" cy="285" r="22" fill="#00ffff" opacity="0.2" filter="url(#cavGlow-${uid})"/><circle cx="245" cy="285" r="14" fill="#00ffff" filter="url(#cavGlow-${uid})"/><circle cx="245" cy="285" r="8" fill="#e6ffff"/></g>`
+            + `</g></g>`
+            + `<g data-layer="socket-right" data-fx="2.5" data-fy="2"><g class="code-av-blink-r"><rect x="325" y="240" width="60" height="90" rx="30" fill="#000000"/>`
+            + `<g data-layer="pupil-right" data-fx="6" data-fy="4.5"><circle cx="355" cy="285" r="22" fill="#00ffff" opacity="0.2" filter="url(#cavGlow-${uid})"/><circle cx="355" cy="285" r="14" fill="#00ffff" filter="url(#cavGlow-${uid})"/><circle cx="355" cy="285" r="8" fill="#e6ffff"/></g>`
+            + `</g></g>`
+            + `<polygon points="120,350 350,120 550,120 320,350" fill="url(#cavGlare-${uid})" clip-path="url(#cavVisor-${uid})"/>`
+            + `</g></g></svg>`;
+        }
+        function codeAvStartBlink(root) {
+            const l = root.querySelector('.code-av-blink-l');
+            const r = root.querySelector('.code-av-blink-r');
+            if (!l || !r) return;
+            const tick = () => {
+                if (!root.isConnected) return;
+                l.classList.add('is-blinking'); r.classList.add('is-blinking');
+                setTimeout(() => { l.classList.remove('is-blinking'); r.classList.remove('is-blinking'); }, 120);
+                if (Math.random() < 0.25) {
+                    setTimeout(() => {
+                        if (!root.isConnected) return;
+                        l.classList.add('is-blinking'); r.classList.add('is-blinking');
+                        setTimeout(() => { l.classList.remove('is-blinking'); r.classList.remove('is-blinking'); }, 120);
+                    }, 250);
+                }
+                setTimeout(tick, Math.random() * 3500 + 2000);
+            };
+            setTimeout(tick, 1500);
+        }
+        // Shared cursor tracker: one mousemove listener + one rAF loop for ALL
+        // code-avatar circles. Only Code mode ever creates such elements, so the
+        // effect is Code-only by construction; Chat spark is never touched. The
+        // loop sleeps when no avatar is in the DOM to save CPU.
+        let codeAvTargetX = 0, codeAvTargetY = 0, codeAvRafId = 0, codeAvTime = 0;
+        const codeAvLerp = (a, b, t) => a + (b - a) * t;
+        function codeAvHandleMove(cx, cy) {
+            codeAvTargetX = (cx / window.innerWidth) * 2 - 1;
+            codeAvTargetY = (cy / window.innerHeight) * 2 - 1;
+        }
+        window.addEventListener('mousemove', (e) => codeAvHandleMove(e.clientX, e.clientY), { passive: true });
+        window.addEventListener('touchmove', (e) => { if (e.touches.length) codeAvHandleMove(e.touches[0].clientX, e.touches[0].clientY); }, { passive: true });
+        window.addEventListener('mouseleave', () => { codeAvTargetX = 0; codeAvTargetY = 0; });
+        window.addEventListener('touchend', () => { codeAvTargetX = 0; codeAvTargetY = 0; });
+        function codeAvLoop() {
+            const roots = document.querySelectorAll('.code-av-circle');
+            if (!roots.length) { codeAvRafId = 0; return; }
+            let anyLayer = false;
+            codeAvTime += 0.03;
+            const floatY = Math.sin(codeAvTime) * 3;
+            roots.forEach((root) => {
+                const isHero = root.id === 'codeHeroAvatar';
+                root.querySelectorAll('[data-layer]').forEach((el) => {
+                    anyLayer = true;
+                    const fx = parseFloat(el.dataset.fx || '0');
+                    const fy = parseFloat(el.dataset.fy || '0');
+                    if (el._avX === undefined) { el._avX = 0; el._avY = 0; }
+                    el._avX = codeAvLerp(el._avX, codeAvTargetX * fx, 0.08);
+                    el._avY = codeAvLerp(el._avY, codeAvTargetY * fy, 0.08);
+                    const isHead = el.dataset.layer === 'head';
+                    const y = (isHead && isHero) ? el._avY + floatY : el._avY;
+                    el.style.transform = `translate(${el._avX.toFixed(2)}px, ${y.toFixed(2)}px)`;
+                });
+            });
+            if (!anyLayer) { codeAvRafId = 0; return; }
+            codeAvRafId = requestAnimationFrame(codeAvLoop);
+        }
+        function codeAvEnsureLoop() {
+            if (codeAvRafId) return;
+            if (!document.querySelector('.code-av-circle [data-layer]')) return;
+            codeAvRafId = requestAnimationFrame(codeAvLoop);
+        }
+        function fillCodeAvatar(root, mini) {
+            codeAvatarUid++;
+            root.innerHTML = codeAvatarInnerSVG(`u${codeAvatarUid}`, !!mini);
+            codeAvStartBlink(root);
+            codeAvEnsureLoop();
+        }
+        // Spark replacement: same 30px .thinking-indicator slot (so the existing
+        // setProse/scheduleAnswerRender/finally-remove lifecycle works unchanged),
+        // but with the robot face inside the circle instead of the spark logo.
+        // Deprecated — Code mode now replaces the avatar circle directly (see
+        // appendMessage above) instead of appending a second indicator to the
+        // message body. Kept for backwards compat if ever called.
+        function createCodeThinkingAvatar() {
+            const wrapper = document.createElement('span');
+            wrapper.className = 'thinking-indicator code-av-circle';
+            wrapper.style.cssText = 'width:30px;height:30px;border-radius:50%;overflow:hidden;background:#0b0c10;border:1px solid var(--border-color);display:inline-flex;';
+            fillCodeAvatar(wrapper, true);
+            return wrapper;
+        }
+
         function highlightCode(el) {
             el.querySelectorAll('pre code').forEach(codeEl => {
                 hljs.highlightElement(codeEl);
@@ -1096,6 +1247,58 @@
         const modeToggle = document.getElementById('modeToggle');
         const chatSettings = document.getElementById('chatSettings');
         const codeSettings = document.getElementById('codeSettings');
+        const codeHeroAvatar = document.getElementById('codeHeroAvatar');
+        // Code-only hero circle above "What do you want to build?". Shown only on
+        // the empty Code screen; hidden in Chat mode and once messages exist.
+        function isCodeHeroVisible() {
+            return !!codeHeroAvatar && !codeHeroAvatar.hidden
+                && currentMode === 'code' && !modes.code.hasMessages
+                && openingScene.style.display !== 'none';
+        }
+        function updateCodeHeroVisibility() {
+            if (!codeHeroAvatar) return;
+            const show = currentMode === 'code' && !modes[currentMode].hasMessages;
+            openingScene.classList.toggle('code-mode', currentMode === 'code');
+            if (show && !codeHeroAvatar.innerHTML) fillCodeAvatar(codeHeroAvatar, false);
+            codeHeroAvatar.hidden = !show;
+            codeAvEnsureLoop();
+        }
+        // Smooth circle-to-circle flight: clone the hero circle and animate it from
+        // the opening scene to the thinking-indicator slot, then reveal the live
+        // mini avatar underneath. Falls back to instant swap on reduced motion.
+        function flyCodeHeroToIndicator(heroRect, targetEl) {
+            try {
+                if (!heroRect || !targetEl || !targetEl.isConnected) return;
+                if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+                const targetRect = targetEl.getBoundingClientRect();
+                if (!targetRect.width && !targetRect.height) return;
+                const fly = document.createElement('div');
+                fly.className = 'code-av-fly code-av-circle';
+                fly.setAttribute('aria-hidden', 'true');
+                fly.innerHTML = codeHeroAvatar.innerHTML;
+                // Remove drop-shadow during flight — it trails behind as a dark blob
+                fly.querySelectorAll('[data-layer="head"]').forEach(el => el.removeAttribute('filter'));
+                fly.style.filter = 'none';
+                const startSize = heroRect.width || 76;
+                fly.style.left = `${heroRect.left}px`;
+                fly.style.top = `${heroRect.top}px`;
+                fly.style.width = `${startSize}px`;
+                fly.style.height = `${heroRect.height || startSize}px`;
+                fly.style.transform = 'translate(0,0) scale(1)';
+                fly.style.opacity = '1';
+                document.body.appendChild(fly);
+                const dx = (targetRect.left + targetRect.width / 2) - (heroRect.left + startSize / 2);
+                const dy = (targetRect.top + targetRect.height / 2) - (heroRect.top + (heroRect.height || startSize) / 2);
+                const scale = (targetRect.width || 30) / startSize;
+                requestAnimationFrame(() => {
+                    requestAnimationFrame(() => {
+                        fly.style.transform = `translate(${dx}px, ${dy}px) scale(${scale})`;
+                        fly.style.opacity = '0.35';
+                    });
+                });
+                setTimeout(() => fly.remove(), 620);
+            } catch (e) { /* flight is decorative — never break send */ }
+        }
         function syncSidebarBackdrop() {
             if (!sidebarBackdrop) return;
             const isMobile = window.innerWidth <= 768;
@@ -1410,6 +1613,7 @@
                 openingScene.style.display = 'flex';
                 chatContent.style.display = 'none';
             }
+            updateCodeHeroVisibility();
         }
 
         function switchMode(mode) {
@@ -1446,6 +1650,7 @@
             setTimeout(() => {
                 chatContent.innerHTML = modes[mode].html;
                 refreshOpeningSceneVisibility();
+                updateCodeHeroVisibility();
                 chatContent.classList.remove('mode-fade-out');
                 chatContent.classList.add('mode-fade-in');
                 scrollToBottom(true);
@@ -1460,6 +1665,7 @@
 
             chatContent.innerHTML = '';
             refreshOpeningSceneVisibility();
+            updateCodeHeroVisibility();
 
             userInput.value = '';
             autoResize(userInput);
@@ -1489,7 +1695,15 @@
             bubble.className = 'message-bubble';
 
             if (role === 'assistant') {
-                const avatar = createAvatarLogo();
+                let avatar;
+                if (currentMode === 'code') {
+                    // Code mode: robot face INSIDE the existing circle (replaces spark)
+                    avatar = document.createElement('div');
+                    avatar.className = 'assistant-avatar code-av-circle';
+                    fillCodeAvatar(avatar, true);
+                } else {
+                    avatar = createAvatarLogo();
+                }
 
                 const body = document.createElement('div');
                 body.className = 'assistant-body';
@@ -1620,6 +1834,12 @@
             if (!text || isWaitingForResponse) return;
 
             const mode = currentMode;
+            // Capture the Code hero circle position BEFORE appendMessage hides the
+            // opening scene, so it can fly to the thinking slot below.
+            let codeHeroRect = null;
+            if (mode === 'code' && isCodeHeroVisible()) {
+                try { codeHeroRect = codeHeroAvatar.getBoundingClientRect(); } catch (e) { codeHeroRect = null; }
+            }
             appendMessage('user', text);
             userInput.value = '';
             autoResize(userInput);
@@ -2242,12 +2462,22 @@
                 renderCanvasFromResult(result);
             }
 
-            // Lives outside .message-prose so setProse() re-parsing the prose HTML
-            // on every streamed token never touches it — see createThinkingIndicator.
+            // Avatar lives inside the message's .assistant-avatar circle. Code mode
+            // replaces the spark inside that existing circle (see appendMessage);
+            // there is no second indicator appended to the message body.
+            // Chat mode keeps the classic spark indicator in the text flow.
             let indicatorEl = null;
             setProse(textContainer, '');
-            indicatorEl = createThinkingIndicator('thinking');
-            textContainer.appendChild(indicatorEl);
+            if (mode === 'code') {
+                indicatorEl = null;
+                if (codeHeroRect) {
+                    const avTarget = assistantBubble.querySelector('.assistant-avatar');
+                    if (avTarget) flyCodeHeroToIndicator(codeHeroRect, avTarget);
+                }
+            } else {
+                indicatorEl = createThinkingIndicator('thinking');
+                textContainer.appendChild(indicatorEl);
+            }
 
             try {
                 const response = await fetch(apiUrl, {
@@ -2387,8 +2617,12 @@
                                     assistantFullText = '';
                                     setProse(textContainer, '');
                                     if (indicatorEl) indicatorEl.remove();
-                                    indicatorEl = createThinkingIndicator('thinking');
-                                    textContainer.appendChild(indicatorEl);
+                                    if (mode === 'code') {
+                                        indicatorEl = null;
+                                    } else {
+                                        indicatorEl = createThinkingIndicator('thinking');
+                                        textContainer.appendChild(indicatorEl);
+                                    }
                                 } else if (parsed.assistant_message) {
                                     if (!answerStarted) {
                                         answerStarted = true;
@@ -2534,6 +2768,7 @@
             }, 2100);
             updateModelPickerLabel();
             updateWorkflowPicker();
+            updateCodeHeroVisibility();
             initResponsiveSidebar();
         };
     </script>
