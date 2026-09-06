@@ -246,12 +246,20 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
     return ChatNVIDIA(model=model_name, temperature=temperature, max_completion_tokens=max_tokens, timeout=transport_timeout)
 
 
-def strip_thinking(text: str) -> str:
+def strip_thinking(text: str, strip_result: bool = True) -> str:
     if not text:
         return text
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL)
-    return text.strip()
+    # strip_result=False preserves leading/trailing whitespace exactly. Needed
+    # by the Code-mode agent loop: when a completion is cut off mid-file (see
+    # continue_truncated_file), the last characters of the response ARE a
+    # trailing newline that's semantically part of the file. A blanket
+    # .strip() here silently deletes it, so two stitched-together chunks land
+    # on the same line — e.g. "return 2" + "def c():" instead of "return 2\n"
+    # + "def c():" — corrupting the generated code. Every other caller keeps
+    # the old stripped behavior (the default).
+    return text.strip() if strip_result else text
 
 
 def get_current_datetime_str() -> str:
@@ -660,7 +668,7 @@ class ThinkingBudgetExceeded(Exception):
     waiting out the full generation timeout for nothing."""
 
 
-async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None, thinking_mode: Optional[bool] = None, reasoning_effort: Optional[str] = None, max_think_chars: Optional[int] = None) -> str:
+async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None, thinking_mode: Optional[bool] = None, reasoning_effort: Optional[str] = None, max_think_chars: Optional[int] = None, strip_result: bool = True) -> str:
     """Invoke once. When a live queue is provided, stream BOTH the visible answer
     ('token' events) and the model's own live reasoning trace ('thought' events) in
     real time, exactly as the model produces them — mirroring Claude.ai's extended
@@ -693,7 +701,7 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
         if reasoning and isinstance(progress, list):
             progress.append({"step": "reasoning", "label": "Thinking", "detail": reasoning.strip()})
         content = _coerce_model_text(getattr(result, "content", "") or "")
-        answer_text = strip_thinking(content).strip()
+        answer_text = strip_thinking(content, strip_result=strip_result)
         if max_think_chars is not None and not answer_text and len(reasoning) > max_think_chars:
             raise ThinkingBudgetExceeded(
                 f"Model produced {len(reasoning)} chars of reasoning (budget {max_think_chars}) "
@@ -792,7 +800,7 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
         check_think_budget()
 
     await drain(flush_all=True)
-    return strip_thinking(full).strip()
+    return strip_thinking(full, strip_result=strip_result)
 
 
 async def chat_understand_node(request: "ChatRequest", session: dict, progress=None) -> dict:
@@ -1392,10 +1400,14 @@ async def continue_truncated_file(
             )),
         ]
         watcher = make_continuation_stream_watcher(emit.queue)
+        # strip_result=False: this chunk is raw file content, not a formatted
+        # reply — a leading/trailing newline here is real file content, and
+        # losing it is exactly the merge-boundary bug this function exists to
+        # avoid (see strip_thinking's docstring note).
         if is_kd:
-            cont_raw = await invoke_model(continue_messages, llm, emit.queue, on_answer_piece=watcher, reasoning_effort=kd_effort)
+            cont_raw = await invoke_model(continue_messages, llm, emit.queue, on_answer_piece=watcher, reasoning_effort=kd_effort, strip_result=False)
         else:
-            cont_raw = await invoke_model(continue_messages, llm, emit.queue, on_answer_piece=watcher, thinking_mode=False)
+            cont_raw = await invoke_model(continue_messages, llm, emit.queue, on_answer_piece=watcher, thinking_mode=False, strip_result=False)
         close_idx = cont_raw.find("```")
         if close_idx != -1:
             accumulated += cont_raw[:close_idx]
@@ -1532,11 +1544,13 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 raw = await invoke_model(
                     agent_messages, llm, emit.queue,
                     on_answer_piece=watcher, reasoning_effort=_kd_effort, max_think_chars=max_think_chars,
+                    strip_result=False,
                 )
             else:
                 raw = await invoke_model(
                     agent_messages, llm, emit.queue,
                     on_answer_piece=watcher, thinking_mode=False, max_think_chars=max_think_chars,
+                    strip_result=False,
                 )
         except ThinkingBudgetExceeded:
             if _is_kd:
@@ -1548,6 +1562,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                     llm, emit.queue,
                     on_answer_piece=make_agent_stream_watcher(emit.queue),
                     reasoning_effort=_kd_effort,
+                    strip_result=False,
                 )
             else:
                 raw = await invoke_model(
@@ -1558,6 +1573,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                     llm, emit.queue,
                     on_answer_piece=make_agent_stream_watcher(emit.queue),
                     thinking_mode=False,
+                    strip_result=False,
                 )
 
         turn = parse_agent_turn(raw)
