@@ -668,6 +668,30 @@ class ThinkingBudgetExceeded(Exception):
     waiting out the full generation timeout for nothing."""
 
 
+# NVIDIA NIM hosts Kimi K3 as a partner/third-party model rather than a native
+# NVIDIA one, and partner-hosted models on NIM get their own, much tighter
+# per-key rate limit than native models like Nemotron — so it's the one that
+# runs out first under repeated use, surfacing as a raw "[429] Too Many
+# Requests" exception with no retry of its own. Kimi isn't broken; the call is
+# being rejected before it ever reaches the model. Retry with backoff instead
+# of failing the whole turn on the first 429 — most of these limits are
+# per-minute and clear within a few seconds.
+_RATE_LIMIT_MARKERS = ("429", "too many requests", "rate limit", "rate_limit")
+MAX_RATE_LIMIT_RETRIES = 4
+RATE_LIMIT_BACKOFF_BASE = 2.0  # seconds; doubles each attempt, plus jitter
+
+
+def _looks_like_rate_limit(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
+
+
+async def _sleep_for_retry(attempt: int) -> None:
+    import random
+    delay = RATE_LIMIT_BACKOFF_BASE * (2 ** attempt) + random.uniform(0, 1)
+    await asyncio.sleep(delay)
+
+
 async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=None, on_answer_piece=None, thinking_mode: Optional[bool] = None, reasoning_effort: Optional[str] = None, max_think_chars: Optional[int] = None, strip_result: bool = True) -> str:
     """Invoke once. When a live queue is provided, stream BOTH the visible answer
     ('token' events) and the model's own live reasoning trace ('thought' events) in
@@ -696,7 +720,14 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
     if reasoning_effort:
         invoke_kwargs["reasoning_effort"] = reasoning_effort
     if not isinstance(progress, asyncio.Queue):
-        result = await llm.ainvoke(messages, **invoke_kwargs)
+        for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+            try:
+                result = await llm.ainvoke(messages, **invoke_kwargs)
+                break
+            except Exception as exc:
+                if attempt >= MAX_RATE_LIMIT_RETRIES or not _looks_like_rate_limit(exc):
+                    raise
+                await _sleep_for_retry(attempt)
         reasoning = _extract_reasoning(result)
         if reasoning and isinstance(progress, list):
             progress.append({"step": "reasoning", "label": "Thinking", "detail": reasoning.strip()})
@@ -783,21 +814,37 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
                 buffer = buffer[idx + len(tag):]
                 in_thought = False
 
-    async for chunk in llm.astream(messages, **invoke_kwargs):
-        reasoning_piece = _extract_reasoning(chunk)
-        if reasoning_piece:
-            reasoning_seen = True
-            await publish_thought(progress, reasoning_piece)
-            think_chars += len(reasoning_piece)
-            check_think_budget()
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        produced_any = False
+        try:
+            async for chunk in llm.astream(messages, **invoke_kwargs):
+                produced_any = True
+                reasoning_piece = _extract_reasoning(chunk)
+                if reasoning_piece:
+                    reasoning_seen = True
+                    await publish_thought(progress, reasoning_piece)
+                    think_chars += len(reasoning_piece)
+                    check_think_budget()
 
-        piece = _coerce_model_text(getattr(chunk, "content", "") or "")
-        if not piece:
-            continue
-        full += piece
-        buffer += piece
-        await drain(flush_all=False)
-        check_think_budget()
+                piece = _coerce_model_text(getattr(chunk, "content", "") or "")
+                if not piece:
+                    continue
+                full += piece
+                buffer += piece
+                await drain(flush_all=False)
+                check_think_budget()
+            break
+        except ThinkingBudgetExceeded:
+            raise
+        except Exception as exc:
+            # Only safe to retry the whole stream from scratch if nothing was
+            # produced yet — a 429 on NIM partner-hosted models like Kimi K3
+            # fails before the first chunk, so this is the common case. If
+            # real content already streamed to the UI, retrying would
+            # duplicate it, so propagate instead.
+            if produced_any or attempt >= MAX_RATE_LIMIT_RETRIES or not _looks_like_rate_limit(exc):
+                raise
+            await _sleep_for_retry(attempt)
 
     await drain(flush_all=True)
     return strip_thinking(full, strip_result=strip_result)
