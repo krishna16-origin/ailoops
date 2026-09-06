@@ -156,19 +156,27 @@ _KIMI_MAX_TOKENS = 65536
 _KIMI_MIN_TOKENS = 8000
 _KIMI_EFFORT_BUDGETS = {
     "low": 8000,
-    "medium": 12000,
-    "high": 16000,
-    "extra": 24000,
-    "max": 32000,
+    "medium": 16000,
+    "high": 24000,
+    "extra": 40000,
+    "max": 65536,      # Kimi's actual NIM ceiling — was capped at 32000, which
+                        # meant "Max" reasoning still couldn't produce a file
+                        # anywhere near what the model is really able to in one
+                        # completion. The continuation logic above now handles
+                        # files even longer than this, but there's no reason to
+                        # force an extra round trip before that's needed.
 }
 
 
 def _model_thinking_budget(model_name: str, level: str, requested: int) -> int:
     """Return the completion budget for a model/effort pair.
 
-    Kimi's reasoning endpoint requires at least 8,000 max tokens, but the
-    larger global budgets made ordinary Kimi requests unnecessarily slow. Keep
-    every Kimi tier below the 32,000-token maximum requested by the product.
+    Kimi's reasoning endpoint requires at least 8,000 max tokens. Lower tiers
+    stay well under the model's ceiling so ordinary requests stay fast; "max"
+    now goes all the way to Kimi's real 65,536-token NIM limit so a "Max"
+    reasoning request can actually use the model's full output budget for long
+    files instead of being cut short by a self-imposed cap (see
+    _KIMI_EFFORT_BUDGETS and continue_truncated_file for the rest of the fix).
     """
     n = max(1, int(requested or 1024))
     if _is_kimi_model(model_name):
@@ -931,6 +939,23 @@ THINK_BUDGET_FRACTION = 0.55       # same guard as before: abort a turn if the
 THINK_CHARS_PER_TOKEN = 4          # model is still "thinking" past this share
                                     # of budget with no visible answer yet.
 
+# THE ACTUAL "can't generate long code" bug: DeepSeek V4 Pro has a hard NVIDIA
+# NIM ceiling of 16384 completion tokens per call, and Kimi K3's own effort
+# budgets (see _KIMI_EFFORT_BUDGETS) top out well under its 65536 ceiling. Any
+# file whose content is longer than what fits in ONE completion gets cut off
+# mid-statement before the closing ``` fence the THOUGHT/ACTION/PATH parser
+# requires. Previously that meant parse_agent_turn() returned None for the
+# whole turn — the model's entire partial file body was thrown away and it was
+# told to "retry", so it started the same file from scratch, hit the same
+# ceiling, and looped until MAX_AGENT_STEPS ran out with nothing long ever
+# saved. Fixed by (1) parse_agent_turn() now keeps an opened-but-unclosed file
+# body instead of discarding it, and (2) continue_truncated_file() below asks
+# the model to resume writing raw content from exactly where it stopped,
+# repeating until the closing fence appears or this cap is spent, then the
+# stitched-together result is saved as one file. This is what actually lets a
+# file be longer than a single completion's token budget.
+MAX_FILE_CONTINUATIONS = 6         # extra resume calls allowed for one truncated file
+
 # No wall-clock ceiling on the whole multi-step agent run either (see
 # run_code_agent_once / stream_code_agent below, which now pass timeout=None to
 # asyncio.wait_for). This used to be a flat CODE_GENERATION_TIMEOUT = 420.0 for
@@ -1195,19 +1220,29 @@ def parse_agent_turn(raw: str) -> Optional[dict]:
         if not path:
             return None
         fence = _FENCE_RE.search(rest)
-        if not fence:
+        if fence:
+            content = fence.group("content")
+            if content.endswith("\n"):
+                content = content[:-1]
+            return {"thought": thought, "action": action, "path": path, "content": content, "truncated": False}
+        # No closing fence — almost always means the completion hit its own
+        # token ceiling mid-file, not that the model produced garbage. If it at
+        # least opened a fence, keep everything written after it instead of
+        # discarding the whole turn; the caller resumes generation from here
+        # (see continue_truncated_file) rather than making the model start the
+        # file over from scratch and hit the exact same ceiling again.
+        open_fence = _FENCE_OPEN_RE.search(rest)
+        if not open_fence:
             return None
-        content = fence.group("content")
-        if content.endswith("\n"):
-            content = content[:-1]
-        return {"thought": thought, "action": action, "path": path, "content": content}
+        content = rest[open_fence.end():]
+        return {"thought": thought, "action": action, "path": path, "content": content, "truncated": True}
     if action in ("read_file", "delete_file"):
         if not path:
             return None
-        return {"thought": thought, "action": action, "path": path, "content": None}
+        return {"thought": thought, "action": action, "path": path, "content": None, "truncated": False}
     # final
     explanation = rest.strip() or thought or "Done."
-    return {"thought": thought, "action": "final", "path": None, "content": explanation}
+    return {"thought": thought, "action": "final", "path": None, "content": explanation, "truncated": False}
 
 
 # ---------------------------------------------------------------------------
@@ -1288,6 +1323,86 @@ def make_agent_stream_watcher(progress):
             state["buffer"] = state["buffer"][send_len:]
 
     return watcher
+
+
+def make_continuation_stream_watcher(progress):
+    """Same streaming behavior as make_agent_stream_watcher's phase 2, but for
+    continuation calls that resume a truncated file body directly: there is no
+    THOUGHT/ACTION/PATH header or opening fence to locate first, because we are
+    already inside the file. Every token is file content until the closing
+    ``` fence appears."""
+    state = {"done": False, "buffer": ""}
+
+    async def watcher(text: str) -> None:
+        if state["done"] or not text:
+            return
+        state["buffer"] += text
+        close_idx = state["buffer"].find("```")
+        if close_idx != -1:
+            content = state["buffer"][:close_idx]
+            if content:
+                await publish_event(progress, {"type": "code_delta", "text": content})
+            state["done"] = True
+            return
+        hold_back = min(len(state["buffer"]), 2)
+        send_len = len(state["buffer"]) - hold_back
+        if send_len > 0:
+            await publish_event(progress, {"type": "code_delta", "text": state["buffer"][:send_len]})
+            state["buffer"] = state["buffer"][send_len:]
+
+    return watcher
+
+
+async def continue_truncated_file(
+    path: str,
+    accumulated: str,
+    llm: ChatNVIDIA,
+    is_kd: bool,
+    kd_effort: Optional[str],
+    agent_messages: List[BaseMessage],
+    raw_turn_text: str,
+    emit,
+) -> Tuple[str, bool]:
+    """Resume a create_file/edit_file body that hit the model's own completion
+    ceiling before its closing ``` fence appeared (DeepSeek's fixed 16384-token
+    NIM ceiling, or Kimi's effort-tier budgets — see _KIMI_EFFORT_BUDGETS).
+
+    Keeps everything already written and asks the model to continue writing
+    RAW file content — no new header, no new fence — picking up exactly where
+    it left off, repeating until a closing fence appears or
+    MAX_FILE_CONTINUATIONS resume calls are spent. This is what lets a file be
+    longer than any single completion's token budget instead of being silently
+    cut off or thrown away entirely.
+
+    Returns (final_content, still_truncated).
+    """
+    last_ai_text = raw_turn_text
+    for _ in range(MAX_FILE_CONTINUATIONS):
+        tail = accumulated[-4000:]
+        continue_messages = agent_messages + [
+            AIMessage(content=last_ai_text),
+            HumanMessage(content=(
+                f"TOOL RESULT: Your last response was cut off after {len(accumulated)} characters because it hit "
+                f"the generation limit — {path} is not finished yet. Continue writing the RAW remaining file "
+                f"content for {path}, starting exactly where you left off. Do not repeat any of what you already "
+                "wrote, do not restate THOUGHT/ACTION/PATH, and do not open a new ``` fence — you are still "
+                "inside the same file body. Output only the next part of the file. When the file is completely "
+                "finished, end your output with a closing ``` fence on its own line and nothing after it.\n\n"
+                f"The last part of what you already wrote was:\n---\n{tail}\n---"
+            )),
+        ]
+        watcher = make_continuation_stream_watcher(emit.queue)
+        if is_kd:
+            cont_raw = await invoke_model(continue_messages, llm, emit.queue, on_answer_piece=watcher, reasoning_effort=kd_effort)
+        else:
+            cont_raw = await invoke_model(continue_messages, llm, emit.queue, on_answer_piece=watcher, thinking_mode=False)
+        close_idx = cont_raw.find("```")
+        if close_idx != -1:
+            accumulated += cont_raw[:close_idx]
+            return accumulated, False
+        accumulated += cont_raw
+        last_ai_text = cont_raw
+    return accumulated, True
 
 
 # ---------------------------------------------------------------------------
@@ -1497,6 +1612,19 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
 
         if action in ("edit_file", "create_file"):
             content = turn["content"] or ""
+            if turn.get("truncated"):
+                content, still_truncated = await continue_truncated_file(
+                    path, content, llm, _is_kd, _kd_effort, agent_messages, raw, emit,
+                )
+                if still_truncated:
+                    await emit({
+                        "type": "activity_error", "action": "edit" if path in file_store else "create",
+                        "file": path,
+                        "message": (
+                            f"{path} is still generating after {MAX_FILE_CONTINUATIONS} continuation calls — "
+                            "saving what was produced so far. Ask to continue if it looks incomplete."
+                        ),
+                    })
             if len(content) > CODE_MAX_FILE_CHARS:
                 content = content[:CODE_MAX_FILE_CHARS] + "\n… output truncated …"
             old_content = file_store.get(path)
