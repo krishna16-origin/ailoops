@@ -152,14 +152,14 @@ def _is_kimi_model(model_name: str) -> bool:
 #   deepseek-v4-pro-0813  max_tokens 1..16384, reasoning_effort: none|high|max
 #   moonshotai/kimi-k3    max_tokens 1..65536, reasoning_effort: low|high|max
 _DEEPSEEK_MAX_TOKENS = 16384
-_KIMI_MAX_TOKENS = 65536
+_KIMI_MAX_TOKENS = 32000
 _KIMI_MIN_TOKENS = 8000
 _KIMI_EFFORT_BUDGETS = {
     "low": 8000,
     "medium": 12000,
     "high": 16000,
     "extra": 24000,
-    "max": 32000,
+    "max": 28000,
 }
 
 
