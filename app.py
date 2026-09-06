@@ -121,7 +121,7 @@ def _get_chat_nvidia_client(model_name: str, temperature: float, max_tokens: int
 
 
 def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
-    """Create the selected Chat-mode model (Deepseek / Nemotron / Kimi). Kimi now uses generic ChatNVIDIA flow."""
+    """Create the selected Chat-mode model (Deepseek / Nemotron / Kimi)."""
     model_name = KIMI_MODEL
     model_type_clean = (model_type or "balanced").strip().lower()
     if model_type_clean == "fast":
@@ -130,11 +130,20 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
     elif model_type_clean == "balanced":
         model_name = KIMI_MODEL
-    # DeepSeek via NVIDIA NIM requires fixed temperature=1.0; Kimi now treated like other models.
-    if _is_deepseek_model(model_name):
+    # DeepSeek AND Kimi via NVIDIA NIM both require fixed temperature=1.0 —
+    # Kimi's own NVIDIA-published sample payloads and benchmark methodology
+    # use temperature 1.0, and deviating from it produces degraded/garbled
+    # output on their NIM endpoint.
+    if _is_long_running_reasoning_model(model_name):
         temperature = 1.0
     max_tokens = _clamp_max_tokens(model_name, max_tokens)
-    transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_deepseek_model(model_name) else 300
+    # Kimi is a native "thinking is always enabled" reasoning model (per
+    # NVIDIA's own model card), same as DeepSeek — it can legitimately spend
+    # minutes reasoning before writing a single visible answer token. A short
+    # 300s transport timeout on either model aborts that call mid-thought and
+    # is exactly what previously surfaced to users as Kimi "not generating a
+    # response" in both Chat and Code mode (both default to Kimi).
+    transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_long_running_reasoning_model(model_name) else 300
     return _get_chat_nvidia_client(model_name, temperature, max_tokens, transport_timeout)
 
 
@@ -156,6 +165,18 @@ DEFAULT_CODE_MODEL = "glimmer"
 # --- Per-model compatibility helpers ---
 def _is_deepseek_model(model_name: str) -> bool:
     return "deepseek" in (model_name or "").lower()
+
+
+def _is_kimi_model(model_name: str) -> bool:
+    return "kimi" in (model_name or "").lower()
+
+
+def _is_long_running_reasoning_model(model_name: str) -> bool:
+    """DeepSeek and Kimi both reason internally before answering and can take
+    far longer than a typical completion — they need the long transport
+    timeout and forced temperature=1.0 that other (non-reasoning-by-default)
+    models on this NIM deployment don't."""
+    return _is_deepseek_model(model_name) or _is_kimi_model(model_name)
 
 
 def _is_429_error(exc: Exception) -> bool:
@@ -182,11 +203,30 @@ def _get_retry_delay(attempt: int, retry_after: Optional[str] = None) -> float:
 
 # NVIDIA NIM hard ceilings (docs.api.nvidia.com, 2026-08):
 #   deepseek-v4-pro-0813  max_tokens 1..16384, reasoning_effort: none|high|max
+#   kimi-k3               thinking is always on; give it enough headroom to
+#                          think AND answer, but keep a ceiling so a verbose
+#                          reasoning pass can't eat the whole transport window.
 _DEEPSEEK_MAX_TOKENS = 16384
+_KIMI_MIN_TOKENS = 8000
+_KIMI_MAX_TOKENS = 65536
+
+# Kimi's own internal <think> pass can burn through most of a small budget
+# before it ever writes an answer, so each thinking level maps to a fixed,
+# pre-tuned ceiling instead of just passing the raw UI-requested value
+# through unchanged (which is what every other model still does below).
+_KIMI_LEVEL_BUDGETS = {
+    "low": 8000,
+    "medium": 12000,
+    "high": 16000,
+    "extra": 24000,
+    "max": 32000,
+}
 
 
 def _model_thinking_budget(model_name: str, level: str, requested: int) -> int:
-    """Return the completion budget for a model/effort pair. Now generic for all models."""
+    """Return the completion budget for a model/effort pair."""
+    if _is_kimi_model(model_name):
+        return _KIMI_LEVEL_BUDGETS[normalize_thinking_level(level)]
     return max(1, int(requested or 1024))
 
 
@@ -195,6 +235,8 @@ def _clamp_max_tokens(model_name: str, max_tokens: int) -> int:
     n = max(1, int(max_tokens or 1024))
     if _is_deepseek_model(model_name):
         return min(n, _DEEPSEEK_MAX_TOKENS)
+    if _is_kimi_model(model_name):
+        return max(min(n, _KIMI_MAX_TOKENS), _KIMI_MIN_TOKENS)
     return n
 
 
@@ -225,13 +267,13 @@ def _resolve_chat_model_name(model_type: str) -> str:
 
 
 def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
-    """Create the selected Code-mode model (generic handling like other models)."""
+    """Create the selected Code-mode model."""
     model_type_clean = (model_type or DEFAULT_CODE_MODEL).strip().lower()
     model_name = CODE_MODEL_MAP.get(model_type_clean, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
-    if _is_deepseek_model(model_name):
+    if _is_long_running_reasoning_model(model_name):
         temperature = 1.0
     max_tokens = _clamp_max_tokens(model_name, max_tokens)
-    transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_deepseek_model(model_name) else 300
+    transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_long_running_reasoning_model(model_name) else 300
     return _get_chat_nvidia_client(model_name, temperature, max_tokens, transport_timeout)
 
 
