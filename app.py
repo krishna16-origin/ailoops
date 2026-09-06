@@ -196,23 +196,26 @@ def _model_thinking_budget(model_name: str, level: str, requested: int) -> int:
     Kimi's reasoning endpoint requires at least 8,000 max tokens, but the
     larger global budgets made ordinary Kimi requests unnecessarily slow. Keep
     every Kimi tier below the 32,000-token maximum requested by the product.
+    DeepSeek keeps original global budget (clamped later in _clamp_max_tokens).
     """
-    n = max(1, int(requested or 1024))
+    lvl = normalize_thinking_level(level)
     if _is_kimi_model(model_name):
-        n = min(n, _KIMI_EFFORT_BUDGETS[normalize_thinking_level(level)])
-        return max(_KIMI_MIN_TOKENS, n)
-    return n
+        # Use the per-effort budget directly - it already enforces the 8000
+        # minimum and the 32k product ceiling. Ignore the global
+        # THINKING_LEVELS value which exists for non-Kimi models.
+        return _KIMI_EFFORT_BUDGETS[lvl]
+    return max(1, int(requested or 1024))
 
 
 def _clamp_max_tokens(model_name: str, max_tokens: int) -> int:
-    """Clamp requested completion budget to the model's NVIDIA NIM limit."""
+    """Clamp requested completion budget to the model's NVIDIA NIM hard limits.
+    This is a safety net - the main per-effort budget is set in
+    _model_thinking_budget(). Keep it here for any direct get_llm() calls."""
     n = max(1, int(max_tokens or 1024))
     if _is_deepseek_model(model_name):
         return min(n, _DEEPSEEK_MAX_TOKENS)
     if _is_kimi_model(model_name):
-        # Kimi's reasoning endpoint rejects completion budgets below 8000,
-        # even when the requested effort is Low. This is a protocol minimum,
-        # not a promise that the model will spend all 8000 tokens.
+        # Kimi's reasoning endpoint rejects <8000 even for Low. Hard floor.
         return max(_KIMI_MIN_TOKENS, min(n, _KIMI_MAX_TOKENS))
     return n
 
