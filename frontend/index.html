@@ -274,6 +274,27 @@
         .response-canvas-preview.active { display:block; }
         .response-canvas-preview iframe { width:100%; height:100%; border:0; display:block; background:#fff; }
 
+        /* ============== LIVE SANDBOX (E2B) panel ============== */
+        .response-canvas-live-tab .live-dot { width:7px; height:7px; border-radius:50%; background:#8a8f98; display:inline-block; margin-right:6px; }
+        .response-canvas-live-tab.is-live .live-dot { background:#22c55e; box-shadow:0 0 0 3px rgba(34,197,94,.18); }
+        .response-canvas-live { display:none; height:420px; flex-direction:column; background:#0b0c0f; color:#e6e6e6; }
+        .response-canvas-live.active { display:flex; }
+        .response-canvas-live-bar { display:flex; align-items:center; gap:8px; padding:8px 10px; background:#141519; border-bottom:1px solid rgba(255,255,255,.08); flex:0 0 auto; }
+        .response-canvas-live-status { font-size:12px; color:#9298a3; flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .response-canvas-live-url { font-size:12px; color:#8cff9a; text-decoration:none; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .response-canvas-live-btn { font-size:12px; padding:4px 10px; border-radius:6px; border:1px solid rgba(255,255,255,.15); background:rgba(255,255,255,.06); color:#e6e6e6; cursor:pointer; }
+        .response-canvas-live-btn:hover { background:rgba(255,255,255,.12); }
+        .response-canvas-live-btn:disabled { opacity:.5; cursor:default; }
+        .response-canvas-live-split { flex:1 1 auto; display:flex; min-height:0; }
+        .response-canvas-live-frame { flex:1 1 60%; background:#fff; min-width:0; }
+        .response-canvas-live-frame iframe { width:100%; height:100%; border:0; display:block; background:#fff; }
+        .response-canvas-live-frame-empty { flex:1 1 60%; display:flex; align-items:center; justify-content:center; color:#6b7280; font:13px sans-serif; background:#fff; }
+        .response-canvas-live-terminal { flex:1 1 40%; min-width:180px; max-width:340px; overflow:auto; padding:8px 10px; font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; border-left:1px solid rgba(255,255,255,.08); white-space:pre-wrap; word-break:break-word; }
+        .response-canvas-live-terminal .log-stderr { color:#ff8a8a; }
+        .response-canvas-live-terminal .log-status { color:#8cff9a; }
+        .response-canvas-live-terminal .log-error { color:#ff6b6b; font-weight:600; }
+        @media (max-width: 640px) { .response-canvas-live-split { flex-direction:column; } .response-canvas-live-terminal { max-width:none; max-height:140px; border-left:none; border-top:1px solid rgba(255,255,255,.08); } }
+
 
         .thinking-block { margin-top:2px; }
         .thinking-toggle { background:none; border:none; padding:0; font-size:13px; font-family:inherit; color:var(--text-secondary); cursor:pointer; }
@@ -1775,6 +1796,18 @@
                         <div class="response-canvas-body">
                             <div class="response-canvas-diff"></div>
                             <div class="response-canvas-preview"><iframe sandbox="allow-scripts allow-same-origin allow-forms allow-modals" title="Live preview"></iframe></div>
+                            <div class="response-canvas-live">
+                                <div class="response-canvas-live-bar">
+                                    <span class="response-canvas-live-status">Not started</span>
+                                    <a class="response-canvas-live-url" href="#" target="_blank" rel="noopener" hidden></a>
+                                    <button type="button" class="response-canvas-live-btn response-canvas-live-go">Go Live</button>
+                                    <button type="button" class="response-canvas-live-btn response-canvas-live-stop" hidden>Stop</button>
+                                </div>
+                                <div class="response-canvas-live-split">
+                                    <div class="response-canvas-live-frame-empty">Live sandbox not started yet.</div>
+                                    <div class="response-canvas-live-terminal"></div>
+                                </div>
+                            </div>
                         </div>
                     `;
                     contentDiv.appendChild(canvas);
@@ -2108,8 +2141,15 @@
             // code_file_start / code_file_diff events arrive, and reconciled against the
             // authoritative final result in finalizeCodeResult() either way (stream or not).
             const canvasFiles = new Map();
-            let canvasActiveTab = null; // filename currently shown, or '__preview__'
+            let canvasActiveTab = null; // filename currently shown, or '__preview__' / '__sandbox__'
             const workflowRowsByFile = new Map(); // filename -> <div class="response-workflow-row">, for live updates
+
+            // Live E2B sandbox state for THIS assistant turn's canvas. status:
+            // 'idle' | 'starting' | 'live' | 'error'. url is set once a server
+            // is confirmed reachable (sandbox_ready), from either the manual
+            // "Go Live" button (POST /sandbox/start) or the agent autonomously
+            // calling start_server mid-build (event arrives on the main SSE feed).
+            const sandboxState = { status: 'idle', url: null, port: null };
 
             const WORKFLOW_ICONS = {
                 edit: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M11.5 2.5a1.6 1.6 0 0 1 2.3 2.3L5.5 13 2 14l1-3.5 8.5-8Z"/></svg>',
@@ -2295,20 +2335,35 @@
                 previewTab.disabled = !previewable;
                 previewTab.addEventListener('click', () => openCanvasTab('__preview__'));
                 tabsEl.appendChild(previewTab);
+
+                const liveTab = document.createElement('button');
+                liveTab.type = 'button';
+                liveTab.className = 'response-canvas-tab response-canvas-live-tab' + (canvasActiveTab === '__sandbox__' ? ' active' : '') + (sandboxState.status === 'live' ? ' is-live' : '');
+                liveTab.innerHTML = `<span class="live-dot"></span><span class="response-canvas-tab-name">Live</span>`;
+                liveTab.addEventListener('click', () => openCanvasTab('__sandbox__'));
+                tabsEl.appendChild(liveTab);
             }
 
             function renderCanvasBody() {
                 if (!canvasEl) return;
                 const codeEl = canvasEl.querySelector('.response-canvas-diff'); // repurposed: plain code pane, not a colored diff
                 const previewEl = canvasEl.querySelector('.response-canvas-preview');
+                const liveEl = canvasEl.querySelector('.response-canvas-live');
+                codeEl.hidden = true;
+                previewEl.classList.remove('active');
+                liveEl.classList.remove('active');
+
                 if (canvasActiveTab === '__preview__') {
-                    codeEl.hidden = true;
                     previewEl.classList.add('active');
                     const doc = buildPreviewDoc();
                     previewEl.querySelector('iframe').srcdoc = doc || '<p style="font:13px sans-serif;color:#888;padding:16px;">Nothing to preview yet.</p>';
                     return;
                 }
-                previewEl.classList.remove('active');
+                if (canvasActiveTab === '__sandbox__') {
+                    liveEl.classList.add('active');
+                    return;
+                }
+
                 codeEl.hidden = false;
                 const file = canvasFiles.get(canvasActiveTab);
                 codeEl.replaceChildren();
@@ -2327,12 +2382,164 @@
             function openCanvasTab(filename) {
                 if (!canvasEl) return;
                 const key = filename === undefined || filename === null ? '' : filename;
-                if (key !== '__preview__' && !canvasFiles.has(key)) return;
+                if (key !== '__preview__' && key !== '__sandbox__' && !canvasFiles.has(key)) return;
                 canvasActiveTab = key;
                 canvasEl.hidden = false;
                 renderCanvasTabs();
                 renderCanvasBody();
                 canvasEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            }
+
+            // ============== LIVE SANDBOX (E2B) ==============
+            // Two ways this panel comes alive: (1) the user clicks "Go Live",
+            // which POSTs /sandbox/start directly for a one-off run, or (2) the
+            // agent itself calls the start_server tool mid-build, whose
+            // terminal_output / sandbox_ready events arrive on the SAME SSE feed
+            // as the rest of the build and are routed here by the caller.
+            function liveBar() { return canvasEl ? canvasEl.querySelector('.response-canvas-live-bar') : null; }
+            function liveStatusEl() { return canvasEl ? canvasEl.querySelector('.response-canvas-live-status') : null; }
+            function liveUrlEl() { return canvasEl ? canvasEl.querySelector('.response-canvas-live-url') : null; }
+            function liveTerminalEl() { return canvasEl ? canvasEl.querySelector('.response-canvas-live-terminal') : null; }
+            function liveFrameSplitEl() { return canvasEl ? canvasEl.querySelector('.response-canvas-live-split') : null; }
+
+            function appendLiveLog(text, cls) {
+                const term = liveTerminalEl();
+                if (!term || !text) return;
+                const span = document.createElement('span');
+                if (cls) span.className = cls;
+                span.textContent = text;
+                term.appendChild(span);
+                term.scrollTop = term.scrollHeight;
+            }
+
+            function setLiveStatus(text) {
+                const el = liveStatusEl();
+                if (el) el.textContent = text;
+            }
+
+            function setLiveUrl(url) {
+                sandboxState.url = url;
+                sandboxState.status = 'live';
+                const a = liveUrlEl();
+                if (a) {
+                    a.href = url;
+                    a.textContent = url.replace(/^https?:\/\//, '');
+                    a.hidden = false;
+                }
+                const split = liveFrameSplitEl();
+                if (split) {
+                    const empty = split.querySelector('.response-canvas-live-frame-empty');
+                    if (empty) {
+                        const frame = document.createElement('div');
+                        frame.className = 'response-canvas-live-frame';
+                        frame.innerHTML = '<iframe title="Live sandbox"></iframe>';
+                        split.replaceChild(frame, empty);
+                    }
+                    const iframe = split.querySelector('.response-canvas-live-frame iframe');
+                    if (iframe) iframe.src = url;
+                }
+                setLiveStatus('Live');
+                const stopBtn = canvasEl && canvasEl.querySelector('.response-canvas-live-stop');
+                const goBtn = canvasEl && canvasEl.querySelector('.response-canvas-live-go');
+                if (stopBtn) stopBtn.hidden = false;
+                if (goBtn) { goBtn.disabled = false; goBtn.textContent = 'Restart'; }
+                renderCanvasTabs();
+            }
+
+            function handleSandboxEvent(parsed) {
+                // Shared by both the manual /sandbox/start stream and the
+                // agent-driven events arriving inline on the main chat SSE feed.
+                if (parsed.type === 'sandbox_status') {
+                    setLiveStatus(parsed.message || parsed.state || 'Working…');
+                    appendLiveLog(`\n[${parsed.state}] ${parsed.message || ''}\n`, 'log-status');
+                } else if (parsed.type === 'sandbox_log' || parsed.type === 'terminal_output') {
+                    appendLiveLog(parsed.text || '', parsed.stream === 'stderr' ? 'log-stderr' : '');
+                } else if (parsed.type === 'sandbox_ready') {
+                    if (canvasEl) canvasEl.hidden = false;
+                    setLiveUrl(parsed.url);
+                } else if (parsed.type === 'sandbox_error') {
+                    sandboxState.status = 'error';
+                    setLiveStatus('Error');
+                    appendLiveLog(`\n[error] ${parsed.message || 'Something went wrong.'}\n`, 'log-error');
+                    const goBtn = canvasEl && canvasEl.querySelector('.response-canvas-live-go');
+                    if (goBtn) { goBtn.disabled = false; goBtn.textContent = 'Go Live'; }
+                    renderCanvasTabs();
+                } else if (parsed.type === 'sandbox_command_done') {
+                    appendLiveLog(`\n[exit code ${parsed.exit_code}]\n`, 'log-status');
+                }
+            }
+
+            async function streamSandboxEndpoint(url, body) {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                if (!response.ok || !response.body) {
+                    handleSandboxEvent({ type: 'sandbox_error', message: 'Could not reach the sandbox endpoint.' });
+                    return;
+                }
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, { stream: true });
+                    const frames = buffer.split('\n\n');
+                    buffer = frames.pop();
+                    for (const frame of frames) {
+                        const line = frame.trim();
+                        if (!line.startsWith('data:')) continue;
+                        try { handleSandboxEvent(JSON.parse(line.slice(5).trim())); } catch (e) { /* ignore */ }
+                    }
+                }
+            }
+
+            function startLiveSandbox() {
+                if (!canvasEl) return;
+                const goBtn = canvasEl.querySelector('.response-canvas-live-go');
+                if (goBtn) { goBtn.disabled = true; goBtn.textContent = 'Starting…'; }
+                sandboxState.status = 'starting';
+                setLiveStatus('Booting sandbox…');
+                openCanvasTab('__sandbox__');
+                streamSandboxEndpoint(`${API_BASE}/sandbox/start`, { session_id: modes.code.sessionId })
+                    .catch((e) => handleSandboxEvent({ type: 'sandbox_error', message: String(e && e.message || e) }));
+            }
+
+            function stopLiveSandbox() {
+                fetch(`${API_BASE}/sandbox/stop`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: modes.code.sessionId }),
+                }).catch(() => {});
+                sandboxState.status = 'idle';
+                sandboxState.url = null;
+                setLiveStatus('Stopped');
+                const a = liveUrlEl();
+                if (a) a.hidden = true;
+                const split = liveFrameSplitEl();
+                if (split) {
+                    const frame = split.querySelector('.response-canvas-live-frame');
+                    if (frame) {
+                        const empty = document.createElement('div');
+                        empty.className = 'response-canvas-live-frame-empty';
+                        empty.textContent = 'Live sandbox not started yet.';
+                        split.replaceChild(empty, frame);
+                    }
+                }
+                const stopBtn = canvasEl && canvasEl.querySelector('.response-canvas-live-stop');
+                const goBtn = canvasEl && canvasEl.querySelector('.response-canvas-live-go');
+                if (stopBtn) stopBtn.hidden = true;
+                if (goBtn) { goBtn.disabled = false; goBtn.textContent = 'Go Live'; }
+                renderCanvasTabs();
+            }
+
+            if (canvasEl) {
+                const goBtn = canvasEl.querySelector('.response-canvas-live-go');
+                const stopBtn = canvasEl.querySelector('.response-canvas-live-stop');
+                if (goBtn) goBtn.addEventListener('click', startLiveSandbox);
+                if (stopBtn) stopBtn.addEventListener('click', stopLiveSandbox);
             }
 
             function renderCanvasFromResult(result = {}) {
@@ -2620,6 +2827,11 @@
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
                                     if (mode === 'code') finalizeCodeResult(parsed);
+                                } else if ((parsed.type === 'terminal_output' || parsed.type === 'sandbox_ready') && mode === 'code') {
+                                    // The agent itself ran run_command/start_server mid-build —
+                                    // route it into the same Live panel the manual "Go Live"
+                                    // button uses, so both paths feel identical to the user.
+                                    handleSandboxEvent(parsed);
                                 } else if (parsed.type === 'message_reset') {
                                     // Compatibility event: clear the current draft if a server
                                     // explicitly asks the client to reset it.
@@ -2694,6 +2906,8 @@
                                     }
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
+                                } else if ((parsed.type === 'terminal_output' || parsed.type === 'sandbox_ready') && mode === 'code') {
+                                    handleSandboxEvent(parsed);
                                 } else if (parsed.assistant_message) {
                                     if (!answerStarted) { answerStarted = true; finishThinking(); if (indicatorEl) setThinkingIndicatorState(indicatorEl, 'listening'); }
                                     assistantFullText += parsed.assistant_message;
