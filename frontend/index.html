@@ -591,10 +591,14 @@
             .message-text pre { max-width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
         }
 
-        /* ============== WATCH LIVE (right-side backend activity monitor) ============== */
+        /* ============== "MAXIMUS'S COMPUTER" (right-side live sandbox panel) ============== */
         /* Code mode only — mirrors the agent's real SSE trace (file reads/edits,
-           commands, sandbox lifecycle, plan/narration) as a running log, the way
-           Manus's "computer" panel shows its own live actions. */
+           commands, sandbox lifecycle, plan/narration) as a running log, the same
+           way Manus's "computer" panel shows its own live actions in a persistent
+           split view next to the chat. Width ratio below (~39% of viewport) was
+           measured from that reference layout at a 1366px-wide window. */
+        :root { --live-panel-w: clamp(420px, 39vw, 640px); }
+
         .watch-live-btn { display:flex; align-items:center; gap:7px; background-color:var(--bg-input); color:var(--text-primary); border:1px solid transparent; padding:7px 13px; border-radius:999px; font-size:13px; font-weight:500; cursor:pointer; transition:background 0.2s ease, border-color 0.2s ease; }
         .watch-live-btn:hover { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.15); }
         .watch-live-btn:active { transform:scale(0.97); }
@@ -604,15 +608,26 @@
         .live-dot-indicator.pulsing { background:#3ecf6a; box-shadow:0 0 0 3px rgba(62,207,106,0.18); animation:liveDotPulse 1.6s ease-in-out infinite; }
         @keyframes liveDotPulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
 
-        .live-monitor { position:fixed; top:0; right:0; height:100vh; height:100dvh; width:380px; max-width:88vw; background-color:var(--bg-sidebar); border-left:1px solid var(--border-color); display:flex; flex-direction:column; transform:translateX(100%); transition:transform 0.3s var(--transition-bezier); z-index:50; box-shadow:-8px 0 28px rgba(0,0,0,0.35); }
+        .live-monitor { position:fixed; top:0; right:0; height:100vh; height:100dvh; width:var(--live-panel-w); max-width:92vw; background-color:#151515; border-left:1px solid var(--border-color); display:flex; flex-direction:column; transform:translateX(100%); transition:transform 0.32s var(--transition-bezier); z-index:50; box-shadow:-8px 0 28px rgba(0,0,0,0.35); }
         .live-monitor.open { transform:translateX(0); }
-        .live-monitor-header { display:flex; align-items:center; justify-content:space-between; padding:14px 8px 14px 16px; border-bottom:1px solid var(--border-color); flex-shrink:0; }
-        .live-monitor-title { display:flex; align-items:center; gap:9px; font-size:14px; font-weight:600; }
-        .live-monitor-status { padding:9px 16px; font-size:12px; color:var(--text-secondary); border-bottom:1px solid var(--border-color); flex-shrink:0; }
-        .live-monitor-feed { flex:1; overflow-y:auto; padding:10px 12px; display:flex; flex-direction:column; gap:1px; scroll-behavior:smooth; }
+
+        .live-monitor-header { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:12px 10px 12px 16px; border-bottom:1px solid var(--border-color); flex-shrink:0; }
+        .live-monitor-title-wrap { display:flex; align-items:center; gap:10px; min-width:0; }
+        .live-monitor-computer-icon { width:28px; height:28px; border-radius:8px; background:var(--bg-input); color:var(--text-secondary); display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+        .live-monitor-computer-icon svg { width:16px; height:16px; }
+        .live-monitor-heading { min-width:0; }
+        .live-monitor-title { display:flex; align-items:center; gap:8px; font-size:14px; font-weight:600; line-height:1.3; }
+        .live-monitor-status { font-size:12px; color:var(--text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-top:1px; }
+        .live-monitor-header-actions { display:flex; align-items:center; gap:2px; flex-shrink:0; }
+        .live-monitor-header-actions .icon-btn { padding:6px; }
+        .live-monitor-header-actions .icon-btn svg { width:16px; height:16px; }
+        .live-monitor-header-actions a.icon-btn[hidden] { display:none; }
+
+        .live-monitor-feed { position:relative; flex:1; overflow-y:auto; padding:10px 12px; display:flex; flex-direction:column; gap:1px; scroll-behavior:smooth; }
         .live-monitor-empty { color:var(--text-secondary); font-size:13px; line-height:1.55; padding:28px 10px; text-align:center; }
-        .live-monitor-row { display:flex; gap:10px; padding:7px 6px; font-size:13px; line-height:1.45; border-radius:6px; animation:liveRowIn 0.2s ease; }
+        .live-monitor-row { display:flex; gap:10px; padding:7px 6px; font-size:13px; line-height:1.45; border-radius:6px; animation:liveRowIn 0.2s ease; scroll-margin:14px; }
         @keyframes liveRowIn { from { opacity:0; transform:translateY(3px); } to { opacity:1; transform:translateY(0); } }
+        .live-monitor-row.step-current { background:rgba(255,255,255,0.045); }
         .live-monitor-icon { width:16px; height:16px; flex-shrink:0; margin-top:2px; color:var(--text-secondary); display:flex; }
         .live-monitor-icon svg { width:100%; height:100%; }
         .live-monitor-icon.live-monitor-spin svg { animation:liveSpin 0.8s linear infinite; transform-origin:center; }
@@ -627,11 +642,43 @@
         .live-monitor-link { display:block; color:var(--accent); font-size:12px; text-decoration:none; word-break:break-all; margin-top:2px; }
         .live-monitor-link:hover { text-decoration:underline; }
         .live-monitor-time { color:var(--text-secondary); font-size:11px; margin-top:2px; opacity:0.75; }
-        .live-monitor-terminal { margin:6px 0 0; padding:8px 9px; background:var(--bg-main); border-radius:6px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11.5px; line-height:1.5; color:var(--text-secondary); white-space:pre-wrap; word-break:break-word; max-height:160px; overflow-y:auto; }
+
+        /* Real terminal transcript: green prompt line (like a shell), plain output below it */
+        .live-monitor-terminal { margin:6px 0 0; padding:8px 9px; background:#0d0d0d; border:1px solid rgba(255,255,255,0.06); border-radius:6px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11.5px; line-height:1.55; color:var(--text-secondary); white-space:pre-wrap; word-break:break-word; max-height:220px; overflow-y:auto; }
+        .lm-prompt-line { color:#e4e4e4; margin-bottom:3px; }
+        .lm-prompt-user { color:#3ecf6a; font-weight:600; }
+        .lm-output { color:#b4b4b4; }
+
+        /* Floating "jump to live" pill, shown when the person has scrolled away from the newest action */
+        .live-monitor-jump { position:absolute; left:50%; bottom:14px; transform:translateX(-50%); display:flex; align-items:center; gap:6px; background:#242424; color:var(--text-primary); border:1px solid rgba(255,255,255,0.12); padding:7px 13px; border-radius:999px; font-size:12.5px; font-weight:500; cursor:pointer; box-shadow:0 6px 18px rgba(0,0,0,0.35); transition:background 0.2s ease, opacity 0.2s ease; z-index:2; }
+        .live-monitor-jump:hover { background:#2c2c2c; }
+        .live-monitor-jump svg { width:13px; height:13px; }
+        .live-monitor-jump[hidden] { display:none; }
+
+        /* Bottom playback bar: step through the agent's actions like a scrubber */
+        .live-monitor-playbar { flex-shrink:0; border-top:1px solid var(--border-color); padding:10px 14px 12px; background:#141414; }
+        .live-monitor-playbar[hidden] { display:none; }
+        .live-monitor-playbar-controls { display:flex; align-items:center; gap:10px; }
+        .live-monitor-step-btn { width:26px; height:26px; border-radius:7px; border:none; background:var(--bg-input); color:var(--text-secondary); display:flex; align-items:center; justify-content:center; cursor:pointer; flex-shrink:0; transition:background 0.15s ease, color 0.15s ease; }
+        .live-monitor-step-btn svg { width:14px; height:14px; }
+        .live-monitor-step-btn:hover:not(:disabled) { background:var(--bg-hover); color:var(--text-primary); }
+        .live-monitor-step-btn:disabled { opacity:0.35; cursor:default; }
+        .live-monitor-scrubber { flex:1; min-width:0; cursor:pointer; padding:8px 0; }
+        .live-monitor-scrubber-track { position:relative; height:3px; border-radius:2px; background:var(--bg-input); overflow:hidden; }
+        .live-monitor-scrubber-fill { position:absolute; inset:0 auto 0 0; width:0%; background:var(--accent); border-radius:2px; transition:width 0.25s ease; }
+        .live-monitor-live-badge { display:flex; align-items:center; gap:6px; font-size:12px; font-weight:500; color:var(--text-secondary); flex-shrink:0; padding:0 2px; }
+        .live-monitor-live-badge .live-dot-indicator { background:var(--text-secondary); }
+        .live-monitor-live-badge.is-live { color:#3ecf6a; }
+        .live-monitor-live-badge.is-live .live-dot-indicator { background:#3ecf6a; box-shadow:0 0 0 3px rgba(62,207,106,0.18); animation:liveDotPulse 1.6s ease-in-out infinite; }
+        .live-monitor-current-step { display:flex; align-items:center; gap:8px; margin-top:9px; font-size:12.5px; color:var(--text-primary); }
+        .lm-step-check { width:15px; height:15px; flex-shrink:0; color:var(--accent); display:flex; }
+        .lm-step-check svg { width:100%; height:100%; }
+        .lm-step-text { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .lm-step-count { flex-shrink:0; color:var(--text-secondary); font-variant-numeric:tabular-nums; }
 
         @media (min-width:769px) {
-            .main-content { transition:margin-right 0.3s var(--transition-bezier); }
-            body.live-monitor-open .main-content { margin-right:380px; }
+            .main-content { transition:margin-right 0.32s var(--transition-bezier); }
+            body.live-monitor-open .main-content { margin-right:var(--live-panel-w); }
         }
         @media (max-width:768px) {
             .live-monitor { width:100vw; max-width:100vw; border-left:none; }
@@ -733,17 +780,56 @@
          same SSE stream the chat already consumes. Code mode only. -->
     <aside class="live-monitor" id="liveMonitor" aria-hidden="true" aria-label="Live backend activity">
         <div class="live-monitor-header">
-            <div class="live-monitor-title">
-                <span class="live-dot-indicator" id="liveMonitorDot"></span>
-                <span>Live activity</span>
+            <div class="live-monitor-title-wrap">
+                <span class="live-monitor-computer-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="13" rx="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+                </span>
+                <div class="live-monitor-heading">
+                    <div class="live-monitor-title">
+                        <span class="live-dot-indicator" id="liveMonitorDot"></span>
+                        <span>Maximus's computer</span>
+                    </div>
+                    <div class="live-monitor-status" id="liveMonitorStatus">Idle — nothing running right now.</div>
+                </div>
             </div>
-            <button type="button" class="icon-btn" onclick="toggleLiveMonitor(false)" title="Close">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-            </button>
+            <div class="live-monitor-header-actions">
+                <a class="icon-btn" id="liveMonitorOpenUrl" href="#" target="_blank" rel="noopener noreferrer" hidden title="Open live preview">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path><polyline points="15 3 21 3 21 9"></polyline><line x1="10" y1="14" x2="21" y2="3"></line></svg>
+                </a>
+                <button type="button" class="icon-btn" onclick="toggleLiveMonitor(false)" title="Close">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                </button>
+            </div>
         </div>
-        <div class="live-monitor-status" id="liveMonitorStatus">Idle — nothing running right now.</div>
         <div class="live-monitor-feed" id="liveMonitorFeed">
             <div class="live-monitor-empty" id="liveMonitorEmpty">Nothing yet. Send a message in Code mode and the agent's actions — file edits, commands, sandbox status — will stream in here as they happen.</div>
+            <button type="button" class="live-monitor-jump" id="liveMonitorJump" hidden onclick="liveMonitorJumpToLive()">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                Jump to live
+            </button>
+        </div>
+        <div class="live-monitor-playbar" id="liveMonitorPlaybar" hidden>
+            <div class="live-monitor-playbar-controls">
+                <button type="button" class="live-monitor-step-btn" id="lmPrevStep" onclick="liveMonitorStep(-1)" title="Previous step">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>
+                </button>
+                <div class="live-monitor-scrubber" id="lmScrubber" onclick="liveMonitorScrub(event)">
+                    <div class="live-monitor-scrubber-track"><div class="live-monitor-scrubber-fill" id="lmScrubberFill"></div></div>
+                </div>
+                <button type="button" class="live-monitor-step-btn" id="lmNextStep" onclick="liveMonitorStep(1)" title="Next step">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                </button>
+                <div class="live-monitor-live-badge" id="lmLiveBadge">
+                    <span class="live-dot-indicator"></span>Live
+                </div>
+            </div>
+            <div class="live-monitor-current-step">
+                <span class="lm-step-check">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                </span>
+                <span class="lm-step-text" id="lmStepText">Waiting for the agent to start…</span>
+                <span class="lm-step-count" id="lmStepCount"></span>
+            </div>
         </div>
     </aside>
     <div class="live-monitor-backdrop" id="liveMonitorBackdrop" hidden onclick="toggleLiveMonitor(false)"></div>
@@ -1425,8 +1511,14 @@
         const liveMonitorFeed = document.getElementById('liveMonitorFeed');
         const liveMonitorStatusEl = document.getElementById('liveMonitorStatus');
         const watchLiveBtn = document.getElementById('watchLiveBtn');
+        const liveMonitorJumpBtn = document.getElementById('liveMonitorJump');
+        const liveMonitorPlaybar = document.getElementById('liveMonitorPlaybar');
+        const liveMonitorOpenUrlBtn = document.getElementById('liveMonitorOpenUrl');
         let liveMonitorOpen = false;
         let liveMonitorActions = new Map(); // "action::file" -> { row, action, file } for in-flight steps
+        let liveMonitorSteps = [];   // ordered list of every row added — one per agent "step"
+        let liveMonitorStepIndex = -1;
+        let liveMonitorFollowing = true; // true = scrubber tracks the newest step automatically
 
         const LIVE_ICONS = {
             read: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5-7-5-7-5Z"/><circle cx="8" cy="8" r="2"/></svg>',
@@ -1482,7 +1574,98 @@
         }
 
         function liveMonitorScrollToBottom() {
-            if (liveMonitorFeed) liveMonitorFeed.scrollTop = liveMonitorFeed.scrollHeight;
+            if (liveMonitorFeed && liveMonitorFollowing) liveMonitorFeed.scrollTop = liveMonitorFeed.scrollHeight;
+        }
+
+        function liveMonitorUpdateJumpVisibility() {
+            if (liveMonitorJumpBtn) liveMonitorJumpBtn.hidden = liveMonitorFollowing;
+        }
+
+        // Stepping through history (scrubber, prev/next) or scrolling up manually
+        // pauses auto-follow; scrolling back to the bottom (or hitting "Jump to
+        // live") resumes it — the same push/pull Manus's own panel has.
+        if (liveMonitorFeed) {
+            liveMonitorFeed.addEventListener('scroll', () => {
+                const nearBottom = liveMonitorFeed.scrollHeight - liveMonitorFeed.scrollTop - liveMonitorFeed.clientHeight < 40;
+                if (!nearBottom && liveMonitorFollowing) {
+                    liveMonitorFollowing = false;
+                    liveMonitorUpdateJumpVisibility();
+                } else if (nearBottom && !liveMonitorFollowing) {
+                    liveMonitorFollowing = true;
+                    liveMonitorStepIndex = liveMonitorSteps.length - 1;
+                    liveMonitorRenderPlaybar();
+                    liveMonitorUpdateJumpVisibility();
+                }
+            });
+        }
+
+        function liveMonitorRenderPlaybar() {
+            if (!liveMonitorPlaybar) return;
+            const total = liveMonitorSteps.length;
+            if (!total) { liveMonitorPlaybar.hidden = true; return; }
+            liveMonitorPlaybar.hidden = false;
+            const idx = liveMonitorStepIndex < 0 ? total - 1 : Math.min(liveMonitorStepIndex, total - 1);
+            const row = liveMonitorSteps[idx];
+            liveMonitorSteps.forEach((r) => r.classList.remove('step-current'));
+            if (row) row.classList.add('step-current');
+            const fill = document.getElementById('lmScrubberFill');
+            if (fill) fill.style.width = `${((idx + 1) / total) * 100}%`;
+            const countEl = document.getElementById('lmStepCount');
+            if (countEl) countEl.textContent = `${idx + 1}/${total}`;
+            const textEl = document.getElementById('lmStepText');
+            if (textEl && row) {
+                const label = row.querySelector('.live-monitor-label');
+                textEl.textContent = label ? label.textContent : '';
+            }
+            const isLive = idx === total - 1 && liveMonitorFollowing;
+            const badge = document.getElementById('lmLiveBadge');
+            if (badge) badge.classList.toggle('is-live', isLive);
+            const prevBtn = document.getElementById('lmPrevStep');
+            const nextBtn = document.getElementById('lmNextStep');
+            if (prevBtn) prevBtn.disabled = idx <= 0;
+            if (nextBtn) nextBtn.disabled = idx >= total - 1;
+        }
+
+        function liveMonitorPushStep(row) {
+            if (!row) return;
+            liveMonitorSteps.push(row);
+            if (liveMonitorFollowing) liveMonitorStepIndex = liveMonitorSteps.length - 1;
+            liveMonitorRenderPlaybar();
+        }
+
+        function liveMonitorStep(delta) {
+            const total = liveMonitorSteps.length;
+            if (!total) return;
+            liveMonitorFollowing = false;
+            const base = liveMonitorStepIndex < 0 ? total - 1 : liveMonitorStepIndex;
+            liveMonitorStepIndex = Math.max(0, Math.min(total - 1, base + delta));
+            if (liveMonitorStepIndex === total - 1) liveMonitorFollowing = true;
+            const row = liveMonitorSteps[liveMonitorStepIndex];
+            if (row) row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            liveMonitorRenderPlaybar();
+            liveMonitorUpdateJumpVisibility();
+        }
+
+        function liveMonitorScrub(evt) {
+            const total = liveMonitorSteps.length;
+            if (!total) return;
+            const track = evt.currentTarget.getBoundingClientRect();
+            const ratio = Math.max(0, Math.min(1, (evt.clientX - track.left) / track.width));
+            liveMonitorFollowing = false;
+            liveMonitorStepIndex = Math.min(total - 1, Math.floor(ratio * total));
+            if (liveMonitorStepIndex === total - 1) liveMonitorFollowing = true;
+            const row = liveMonitorSteps[liveMonitorStepIndex];
+            if (row) row.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            liveMonitorRenderPlaybar();
+            liveMonitorUpdateJumpVisibility();
+        }
+
+        function liveMonitorJumpToLive() {
+            liveMonitorFollowing = true;
+            liveMonitorStepIndex = liveMonitorSteps.length - 1;
+            liveMonitorScrollToBottom();
+            liveMonitorRenderPlaybar();
+            liveMonitorUpdateJumpVisibility();
         }
 
         function liveMonitorSetLabel(labelEl, content) {
@@ -1530,13 +1713,14 @@
             body.appendChild(timeEl);
             row.appendChild(body);
             liveMonitorFeed.appendChild(row);
+            liveMonitorPushStep(row);
             liveMonitorScrollToBottom();
             return row;
         }
 
         function liveMonitorFinishRow(row, kind, content, isError) {
             if (!row) return;
-            row.className = `live-monitor-row kind-${isError ? 'error' : kind}`;
+            row.className = `live-monitor-row kind-${isError ? 'error' : kind}` + (row.classList.contains('step-current') ? ' step-current' : '');
             const iconWrap = row.querySelector('.live-monitor-icon');
             if (iconWrap) {
                 iconWrap.classList.remove('live-monitor-spin');
@@ -1544,6 +1728,7 @@
             }
             const labelEl = row.querySelector('.live-monitor-label');
             if (labelEl) liveMonitorSetLabel(labelEl, content);
+            liveMonitorRenderPlaybar();
             liveMonitorScrollToBottom();
         }
 
@@ -1561,10 +1746,10 @@
             detailEl.textContent = text;
         }
 
-        function liveMonitorAppendTerminal(row, text) {
-            if (!row || !text) return;
+        function liveMonitorEnsureTerminal(row) {
+            if (!row) return null;
             const body = row.querySelector('.live-monitor-body');
-            if (!body) return;
+            if (!body) return null;
             let pre = body.querySelector('.live-monitor-terminal');
             if (!pre) {
                 pre = document.createElement('pre');
@@ -1572,8 +1757,39 @@
                 const timeEl = body.querySelector('.live-monitor-time');
                 body.insertBefore(pre, timeEl || null);
             }
-            pre.textContent += text;
-            if (pre.textContent.length > 4000) pre.textContent = pre.textContent.slice(-4000);
+            return pre;
+        }
+
+        // Renders the actual command as a shell prompt line ("user@sandbox:~$ cmd"),
+        // the same visual language as Manus's terminal tool view, before any output
+        // streams in below it.
+        function liveMonitorSetPrompt(row, command) {
+            const pre = liveMonitorEnsureTerminal(row);
+            if (!pre || !command || pre.querySelector('.lm-prompt-line')) return;
+            const promptLine = document.createElement('div');
+            promptLine.className = 'lm-prompt-line';
+            promptLine.innerHTML = '<span class="lm-prompt-user">sandbox:~$</span> ' + lmEscapeHtml(command);
+            pre.appendChild(promptLine);
+            const out = document.createElement('span');
+            out.className = 'lm-output';
+            pre.appendChild(out);
+            pre._lmOut = out;
+            liveMonitorScrollToBottom();
+        }
+
+        function liveMonitorAppendTerminal(row, text) {
+            if (!row || !text) return;
+            const pre = liveMonitorEnsureTerminal(row);
+            if (!pre) return;
+            let out = pre._lmOut;
+            if (!out) {
+                out = document.createElement('span');
+                out.className = 'lm-output';
+                pre.appendChild(out);
+                pre._lmOut = out;
+            }
+            out.textContent += text;
+            if (out.textContent.length > 4000) out.textContent = out.textContent.slice(-4000);
             liveMonitorScrollToBottom();
         }
 
@@ -1584,6 +1800,14 @@
             delete: ['Deleting', 'Deleted'],
             run_command: ['Running a command', 'Ran a command'],
             start_server: ['Starting the server', 'Started the server'],
+        };
+        const LIVE_STATUS_PHRASES = {
+            read: 'Using Files — reading',
+            edit: 'Using Editor',
+            delete: 'Using Files — removing',
+            command: 'Using Terminal',
+            server: 'Starting a live server',
+            status: 'Working…',
         };
         function liveActionIconKind(action) {
             if (action === 'read') return 'read';
@@ -1613,6 +1837,10 @@
                     const kind = liveActionIconKind(parsed.action);
                     const row = liveMonitorAddRow(kind, liveActionLabel(parsed.action, parsed.file, false), { spinner: true });
                     liveMonitorActions.set(liveActionKey(parsed), { row, action: parsed.action, file: parsed.file });
+                    if (liveMonitorStatusEl) liveMonitorStatusEl.textContent = LIVE_STATUS_PHRASES[kind] || 'Working…';
+                    if ((parsed.action === 'run_command' || parsed.action === 'start_server') && parsed.command) {
+                        liveMonitorSetPrompt(row, parsed.command);
+                    }
                     break;
                 }
                 case 'activity_complete': {
@@ -1670,6 +1898,10 @@
                 }
                 case 'sandbox_ready': {
                     liveMonitorAddRow('server', 'Sandbox server is live', { url: parsed.url || null });
+                    if (parsed.url && liveMonitorOpenUrlBtn) {
+                        liveMonitorOpenUrlBtn.href = parsed.url;
+                        liveMonitorOpenUrlBtn.hidden = false;
+                    }
                     break;
                 }
                 case 'sandbox_error': {
@@ -1707,11 +1939,18 @@
             liveMonitorFeed.innerHTML = '';
             liveMonitorActions.clear();
             setLiveMonitorActive(false);
+            liveMonitorSteps = [];
+            liveMonitorStepIndex = -1;
+            liveMonitorFollowing = true;
+            liveMonitorRenderPlaybar();
+            liveMonitorUpdateJumpVisibility();
+            if (liveMonitorOpenUrlBtn) liveMonitorOpenUrlBtn.hidden = true;
             const empty = document.createElement('div');
             empty.className = 'live-monitor-empty';
             empty.id = 'liveMonitorEmpty';
             empty.textContent = message || 'Nothing yet. Send a message in Code mode and the agent\'s actions — file edits, commands, sandbox status — will stream in here as they happen.';
             liveMonitorFeed.appendChild(empty);
+            if (liveMonitorJumpBtn) liveMonitorFeed.appendChild(liveMonitorJumpBtn);
         }
 
         function liveMonitorBeginTurn(text) {
