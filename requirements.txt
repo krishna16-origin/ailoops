@@ -8,3 +8,4 @@ langgraph
 tavily-python>=0.5
 python-dotenv
 openai
+e2b
