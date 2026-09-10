@@ -1680,7 +1680,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             command = turn["content"] or ""
             session_id = getattr(request, "session_id", None)
             activities.append({"kind": "command", "text": command})
-            await emit({"type": "activity_start", "action": action, "file": path})
+            await emit({"type": "activity_start", "action": action, "file": path, "command": command})
 
             if not sandbox_manager.sandbox_configured():
                 msg = ("The live sandbox isn't configured yet (no E2B_API_KEY on the server). "
