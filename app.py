@@ -29,6 +29,7 @@ from langchain_nvidia_ai_endpoints import ChatNVIDIA
 from tavily import TavilyClient
 
 from constitution import build_constitution_block
+import sandbox_manager
 
 load_dotenv()
 
@@ -36,6 +37,8 @@ if not os.getenv("NVIDIA_API_KEY"):
     print("WARNING: NVIDIA_API_KEY not found in environment. The API calls will fail.")
 if not os.getenv("TAVILY_API_KEY"):
     print("WARNING: TAVILY_API_KEY not found in environment. Web search will be disabled.")
+if not sandbox_manager.sandbox_configured():
+    print("WARNING: E2B_API_KEY not found in environment. The live sandbox will be disabled.")
 
 _tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY")) if os.getenv("TAVILY_API_KEY") else None
 
@@ -1036,7 +1039,7 @@ THINK_CHARS_PER_TOKEN = 4          # model is still "thinking" past this share
 # number of tool-call turns so the loop itself can't run forever.
 
 
-VALID_ACTIONS = {"read_file", "edit_file", "create_file", "delete_file", "final"}
+VALID_ACTIONS = {"read_file", "edit_file", "create_file", "delete_file", "run_command", "start_server", "final"}
 
 
 # ---------------------------------------------------------------------------
@@ -1217,23 +1220,38 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
     skill_block = _matching_skill_blocks(latest_user_text)
     return (
         build_constitution_block() + skill_block + "\n\n"
-        "You are an autonomous coding agent working in a loop, one tool call per turn. You do not have "
-        "filesystem or shell access outside these tools — never claim to have run, saved, or previewed "
-        "anything except through them.\n\n"
+        "You are an autonomous coding agent working in a loop, one tool call per turn. Beyond the files "
+        + ("below, you also have a real, live cloud sandbox with shell access via run_command/start_server — "
+           "never claim to have run, installed, or served anything except through those tools.\n\n"
+           if sandbox_manager.sandbox_configured() else
+           "below, you do not have shell or live-sandbox access in this deployment (no E2B_API_KEY configured) "
+           "— never claim to have run a command or started a live server.\n\n") +
         "Tools:\n"
         "- read_file: view the current, real contents of an existing project file.\n"
         "- edit_file: completely replace an existing file's contents. You must return the COMPLETE new "
         "file content, never a snippet or a diff.\n"
         "- create_file: create a new file that does not exist yet, with its full content.\n"
         "- delete_file: remove a file that is no longer needed.\n"
+        "- run_command: run a shell command to completion in the live sandbox (e.g. `npm install`, "
+        "`pip install -r requirements.txt`, a build step, or tests). The project's current files are "
+        "synced into the sandbox automatically before it runs. Omit PATH; put the command in the code "
+        "fence. Its real stdout/stderr and exit code are returned to you.\n"
+        "- start_server: start (or restart) the project's long-running dev/preview server in the sandbox "
+        "and make it live. PATH is the port number the server listens on (e.g. `3000`); the code fence "
+        "holds the exact command to run it, which MUST bind 0.0.0.0 (e.g. `npm run dev -- --host 0.0.0.0 "
+        "--port 3000`, or `python3 -m http.server 8080 --bind 0.0.0.0` for a static site). Only call this "
+        "once the needed files/dependencies are in place — use run_command first if install/build steps "
+        "are required. A public URL is returned and shown to the user as a live preview.\n"
         "- final: end the turn and report back to the user. Use this once the request is satisfied.\n\n"
         "On every turn, respond in EXACTLY this format:\n\n"
         "THOUGHT: <one short, plain sentence about what you're about to do and why — shown directly to "
         "the user, so keep it natural and free of meta-commentary about these instructions>\n"
-        "ACTION: read_file | edit_file | create_file | delete_file | final\n"
-        "PATH: <relative/file/path>   (omit only when ACTION is final)\n"
-        "```<language>                (ONLY for edit_file / create_file — omit for read_file, delete_file, final)\n"
-        "<the complete file content>\n"
+        "ACTION: read_file | edit_file | create_file | delete_file | run_command | start_server | final\n"
+        "PATH: <relative/file/path, or port number for start_server>   (omit only for read/write actions "
+        "that don't need one — run_command and final)\n"
+        "```<language or bash>        (for edit_file / create_file / run_command / start_server — omit "
+        "for read_file, delete_file, final)\n"
+        "<the complete file content, or the shell command>\n"
         "```\n\n"
         "Rules:\n"
         "- Exactly one ACTION per turn. Never combine multiple actions in one response.\n"
@@ -1243,6 +1261,8 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
         "- Preserve every existing function, section, style rule, or piece of functionality the user did "
         "not ask you to change when editing a file — never silently drop or rewrite unrelated code.\n"
         "- Only touch the file(s) the request actually concerns.\n"
+        "- Prefer start_server (once) over repeated run_command calls that just re-run the same dev "
+        "server — restarting it is cheap, so use it again after changes if the user wants to see them live.\n"
         "- When finished, respond with ACTION: final and, on the following lines, a short 2-4 sentence "
         "explanation of what changed. No PATH line and no code block after final.\n"
         f"- You have {MAX_AGENT_STEPS} tool-call turns available in total; this is turn {step_number} of "
@@ -1268,7 +1288,7 @@ def build_agent_messages(history: List[BaseMessage], transcript: List[BaseMessag
 
 
 _AGENT_TURN_RE = re.compile(
-    r"THOUGHT:\s*(?P<thought>.*?)\s*\n\s*ACTION:\s*(?P<action>read_file|edit_file|create_file|delete_file|final)\b"
+    r"THOUGHT:\s*(?P<thought>.*?)\s*\n\s*ACTION:\s*(?P<action>read_file|edit_file|create_file|delete_file|run_command|start_server|final)\b"
     r"(?:[ \t]*\n[ \t]*PATH:\s*(?P<path>[^\n]+))?"
     r"(?P<rest>[\s\S]*)$",
     re.IGNORECASE,
@@ -1285,9 +1305,17 @@ def parse_agent_turn(raw: str) -> Optional[dict]:
     action = match.group("action").lower()
     path = (match.group("path") or "").strip().strip("`") or None
     rest = match.group("rest") or ""
-    if action in ("edit_file", "create_file"):
+    if action in ("edit_file", "create_file", "start_server"):
         if not path:
             return None
+        fence = _FENCE_RE.search(rest)
+        if not fence:
+            return None
+        content = fence.group("content")
+        if content.endswith("\n"):
+            content = content[:-1]
+        return {"thought": thought, "action": action, "path": path, "content": content}
+    if action == "run_command":
         fence = _FENCE_RE.search(rest)
         if not fence:
             return None
@@ -1648,6 +1676,63 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             transcript.append(HumanMessage(content=f"TOOL RESULT: {path} {'deleted' if existed else 'did not exist; nothing to delete'}."))
             continue
 
+        if action in ("run_command", "start_server"):
+            command = turn["content"] or ""
+            session_id = getattr(request, "session_id", None)
+            activities.append({"kind": "command", "text": command})
+            await emit({"type": "activity_start", "action": action, "file": path})
+
+            if not sandbox_manager.sandbox_configured():
+                msg = ("The live sandbox isn't configured yet (no E2B_API_KEY on the server). "
+                       "Add it to the .env file and restart to enable run_command/start_server.")
+                await emit({"type": "activity_error", "action": action, "message": msg})
+                transcript.append(AIMessage(content=raw))
+                transcript.append(HumanMessage(content=f"TOOL RESULT: {msg}"))
+                continue
+
+            async def _on_output(stream: str, text: str, _action=action):
+                await emit({"type": "terminal_output", "stream": stream, "text": text, "action": _action})
+
+            try:
+                await sandbox_manager.sync_files(session_id, file_store)
+                if action == "run_command":
+                    exit_code, output = await sandbox_manager.run_command(session_id, command, on_output=_on_output)
+                    tail = output[-4000:] if len(output) > 4000 else output
+                    await emit({"type": "activity_complete", "action": action, "file": path, "exit_code": exit_code})
+                    transcript.append(AIMessage(content=raw))
+                    transcript.append(HumanMessage(content=(
+                        f"TOOL RESULT: command exited with code {exit_code}. Output (may be truncated):\n"
+                        f"```\n{tail}\n```"
+                    )))
+                else:  # start_server
+                    try:
+                        port = int(re.sub(r"[^0-9]", "", path or "") or "0")
+                    except ValueError:
+                        port = 0
+                    if not port:
+                        msg = "start_server needs a numeric PATH (the port the server listens on)."
+                        await emit({"type": "activity_error", "action": action, "message": msg})
+                        transcript.append(AIMessage(content=raw))
+                        transcript.append(HumanMessage(content=f"TOOL RESULT: {msg}"))
+                        continue
+                    url = await sandbox_manager.start_server(session_id, command, port, on_output=_on_output)
+                    await emit({"type": "activity_complete", "action": action, "file": path})
+                    await emit({"type": "sandbox_ready", "url": url, "port": port})
+                    transcript.append(AIMessage(content=raw))
+                    transcript.append(HumanMessage(content=(
+                        f"TOOL RESULT: live server started on port {port}, publicly reachable at {url}."
+                    )))
+            except sandbox_manager.SandboxNotConfigured as exc:
+                await emit({"type": "activity_error", "action": action, "message": str(exc)})
+                transcript.append(AIMessage(content=raw))
+                transcript.append(HumanMessage(content=f"TOOL RESULT: {exc}"))
+            except Exception as exc:
+                err_text = str(exc)[:800]
+                await emit({"type": "activity_error", "action": action, "message": err_text})
+                transcript.append(AIMessage(content=raw))
+                transcript.append(HumanMessage(content=f"TOOL RESULT: sandbox error: {err_text}"))
+            continue
+
     if not reached_final:
         # Hit the step cap without the model wrapping up — force one last
         # summarizing call instead of leaving the user without a response.
@@ -1781,7 +1866,8 @@ async def stream_code_agent(request: Any, session: dict, session_id: str):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             elif etype in ("plan_created", "activity_start", "activity_complete", "activity_error",
                            "file_read", "file_created", "file_edited", "file_deleted",
-                           "diff_created", "artifact_created", "complete"):
+                           "diff_created", "artifact_created", "complete",
+                           "terminal_output", "sandbox_ready"):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         result, transcript = await task
     except asyncio.TimeoutError:
@@ -1818,6 +1904,145 @@ async def forward_live_events(task: asyncio.Task, progress_queue: asyncio.Queue,
             yield await asyncio.wait_for(progress_queue.get(), timeout=2.5)
         except asyncio.TimeoutError:
             yield {'type': 'AGENT_HEARTBEAT', 'label': 'Working'}
+
+
+class SandboxSessionRequest(BaseModel):
+    session_id: str
+
+
+class SandboxStartRequest(BaseModel):
+    session_id: str
+    command: Optional[str] = None
+    port: Optional[int] = None
+
+
+class SandboxCommandRequest(BaseModel):
+    session_id: str
+    command: str
+    cwd: Optional[str] = None
+
+
+def _sse(event: dict) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+async def _pump_sandbox_task(runner) -> Any:
+    """Runs `runner(queue)` as a background task and yields whatever it puts
+    on the queue as SSE frames until it signals completion."""
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def wrapped():
+        try:
+            await runner(queue)
+        finally:
+            await queue.put({"type": "__done__"})
+
+    task = asyncio.create_task(wrapped())
+    try:
+        while True:
+            item = await queue.get()
+            if item.get("type") == "__done__":
+                break
+            yield _sse(item)
+    finally:
+        await task
+
+
+async def _sandbox_start_stream(request: SandboxStartRequest):
+    if not sandbox_manager.sandbox_configured():
+        yield _sse({"type": "sandbox_error", "message": (
+            "E2B_API_KEY is not set on the server. Add it to your .env and restart the backend to "
+            "enable the live sandbox."
+        )})
+        return
+
+    session = sessions.get(request.session_id)
+    file_store: Dict[str, str] = (session or {}).get("code_files") or {}
+    if not file_store:
+        yield _sse({"type": "sandbox_error", "message": "No generated project yet — build something in Code mode first."})
+        return
+
+    command, port = request.command, request.port
+    if not command or not port:
+        command, port = sandbox_manager.detect_default_start(file_store)
+
+    async def runner(queue: asyncio.Queue):
+        async def on_output(stream: str, text: str):
+            await queue.put({"type": "sandbox_log", "stream": stream, "text": text})
+        try:
+            await queue.put({"type": "sandbox_status", "state": "starting", "message": "Booting sandbox…"})
+            await sandbox_manager.ensure_session(request.session_id)
+            await queue.put({"type": "sandbox_status", "state": "syncing", "message": "Syncing project files…"})
+            await sandbox_manager.sync_files(request.session_id, file_store)
+            await queue.put({"type": "sandbox_status", "state": "installing", "message": f"Running: {command}"})
+            url = await sandbox_manager.start_server(request.session_id, command, port, on_output=on_output)
+            await queue.put({"type": "sandbox_ready", "url": url, "port": port})
+        except sandbox_manager.SandboxNotConfigured as exc:
+            await queue.put({"type": "sandbox_error", "message": str(exc)})
+        except Exception as exc:
+            await queue.put({"type": "sandbox_error", "message": str(exc)[:600]})
+
+    async for frame in _pump_sandbox_task(runner):
+        yield frame
+
+
+@app.post("/sandbox/start")
+async def sandbox_start(request: SandboxStartRequest):
+    return StreamingResponse(
+        _sandbox_start_stream(request),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+async def _sandbox_command_stream(request: SandboxCommandRequest):
+    if not sandbox_manager.sandbox_configured():
+        yield _sse({"type": "sandbox_error", "message": "E2B_API_KEY is not set on the server."})
+        return
+
+    async def runner(queue: asyncio.Queue):
+        async def on_output(stream: str, text: str):
+            await queue.put({"type": "sandbox_log", "stream": stream, "text": text})
+        try:
+            exit_code, _ = await sandbox_manager.run_command(
+                request.session_id, request.command, on_output=on_output, cwd=request.cwd,
+            )
+            await queue.put({"type": "sandbox_command_done", "exit_code": exit_code})
+        except sandbox_manager.SandboxNotConfigured as exc:
+            await queue.put({"type": "sandbox_error", "message": str(exc)})
+        except Exception as exc:
+            await queue.put({"type": "sandbox_error", "message": str(exc)[:600]})
+
+    async for frame in _pump_sandbox_task(runner):
+        yield frame
+
+
+@app.post("/sandbox/command")
+async def sandbox_command(request: SandboxCommandRequest):
+    return StreamingResponse(
+        _sandbox_command_stream(request),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
+
+
+@app.post("/sandbox/stop")
+async def sandbox_stop(request: SandboxSessionRequest):
+    stopped = await sandbox_manager.stop_session(request.session_id)
+    return {"status": "stopped" if stopped else "not_found"}
+
+
+@app.get("/sandbox/status/{session_id}")
+async def sandbox_status(session_id: str):
+    state = sandbox_manager.get_session(session_id)
+    if state is None:
+        return {"active": False, "configured": sandbox_manager.sandbox_configured()}
+    return {
+        "active": True,
+        "configured": True,
+        "url": state.server_url,
+        "port": state.server_port,
+    }
 
 
 @app.get("/health")
