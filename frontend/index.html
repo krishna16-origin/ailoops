@@ -82,6 +82,41 @@
         .history-item { padding:12px; border-radius:8px; cursor:pointer; font-size:14px; overflow:hidden; text-overflow:ellipsis; color:var(--text-secondary); transition:background 0.2s, color 0.2s; }
         .history-item:hover { background-color:var(--bg-hover); color:var(--text-primary); }
         .sidebar-settings { margin-top:auto; padding-top:16px; border-top:1px solid var(--border-color); display:flex; flex-direction:column; gap:12px; }
+        .mcp-entry { width:100%; display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; border:0; border-radius:8px; background:transparent; color:var(--text-primary); cursor:pointer; text-align:left; transition:background .2s,color .2s; }
+        .mcp-entry:hover { background:var(--bg-hover); }
+        .mcp-entry-copy { display:flex; flex-direction:column; gap:2px; min-width:0; }
+        .mcp-entry-title { font-size:13px; font-weight:600; }
+        .mcp-entry-subtitle { font-size:11px; color:var(--text-secondary); }
+        .mcp-backdrop { position:fixed; inset:0; z-index:79; background:rgba(0,0,0,.42); backdrop-filter:blur(2px); -webkit-backdrop-filter:blur(2px); }
+        .mcp-backdrop[hidden] { display:none; }
+        .mcp-panel { position:fixed; z-index:80; inset:0 0 0 auto; width:min(400px, 100vw); overflow:auto; padding:22px 24px 28px; border-left:1px solid var(--border-color); background:var(--bg-sidebar); box-shadow:-20px 0 60px rgba(0,0,0,.35); animation:mcpDrawerIn .22s ease; }
+        @keyframes mcpDrawerIn { from { transform:translateX(18px); opacity:0; } to { transform:translateX(0); opacity:1; } }
+        .mcp-panel[hidden] { display:none; }
+        .mcp-panel-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
+        .mcp-panel-title { font-size:18px; font-weight:700; letter-spacing:-.02em; }
+        .mcp-panel-kicker { color:var(--text-secondary); font-size:12px; line-height:1.5; margin:0 0 18px; }
+        .mcp-panel-search { width:100%; box-sizing:border-box; padding:10px 12px; color:var(--text-primary); background:var(--bg-input); border:1px solid var(--border-color); border-radius:9px; outline:none; font-size:13px; margin-bottom:14px; }
+        .mcp-panel-search:focus { border-color:var(--accent); }
+        .mcp-section-label { color:var(--text-secondary); font-size:10px; font-weight:700; letter-spacing:.09em; text-transform:uppercase; margin:18px 0 7px; }
+        .mcp-server-row { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:12px 0; border-top:1px solid var(--border-color); }
+        .mcp-server-name { font-size:13px; font-weight:600; }
+        .mcp-server-desc { display:block; color:var(--text-secondary); font-size:11px; margin-top:3px; }
+        .mcp-server-actions { display:flex; align-items:center; gap:6px; }
+        .mcp-test-btn { border:1px solid var(--border-color); background:transparent; color:var(--text-secondary); border-radius:6px; padding:4px 7px; cursor:pointer; font-size:11px; }
+        .mcp-test-btn:hover { color:var(--text-primary); border-color:var(--accent); }
+        .mcp-status { font-size:10px; color:var(--accent); min-width:42px; text-align:right; }
+        .mcp-status.off { color:var(--text-secondary); }
+        .mcp-custom-card { margin-top:18px; padding:14px; background:var(--bg-hover); border:1px solid var(--border-color); border-radius:11px; }
+        .mcp-custom-card strong { display:block; font-size:13px; margin-bottom:4px; }
+        .mcp-custom-card p { color:var(--text-secondary); font-size:11px; line-height:1.45; margin:0 0 11px; }
+        .mcp-custom-form { display:none; gap:8px; flex-direction:column; }
+        .mcp-custom-form.open { display:flex; }
+        .mcp-custom-form input { width:100%; box-sizing:border-box; padding:9px 10px; border:1px solid var(--border-color); border-radius:7px; background:var(--bg-main); color:var(--text-primary); outline:none; }
+        .mcp-custom-form input:focus { border-color:var(--accent); }
+        .mcp-custom-form-actions { display:flex; gap:7px; }
+        .mcp-primary-btn { flex:1; border:0; border-radius:7px; padding:8px 10px; background:var(--text-primary); color:var(--bg-main); font-size:12px; font-weight:600; cursor:pointer; }
+        .mcp-secondary-btn { border:1px solid var(--border-color); border-radius:7px; padding:8px 10px; background:transparent; color:var(--text-secondary); font-size:12px; cursor:pointer; }
+        @media (max-width:768px) { .mcp-panel { width:100vw; } }
         .settings-panel { display:flex; flex-direction:column; gap:12px; animation:fadeInSettings 0.25s ease; }
         @keyframes fadeInSettings { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
         .settings-panel[hidden] { display:none; }
@@ -782,6 +817,10 @@
             </button>
         </div>
         <div class="history-list" id="historyList"></div>
+        <button type="button" class="mcp-entry" onclick="toggleMcpPanel()" title="Manage MCP integrations">
+            <span class="mcp-entry-copy"><span class="mcp-entry-title">MCP integrations</span><span class="mcp-entry-subtitle" id="mcpEntrySubtitle">Loading integrations…</span></span>
+            <span aria-hidden="true">›</span>
+        </button>
         <div class="sidebar-settings">
             <!-- Chat mode settings — Model, Temperature and Effort moved to the
                  picker attached to the message composer (see input-container below). -->
@@ -802,6 +841,23 @@
         </div>
     </div>
     <div class="sidebar-backdrop" id="sidebarBackdrop" hidden onclick="toggleSidebar()"></div>
+    <div class="mcp-backdrop" id="mcpBackdrop" hidden onclick="toggleMcpPanel(false)"></div>
+    <section class="mcp-panel" id="mcpPanel" hidden aria-label="MCP integrations">
+        <div class="mcp-panel-header"><span class="mcp-panel-title">Integrations</span><button type="button" class="icon-btn" onclick="toggleMcpPanel(false)" title="Close">×</button></div>
+        <p class="mcp-panel-kicker">Connect tools to use across Chat and Code. Your enabled integrations are available when you send a message.</p>
+        <input class="mcp-panel-search" id="mcpSearch" type="search" placeholder="Search integrations" oninput="renderMcpServers()" autocomplete="off">
+        <div id="mcpServerList"><div class="mcp-entry-subtitle">Loading…</div></div>
+        <div class="mcp-custom-card">
+            <strong>Connect your own MCP</strong>
+            <p>Add a remote MCP server. It starts disabled until you turn it on.</p>
+            <button type="button" class="mcp-secondary-btn" id="mcpAddButton" onclick="toggleCustomMcpForm(true)">+ Add custom integration</button>
+            <div class="mcp-custom-form" id="mcpCustomForm">
+                <input id="mcpCustomName" placeholder="Integration name" autocomplete="off">
+                <input id="mcpCustomUrl" placeholder="https://your-mcp-server.example/mcp" autocomplete="off">
+                <div class="mcp-custom-form-actions"><button type="button" class="mcp-primary-btn" onclick="addCustomMcp()">Connect</button><button type="button" class="mcp-secondary-btn" onclick="toggleCustomMcpForm(false)">Cancel</button></div>
+            </div>
+        </div>
+    </section>
 
     <!-- WATCH LIVE panel: a running log of the code agent's real backend actions
          (file reads/edits, commands, sandbox status, plan + narration), fed by the
@@ -1528,6 +1584,70 @@
             sidebarBackdrop.hidden = sidebar.classList.contains('collapsed');
         }
         function toggleSidebar() { sidebar.classList.toggle('collapsed'); syncSidebarBackdrop(); }
+
+        let mcpServers = [];
+        let mcpPanelOpen = false;
+        const mcpPanel = document.getElementById('mcpPanel');
+        const mcpBackdrop = document.getElementById('mcpBackdrop');
+        const mcpServerList = document.getElementById('mcpServerList');
+        const mcpEntrySubtitle = document.getElementById('mcpEntrySubtitle');
+        function toggleMcpPanel(force) {
+            mcpPanelOpen = typeof force === 'boolean' ? force : !mcpPanelOpen;
+            if (mcpPanel) mcpPanel.hidden = !mcpPanelOpen;
+            if (mcpBackdrop) mcpBackdrop.hidden = !mcpPanelOpen;
+            if (mcpPanelOpen) loadMcpServers();
+        }
+        function selectedMcpServers() {
+            return mcpServers.filter(s => s.enabled).map(s => s.id);
+        }
+        function renderMcpServers() {
+            if (!mcpServerList) return;
+            const enabled = mcpServers.filter(s => s.enabled).length;
+            if (mcpEntrySubtitle) mcpEntrySubtitle.textContent = `${enabled} integration${enabled === 1 ? '' : 's'} enabled`;
+            const query = (document.getElementById('mcpSearch')?.value || '').trim().toLowerCase();
+            const visible = mcpServers.filter(s => !query || `${s.name} ${s.description} ${s.category}`.toLowerCase().includes(query));
+            const groups = [['public', 'Public data'], ['local', 'Workspace tools'], ['network', 'Web access'], ['storage', 'Memory'], ['browser', 'Browser'], ['custom', 'Your integrations']];
+            mcpServerList.innerHTML = groups.map(([category, label]) => {
+                const items = visible.filter(s => (s.category || 'custom') === category);
+                if (!items.length) return '';
+                return `<div class="mcp-section-label">${label}</div>` + items.map(s => `<div class="mcp-server-row">
+                    <label style="display:flex;align-items:center;gap:10px;min-width:0;flex:1;cursor:pointer">
+                        <input type="checkbox" ${s.enabled ? 'checked' : ''} onchange="setMcpEnabled('${s.id}', this.checked)">
+                        <span><span class="mcp-server-name">${escapeHtml(s.name)}</span><span class="mcp-server-desc">${escapeHtml(s.description || '')}</span></span>
+                    </label>
+                    <span class="mcp-server-actions"><span class="mcp-status ${s.enabled ? '' : 'off'}">${s.enabled ? 'On' : 'Off'}</span><button class="mcp-test-btn" onclick="testMcp('${s.id}')">Test</button></span>
+                </div>`).join('');
+            }).join('') || '<div class="mcp-entry-subtitle">No integrations match your search.</div>';
+        }
+        async function loadMcpServers() {
+            try { const r = await fetch(`${API_BASE}/mcp/servers`); const data = await r.json(); mcpServers = data.servers || []; renderMcpServers(); }
+            catch (e) { if (mcpServerList) mcpServerList.innerHTML = '<div class="mcp-entry-subtitle">MCP endpoint unavailable.</div>'; }
+        }
+        async function setMcpEnabled(id, enabled) {
+            try { await fetch(`${API_BASE}/mcp/servers/${encodeURIComponent(id)}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled}) }); const s = mcpServers.find(x => x.id === id); if (s) s.enabled = enabled; renderMcpServers(); }
+            catch (e) { loadMcpServers(); }
+        }
+        async function testMcp(id) {
+            const button = [...document.querySelectorAll('.mcp-test-btn')].find(b => b.getAttribute('onclick') === `testMcp('${id}')`);
+            if (button) { button.disabled = true; button.textContent = '…'; }
+            try { const r = await fetch(`${API_BASE}/mcp/servers/${encodeURIComponent(id)}/test`, {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); const data = await r.json(); alert(data.error ? data.message : `${id} responded successfully.`); }
+            catch (e) { alert(`MCP test failed: ${e.message}`); }
+            finally { if (button) { button.disabled = false; button.textContent = 'Test'; } }
+        }
+        function toggleCustomMcpForm(open) {
+            const form = document.getElementById('mcpCustomForm');
+            const button = document.getElementById('mcpAddButton');
+            if (form) form.classList.toggle('open', open);
+            if (button) button.hidden = open;
+            if (open) document.getElementById('mcpCustomName')?.focus();
+        }
+        async function addCustomMcp() {
+            const name = document.getElementById('mcpCustomName')?.value.trim();
+            const url = document.getElementById('mcpCustomUrl')?.value.trim();
+            if (!name || !url) { alert('Enter an integration name and MCP URL.'); return; }
+            try { const r = await fetch(`${API_BASE}/mcp/servers`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,url,transport:'http'})}); if (!r.ok) throw new Error('Could not add integration'); document.getElementById('mcpCustomName').value = ''; document.getElementById('mcpCustomUrl').value = ''; toggleCustomMcpForm(false); await loadMcpServers(); }
+            catch (e) { alert(e.message); }
+        }
 
         // ============== WATCH LIVE: backend activity monitor (code mode) ==============
         // A right-side panel that mirrors the code agent's real SSE trace as a running
@@ -2568,7 +2688,8 @@
                     model_type: modelType,
                     stream: useStream,
                     temperature: 0.3,
-                    thinking_level: thinkingLevel
+                    thinking_level: thinkingLevel,
+                    mcp_servers: selectedMcpServers()
                 };
             } else {
                 const codeModel = document.getElementById('codeModel').value;
@@ -2581,7 +2702,8 @@
                     model: codeModel,
                     reasoning_level: reasoningLevel,
                     mode: document.getElementById('codeWorkflowMode').value,
-                    stream: useStream
+                    stream: useStream,
+                    mcp_servers: selectedMcpServers()
                     // No temperature — Code Mode intentionally omits it; backend applies its own default.
                 };
             }
@@ -2699,6 +2821,21 @@
                 lastThoughtContentEl = content;
 
                 scrollToBottom();
+            }
+
+            function handleMcpEvent(event) {
+                if (!event || !event.type || !event.type.startsWith('tool_')) return;
+                const server = event.server_id || 'MCP';
+                if (event.type === 'tool_call') {
+                    addThought(`Using ${server}`, `${event.tool_name || 'tool'} is running`, 'mcp');
+                    if (mode === 'code') liveMonitorAddRow('server', `${server}: ${event.tool_name || 'tool'}`, { spinner: true });
+                } else if (event.type === 'tool_result') {
+                    addThought(`${server} ready`, 'Returned bounded tool context for this response.', 'mcp');
+                    if (mode === 'code') liveMonitorAddRow('server', `${server}: completed ${event.tool_name || 'tool'}`);
+                } else if (event.type === 'tool_error') {
+                    addThought(`${server} failed`, event.message || 'The MCP tool could not complete.', 'mcp');
+                    if (mode === 'code') liveMonitorAddRow('server', `${server}: ${event.message || 'tool failed'}`, { error: true });
+                }
             }
 
             // Streams the model's OWN live reasoning — whatever real text it wrote
@@ -3497,6 +3634,7 @@
                             try {
                                 const parsed = JSON.parse(jsonStr);
                                 if (mode === 'code') handleLiveMonitorEvent(parsed);
+                                handleMcpEvent(parsed);
                                 if (parsed.type === 'status') {
                                     // Backend node narration ("chat_understand_node", "Invoking the
                                     // model with...", etc.) is intentionally not shown here anymore —
@@ -3769,6 +3907,10 @@
         window.addEventListener('resize', syncLiveMonitorBackdrop);
         // Close drawer on Escape
         document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && mcpPanelOpen) {
+                toggleMcpPanel(false);
+                return;
+            }
             if (e.key === 'Escape' && window.innerWidth <= 768 && !sidebar.classList.contains('collapsed')) {
                 toggleSidebar();
                 closeModelPicker();
@@ -3792,6 +3934,7 @@
             updateWatchLiveVisibility();
             updateCodeHeroVisibility();
             initResponsiveSidebar();
+            loadMcpServers();
         };
     </script>
 </body>

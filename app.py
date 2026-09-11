@@ -30,6 +30,7 @@ from tavily import TavilyClient
 
 from constitution import build_constitution_block
 import sandbox_manager
+import mcp_gateway
 
 load_dotenv()
 
@@ -913,7 +914,13 @@ async def chat_context_node(state: dict, progress=None) -> dict:
         await publish_progress(progress, "chat_context_result", "chat_context_result", f"Collected {len(links)} source result(s) for the response context.")
     else:
         await publish_progress(progress, "chat_context_node", "chat_context_node", "No web lookup was required; continuing with the conversation context.")
-    state.update({"search_text": search_text, "links": links, "images": images})
+    mcp_context = await mcp_gateway.context_for_message(
+        latest, state.get("mcp_servers"), state.get("session_id", "default"), "chat",
+        emit=(lambda event: publish_event(progress, event)) if progress is not None else None,
+    )
+    if mcp_context:
+        await publish_progress(progress, "mcp_context", "MCP context", "Fetched context from an enabled MCP integration.")
+    state.update({"search_text": search_text, "links": links, "images": images, "mcp_context": mcp_context})
     return state
 
 
@@ -921,7 +928,8 @@ async def chat_compose_node(request: "ChatRequest", state: dict, progress=None) 
     config = state["config"]
     await publish_progress(progress, "chat_compose_node", "chat_compose_node", f"Invoking the model with {config['label']} thinking and a {config['max_tokens']}-token budget.")
     _chat_model_name = _resolve_chat_model_name(request.model_type)
-    _chat_messages = build_messages(state["history"], request.thinking_level, state["search_text"])
+    combined_context = "\n\n".join(x for x in (state["search_text"], state.get("mcp_context", "")) if x)
+    _chat_messages = build_messages(state["history"], request.thinking_level, combined_context)
     _chat_budget = _model_thinking_budget(_chat_model_name, request.thinking_level, config["max_tokens"])
     llm = get_llm(request.model_type, request.temperature, _chat_budget)
     if _is_deepseek_model(_chat_model_name):
@@ -947,6 +955,8 @@ async def chat_finalize_node(state: dict, progress=None) -> str:
 
 async def generate_response_once(request: "ChatRequest", session: dict, progress=None) -> str:
     state = await chat_understand_node(request, session, progress)
+    state["session_id"] = request.session_id
+    state["mcp_servers"] = request.mcp_servers
     state = await chat_context_node(state, progress)
     state = await chat_compose_node(request, state, progress)
     return await chat_finalize_node(state, progress)
@@ -980,6 +990,7 @@ class ChatRequest(BaseModel):
     stream: bool = False
     temperature: float = 0.7
     thinking_level: str = DEFAULT_THINKING_LEVEL
+    mcp_servers: Optional[List[str]] = None
 
 
 class ClearSessionRequest(BaseModel):
@@ -993,6 +1004,7 @@ class CodeChatRequest(BaseModel):
     reasoning_level: str = DEFAULT_THINKING_LEVEL
     mode: str = "build"  # plan stores a plan only; build executes it directly
     stream: bool = False
+    mcp_servers: Optional[List[str]] = None
 
 
 
@@ -1650,6 +1662,10 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     file_store: Dict[str, str] = session.setdefault("code_files", {})
     history: List[BaseMessage] = session["messages"]
     workflow_mode = normalize_code_workflow_mode(getattr(request, "mode", "build"))
+    mcp_context = await mcp_gateway.context_for_message(
+        getattr(request, "message", ""), getattr(request, "mcp_servers", None),
+        getattr(request, "session_id", "default"), "code", emit=emit,
+    )
 
     # Plan mode is deliberately side-effect free: it may inspect the project
     # through the model context, but it never enters the file-editing loop.
@@ -1670,6 +1686,8 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             session_id = getattr(request, "session_id", None)
             repo_context = await _maybe_fetch_plan_repo_context(session_id, latest_text, emit)
             plan_messages = build_plan_messages(history, file_store, request.reasoning_level, repo_context)
+            if mcp_context:
+                plan_messages.append(SystemMessage(content=mcp_context))
             if _is_deepseek_model(model_name):
                 llm = get_code_llm(model_key, 0.2, _model_thinking_budget(model_name, request.reasoning_level, config["max_tokens"]))
                 plan_text = await invoke_model(
@@ -1754,6 +1772,8 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             _active_idx = min(len(plan_steps) - 1, (step - 1) * len(plan_steps) // MAX_AGENT_STEPS)
             await emit({"type": "step_progress", "index": _active_idx, "total": len(plan_steps)})
         agent_messages = build_agent_messages(history, transcript, file_store, plan_steps, reasoning_level, step)
+        if mcp_context:
+            agent_messages.append(SystemMessage(content=mcp_context))
         if _is_deepseek:
             agent_messages.append(SystemMessage(content=(
                 "FAST CODE EXECUTION: Think internally, then write exactly one short THOUGHT sentence. "
@@ -2471,6 +2491,64 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/mcp/servers")
+async def mcp_servers():
+    """Return built-in and user-configured MCPs with secrets excluded."""
+    return {"servers": mcp_gateway.list_servers()}
+
+
+@app.post("/mcp/servers")
+async def mcp_register_server(payload: dict):
+    return {"server": mcp_gateway.register_server(payload)}
+
+
+@app.patch("/mcp/servers/{server_id}")
+async def mcp_update_server(server_id: str, payload: dict):
+    return {"server": mcp_gateway.update_server(server_id, payload)}
+
+
+@app.delete("/mcp/servers/{server_id}")
+async def mcp_delete_server(server_id: str):
+    return {"deleted": mcp_gateway.delete_server(server_id)}
+
+
+@app.get("/mcp/servers/{server_id}/tools")
+async def mcp_server_tools(server_id: str):
+    server = next((x for x in mcp_gateway.list_servers() if x["id"] == server_id), None)
+    if server is None:
+        return {"error": "Unknown MCP server"}
+    return {"server_id": server_id, "tools": server.get("tools", [])}
+
+
+@app.post("/mcp/servers/{server_id}/test")
+async def mcp_test_server(server_id: str, payload: dict = {}):
+    tool = payload.get("tool") or (mcp_gateway.list_servers()[0].get("tools", [None])[0])
+    if server_id == "open-meteo":
+        tool, arguments = "geocode", {"name": "London"}
+    elif server_id == "wikipedia":
+        tool, arguments = "search", {"query": "artificial intelligence", "limit": 1}
+    elif server_id == "arxiv":
+        tool, arguments = "search", {"query": "machine learning", "limit": 1}
+    elif server_id == "nominatim":
+        tool, arguments = "search_places", {"query": "London", "limit": 1}
+    elif server_id == "filesystem":
+        tool, arguments = "list_directory", {"path": "."}
+    elif server_id == "git":
+        tool, arguments = "status", {}
+    elif server_id == "sqlite":
+        tool, arguments = "query", {"query": "select 1 as healthy"}
+    elif server_id == "memory":
+        tool, arguments = "recall", {}
+    else:
+        tool, arguments = tool or "browser_status", {}
+    return await mcp_gateway.call_tool(server_id, tool, arguments, session_id="mcp-test", mode="chat")
+
+
+@app.get("/mcp/policies")
+async def mcp_policies():
+    return {"defaults": {"filesystem": "read-only workspace", "git": "read-only workspace", "sqlite": "read-only", "playwright": "disabled", "custom": "disabled"}}
+
+
 @app.post("/clear-session")
 async def clear_session(request: ClearSessionRequest):
     sessions.pop(request.session_id, None)
@@ -2490,6 +2568,8 @@ async def generate_stream(request: ChatRequest, session: dict, session_id: str):
                 yield f"data: {json.dumps(event)}\n\n"
             elif event["type"] == "status":
                 yield f"data: {json.dumps(event)}\n\n"
+            elif event["type"].startswith("tool_"):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             elif event["type"] == "token":
                 emitted_content = True
                 final_response += event["text"]
