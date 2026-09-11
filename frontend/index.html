@@ -227,6 +227,13 @@
         .response-workflow-plain { color:var(--text-secondary); }
         .response-workflow-plain code { font:12px 'Courier New', Courier, monospace; background:var(--bg-hover); border:1px solid var(--border-color); border-radius:4px; padding:1px 5px; color:var(--text-primary); }
         .response-workflow-command-text { color:#d2a8ff; font:12.5px 'Courier New', Courier, monospace; }
+        .response-workflow-command-wrap { display:flex; flex-direction:column; gap:5px; width:100%; }
+        .response-workflow-command-wrap .response-workflow-command-text { white-space:pre-wrap; word-break:break-all; }
+        .response-workflow-command-output { margin:0; padding:8px 10px; background:#0d1117; border:1px solid var(--border-color); border-radius:6px; color:#c9d1d9; font:12px/1.5 'Courier New', Courier, monospace; white-space:pre-wrap; word-break:break-word; max-height:260px; overflow:auto; }
+        .response-workflow-command-output.is-error { color:#ff7b72; border-color:#f85149; }
+        .response-workflow-command-status { font:12px 'Inter',sans-serif; font-weight:600; }
+        .response-workflow-command-status.ok { color:#3fb950; }
+        .response-workflow-command-status.fail { color:#f85149; }
 
         /* Manus-style plan checklist: the 2-6 high-level steps for this turn,
            shown once up front and ticked off live as the agent works through
@@ -1883,7 +1890,9 @@
                     const key = liveActionKey(parsed);
                     const entry = liveMonitorActions.get(key);
                     const label = liveActionLabel(parsed.action, parsed.file, true);
-                    if (parsed.action !== 'start_server' && parsed.exit_code !== undefined && parsed.exit_code !== 0) {
+                    if (parsed.action === 'run_tests' && typeof parsed.passed === 'boolean') {
+                        label.suffix = parsed.passed ? ' — passed' : ` — FAILED (exit ${parsed.exit_code})`;
+                    } else if (parsed.action !== 'start_server' && parsed.exit_code !== undefined && parsed.exit_code !== 0) {
                         label.suffix = ` (exit ${parsed.exit_code})`;
                     }
                     if (entry) {
@@ -2918,10 +2927,51 @@
                     text.className = 'response-workflow-plain';
                     text.innerHTML = inlineBackticks(activity.text || '');
                 } else if (activity.kind === 'command') {
-                    // A real server-side operation (e.g. "diff -u file.html") —
-                    // shown verbatim, monospaced, like terminal output.
-                    text.className = 'response-workflow-command-text';
-                    text.textContent = activity.text || '';
+                    // A real sandbox operation. Renders as an actual terminal
+                    // block: the literal command that ran, its real captured
+                    // stdout/stderr underneath, then a pass/fail or exit-code
+                    // line. Every field here (text/output/exit_code/passed)
+                    // only exists because the backend actually executed this
+                    // in the live E2B sandbox and reported back what happened —
+                    // nothing is fabricated client-side.
+                    text.className = 'response-workflow-command-wrap';
+                    const cmdLine = document.createElement('div');
+                    cmdLine.className = 'response-workflow-command-text';
+                    cmdLine.textContent = '$ ' + (activity.text || '');
+                    text.appendChild(cmdLine);
+
+                    if (activity.error) {
+                        const err = document.createElement('pre');
+                        err.className = 'response-workflow-command-output is-error';
+                        err.textContent = activity.error;
+                        text.appendChild(err);
+                    } else if (activity.output) {
+                        const out = document.createElement('pre');
+                        out.className = 'response-workflow-command-output';
+                        out.textContent = activity.output;
+                        text.appendChild(out);
+                    }
+
+                    const status = document.createElement('div');
+                    if (activity.is_test && typeof activity.passed === 'boolean') {
+                        status.className = 'response-workflow-command-status ' + (activity.passed ? 'ok' : 'fail');
+                        status.textContent = activity.passed
+                            ? '✓ Tests passed'
+                            : `✗ Tests failed (exit ${activity.exit_code})`;
+                        text.appendChild(status);
+                    } else if (activity.url) {
+                        status.className = 'response-workflow-command-status ok';
+                        status.textContent = `✓ live at ${activity.url}`;
+                        text.appendChild(status);
+                    } else if (activity.error) {
+                        status.className = 'response-workflow-command-status fail';
+                        status.textContent = '✗ failed';
+                        text.appendChild(status);
+                    } else if (typeof activity.exit_code === 'number') {
+                        status.className = 'response-workflow-command-status ' + (activity.exit_code === 0 ? 'ok' : 'fail');
+                        status.textContent = activity.exit_code === 0 ? '✓ exit 0' : `✗ exit ${activity.exit_code}`;
+                        text.appendChild(status);
+                    }
                 } else {
                     text.className = 'response-workflow-plain';
                     text.innerHTML = inlineBackticks(activity.text || '');
