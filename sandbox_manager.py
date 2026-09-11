@@ -73,6 +73,22 @@ async def _create_sandbox() -> AsyncSandbox:
         api_key=os.getenv("E2B_API_KEY"),
     )
     await sbx.commands.run(f"mkdir -p {PROJECT_DIR}", timeout=15)
+    # Best-effort: make sure the basics for "download something / extract an
+    # archive / test something" work even on a minimal base image, without
+    # slowing down sandboxes that already have them. Failures here (no apt,
+    # no root, offline mirror, etc.) are swallowed — run_command will simply
+    # surface a real "command not found" to the model/user if a tool truly
+    # isn't available, same as any other command.
+    try:
+        await sbx.commands.run(
+            "command -v curl >/dev/null && command -v wget >/dev/null && "
+            "command -v unzip >/dev/null && command -v zip >/dev/null && "
+            "command -v git >/dev/null || "
+            "(apt-get update -qq && apt-get install -y -qq curl wget unzip zip git >/dev/null 2>&1)",
+            timeout=60,
+        )
+    except Exception:
+        pass
     return sbx
 
 
@@ -118,6 +134,62 @@ async def stop_session(session_id: str) -> bool:
 
 def _hash(content: str) -> str:
     return hashlib.sha1((content or "").encode("utf-8", errors="ignore")).hexdigest()
+
+
+# Extensions we never pull back into file_store as text: binary content decoded
+# "successfully" as UTF-8 is usually garbage, and file_store/the preview canvas
+# are text-oriented. Real command output already reports what a download/unzip
+# produced, so the person isn't losing visibility — just the raw bytes.
+_BINARY_SKIP_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".svgz",
+    ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar", ".pdf",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".mp3", ".mp4", ".mov", ".avi", ".wav", ".ogg",
+    ".wasm", ".so", ".pyc", ".class", ".jar", ".exe", ".bin", ".db", ".sqlite",
+}
+_SNAPSHOT_EXCLUDE_DIRS = ("node_modules", ".git", "__pycache__", "venv", ".venv", "dist", "build", ".next")
+
+
+async def snapshot_project_files(session_id: str) -> Dict[str, str]:
+    """Read back every reasonably-small text file currently under PROJECT_DIR
+    inside the sandbox. Used after run_command/start_server so files a real
+    command downloaded (curl/wget), extracted (unzip/tar), generated (a build
+    step), or otherwise changed on disk become real project files the agent
+    can read_file/edit_file and that show up in the final result — instead of
+    only ever existing as a side effect inside the sandbox that then vanishes
+    with it. Also refreshes this session's file_hashes so the next sync_files()
+    call doesn't immediately try to overwrite what it just read back."""
+    state = get_session(session_id)
+    if state is None:
+        return {}
+    exclude_clause = " ".join(f"-not -path '*/{d}/*'" for d in _SNAPSHOT_EXCLUDE_DIRS)
+    find_cmd = f"find {PROJECT_DIR} -type f {exclude_clause} -size -2M 2>/dev/null"
+    try:
+        result = await state.sandbox.commands.run(find_cmd, timeout=20)
+        abs_paths = [p.strip() for p in (result.stdout or "").splitlines() if p.strip()]
+    except Exception:
+        return {}
+
+    files: Dict[str, str] = {}
+    for abs_path in abs_paths:
+        if not abs_path.startswith(PROJECT_DIR + "/"):
+            continue
+        rel_path = abs_path[len(PROJECT_DIR) + 1:]
+        ext = ("." + rel_path.rsplit(".", 1)[-1].lower()) if "." in rel_path.rsplit("/", 1)[-1] else ""
+        if ext in _BINARY_SKIP_EXTENSIONS:
+            continue
+        try:
+            raw = await state.sandbox.files.read(abs_path)
+        except Exception:
+            continue
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                raw = raw.decode("utf-8")
+            except Exception:
+                continue  # not real text — skip rather than corrupt it
+        files[rel_path] = raw
+        state.file_hashes[rel_path] = _hash(raw)
+    return files
 
 
 async def sync_files(session_id: str, file_store: Dict[str, str]) -> List[str]:
