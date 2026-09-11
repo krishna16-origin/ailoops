@@ -21,7 +21,7 @@ warnings.filterwarnings(
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
@@ -2624,6 +2624,20 @@ async def upload_file(session_id: str = Form(...), file: UploadFile = File(...))
 async def list_session_files(session_id: str):
     session = sessions.get(session_id) or {}
     return {"session_id": session_id, "files": rag_engine.list_files(session)}
+
+
+@app.get("/session-files/{session_id}/{file_id}/content")
+async def session_file_content(session_id: str, file_id: str):
+    session = sessions.get(session_id)
+    content = rag_engine.get_file_content(session or {}, file_id)
+    if not content:
+        raise HTTPException(status_code=404, detail="File content not found in this session.")
+    data, content_type, filename = content
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={"Content-Disposition": f'inline; filename="{filename.replace(chr(34), "")}"'},
+    )
 
 
 @app.delete("/session-files/{session_id}/{file_id}")

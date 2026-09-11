@@ -419,9 +419,20 @@ def has_files(session: dict) -> bool:
 def list_files(session: dict) -> List[dict]:
     files = session.get("rag_files") or {}
     return sorted(
-        ({k: v for k, v in rec.items()} for rec in files.values()),
+        ({k: v for k, v in rec.items() if not k.startswith("_")} for rec in files.values()),
         key=lambda f: f.get("uploaded_at", ""),
     )
+
+
+def get_file_content(session: dict, file_id: str) -> Optional[Tuple[bytes, str, str]]:
+    """Return raw attachment bytes plus metadata for a session-scoped preview."""
+    record = (session.get("rag_files") or {}).get(file_id)
+    if not record or record.get("status") != "ready":
+        return None
+    data = record.get("_content")
+    if not isinstance(data, (bytes, bytearray)):
+        return None
+    return bytes(data), record.get("content_type") or "application/octet-stream", record.get("filename") or "download"
 
 
 def remove_file(session: dict, file_id: str) -> bool:
@@ -455,6 +466,8 @@ async def process_upload(filename: str, data: bytes, content_type: str, session:
         "error": None,
         "thumbnail": None,
         "used_vision_model": False,
+        "content_type": content_type or "application/octet-stream",
+        "_content": data,
     }
     files[file_id] = record
 

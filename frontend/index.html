@@ -547,11 +547,13 @@
         .attachment-chip-error-dot { width:14px; height:14px; border-radius:50%; background:#ef4444; color:#fff; font-size:10px; font-weight:700; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
         @keyframes attachSpin { to { transform:rotate(360deg); } }
 
-        .message-attachments { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
-        .message-attachment-chip { display:flex; align-items:center; gap:6px; background:rgba(255,255,255,0.08); border-radius:10px; padding:4px 8px 4px 4px; max-width:180px; }
-        .message-attachment-chip img { width:22px; height:22px; object-fit:cover; border-radius:5px; }
-        .message-attachment-icon { width:22px; height:22px; display:flex; align-items:center; justify-content:center; font-size:13px; background:rgba(255,255,255,0.1); border-radius:5px; }
-        .message-attachment-name { font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .message-attachments { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:9px; }
+        .message-attachment-chip { display:flex; align-items:center; gap:8px; min-width:0; max-width:260px; padding:6px 9px 6px 6px; border:1px solid var(--border-color); border-radius:11px; background:var(--bg-hover); color:var(--text-primary); text-decoration:none; }
+        .message-attachment-chip:hover { background:var(--bg-input); border-color:rgba(255,255,255,.3); }
+        .message-attachment-chip.image { width:150px; height:118px; padding:0; overflow:hidden; cursor:zoom-in; }
+        .message-attachment-chip.image img { width:100%; height:100%; max-width:none; max-height:none; object-fit:cover; border:0; border-radius:10px; }
+        .message-attachment-icon { width:30px; height:30px; display:flex; align-items:center; justify-content:center; font-size:16px; background:rgba(255,255,255,0.1); border-radius:7px; flex:0 0 auto; }
+        .message-attachment-name { min-width:0; font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
         .camera-modal { position:fixed; inset:0; background:rgba(0,0,0,0.92); z-index:90; display:flex; align-items:center; justify-content:center; }
         .camera-modal[hidden] { display:none; }
@@ -567,6 +569,7 @@
         @media (max-width: 640px) {
             .attach-menu-panel { position:fixed; left:12px; right:auto; bottom:86px; width:min(240px, 80vw); }
             .attachment-chip { max-width:150px; }
+            .message-attachment-chip.image { width:130px; height:104px; }
         }
 
         /* Floating "jump to latest" button — only shown once the user has scrolled
@@ -2568,8 +2571,8 @@
             if (!el) return;
             const isError = rec.status === 'error';
             el.classList.toggle('attachment-chip-error', isError);
-            const thumbHtml = rec.thumbnail
-                ? `<img class="attachment-chip-thumb" src="${rec.thumbnail}" alt="">`
+            const thumbHtml = rec.thumbnail || rec.localPreview
+                ? `<img class="attachment-chip-thumb" src="${rec.thumbnail || rec.localPreview}" alt="">`
                 : `<div class="attachment-chip-icon">${attachmentChipIcon(rec.kind)}</div>`;
             const statusHtml = rec.status === 'processing'
                 ? `<div class="attachment-chip-spinner"></div>`
@@ -2598,20 +2601,37 @@
 
         async function uploadAttachment(file) {
             const localId = 'local-' + Math.random().toString(36).slice(2);
-            renderAttachmentChip({ localId, filename: file.name, kind: guessKindClient(file), status: 'processing' });
-            try {
+            const record = {
+                localId,
+                filename: file.name,
+                kind: guessKindClient(file),
+                status: 'processing',
+                localPreview: file.type.startsWith('image/') ? URL.createObjectURL(file) : null,
+            };
+            pendingAttachments.push(record);
+            renderAttachmentChip(record);
+            record.uploadPromise = (async () => {
+              try {
                 const formData = new FormData();
                 formData.append('session_id', modes[currentMode].sessionId);
                 formData.append('file', file);
                 const res = await fetch(`${API_BASE}/upload`, { method: 'POST', body: formData });
                 if (!res.ok) throw new Error('Upload request failed');
-                const record = await res.json();
-                record.localId = localId;
+                const uploaded = await res.json();
+                Object.assign(record, uploaded, {
+                    localId,
+                    localPreview: record.localPreview,
+                    previewUrl: uploaded.id
+                        ? `${API_BASE}/session-files/${encodeURIComponent(modes[currentMode].sessionId)}/${encodeURIComponent(uploaded.id)}/content`
+                        : null,
+                });
                 updateAttachmentChip(localId, record);
-                if (record.status === 'ready') pendingAttachments.push(record);
-            } catch (err) {
-                updateAttachmentChip(localId, { filename: file.name, status: 'error', error: 'Upload failed — check your connection.' });
-            }
+              } catch (err) {
+                Object.assign(record, { status: 'error', error: 'Upload failed — check your connection.' });
+                updateAttachmentChip(localId, record);
+              }
+            })();
+            return record.uploadPromise;
         }
 
         // ---- Camera capture ----
@@ -2754,7 +2774,20 @@
             return div.innerHTML;
         }
 
-        function appendMessage(role, text) {
+        function renderMessageAttachments(attachments) {
+            if (!attachments || !attachments.length) return '';
+            return `<div class="message-attachments">${attachments.map((att) => {
+                const src = att.thumbnail || att.localPreview || att.previewUrl;
+                const href = att.previewUrl || src || '#';
+                const name = escapeHtml(att.filename || 'Attachment');
+                if (att.kind === 'image' && src) {
+                    return `<a class="message-attachment-chip image" href="${href}" target="_blank" rel="noopener" title="Open ${name}"><img src="${src}" alt="${name}"></a>`;
+                }
+                return `<a class="message-attachment-chip" href="${href}" target="_blank" rel="noopener" title="Open ${name}"><span class="message-attachment-icon">${attachmentChipIcon(att.kind)}</span><span class="message-attachment-name">${name}</span></a>`;
+            }).join('')}</div>`;
+        }
+
+        function appendMessage(role, text, attachments = []) {
             modes[currentMode].hasMessages = true;
             openingScene.style.display = 'none';
             chatContent.style.display = 'flex';
@@ -2864,7 +2897,7 @@
                 bubble.appendChild(avatar);
                 bubble.appendChild(body);
             } else {
-                bubble.innerText = text;
+                bubble.innerHTML = renderMessageAttachments(attachments) + (text ? `<div class="message-attachment-text">${escapeHtml(text)}</div>` : '');
             }
 
             row.appendChild(bubble);
@@ -2920,7 +2953,14 @@
 
         async function sendMessage() {
             const text = userInput.value.trim();
-            if (!text || isWaitingForResponse) return;
+            if (isWaitingForResponse) return;
+            const stagedAttachments = pendingAttachments.slice();
+            if (!text && !stagedAttachments.length) return;
+            if (stagedAttachments.length) {
+                await Promise.all(stagedAttachments.map(a => a.uploadPromise).filter(Boolean));
+            }
+            const sentAttachments = stagedAttachments.filter(a => a.status === 'ready' && a.id);
+            if (!text && !sentAttachments.length) return;
 
             const mode = currentMode;
             // Capture the Code hero circle position BEFORE appendMessage hides the
@@ -2929,7 +2969,7 @@
             if (mode === 'code' && isCodeHeroVisible()) {
                 try { codeHeroRect = codeHeroAvatar.getBoundingClientRect(); } catch (e) { codeHeroRect = null; }
             }
-            appendMessage('user', text);
+            appendMessage('user', text, sentAttachments);
             userInput.value = '';
             autoResize(userInput);
             sendBtn.disabled = true;
@@ -2952,7 +2992,7 @@
                     thinking_level: thinkingLevel,
                     mcp_servers: selectedMcpServers()
                 };
-                if (pendingAttachments.length) payload.attachment_ids = pendingAttachments.filter(a => a.id).map(a => a.id);
+                if (sentAttachments.length) payload.attachment_ids = sentAttachments.map(a => a.id);
             } else {
                 const codeModel = document.getElementById('codeModel').value;
                 const reasoningLevel = document.getElementById('codeReasoningLevel').value;
@@ -2968,18 +3008,23 @@
                     mcp_servers: selectedMcpServers()
                     // No temperature — Code Mode intentionally omits it; backend applies its own default.
                 };
-                if (pendingAttachments.length) payload.attachment_ids = pendingAttachments.filter(a => a.id).map(a => a.id);
+                if (sentAttachments.length) payload.attachment_ids = sentAttachments.map(a => a.id);
             }
             const workflowSubmode = mode === 'code' ? payload.mode : null;
 
             // Files/photos stay attached to the session for retrieval on every later
             // turn too (see backend /upload), so the composer just needs to clear its
             // own staged chips now that they've been folded into this message.
-            if (pendingAttachments.length) {
+            if (stagedAttachments.length) {
                 pendingAttachments = [];
                 const chips = document.getElementById('attachmentChips');
                 chips.innerHTML = '';
                 chips.hidden = true;
+                stagedAttachments.forEach(a => {
+                    if (a.localPreview) {
+                        try { URL.revokeObjectURL(a.localPreview); } catch (e) { /* best effort */ }
+                    }
+                });
             }
 
             const assistantBubble = appendMessage('assistant', '');
