@@ -2625,7 +2625,9 @@ async def upload_file(session_id: str = Form(...), file: UploadFile = File(...))
                 file.filename or "upload", data, file.content_type or "", session, record=record
             )
         )
-    return record
+    # `_content` is kept privately in the in-memory session for preview/download;
+    # never send raw binary bytes through the JSON upload response.
+    return {key: value for key, value in record.items() if not key.startswith("_")}
 
 
 @app.get("/session-files/{session_id}")
