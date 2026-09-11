@@ -462,6 +462,10 @@
         .model-picker-btn:hover { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); }
         .model-picker-btn svg { color:var(--text-secondary); flex-shrink:0; }
         .model-picker-sep { color:var(--text-secondary); }
+        /* Model brand logos — trigger chip, main row, and "More models" flyout rows */
+        .model-picker-logo { width:15px; height:15px; flex-shrink:0; object-fit:contain; border-radius:3px; }
+        .picker-row-logo { width:18px; height:18px; flex-shrink:0; object-fit:contain; border-radius:4px; margin-right:9px; }
+        .picker-more-item-logo { width:16px; height:16px; flex-shrink:0; object-fit:contain; border-radius:3.5px; }
         #modelPickerLevel { color:var(--text-secondary); }
         .model-picker-panel { position:absolute; left:0; bottom:calc(100% + 10px); width:280px; background-color:#262626; border:1px solid var(--border-color); border-radius:14px; box-shadow:0 10px 38px rgba(0,0,0,0.45); padding:6px; z-index:30; animation:pickerPopIn 0.16s var(--transition-bezier); }
         @keyframes pickerPopIn { from { opacity:0; transform:translateY(6px) scale(0.98); } to { opacity:1; transform:translateY(0) scale(1); } }
@@ -470,6 +474,7 @@
         .picker-row { display:flex; align-items:center; justify-content:space-between; width:100%; background:transparent; border:none; text-align:left; padding:9px 10px; border-radius:9px; cursor:pointer; color:var(--text-primary); transition:background 0.15s ease; }
         .picker-row:hover { background-color:var(--bg-hover); }
         .picker-row-nav { font-size:13.5px; }
+        .picker-row-left { display:flex; align-items:center; min-width:0; }
 
         /* ============== WORKFLOW PICKER (Plan / Build) — Code mode only.
            Its own standalone picker in the composer toolbar, separate from
@@ -508,6 +513,7 @@
         .picker-more-header { font-size:12px; font-weight:600; color:var(--text-secondary); letter-spacing:0.04em; text-transform:uppercase; padding:8px 10px 6px; }
         .picker-more-item { display:flex; align-items:center; justify-content:space-between; width:100%; background:transparent; border:none; text-align:left; padding:9px 10px; border-radius:9px; cursor:pointer; transition:background 0.15s ease; }
         .picker-more-item:hover { background-color:var(--bg-hover); }
+        .picker-more-item-group { display:flex; align-items:center; gap:9px; min-width:0; }
         .picker-more-item-left { display:flex; flex-direction:column; gap:2px; min-width:0; }
         .picker-more-item-name { font-size:14px; font-weight:500; color:var(--text-primary); display:flex; align-items:center; gap:6px; }
         .picker-more-item-desc { font-size:12px; color:var(--text-secondary); }
@@ -974,6 +980,7 @@
                     <div class="composer-toolbar-left">
                     <div class="model-picker" id="modelPicker">
                         <button type="button" class="model-picker-btn" id="modelPickerBtn" onclick="toggleModelPicker(event)">
+                            <img class="model-picker-logo" id="modelPickerLogo" src="logos/kimi.svg" alt="">
                             <span id="modelPickerLabel">Kimi K3</span>
                             <span class="model-picker-sep">&middot;</span>
                             <span id="modelPickerLevel">Medium</span>
@@ -2119,26 +2126,30 @@
         // composer, hidden) remain the single source of truth sendMessage() reads —
         // this picker only renders their current state and writes back to them.
         // Code mode uses Claude-like layout: main panel shows current model + Effort + More models flyout.
+        // Logo paths point at frontend/logos/*.svg (official brand marks).
+        // "Amun-Ra" is the Chat-mode display name for the same backend model as
+        // Code mode's "Nemotron Ultra" (nvidia/nemotron-3-ultra-550b-a55b, see
+        // app.py:_resolve_chat_model_name) — so it wears the NVIDIA mark too.
         const MODEL_OPTIONS = {
             chat: [
-                { value: 'fast', name: 'Deepseek V4 Pro', desc: 'Fastest for quick answers' },
-                { value: 'balanced', name: 'Kimi K3', desc: 'Most efficient for everyday tasks' },
-                { value: 'reasoning', name: 'Amun-Ra', desc: 'For complex requests' }
+                { value: 'fast', name: 'Deepseek V4 Pro', desc: 'Fastest for quick answers', logo: 'logos/deepseek.svg' },
+                { value: 'balanced', name: 'Kimi K3', desc: 'Most efficient for everyday tasks', logo: 'logos/kimi.svg' },
+                { value: 'reasoning', name: 'Amun-Ra', desc: 'For complex requests', logo: 'logos/nvidia.svg' }
             ],
             code: [
-                { value: 'fast', name: 'Gemma', desc: 'Gemma-4 — fastest, best for quick edits' },
-                { value: 'medium', name: 'Kimi K3', desc: 'Moonshot AI — balanced speed and quality' },
-                { value: 'strong', name: 'Nemotron Ultra', desc: 'nvidia/nemotron-3-ultra-550b-a55b — strongest, best for hard problems' }
+                { value: 'fast', name: 'Gemma', desc: 'Gemma-4 — fastest, best for quick edits', logo: 'logos/gemma.svg' },
+                { value: 'medium', name: 'Kimi K3', desc: 'Moonshot AI — balanced speed and quality', logo: 'logos/kimi.svg' },
+                { value: 'strong', name: 'Nemotron Ultra', desc: 'nvidia/nemotron-3-ultra-550b-a55b — strongest, best for hard problems', logo: 'logos/nvidia.svg' }
             ]
         };
         // Normal catalog for Code mode — no long-horizon distinction
         const CODE_MODEL_CATALOG = [
-            { value: 'gemma', name: 'Gemma 4', provider: 'Google', desc: 'Gemma-4 31B — fastest', strength: 'fast' },
-            { value: 'glimmer', name: 'Kimi K3', provider: 'Moonshot AI', desc: 'Most efficient for everyday tasks', strength: 'strong' },
-            { value: 'ultra', name: 'Nemotron Ultra', provider: 'NVIDIA', desc: 'nvidia/nemotron-3-ultra-550b-a55b — strongest', strength: 'strong' },
-            { value: 'laguna', name: 'Laguna XS 2.1', provider: 'Poolside', desc: 'poolside/laguna-xs-2.1', strength: 'strong' },
-            { value: 'super', name: 'Nemotron Super', provider: 'NVIDIA', desc: 'nvidia/nemotron-3-super-120b-a12b', strength: 'strong' },
-            { value: 'step-flash', name: 'Deepseek V4 Pro', provider: 'DeepSeek', desc: 'deepseek-ai/deepseek-v4-pro-0813', strength: 'strong' }
+            { value: 'gemma', name: 'Gemma 4', provider: 'Google', desc: 'Gemma-4 31B — fastest', strength: 'fast', logo: 'logos/gemma.svg' },
+            { value: 'glimmer', name: 'Kimi K3', provider: 'Moonshot AI', desc: 'Most efficient for everyday tasks', strength: 'strong', logo: 'logos/kimi.svg' },
+            { value: 'ultra', name: 'Nemotron Ultra', provider: 'NVIDIA', desc: 'nvidia/nemotron-3-ultra-550b-a55b — strongest', strength: 'strong', logo: 'logos/nvidia.svg' },
+            { value: 'laguna', name: 'Laguna XS 2.1', provider: 'Poolside', desc: 'poolside/laguna-xs-2.1', strength: 'strong', logo: 'logos/poolside.svg' },
+            { value: 'super', name: 'Nemotron Super', provider: 'NVIDIA', desc: 'nvidia/nemotron-3-super-120b-a12b', strength: 'strong', logo: 'logos/nvidia.svg' },
+            { value: 'step-flash', name: 'Deepseek V4 Pro', provider: 'DeepSeek', desc: 'deepseek-ai/deepseek-v4-pro-0813', strength: 'strong', logo: 'logos/deepseek.svg' }
         ];
 
         const LEVEL_OPTIONS = {
@@ -2179,6 +2190,7 @@
         const pickerMoreModelsRow = document.getElementById('pickerMoreModelsRow');
         const pickerLevelList = document.getElementById('pickerLevelList');
         const modelPickerLabel = document.getElementById('modelPickerLabel');
+        const modelPickerLogo = document.getElementById('modelPickerLogo');
         const modelPickerLevel = document.getElementById('modelPickerLevel');
         const codeWorkflowMode = document.getElementById('codeWorkflowMode');
 
@@ -2219,6 +2231,8 @@
                 if (!match) match = models[0];
             }
             modelPickerLabel.textContent = match ? match.name : 'Kimi K3';
+            modelPickerLogo.src = match ? match.logo : 'logos/kimi.svg';
+            modelPickerLogo.alt = match ? match.name : '';
             modelPickerLevel.textContent = currentLevelLabel();
         }
 
@@ -2274,9 +2288,11 @@
                 }
                 pickerModelList.innerHTML = `
                 <button type="button" class="picker-row picker-model-row" onclick="selectModel('${current.value}')">
-                    <span class="picker-row-text">
-                        <span class="picker-row-name">${escapeHtml(current.name)}</span>
-                        <span class="picker-row-desc">${escapeHtml(current.desc)}</span>
+                    <span class="picker-row-left">
+                        <img class="picker-row-logo" src="${current.logo}" alt="" onerror="this.style.display='none'">
+                        <span class="picker-row-text">
+                            <span class="picker-row-name">${escapeHtml(current.name)}</span>
+                        </span>
                     </span>
                     ${CHECK_ICON}
                 </button>`;
@@ -2289,9 +2305,11 @@
                 const models = MODEL_OPTIONS[currentMode];
                 pickerModelList.innerHTML = models.map(m => `
                 <button type="button" class="picker-row picker-model-row" onclick="selectModel('${m.value}')">
-                    <span class="picker-row-text">
-                        <span class="picker-row-name">${escapeHtml(m.name)}</span>
-                        <span class="picker-row-desc">${escapeHtml(m.desc)}</span>
+                    <span class="picker-row-left">
+                        <img class="picker-row-logo" src="${m.logo}" alt="" onerror="this.style.display='none'">
+                        <span class="picker-row-text">
+                            <span class="picker-row-name">${escapeHtml(m.name)}</span>
+                        </span>
                     </span>
                     ${field.value === m.value ? CHECK_ICON : ''}
                 </button>
@@ -2313,9 +2331,11 @@
                 else badges += '<span class="picker-badge-strong">Strong</span>';
                 return `
                 <button type="button" class="picker-more-item" onclick="selectModel('${m.value}')">
-                    <span class="picker-more-item-left">
-                        <span class="picker-more-item-name">${escapeHtml(m.name)} ${badges}</span>
-                        <span class="picker-more-item-desc">${escapeHtml(m.desc)}</span>
+                    <span class="picker-more-item-group">
+                        <img class="picker-more-item-logo" src="${m.logo}" alt="" onerror="this.style.display='none'">
+                        <span class="picker-more-item-left">
+                            <span class="picker-more-item-name">${escapeHtml(m.name)} ${badges}</span>
+                        </span>
                     </span>
                     ${isActive ? '<span class="picker-more-check">'+CHECK_ICON+'</span>' : ''}
                 </button>`;
