@@ -19,7 +19,7 @@ warnings.filterwarnings(
 )
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -31,6 +31,7 @@ from tavily import TavilyClient
 from constitution import build_constitution_block
 import sandbox_manager
 import mcp_gateway
+import rag_engine
 
 load_dotenv()
 
@@ -611,7 +612,7 @@ def _guess_raw_code_language(line: str) -> str:
     return ''
 
 
-def build_messages(history: List[BaseMessage], thinking_level: str, search_text: str = "") -> List[BaseMessage]:
+def build_messages(history: List[BaseMessage], thinking_level: str, search_text: str = "", rag_text: str = "") -> List[BaseMessage]:
     level_key = normalize_thinking_level(thinking_level)
     config = THINKING_LEVELS[level_key]
     depth = THINKING_DEPTH_INSTRUCTIONS[level_key]
@@ -651,6 +652,19 @@ def build_messages(history: List[BaseMessage], thinking_level: str, search_text:
             "results only partially cover the question, answer what they do cover from the results and fill any "
             "remaining gap with your best general knowledge, clearly noting which part is which — do not simply "
             "decline to answer. Cite sources when you use them."
+        )
+    if rag_text:
+        system_text += (
+            "\n\nRELEVANT CONTENT FROM THE USER'S UPLOADED FILES/IMAGES (retrieved via semantic search over "
+            "everything they've attached this session — for images, this is a detailed vision-model analysis "
+            "of the image, not the raw pixels):\n"
+            + rag_text
+            + "\n\nCRITICAL: When the user's question concerns something they uploaded (a document, photo, "
+            "screenshot, spreadsheet, etc.), answer primarily from this retrieved content, quoting or citing "
+            "the specific file by name. If the retrieved excerpts only partially answer the question, say what "
+            "they do cover and clearly flag what's missing rather than guessing. If nothing above is actually "
+            "relevant to the current question, ignore it and answer normally — don't force a reference to an "
+            "uploaded file that isn't related."
         )
     return [SystemMessage(content=system_text), *history[-6:]]
 
@@ -898,7 +912,7 @@ async def chat_understand_node(request: "ChatRequest", session: dict, progress=N
     config = get_thinking_config(request.thinking_level)
     excerpt = request_excerpt(latest)
     await publish_progress(progress, "chat_understand_node", "chat_understand_node", f"Read the latest user request and isolated the topic: “{excerpt}”")
-    return {"history": history, "latest": latest, "config": config}
+    return {"history": history, "latest": latest, "config": config, "session": session}
 
 
 async def chat_context_node(state: dict, progress=None) -> dict:
@@ -920,7 +934,16 @@ async def chat_context_node(state: dict, progress=None) -> dict:
     )
     if mcp_context:
         await publish_progress(progress, "mcp_context", "MCP context", "Fetched context from an enabled MCP integration.")
-    state.update({"search_text": search_text, "links": links, "images": images, "mcp_context": mcp_context})
+
+    rag_text = ""
+    session = state.get("session") or {}
+    if rag_engine.has_files(session):
+        rag_text, rag_chunks = await rag_engine.build_context(session, latest, attachment_ids=state.get("attachment_ids"))
+        if rag_chunks:
+            names = ", ".join(sorted({c["filename"] for c in rag_chunks}))
+            await publish_progress(progress, "rag_context", "rag_context", f"Searched your uploaded files/images and pulled relevant content from: {names}")
+
+    state.update({"search_text": search_text, "links": links, "images": images, "mcp_context": mcp_context, "rag_text": rag_text})
     return state
 
 
@@ -929,7 +952,7 @@ async def chat_compose_node(request: "ChatRequest", state: dict, progress=None) 
     await publish_progress(progress, "chat_compose_node", "chat_compose_node", f"Invoking the model with {config['label']} thinking and a {config['max_tokens']}-token budget.")
     _chat_model_name = _resolve_chat_model_name(request.model_type)
     combined_context = "\n\n".join(x for x in (state["search_text"], state.get("mcp_context", "")) if x)
-    _chat_messages = build_messages(state["history"], request.thinking_level, combined_context)
+    _chat_messages = build_messages(state["history"], request.thinking_level, combined_context, state.get("rag_text", ""))
     _chat_budget = _model_thinking_budget(_chat_model_name, request.thinking_level, config["max_tokens"])
     llm = get_llm(request.model_type, request.temperature, _chat_budget)
     if _is_deepseek_model(_chat_model_name):
@@ -957,6 +980,7 @@ async def generate_response_once(request: "ChatRequest", session: dict, progress
     state = await chat_understand_node(request, session, progress)
     state["session_id"] = request.session_id
     state["mcp_servers"] = request.mcp_servers
+    state["attachment_ids"] = request.attachment_ids
     state = await chat_context_node(state, progress)
     state = await chat_compose_node(request, state, progress)
     return await chat_finalize_node(state, progress)
@@ -991,6 +1015,10 @@ class ChatRequest(BaseModel):
     temperature: float = 0.7
     thinking_level: str = DEFAULT_THINKING_LEVEL
     mcp_servers: Optional[List[str]] = None
+    # Optional: restrict RAG retrieval to specific uploaded file ids for this
+    # turn. When omitted/empty, retrieval searches every file uploaded so far
+    # in this session — upload once, ask about it across multiple turns.
+    attachment_ids: Optional[List[str]] = None
 
 
 class ClearSessionRequest(BaseModel):
@@ -1005,6 +1033,7 @@ class CodeChatRequest(BaseModel):
     mode: str = "build"  # plan stores a plan only; build executes it directly
     stream: bool = False
     mcp_servers: Optional[List[str]] = None
+    attachment_ids: Optional[List[str]] = None
 
 
 
@@ -1207,10 +1236,16 @@ def _matching_skill_blocks(text: str) -> str:
 _PLAN_STEPS_DELIMITER = "===STEPS==="
 
 
-def build_plan_messages(history: List[BaseMessage], file_store: Dict[str, str], reasoning_level: str, repo_context: str = "") -> List[BaseMessage]:
+def build_plan_messages(history: List[BaseMessage], file_store: Dict[str, str], reasoning_level: str, repo_context: str = "", rag_context: str = "") -> List[BaseMessage]:
     latest_text = history[-1].content if history else ""
     skill_block = _matching_skill_blocks(latest_text)
     repo_block = f"\n\nFETCHED REPOSITORY PREVIEW (read-only, Plan mode only):\n{repo_context}" if repo_context else ""
+    rag_block = (
+        "\n\nRELEVANT CONTENT FROM THE USER'S UPLOADED FILES/IMAGES (retrieved via semantic search; for images "
+        "this is a vision-model analysis, not raw pixels — treat it as ground truth about what the image "
+        f"contains):\n{rag_context}"
+        if rag_context else ""
+    )
     system_text = (
         build_constitution_block("plan") + skill_block + "\n\n"
         "You are the planning stage of an autonomous coding agent. You do not write code here — only a plan.\n"
@@ -1242,6 +1277,7 @@ def build_plan_messages(history: List[BaseMessage], file_store: Dict[str, str], 
         f"Current date and time: {get_current_datetime_str()}\n\n"
         f"EXISTING PROJECT FILES:\n{_file_listing(file_store)}"
         f"{repo_block}"
+        f"{rag_block}"
     )
     messages: List[BaseMessage] = [SystemMessage(content=system_text)]
     messages.extend(trim_memory(history, limit=6))
@@ -1341,11 +1377,17 @@ def split_plan_output(raw_text: str) -> Tuple[str, List[str]]:
 # ---------------------------------------------------------------------------
 # Agent loop: system prompt + turn parsing
 # ---------------------------------------------------------------------------
-def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], plan_steps: List[str], step_number: int, latest_user_text: str = "", workflow_mode: str = "build") -> str:
+def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], plan_steps: List[str], step_number: int, latest_user_text: str = "", workflow_mode: str = "build", rag_context: str = "") -> str:
     level_key = normalize_thinking_level(reasoning_level)
     depth = "Execute the supplied plan directly; do not plan, deliberate, or explore alternatives again."
     plan_block = "\n".join(f"{i+1}. {s}" for i, s in enumerate(plan_steps)) if plan_steps else "(no plan steps given)"
     skill_block = _matching_skill_blocks(latest_user_text)
+    rag_block = (
+        "\n\nRELEVANT CONTENT FROM THE USER'S UPLOADED FILES/IMAGES (retrieved via semantic search; for images "
+        "this is a vision-model analysis, not raw pixels — treat it as ground truth about what the image "
+        f"contains):\n{rag_context}"
+        if rag_context else ""
+    )
     return (
         build_constitution_block(workflow_mode) + skill_block + "\n\n"
         "You are an autonomous coding agent working in a loop, one tool call per turn. Beyond the files "
@@ -1437,13 +1479,14 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
         "think through a second approach. Use the required ACTION format immediately.\n\n"
         f"PLAN FOR THIS REQUEST:\n{plan_block}\n\n"
         f"EXISTING PROJECT FILES (names only — use read_file to see contents):\n{_file_listing(file_store)}"
+        f"{rag_block}"
     )
 
 
 def build_agent_messages(history: List[BaseMessage], transcript: List[BaseMessage], file_store: Dict[str, str],
-                          plan_steps: List[str], reasoning_level: str, step_number: int) -> List[BaseMessage]:
+                          plan_steps: List[str], reasoning_level: str, step_number: int, rag_context: str = "") -> List[BaseMessage]:
     latest_user_text = history[-1].content if history else ""
-    messages: List[BaseMessage] = [SystemMessage(content=build_agent_system_text(reasoning_level, file_store, plan_steps, step_number, latest_user_text))]
+    messages: List[BaseMessage] = [SystemMessage(content=build_agent_system_text(reasoning_level, file_store, plan_steps, step_number, latest_user_text, rag_context=rag_context))]
     messages.extend(trim_memory(history, limit=6))
     messages.extend(transcript)
     return messages
@@ -1667,6 +1710,15 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         getattr(request, "session_id", "default"), "code", emit=emit,
     )
 
+    rag_context_text = ""
+    if rag_engine.has_files(session):
+        rag_context_text, rag_chunks = await rag_engine.build_context(
+            session, getattr(request, "message", ""), attachment_ids=getattr(request, "attachment_ids", None),
+        )
+        if rag_chunks:
+            names = ", ".join(sorted({c["filename"] for c in rag_chunks}))
+            await emit({"type": "activity_complete", "action": "rag_context", "file": names})
+
     # Plan mode is deliberately side-effect free: it may inspect the project
     # through the model context, but it never enters the file-editing loop.
     if workflow_mode == "plan":
@@ -1685,7 +1737,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         else:
             session_id = getattr(request, "session_id", None)
             repo_context = await _maybe_fetch_plan_repo_context(session_id, latest_text, emit)
-            plan_messages = build_plan_messages(history, file_store, request.reasoning_level, repo_context)
+            plan_messages = build_plan_messages(history, file_store, request.reasoning_level, repo_context, rag_context_text)
             if mcp_context:
                 plan_messages.append(SystemMessage(content=mcp_context))
             if _is_deepseek_model(model_name):
@@ -1771,7 +1823,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         if plan_steps:
             _active_idx = min(len(plan_steps) - 1, (step - 1) * len(plan_steps) // MAX_AGENT_STEPS)
             await emit({"type": "step_progress", "index": _active_idx, "total": len(plan_steps)})
-        agent_messages = build_agent_messages(history, transcript, file_store, plan_steps, reasoning_level, step)
+        agent_messages = build_agent_messages(history, transcript, file_store, plan_steps, reasoning_level, step, rag_context_text)
         if mcp_context:
             agent_messages.append(SystemMessage(content=mcp_context))
         if _is_deepseek:
@@ -2176,7 +2228,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         # Hit the step cap without the model wrapping up — force one last
         # summarizing call instead of leaving the user without a response.
         try:
-            wrap_messages = build_agent_messages(history, transcript, file_store, plan_steps, reasoning_level, MAX_AGENT_STEPS)
+            wrap_messages = build_agent_messages(history, transcript, file_store, plan_steps, reasoning_level, MAX_AGENT_STEPS, rag_context_text)
             wrap_messages.append(SystemMessage(content=(
                 "You are out of tool-call turns. Respond now with ACTION: final and a short explanation of "
                 "what was accomplished."
@@ -2553,6 +2605,33 @@ async def mcp_policies():
 async def clear_session(request: ClearSessionRequest):
     sessions.pop(request.session_id, None)
     return {"status": "success", "message": f"Session {request.session_id} cleared."}
+
+
+@app.post("/upload")
+async def upload_file(session_id: str = Form(...), file: UploadFile = File(...)):
+    """Ingest one uploaded file/image into the given session's RAG store:
+    extract -> chunk -> embed -> store. Used by the composer's '+' attach
+    button (files) and camera capture (photos) in both Chat and Code mode —
+    the resulting content becomes retrievable on every subsequent turn in
+    this session, in both modes."""
+    session = sessions.setdefault(session_id, {"messages": []})
+    data = await file.read()
+    record = await rag_engine.process_upload(file.filename or "upload", data, file.content_type or "", session)
+    return record
+
+
+@app.get("/session-files/{session_id}")
+async def list_session_files(session_id: str):
+    session = sessions.get(session_id) or {}
+    return {"session_id": session_id, "files": rag_engine.list_files(session)}
+
+
+@app.delete("/session-files/{session_id}/{file_id}")
+async def delete_session_file(session_id: str, file_id: str):
+    session = sessions.get(session_id)
+    if not session or not rag_engine.remove_file(session, file_id):
+        raise HTTPException(status_code=404, detail="File not found in this session.")
+    return {"status": "success", "file_id": file_id}
 
 
 async def generate_stream(request: ChatRequest, session: dict, session_id: str):
