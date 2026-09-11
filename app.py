@@ -1039,7 +1039,12 @@ THINK_CHARS_PER_TOKEN = 4          # model is still "thinking" past this share
 # number of tool-call turns so the loop itself can't run forever.
 
 
-VALID_ACTIONS = {"read_file", "edit_file", "create_file", "delete_file", "run_command", "start_server", "final"}
+VALID_ACTIONS = {
+    "read_file", "edit_file", "create_file", "delete_file",
+    "run_command", "start_server",
+    "download_file", "extract_archive", "run_tests", "list_dir", "web_search",
+    "final",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1221,11 +1226,14 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
     return (
         build_constitution_block() + skill_block + "\n\n"
         "You are an autonomous coding agent working in a loop, one tool call per turn. Beyond the files "
-        + ("below, you also have a real, live cloud sandbox with shell access via run_command/start_server — "
-           "never claim to have run, installed, or served anything except through those tools.\n\n"
+        + ("below, you also have a real, live cloud sandbox with shell access — run_command, download_file, "
+           "extract_archive, run_tests, list_dir, and start_server — plus web_search for live information. "
+           "Never claim to have run, installed, downloaded, tested, served, or searched for anything except "
+           "through those tools.\n\n"
            if sandbox_manager.sandbox_configured() else
-           "below, you do not have shell or live-sandbox access in this deployment (no E2B_API_KEY configured) "
-           "— never claim to have run a command or started a live server.\n\n") +
+           "below, you do not have shell or live-sandbox access in this deployment (no E2B_API_KEY "
+           "configured) — never claim to have run a command, downloaded/extracted a file, run tests, "
+           "listed a directory, or started a live server. web_search may still be available separately.\n\n") +
         "Tools:\n"
         "- read_file: view the current, real contents of an existing project file.\n"
         "- edit_file: completely replace an existing file's contents. You must return the COMPLETE new "
@@ -1233,16 +1241,30 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
         "- create_file: create a new file that does not exist yet, with its full content.\n"
         "- delete_file: remove a file that is no longer needed.\n"
         "- run_command: run ANY real shell command to completion in the live sandbox — this is a genuine "
-        "Linux shell, not a restricted helper. Use it for: installing dependencies (`npm install`, "
-        "`pip install -r requirements.txt --break-system-packages`, `apt-get install -y <pkg>`), running "
-        "test suites (`pytest`, `npm test`, `npm run lint`), downloading files from the internet (`curl -L "
-        "-o file.zip <url>`, `wget <url>`), extracting or creating archives (`unzip file.zip`, `tar -xzf "
-        "file.tar.gz`, `zip -r out.zip dir/`), inspecting the project (`ls`, `cat`, `grep`, `find`, `git "
-        "log`), or any other real command a developer would run in a terminal. The project's current files "
-        "are synced into the sandbox automatically before it runs, and any files the command creates or "
-        "changes are synced back afterward, so downloaded/extracted files become real project files you can "
-        "then read_file/edit_file. Omit PATH; put the command in the code fence. Its real stdout/stderr and "
-        "exit code are returned to you — never fabricate output, only report what actually came back.\n"
+        "Linux shell, not a restricted helper. Use it for anything that doesn't fit one of the more "
+        "specific tools below: installing dependencies (`npm install`, `pip install -r requirements.txt "
+        "--break-system-packages`, `apt-get install -y <pkg>`), running lint/build steps (`npm run lint`, "
+        "`npm run build`), inspecting the project (`cat`, `grep`, `git log`, `git diff`), or any other "
+        "real command a developer would run in a terminal. The project's current files are synced into "
+        "the sandbox automatically before it runs, and any files the command creates or changes are "
+        "synced back afterward, so downloaded/extracted/generated files become real project files you can "
+        "then read_file/edit_file. Omit PATH; put the command in the code fence. Its real stdout/stderr "
+        "and exit code are returned to you — never fabricate output, only report what actually came back.\n"
+        "- download_file: fetch a URL into the project directory with a real curl/wget — use this instead "
+        "of hand-writing curl for simple downloads. PATH is the optional destination filename (auto-"
+        "derived from the URL if omitted); the code fence holds ONLY the URL, nothing else.\n"
+        "- extract_archive: unpack a .zip/.tar/.tar.gz/.tgz/.tar.bz2/.tar.xz/.gz/.7z file already in the "
+        "project into a real directory. PATH is the archive's path (required); the code fence optionally "
+        "names the destination directory (auto-derived from the archive's filename if omitted).\n"
+        "- run_tests: run the project's test suite for real. Omit PATH. Leave the code fence empty/omitted "
+        "to auto-detect the right runner (npm test / pytest / go test / cargo test based on what's "
+        "actually in the project); or put an explicit test command in the fence to override detection.\n"
+        "- list_dir: list real files/directories on disk (like `find`), when you need an overview instead "
+        "of reading one file at a time. PATH is the directory to list (defaults to the project root).\n"
+        "- web_search: search the live web for current information — docs, package versions, API changes, "
+        "error messages, anything you're not certain about. Put the query in the code fence (or PATH for a "
+        "short query). Returns real search results, never fabricated ones; unavailable if no search "
+        "provider is configured on the server, in which case say so rather than guessing.\n"
         "- start_server: start (or restart) the project's long-running dev/preview server in the sandbox "
         "and make it live. PATH is the port number the server listens on (e.g. `3000`); the code fence "
         "holds the exact command to run it, which MUST bind 0.0.0.0 (e.g. `npm run dev -- --host 0.0.0.0 "
@@ -1253,13 +1275,21 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
         "On every turn, respond in EXACTLY this format:\n\n"
         "THOUGHT: <one short, plain sentence about what you're about to do and why — shown directly to "
         "the user, so keep it natural and free of meta-commentary about these instructions>\n"
-        "ACTION: read_file | edit_file | create_file | delete_file | run_command | start_server | final\n"
-        "PATH: <relative/file/path, or port number for start_server>   (omit only for read/write actions "
-        "that don't need one — run_command and final)\n"
-        "```<language or bash>        (for edit_file / create_file / run_command / start_server — omit "
-        "for read_file, delete_file, final)\n"
-        "<the complete file content, or the shell command>\n"
+        "ACTION: read_file | edit_file | create_file | delete_file | run_command | download_file | "
+        "extract_archive | run_tests | list_dir | web_search | start_server | final\n"
+        "PATH: <relative/file/path, port number for start_server, or destination/query for the tools "
+        "above>   (omit only for actions that don't need one — see each tool's description)\n"
+        "```<language, bash, text, or url>        (for edit_file / create_file / run_command / "
+        "download_file / extract_archive / run_tests / web_search / start_server — omit for read_file, "
+        "delete_file, list_dir, final)\n"
+        "<the complete file content, the shell command, the URL, the query, etc. — see each tool above>\n"
         "```\n\n"
+        "CRITICAL: whatever text appears inside the code fence for run_command / download_file / "
+        "run_tests / start_server is sent to the live sandbox and executed VERBATIM as a real shell "
+        "command. It must contain ONLY that literal command — never your THOUGHT sentence, never an "
+        "explanation, never restated instructions. Nothing you write in THOUGHT is ever executed; only the "
+        "fenced content is. If you don't have a real command to run, use run_tests/web_search with no "
+        "override, or pick a different action.\n\n"
         "Rules:\n"
         "- Exactly one ACTION per turn. Never combine multiple actions in one response.\n"
         "- Never edit_file a file you have not first read_file'd earlier in this run, unless it does not "
@@ -1268,6 +1298,8 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
         "- Preserve every existing function, section, style rule, or piece of functionality the user did "
         "not ask you to change when editing a file — never silently drop or rewrite unrelated code.\n"
         "- Only touch the file(s) the request actually concerns.\n"
+        "- Prefer download_file/extract_archive/run_tests/list_dir over hand-writing the equivalent "
+        "run_command shell for those exact operations — they're more reliable and easier to verify.\n"
         "- Prefer start_server (once) over repeated run_command calls that just re-run the same dev "
         "server — restarting it is cheap, so use it again after changes if the user wants to see them live.\n"
         "- When finished, respond with ACTION: final and, on the following lines, a short 2-4 sentence "
@@ -1295,12 +1327,22 @@ def build_agent_messages(history: List[BaseMessage], transcript: List[BaseMessag
 
 
 _AGENT_TURN_RE = re.compile(
-    r"THOUGHT:\s*(?P<thought>.*?)\s*\n\s*ACTION:\s*(?P<action>read_file|edit_file|create_file|delete_file|run_command|start_server|final)\b"
+    r"THOUGHT:\s*(?P<thought>.*?)\s*\n\s*ACTION:\s*(?P<action>read_file|edit_file|create_file|delete_file|"
+    r"run_command|start_server|download_file|extract_archive|run_tests|list_dir|web_search|final)\b"
     r"(?:[ \t]*\n[ \t]*PATH:\s*(?P<path>[^\n]+))?"
     r"(?P<rest>[\s\S]*)$",
     re.IGNORECASE,
 )
 _FENCE_RE = re.compile(r"```[A-Za-z0-9_+#.-]*[ \t]*\n(?P<content>[\s\S]*?)```", re.DOTALL)
+
+# Actions whose fenced code-block content is REQUIRED and executed verbatim
+# as a real shell command/URL in the live sandbox (as opposed to file
+# content, which is just written to disk, or run_tests's OPTIONAL override,
+# handled separately in the dispatch loop since an empty command there is
+# legitimate — it means "auto-detect"). These are exactly the actions the
+# leaked-prose guard in the dispatch loop always applies to — see
+# _looks_like_leaked_prose.
+_SANDBOX_COMMAND_ACTIONS = {"run_command", "start_server", "download_file"}
 
 
 def parse_agent_turn(raw: str) -> Optional[dict]:
@@ -1330,6 +1372,40 @@ def parse_agent_turn(raw: str) -> Optional[dict]:
         if content.endswith("\n"):
             content = content[:-1]
         return {"thought": thought, "action": action, "path": path, "content": content}
+    if action == "download_file":
+        # PATH is the optional destination filename; the fence holds only the
+        # URL to fetch (derived from the URL if PATH is omitted).
+        fence = _FENCE_RE.search(rest)
+        url = fence.group("content").strip() if fence else (path or "").strip()
+        if not url:
+            return None
+        # If there was no PATH line, the "path" the model gave was actually
+        # the URL — don't also treat it as a destination filename.
+        dest = path if fence else None
+        return {"thought": thought, "action": action, "path": dest, "content": url}
+    if action == "extract_archive":
+        # PATH is the archive file to extract; the fence optionally names a
+        # destination directory (auto-derived from the archive name if omitted).
+        if not path:
+            return None
+        fence = _FENCE_RE.search(rest)
+        dest = fence.group("content").strip() if fence else None
+        return {"thought": thought, "action": action, "path": path, "content": dest or None}
+    if action == "run_tests":
+        # No PATH needed. Fence is an optional explicit test command; if
+        # omitted, the sandbox auto-detects the right test runner.
+        fence = _FENCE_RE.search(rest)
+        cmd = fence.group("content").strip() if fence else None
+        return {"thought": thought, "action": action, "path": None, "content": cmd or None}
+    if action == "list_dir":
+        return {"thought": thought, "action": action, "path": path or ".", "content": None}
+    if action == "web_search":
+        # PATH or the fence can hold the query; fence takes priority if both given.
+        fence = _FENCE_RE.search(rest)
+        query = fence.group("content").strip() if fence else (path or "").strip()
+        if not query:
+            return None
+        return {"thought": thought, "action": action, "path": None, "content": query}
     if action in ("read_file", "delete_file"):
         if not path:
             return None
@@ -1337,6 +1413,27 @@ def parse_agent_turn(raw: str) -> Optional[dict]:
     # final
     explanation = rest.strip() or thought or "Done."
     return {"thought": thought, "action": "final", "path": None, "content": explanation}
+
+
+def _looks_like_leaked_prose(command: str, thought: str) -> bool:
+    """Defensive guard between the model and the live sandbox: refuses to
+    execute a 'command' that is actually the model's reasoning/prose leaking
+    through — e.g. it re-typed its THOUGHT sentence inside the code fence, or
+    the fence still contains stray THOUGHT:/ACTION:/PATH: markers from a
+    malformed turn — instead of a literal shell command, URL, or argument.
+    This is what keeps the sandbox executing only real, literal commands: the
+    THOUGHT text itself is never sent to the sandbox by any code path, and
+    this check catches the case where the model accidentally put prose where
+    a command belongs."""
+    c = (command or "").strip()
+    if not c:
+        return True
+    if re.search(r"^\s*(THOUGHT|ACTION|PATH)\s*:", c, re.IGNORECASE | re.MULTILINE):
+        return True
+    t = (thought or "").strip()
+    if t and len(t) > 25 and c.lower() == t.lower():
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1693,19 +1790,70 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             transcript.append(HumanMessage(content=f"TOOL RESULT: {path} {'deleted' if existed else 'did not exist; nothing to delete'}."))
             continue
 
-        if action in ("run_command", "start_server"):
-            command = turn["content"] or ""
+        if action == "web_search":
+            query = turn["content"] or ""
+            activities.append({"kind": "command", "text": f"web_search: {query}"})
+            await emit({"type": "activity_start", "action": "web_search", "query": query})
+            if _tavily_client is None:
+                msg = ("Web search isn't configured on the server (no TAVILY_API_KEY). Add it to the "
+                       ".env file and restart to enable web_search.")
+                await emit({"type": "activity_error", "action": "web_search", "message": msg})
+                transcript.append(AIMessage(content=raw))
+                transcript.append(HumanMessage(content=f"TOOL RESULT: {msg}"))
+                continue
+            try:
+                search_text, results = await web_search(query)
+            except Exception as exc:
+                err_text = str(exc)[:800]
+                await emit({"type": "activity_error", "action": "web_search", "message": err_text})
+                transcript.append(AIMessage(content=raw))
+                transcript.append(HumanMessage(content=f"TOOL RESULT: web search failed: {err_text}"))
+                continue
+            await emit({"type": "activity_complete", "action": "web_search", "result_count": len(results)})
+            if results:
+                await emit({"type": "web_search_results", "query": query, "results": results})
+            transcript.append(AIMessage(content=raw))
+            transcript.append(HumanMessage(content=(
+                f"TOOL RESULT: {search_text}" if search_text
+                else f"TOOL RESULT: web search for '{query}' returned no results."
+            )))
+            continue
+
+        if action in ("run_command", "start_server", "download_file", "extract_archive", "run_tests", "list_dir"):
+            command = turn["content"] or ""  # meaning depends on action — see display_text/dispatch below
             session_id = getattr(request, "session_id", None)
-            activities.append({"kind": "command", "text": command})
-            await emit({"type": "activity_start", "action": action, "file": path, "command": command})
 
             if not sandbox_manager.sandbox_configured():
                 msg = ("The live sandbox isn't configured yet (no E2B_API_KEY on the server). "
-                       "Add it to the .env file and restart to enable run_command/start_server.")
+                       "Add it to the .env file and restart to enable the sandbox tools.")
                 await emit({"type": "activity_error", "action": action, "message": msg})
                 transcript.append(AIMessage(content=raw))
                 transcript.append(HumanMessage(content=f"TOOL RESULT: {msg}"))
                 continue
+
+            # Guard the sandbox from ever executing the model's reasoning instead
+            # of a real command: mandatory for run_command/start_server/download_file
+            # (their fence content must always be a literal command/URL), and for
+            # run_tests only when an override command was actually given (an empty
+            # command there legitimately means "auto-detect", not leaked prose).
+            needs_guard = action in _SANDBOX_COMMAND_ACTIONS or (action == "run_tests" and command)
+            if needs_guard and _looks_like_leaked_prose(command, thought):
+                msg = ("That doesn't look like a real command — the code fence must contain ONLY the "
+                       "literal command/URL to run, never your reasoning or restated instructions. "
+                       f"Retry {action} with just the literal command/URL in the fence.")
+                await emit({"type": "activity_error", "action": action, "message": msg})
+                transcript.append(AIMessage(content=raw))
+                transcript.append(HumanMessage(content=f"TOOL RESULT: {msg}"))
+                continue
+
+            display_text = {
+                "download_file": f"download {command}" + (f" -> {path}" if path else ""),
+                "extract_archive": f"extract {path}" + (f" -> {command}" if command else ""),
+                "run_tests": command or "run_tests (auto-detect runner)",
+                "list_dir": f"find {path or '.'}",
+            }.get(action, command)  # run_command / start_server just show the literal command
+            activities.append({"kind": "command", "text": display_text})
+            await emit({"type": "activity_start", "action": action, "file": path, "command": display_text})
 
             async def _on_output(stream: str, text: str, _action=action):
                 await emit({"type": "terminal_output", "stream": stream, "text": text, "action": _action})
@@ -1765,6 +1913,64 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                     transcript.append(HumanMessage(content=(
                         f"TOOL RESULT: command exited with code {exit_code}. Output (may be truncated):\n"
                         f"```\n{tail}\n```{pulled_note}"
+                    )))
+                elif action == "download_file":
+                    exit_code, output, dest = await sandbox_manager.download_file(
+                        session_id, command, dest_path=path, on_output=_on_output
+                    )
+                    tail = output[-4000:] if len(output) > 4000 else output
+                    pulled = await _pull_sandbox_changes()
+                    await emit({"type": "activity_complete", "action": action, "file": dest, "exit_code": exit_code})
+                    pulled_note = (
+                        f"\n{len(pulled)} project file(s) were created/updated on disk and are now available "
+                        f"via read_file: {', '.join(pulled[:20])}" + (" …" if len(pulled) > 20 else "")
+                    ) if pulled else ""
+                    status = "downloaded" if exit_code == 0 else f"download FAILED (exit code {exit_code})"
+                    transcript.append(AIMessage(content=raw))
+                    transcript.append(HumanMessage(content=(
+                        f"TOOL RESULT: {status} to {dest}. Output (may be truncated):\n"
+                        f"```\n{tail}\n```{pulled_note}"
+                    )))
+                elif action == "extract_archive":
+                    exit_code, output, dest_dir = await sandbox_manager.extract_archive(
+                        session_id, path, dest_dir=(command or None), on_output=_on_output
+                    )
+                    tail = output[-4000:] if len(output) > 4000 else output
+                    pulled = await _pull_sandbox_changes()
+                    await emit({"type": "activity_complete", "action": action, "file": dest_dir, "exit_code": exit_code})
+                    pulled_note = (
+                        f"\n{len(pulled)} project file(s) were created/updated on disk and are now available "
+                        f"via read_file: {', '.join(pulled[:20])}" + (" …" if len(pulled) > 20 else "")
+                    ) if pulled else ""
+                    status = "extracted" if exit_code == 0 else f"extraction FAILED (exit code {exit_code})"
+                    transcript.append(AIMessage(content=raw))
+                    transcript.append(HumanMessage(content=(
+                        f"TOOL RESULT: {status} {path} into {dest_dir}. Output (may be truncated):\n"
+                        f"```\n{tail}\n```{pulled_note}"
+                    )))
+                elif action == "run_tests":
+                    exit_code, output = await sandbox_manager.run_tests(
+                        session_id, command=(command or None), on_output=_on_output
+                    )
+                    tail = output[-6000:] if len(output) > 6000 else output
+                    pulled = await _pull_sandbox_changes()
+                    await emit({"type": "activity_complete", "action": action, "exit_code": exit_code})
+                    status = "passed" if exit_code == 0 else f"FAILED (exit code {exit_code})"
+                    pulled_note = (
+                        f"\n{len(pulled)} project file(s) changed on disk and are now available via "
+                        f"read_file: {', '.join(pulled[:20])}" + (" …" if len(pulled) > 20 else "")
+                    ) if pulled else ""
+                    transcript.append(AIMessage(content=raw))
+                    transcript.append(HumanMessage(content=(
+                        f"TOOL RESULT: tests {status}. Output (may be truncated):\n```\n{tail}\n```{pulled_note}"
+                    )))
+                elif action == "list_dir":
+                    exit_code, output = await sandbox_manager.list_dir(session_id, path=path or ".")
+                    tail = output[-6000:] if len(output) > 6000 else output
+                    await emit({"type": "activity_complete", "action": action, "exit_code": exit_code})
+                    transcript.append(AIMessage(content=raw))
+                    transcript.append(HumanMessage(content=(
+                        f"TOOL RESULT: contents of {path or '.'} (may be truncated):\n```\n{tail or '(empty)'}\n```"
                     )))
                 else:  # start_server
                     try:
