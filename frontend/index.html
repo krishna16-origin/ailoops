@@ -2508,6 +2508,170 @@
             }
         }
 
+        // ============== ATTACH / FILE / CAMERA (composer '+' button) ==============
+        // Records for files/photos staged in the composer for the *next* message.
+        // Each entry mirrors the backend's rag_engine record: {localId, id, filename,
+        // kind, status: 'processing'|'ready'|'error', thumbnail, error}.
+        let pendingAttachments = [];
+
+        function toggleAttachMenu(event) {
+            event.stopPropagation();
+            document.getElementById('attachMenuPanel').hidden = !document.getElementById('attachMenuPanel').hidden;
+        }
+
+        // Close the menu on any click outside it.
+        document.addEventListener('click', (event) => {
+            const panel = document.getElementById('attachMenuPanel');
+            const menu = document.getElementById('attachMenu');
+            if (panel && !panel.hidden && menu && !menu.contains(event.target)) panel.hidden = true;
+        });
+
+        function triggerFilePicker() {
+            document.getElementById('attachMenuPanel').hidden = true;
+            document.getElementById('fileAttachInput').click();
+        }
+
+        function handleFileInputChange(event) {
+            const files = Array.from(event.target.files || []);
+            files.forEach(uploadAttachment);
+            event.target.value = ''; // allow re-selecting the same file later
+        }
+
+        function guessKindClient(file) {
+            const type = (file.type || '').toLowerCase();
+            if (type.startsWith('image/')) return 'image';
+            if (type === 'application/pdf') return 'pdf';
+            if (type.includes('word') || /\.docx?$/i.test(file.name || '')) return 'docx';
+            return 'text';
+        }
+
+        function attachmentChipIcon(kind) {
+            if (kind === 'pdf') return '📄';
+            if (kind === 'docx') return '📝';
+            if (kind === 'image') return '🖼️';
+            return '📎';
+        }
+
+        function renderAttachmentChip(rec) {
+            const chips = document.getElementById('attachmentChips');
+            chips.hidden = false;
+            const el = document.createElement('div');
+            el.className = 'attachment-chip';
+            el.dataset.chipId = rec.localId;
+            chips.appendChild(el);
+            updateAttachmentChip(rec.localId, rec);
+            return el;
+        }
+
+        function updateAttachmentChip(localId, rec) {
+            const el = document.querySelector(`.attachment-chip[data-chip-id="${localId}"]`);
+            if (!el) return;
+            const isError = rec.status === 'error';
+            el.classList.toggle('attachment-chip-error', isError);
+            const thumbHtml = rec.thumbnail
+                ? `<img class="attachment-chip-thumb" src="${rec.thumbnail}" alt="">`
+                : `<div class="attachment-chip-icon">${attachmentChipIcon(rec.kind)}</div>`;
+            const statusHtml = rec.status === 'processing'
+                ? `<div class="attachment-chip-spinner"></div>`
+                : isError
+                    ? `<div class="attachment-chip-error-dot" title="${escapeHtml(rec.error || 'Upload failed')}">!</div>`
+                    : '';
+            el.innerHTML = `${thumbHtml}<span class="attachment-chip-name" title="${escapeHtml(rec.filename || '')}">${escapeHtml(rec.filename || 'File')}</span>${statusHtml}` +
+                `<button type="button" class="attachment-chip-remove" onclick="removeAttachmentChip('${localId}')" title="Remove" aria-label="Remove attachment">&times;</button>`;
+        }
+
+        async function removeAttachmentChip(localId) {
+            const el = document.querySelector(`.attachment-chip[data-chip-id="${localId}"]`);
+            if (el) el.remove();
+            const idx = pendingAttachments.findIndex(a => a.localId === localId);
+            if (idx !== -1) {
+                const [rec] = pendingAttachments.splice(idx, 1);
+                if (rec.id) {
+                    try {
+                        await fetch(`${API_BASE}/session-files/${modes[currentMode].sessionId}/${rec.id}`, { method: 'DELETE' });
+                    } catch (err) { /* best effort — file just stops being offered for retrieval */ }
+                }
+            }
+            const chips = document.getElementById('attachmentChips');
+            if (!chips.children.length) chips.hidden = true;
+        }
+
+        async function uploadAttachment(file) {
+            const localId = 'local-' + Math.random().toString(36).slice(2);
+            renderAttachmentChip({ localId, filename: file.name, kind: guessKindClient(file), status: 'processing' });
+            try {
+                const formData = new FormData();
+                formData.append('session_id', modes[currentMode].sessionId);
+                formData.append('file', file);
+                const res = await fetch(`${API_BASE}/upload`, { method: 'POST', body: formData });
+                if (!res.ok) throw new Error('Upload request failed');
+                const record = await res.json();
+                record.localId = localId;
+                updateAttachmentChip(localId, record);
+                if (record.status === 'ready') pendingAttachments.push(record);
+            } catch (err) {
+                updateAttachmentChip(localId, { filename: file.name, status: 'error', error: 'Upload failed — check your connection.' });
+            }
+        }
+
+        // ---- Camera capture ----
+        let cameraStream = null;
+        let cameraFacingMode = 'environment';
+
+        async function openCamera() {
+            document.getElementById('attachMenuPanel').hidden = true;
+            document.getElementById('cameraModal').hidden = false;
+            await startCameraStream();
+        }
+
+        async function startCameraStream() {
+            stopCameraStream();
+            try {
+                cameraStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: cameraFacingMode }, audio: false });
+                const video = document.getElementById('cameraVideo');
+                video.srcObject = cameraStream;
+                video.style.transform = cameraFacingMode === 'user' ? 'scaleX(-1)' : 'none';
+            } catch (err) {
+                alert('Could not access the camera. Check your browser/site camera permission and try again.');
+                closeCamera();
+            }
+        }
+
+        function stopCameraStream() {
+            if (cameraStream) {
+                cameraStream.getTracks().forEach(track => track.stop());
+                cameraStream = null;
+            }
+        }
+
+        function closeCamera() {
+            document.getElementById('cameraModal').hidden = true;
+            stopCameraStream();
+        }
+
+        function switchCamera() {
+            cameraFacingMode = cameraFacingMode === 'environment' ? 'user' : 'environment';
+            startCameraStream();
+        }
+
+        function captureCameraPhoto() {
+            const video = document.getElementById('cameraVideo');
+            const canvas = document.getElementById('cameraCanvas');
+            if (!video.videoWidth) return;
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            if (cameraFacingMode === 'user') {
+                ctx.translate(canvas.width, 0);
+                ctx.scale(-1, 1);
+            }
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            canvas.toBlob((blob) => {
+                if (blob) uploadAttachment(new File([blob], `camera-${Date.now()}.jpg`, { type: 'image/jpeg' }));
+            }, 'image/jpeg', 0.92);
+            closeCamera();
+        }
+
         function refreshOpeningSceneVisibility() {
             const state = modes[currentMode];
             if (state.hasMessages) {
@@ -2788,6 +2952,7 @@
                     thinking_level: thinkingLevel,
                     mcp_servers: selectedMcpServers()
                 };
+                if (pendingAttachments.length) payload.attachment_ids = pendingAttachments.filter(a => a.id).map(a => a.id);
             } else {
                 const codeModel = document.getElementById('codeModel').value;
                 const reasoningLevel = document.getElementById('codeReasoningLevel').value;
@@ -2803,8 +2968,19 @@
                     mcp_servers: selectedMcpServers()
                     // No temperature — Code Mode intentionally omits it; backend applies its own default.
                 };
+                if (pendingAttachments.length) payload.attachment_ids = pendingAttachments.filter(a => a.id).map(a => a.id);
             }
             const workflowSubmode = mode === 'code' ? payload.mode : null;
+
+            // Files/photos stay attached to the session for retrieval on every later
+            // turn too (see backend /upload), so the composer just needs to clear its
+            // own staged chips now that they've been folded into this message.
+            if (pendingAttachments.length) {
+                pendingAttachments = [];
+                const chips = document.getElementById('attachmentChips');
+                chips.innerHTML = '';
+                chips.hidden = true;
+            }
 
             const assistantBubble = appendMessage('assistant', '');
             const textContainer = assistantBubble.querySelector('.message-text');
