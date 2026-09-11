@@ -1232,10 +1232,17 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
         "file content, never a snippet or a diff.\n"
         "- create_file: create a new file that does not exist yet, with its full content.\n"
         "- delete_file: remove a file that is no longer needed.\n"
-        "- run_command: run a shell command to completion in the live sandbox (e.g. `npm install`, "
-        "`pip install -r requirements.txt`, a build step, or tests). The project's current files are "
-        "synced into the sandbox automatically before it runs. Omit PATH; put the command in the code "
-        "fence. Its real stdout/stderr and exit code are returned to you.\n"
+        "- run_command: run ANY real shell command to completion in the live sandbox — this is a genuine "
+        "Linux shell, not a restricted helper. Use it for: installing dependencies (`npm install`, "
+        "`pip install -r requirements.txt --break-system-packages`, `apt-get install -y <pkg>`), running "
+        "test suites (`pytest`, `npm test`, `npm run lint`), downloading files from the internet (`curl -L "
+        "-o file.zip <url>`, `wget <url>`), extracting or creating archives (`unzip file.zip`, `tar -xzf "
+        "file.tar.gz`, `zip -r out.zip dir/`), inspecting the project (`ls`, `cat`, `grep`, `find`, `git "
+        "log`), or any other real command a developer would run in a terminal. The project's current files "
+        "are synced into the sandbox automatically before it runs, and any files the command creates or "
+        "changes are synced back afterward, so downloaded/extracted files become real project files you can "
+        "then read_file/edit_file. Omit PATH; put the command in the code fence. Its real stdout/stderr and "
+        "exit code are returned to you — never fabricate output, only report what actually came back.\n"
         "- start_server: start (or restart) the project's long-running dev/preview server in the sandbox "
         "and make it live. PATH is the port number the server listens on (e.g. `3000`); the code fence "
         "holds the exact command to run it, which MUST bind 0.0.0.0 (e.g. `npm run dev -- --host 0.0.0.0 "
@@ -1522,6 +1529,14 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     reached_final = False
 
     for step in range(1, MAX_AGENT_STEPS + 1):
+        # Best-effort mapping of "which plan step are we probably on" — the agent
+        # doesn't declare this explicitly, so we distribute the MAX_AGENT_STEPS
+        # tool-call turns proportionally across plan_steps. Imperfect, but it
+        # gives the checklist in the UI a live, monotonically-advancing signal
+        # (like Manus's checkbox list) instead of staying static until the end.
+        if plan_steps:
+            _active_idx = min(len(plan_steps) - 1, (step - 1) * len(plan_steps) // MAX_AGENT_STEPS)
+            await emit({"type": "step_progress", "index": _active_idx, "total": len(plan_steps)})
         agent_messages = build_agent_messages(history, transcript, file_store, plan_steps, reasoning_level, step)
         if _is_deepseek:
             agent_messages.append(SystemMessage(content=(
@@ -1589,6 +1604,8 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 if thought.strip() != final_text.strip():
                     await emit({"type": "agent_message", "text": thought})
             await emit({"type": "final_message", "text": final_text})
+            if plan_steps:
+                await emit({"type": "step_progress", "index": len(plan_steps), "total": len(plan_steps)})
             reached_final = True
             transcript.append(AIMessage(content=raw))
             break
@@ -1693,16 +1710,61 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             async def _on_output(stream: str, text: str, _action=action):
                 await emit({"type": "terminal_output", "stream": stream, "text": text, "action": _action})
 
+            async def _pull_sandbox_changes():
+                """After a real shell command, pull back any files it created or
+                changed on disk (a download via curl/wget, an extracted archive,
+                generated build output, etc.) so they become real project files
+                the agent can read_file/edit_file next turn and that show up in
+                the final result — not just a side effect that vanishes with the
+                sandbox. Returns the list of new/changed relative paths."""
+                try:
+                    snapshot = await sandbox_manager.snapshot_project_files(session_id)
+                except Exception:
+                    return []
+                changed: List[str] = []
+                for rel_path, content in snapshot.items():
+                    if file_store.get(rel_path) == content:
+                        continue
+                    old_content = file_store.get(rel_path)
+                    is_edit = old_content is not None
+                    file_store[rel_path] = content
+                    turn_files_touched[rel_path] = content
+                    changed.append(rel_path)
+                    if is_edit:
+                        additions, deletions, diff_lines = diff_file(old_content, content)
+                    else:
+                        new_lines = content.splitlines()
+                        additions, deletions = len(new_lines), 0
+                        diff_lines = [{"type": "add", "content": line} for line in new_lines]
+                    evt_type = "file_edited" if is_edit else "file_created"
+                    diff_id = f"diff_{len(diffs) + 1}"
+                    diffs.append({"diff_id": diff_id, "file": rel_path, "additions": additions,
+                                  "deletions": deletions, "diff_lines": diff_lines})
+                    activities.append({"kind": "edit", "file": rel_path, "filename": rel_path,
+                                        "additions": additions, "deletions": deletions, "diff_lines": diff_lines})
+                    await emit({"type": evt_type, "file": rel_path, "additions": additions,
+                                "deletions": deletions, "diff_id": diff_id})
+                    await emit({"type": "code_file_diff", "filename": rel_path, "language": _guess_language(rel_path),
+                                "additions": additions, "deletions": deletions, "diff_lines": diff_lines, "content": content})
+                    await emit({"type": "diff_created", "diff_id": diff_id, "file": rel_path, "diff_lines": diff_lines,
+                                "additions": additions, "deletions": deletions})
+                return changed
+
             try:
                 await sandbox_manager.sync_files(session_id, file_store)
                 if action == "run_command":
                     exit_code, output = await sandbox_manager.run_command(session_id, command, on_output=_on_output)
                     tail = output[-4000:] if len(output) > 4000 else output
+                    pulled = await _pull_sandbox_changes()
                     await emit({"type": "activity_complete", "action": action, "file": path, "exit_code": exit_code})
+                    pulled_note = (
+                        f"\n{len(pulled)} project file(s) were created/updated on disk and are now available "
+                        f"via read_file: {', '.join(pulled[:20])}" + (" …" if len(pulled) > 20 else "")
+                    ) if pulled else ""
                     transcript.append(AIMessage(content=raw))
                     transcript.append(HumanMessage(content=(
                         f"TOOL RESULT: command exited with code {exit_code}. Output (may be truncated):\n"
-                        f"```\n{tail}\n```"
+                        f"```\n{tail}\n```{pulled_note}"
                     )))
                 else:  # start_server
                     try:
@@ -1716,6 +1778,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                         transcript.append(HumanMessage(content=f"TOOL RESULT: {msg}"))
                         continue
                     url = await sandbox_manager.start_server(session_id, command, port, on_output=_on_output)
+                    await _pull_sandbox_changes()
                     await emit({"type": "activity_complete", "action": action, "file": path})
                     await emit({"type": "sandbox_ready", "url": url, "port": port})
                     transcript.append(AIMessage(content=raw))
@@ -1751,6 +1814,8 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         except Exception:
             final_text = "Reached the step limit — here's what changed so far."
         await emit({"type": "final_message", "text": final_text})
+        if plan_steps:
+            await emit({"type": "step_progress", "index": len(plan_steps), "total": len(plan_steps)})
 
     file_languages = {name: _guess_language(name) for name in turn_files_touched}
     commands = sum(1 for a in activities if a["kind"] == "command")
