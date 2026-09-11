@@ -13,6 +13,7 @@ Nothing here talks to FastAPI directly; app.py wires this into the
 start_server tool actions.
 """
 import os
+import re
 import time
 import shlex
 import asyncio
@@ -329,6 +330,69 @@ async def download_file(
     )
     exit_code, output = await run_command(session_id, cmd, on_output=on_output, timeout=timeout)
     return exit_code, output, dest_path
+
+
+# ---------------------------------------------------------------------------
+# Plan-mode's ONE sandbox capability.
+#
+# Build mode gets the full sandbox (run_command, download_file, run_tests,
+# start_server, ...). Plan mode gets none of that — except, when the user's
+# request actually points at a GitHub repo, a single read-only clone-and-look
+# so the plan can be grounded in the real project instead of guessed. This is
+# intentionally its own narrow function rather than letting Plan mode call
+# run_command: it only ever runs `git clone` against a github.com URL, into a
+# scratch directory that is never synced into the user's project files, and
+# it never installs dependencies, runs anything from the repo, or starts a
+# server. That keeps Plan mode side-effect-free with respect to the user's
+# actual project even though it now touches the sandbox.
+# ---------------------------------------------------------------------------
+GITHUB_REPO_URL_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?",
+    re.IGNORECASE,
+)
+PLAN_REPO_PREVIEW_DIR = "/tmp/plan_repo_preview"
+REPO_FETCH_TIMEOUT_SECONDS = float(os.getenv("E2B_REPO_FETCH_TIMEOUT", "90"))
+
+
+def find_github_repo_url(text: str) -> Optional[str]:
+    """Return the first github.com repo URL mentioned in `text`, or None.
+    Deliberately github.com-only — this is the gate that keeps Plan mode's
+    sandbox use to "fetch/pull a GitHub repo" and nothing broader like an
+    arbitrary git remote or hosting URL."""
+    if not text:
+        return None
+    match = GITHUB_REPO_URL_RE.search(text)
+    if not match:
+        return None
+    return match.group(0).rstrip(").,]>\"'").rstrip("/")
+
+
+async def fetch_github_repo_preview(
+    session_id: str,
+    url: str,
+    on_output: Optional[LogCallback] = None,
+    timeout: float = REPO_FETCH_TIMEOUT_SECONDS,
+) -> Tuple[int, str]:
+    """Shallow-clone a public GitHub repo into a scratch directory (never the
+    user's project dir) and return (exit_code, summary) — a short file tree
+    plus a README excerpt. This is Plan mode's only sandbox operation: no
+    dependency install, no running anything from the repo, no writes to the
+    user's actual project files."""
+    url = (url or "").strip()
+    if not GITHUB_REPO_URL_RE.match(url):
+        return 1, "fetch_github_repo_preview: only github.com repository URLs are allowed in Plan mode."
+    dest = PLAN_REPO_PREVIEW_DIR
+    q_url = shlex.quote(url)
+    q_dest = shlex.quote(dest)
+    cmd = (
+        f"rm -rf {q_dest} && "
+        f"git clone --depth 1 --quiet {q_url} {q_dest} && "
+        "echo '--- FILES ---' && "
+        f"find {q_dest} -maxdepth 3 -not -path '*/.git*' | sed \"s#{dest}/##\" | sort | head -200 && "
+        "echo '--- README ---' && "
+        f"(head -c 2000 {q_dest}/README.md 2>/dev/null || head -c 2000 {q_dest}/readme.md 2>/dev/null || echo '(no README found)')"
+    )
+    return await run_command(session_id, cmd, on_output=on_output, cwd="/tmp", timeout=timeout)
 
 
 def _strip_archive_suffix(name: str) -> str:
