@@ -14,6 +14,7 @@ start_server tool actions.
 """
 import os
 import time
+import shlex
 import asyncio
 import hashlib
 from dataclasses import dataclass, field
@@ -83,8 +84,10 @@ async def _create_sandbox() -> AsyncSandbox:
         await sbx.commands.run(
             "command -v curl >/dev/null && command -v wget >/dev/null && "
             "command -v unzip >/dev/null && command -v zip >/dev/null && "
-            "command -v git >/dev/null || "
-            "(apt-get update -qq && apt-get install -y -qq curl wget unzip zip git >/dev/null 2>&1)",
+            "command -v tar >/dev/null && command -v gzip >/dev/null && "
+            "command -v git >/dev/null && command -v jq >/dev/null || "
+            "(apt-get update -qq && apt-get install -y -qq "
+            "curl wget unzip zip tar gzip git jq ca-certificates file >/dev/null 2>&1)",
             timeout=60,
         )
     except Exception:
@@ -270,6 +273,179 @@ async def run_command(
 
     state.last_active = time.time()
     return exit_code, "".join(combined)
+
+
+# ---------------------------------------------------------------------------
+# Higher-level "Manus-style" tools, built on top of run_command.
+#
+# These exist so the agent (and app.py's turn parser) get a small, reliable,
+# parameterized surface for the operations that come up constantly — download
+# a file, unpack an archive, run whatever test suite the project has, list
+# what's on disk — instead of asking the model to hand-roll shell for each one
+# every time. Under the hood every one of these still runs a single real
+# command through run_command(): nothing here is simulated, and nothing the
+# model merely *says* (its THOUGHT) is ever treated as one of these actions —
+# only the literal argument passed in (a URL, a path, an optional command
+# override) reaches the shell. run_command itself remains available for
+# anything that doesn't fit one of these shapes.
+# ---------------------------------------------------------------------------
+
+DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("E2B_DOWNLOAD_TIMEOUT", "180"))
+EXTRACT_TIMEOUT_SECONDS = float(os.getenv("E2B_EXTRACT_TIMEOUT", "180"))
+TEST_TIMEOUT_SECONDS = float(os.getenv("E2B_TEST_TIMEOUT", "300"))
+
+_ARCHIVE_SUFFIXES = (
+    ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".tar", ".zip", ".gz", ".7z",
+)
+
+
+def _derive_download_dest(url: str) -> str:
+    """Best-effort filename from a URL when the caller doesn't specify one."""
+    from urllib.parse import urlparse
+    name = os.path.basename(urlparse(url).path).strip()
+    return name or "downloaded_file"
+
+
+async def download_file(
+    session_id: str,
+    url: str,
+    dest_path: Optional[str] = None,
+    on_output: Optional[LogCallback] = None,
+    timeout: float = DOWNLOAD_TIMEOUT_SECONDS,
+) -> Tuple[int, str, str]:
+    """Download `url` into the sandbox project dir as a real curl/wget command
+    (curl first, falling back to wget so either being present is enough).
+    Returns (exit_code, combined_output, dest_path)."""
+    url = (url or "").strip()
+    if not url:
+        return 1, "download_file: no URL given.", dest_path or ""
+    dest_path = (dest_path or "").strip() or _derive_download_dest(url)
+    q_url = shlex.quote(url)
+    q_dest = shlex.quote(dest_path)
+    cmd = (
+        f'mkdir -p "$(dirname {q_dest})" 2>/dev/null; '
+        f'curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o {q_dest} {q_url} '
+        f'|| wget -q -O {q_dest} {q_url}'
+    )
+    exit_code, output = await run_command(session_id, cmd, on_output=on_output, timeout=timeout)
+    return exit_code, output, dest_path
+
+
+def _strip_archive_suffix(name: str) -> str:
+    low = name.lower()
+    for suf in _ARCHIVE_SUFFIXES:
+        if low.endswith(suf):
+            return name[: -len(suf)]
+    return name
+
+
+def _archive_extract_command(archive_path: str, dest_dir: str) -> Optional[str]:
+    low = archive_path.lower()
+    src = shlex.quote(archive_path)
+    dst = shlex.quote(dest_dir)
+    mkdir = f"mkdir -p {dst}"
+    if low.endswith((".tar.gz", ".tgz")):
+        return f"{mkdir} && tar -xzf {src} -C {dst}"
+    if low.endswith((".tar.bz2", ".tbz2")):
+        return f"{mkdir} && tar -xjf {src} -C {dst}"
+    if low.endswith((".tar.xz", ".txz")):
+        return f"{mkdir} && tar -xJf {src} -C {dst}"
+    if low.endswith(".tar"):
+        return f"{mkdir} && tar -xf {src} -C {dst}"
+    if low.endswith(".zip"):
+        return f"{mkdir} && unzip -o {src} -d {dst}"
+    if low.endswith(".gz"):
+        base = shlex.quote(os.path.basename(archive_path))
+        return f"{mkdir} && cp {src} {dst}/ && gunzip -f {dst}/{base}"
+    if low.endswith(".7z"):
+        return (
+            f"{mkdir} && (command -v 7z >/dev/null || "
+            f"(apt-get update -qq && apt-get install -y -qq p7zip-full >/dev/null 2>&1)) && "
+            f"7z x -y {src} -o{dst}"
+        )
+    return None
+
+
+async def extract_archive(
+    session_id: str,
+    archive_path: str,
+    dest_dir: Optional[str] = None,
+    on_output: Optional[LogCallback] = None,
+    timeout: float = EXTRACT_TIMEOUT_SECONDS,
+) -> Tuple[int, str, str]:
+    """Extract a .zip/.tar/.tar.gz/.tar.bz2/.tar.xz/.gz/.7z archive already
+    present in the project dir. Returns (exit_code, combined_output, dest_dir)."""
+    archive_path = (archive_path or "").strip()
+    if not archive_path:
+        return 1, "extract_archive: no archive path given.", dest_dir or ""
+    dest_dir = (dest_dir or "").strip() or _strip_archive_suffix(os.path.basename(archive_path)) or "extracted"
+    cmd = _archive_extract_command(archive_path, dest_dir)
+    if cmd is None:
+        supported = ", ".join(_ARCHIVE_SUFFIXES)
+        return 1, f"extract_archive: unsupported archive type for '{archive_path}'. Supported: {supported}", dest_dir
+    exit_code, output = await run_command(session_id, cmd, on_output=on_output, timeout=timeout)
+    return exit_code, output, dest_dir
+
+
+# Auto-detected test runner: tries, in order, an npm "test" script, pytest
+# (via common markers), Go, then Rust — same "look at what's actually in the
+# project" spirit as detect_default_start below, but for running tests
+# instead of serving the app. Only used when the caller doesn't supply an
+# explicit test command.
+_AUTO_TEST_SCRIPT = r"""
+if [ -f package.json ] && grep -q '"test"' package.json; then
+  echo "[detected] npm test"
+  npm install --no-audit --no-fund --silent 2>/dev/null
+  npm test
+elif [ -f pytest.ini ] || [ -f pyproject.toml ] || [ -f setup.cfg ] || [ -d tests ] || ls test_*.py >/dev/null 2>&1 || ls *_test.py >/dev/null 2>&1; then
+  echo "[detected] pytest"
+  [ -f requirements.txt ] && pip install -r requirements.txt --break-system-packages --quiet 2>/dev/null
+  pip install pytest --break-system-packages --quiet 2>/dev/null
+  pytest -q
+elif [ -f go.mod ]; then
+  echo "[detected] go test"
+  go test ./...
+elif [ -f Cargo.toml ]; then
+  echo "[detected] cargo test"
+  cargo test
+else
+  echo "No recognized test suite found (checked package.json \"test\" script, pytest markers/tests dir, go.mod, Cargo.toml)."
+  exit 3
+fi
+""".strip()
+
+
+async def run_tests(
+    session_id: str,
+    command: Optional[str] = None,
+    on_output: Optional[LogCallback] = None,
+    timeout: float = TEST_TIMEOUT_SECONDS,
+) -> Tuple[int, str]:
+    """Run the project's test suite. If `command` is given, run exactly that
+    (still via run_command, so it's a real command, never fabricated output).
+    Otherwise auto-detect the right runner from what's actually in the
+    project directory inside the sandbox."""
+    cmd = (command or "").strip() or _AUTO_TEST_SCRIPT
+    return await run_command(session_id, cmd, on_output=on_output, timeout=timeout)
+
+
+async def list_dir(
+    session_id: str,
+    path: str = ".",
+    max_depth: int = 3,
+    on_output: Optional[LogCallback] = None,
+    timeout: float = 20.0,
+) -> Tuple[int, str]:
+    """List files/directories under `path` (relative to the project dir),
+    skipping the same noisy directories snapshot_project_files ignores."""
+    path = (path or ".").strip() or "."
+    try:
+        depth = max(1, int(max_depth))
+    except (TypeError, ValueError):
+        depth = 3
+    exclude_clause = " ".join(f"-not -path '*/{d}/*'" for d in _SNAPSHOT_EXCLUDE_DIRS)
+    cmd = f"find {shlex.quote(path)} -maxdepth {depth} {exclude_clause} 2>/dev/null | sort"
+    return await run_command(session_id, cmd, on_output=on_output, timeout=timeout)
 
 
 async def start_server(
