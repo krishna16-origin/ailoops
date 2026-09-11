@@ -523,6 +523,52 @@
         .picker-badge-long { font-size:10px; color:#6ee7b7; background:rgba(16,185,129,0.15); border:1px solid rgba(16,185,129,0.25); padding:2px 6px; border-radius:99px; }
         .picker-more-check { color:var(--accent); flex-shrink:0; margin-left:8px; }
 
+        /* ============== ATTACH / FILE / CAMERA (advanced RAG uploads) ============== */
+        .attach-menu { position:relative; }
+        .attach-btn { display:flex; align-items:center; justify-content:center; width:30px; height:30px; background:transparent; border:1px solid var(--border-color); color:var(--text-secondary); border-radius:50%; cursor:pointer; transition:background 0.2s ease, border-color 0.2s ease, color 0.2s ease; flex-shrink:0; }
+        .attach-btn:hover { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); color:var(--text-primary); }
+        .attach-btn svg { width:16px; height:16px; }
+        .attach-menu-panel { position:absolute; left:0; bottom:calc(100% + 10px); width:220px; background-color:#262626; border:1px solid var(--border-color); border-radius:14px; box-shadow:0 10px 38px rgba(0,0,0,0.45); padding:6px; z-index:30; animation:pickerPopIn 0.16s var(--transition-bezier); }
+        .attach-menu-panel[hidden] { display:none; }
+        .attach-menu-option { display:flex; align-items:center; gap:10px; width:100%; background:transparent; border:none; text-align:left; padding:9px 10px; border-radius:9px; cursor:pointer; color:var(--text-primary); font-size:13.5px; transition:background 0.15s ease; }
+        .attach-menu-option:hover { background-color:var(--bg-hover); }
+        .attach-menu-option svg { width:16px; height:16px; color:var(--text-secondary); flex-shrink:0; }
+
+        .attachment-chips { display:flex; flex-wrap:wrap; gap:8px; padding:2px 2px 8px; }
+        .attachment-chips[hidden] { display:none; }
+        .attachment-chip { position:relative; display:flex; align-items:center; gap:6px; background-color:var(--bg-hover); border:1px solid var(--border-color); border-radius:10px; padding:5px 8px 5px 5px; max-width:220px; }
+        .attachment-chip-error { border-color:rgba(239,68,68,0.5); }
+        .attachment-chip-thumb { width:26px; height:26px; object-fit:cover; border-radius:6px; flex-shrink:0; }
+        .attachment-chip-icon { width:26px; height:26px; display:flex; align-items:center; justify-content:center; font-size:14px; background:rgba(255,255,255,0.08); border-radius:6px; flex-shrink:0; }
+        .attachment-chip-name { font-size:12.5px; color:var(--text-primary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .attachment-chip-remove { background:transparent; border:none; color:var(--text-secondary); cursor:pointer; font-size:15px; line-height:1; padding:0 2px; flex-shrink:0; }
+        .attachment-chip-remove:hover { color:var(--text-primary); }
+        .attachment-chip-spinner { width:11px; height:11px; border-radius:50%; border:2px solid rgba(255,255,255,0.25); border-top-color:var(--text-primary); animation:attachSpin 0.7s linear infinite; flex-shrink:0; }
+        .attachment-chip-error-dot { width:14px; height:14px; border-radius:50%; background:#ef4444; color:#fff; font-size:10px; font-weight:700; display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+        @keyframes attachSpin { to { transform:rotate(360deg); } }
+
+        .message-attachments { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
+        .message-attachment-chip { display:flex; align-items:center; gap:6px; background:rgba(255,255,255,0.08); border-radius:10px; padding:4px 8px 4px 4px; max-width:180px; }
+        .message-attachment-chip img { width:22px; height:22px; object-fit:cover; border-radius:5px; }
+        .message-attachment-icon { width:22px; height:22px; display:flex; align-items:center; justify-content:center; font-size:13px; background:rgba(255,255,255,0.1); border-radius:5px; }
+        .message-attachment-name { font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+        .camera-modal { position:fixed; inset:0; background:rgba(0,0,0,0.92); z-index:90; display:flex; align-items:center; justify-content:center; }
+        .camera-modal[hidden] { display:none; }
+        .camera-modal-inner { position:relative; width:min(560px, 94vw); max-height:88vh; display:flex; flex-direction:column; align-items:center; gap:18px; }
+        .camera-modal-inner video { width:100%; max-height:70vh; border-radius:16px; background:#000; object-fit:cover; transform:scaleX(-1); }
+        .camera-modal-controls { display:flex; align-items:center; justify-content:center; gap:28px; width:100%; }
+        .camera-cancel-btn { background:transparent; border:none; color:#fff; font-size:14px; cursor:pointer; padding:10px; }
+        .camera-capture-btn { width:64px; height:64px; border-radius:50%; background:#fff; border:4px solid rgba(255,255,255,0.35); cursor:pointer; transition:transform 0.15s var(--transition-bezier); }
+        .camera-capture-btn:active { transform:scale(0.92); }
+        .camera-switch-btn { width:42px; height:42px; border-radius:50%; background:rgba(255,255,255,0.12); border:1px solid rgba(255,255,255,0.25); color:#fff; display:flex; align-items:center; justify-content:center; cursor:pointer; }
+        .camera-switch-btn svg { width:18px; height:18px; }
+
+        @media (max-width: 640px) {
+            .attach-menu-panel { position:fixed; left:12px; right:auto; bottom:86px; width:min(240px, 80vw); }
+            .attachment-chip { max-width:150px; }
+        }
+
         /* Floating "jump to latest" button — only shown once the user has scrolled
            up away from the bottom during a response, exactly like ChatGPT. Clicking
            it (or scrolling back down manually) re-engages auto-scroll. */
@@ -848,6 +894,20 @@
     </div>
     <div class="sidebar-backdrop" id="sidebarBackdrop" hidden onclick="toggleSidebar()"></div>
     <div class="mcp-backdrop" id="mcpBackdrop" hidden onclick="toggleMcpPanel(false)"></div>
+
+    <div class="camera-modal" id="cameraModal" hidden>
+        <div class="camera-modal-inner">
+            <video id="cameraVideo" autoplay playsinline muted></video>
+            <canvas id="cameraCanvas" hidden></canvas>
+            <div class="camera-modal-controls">
+                <button type="button" class="camera-cancel-btn" onclick="closeCamera()">Cancel</button>
+                <button type="button" class="camera-capture-btn" onclick="captureCameraPhoto()" title="Capture photo" aria-label="Capture photo"></button>
+                <button type="button" class="camera-switch-btn" onclick="switchCamera()" title="Switch camera" aria-label="Switch camera">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"></path><path d="M1 20v-6h6"></path><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+                </button>
+            </div>
+        </div>
+    </div>
     <section class="mcp-panel" id="mcpPanel" hidden aria-label="MCP integrations">
         <div class="mcp-panel-header"><span class="mcp-panel-title">Integrations</span><button type="button" class="icon-btn" onclick="toggleMcpPanel(false)" title="Close">×</button></div>
         <p class="mcp-panel-kicker">Connect tools to use across Chat and Code. Your enabled integrations are available when you send a message.</p>
@@ -975,9 +1035,26 @@
 
         <div class="input-container">
             <div class="input-box">
+                <div class="attachment-chips" id="attachmentChips" hidden></div>
                 <textarea id="userInput" rows="1" placeholder="Describe your objective..." oninput="autoResize(this)" onkeydown="handleEnter(event)"></textarea>
+                <input type="file" id="fileAttachInput" multiple hidden accept=".pdf,.docx,.txt,.md,.markdown,.rst,.log,.csv,.tsv,.json,.yaml,.yml,.xml,.ini,.cfg,.toml,.py,.js,.jsx,.ts,.tsx,.java,.c,.cpp,.h,.hpp,.cs,.go,.rs,.rb,.php,.swift,.kt,.sql,.sh,.bash,.html,.css,.scss,.vue,.svelte,.png,.jpg,.jpeg,.gif,.webp,.bmp" onchange="handleFileInputChange(event)">
                 <div class="composer-toolbar">
                     <div class="composer-toolbar-left">
+                    <div class="attach-menu" id="attachMenu">
+                        <button type="button" class="attach-btn" id="attachBtn" onclick="toggleAttachMenu(event)" title="Add photos, files, or camera">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                        </button>
+                        <div class="attach-menu-panel" id="attachMenuPanel" hidden>
+                            <button type="button" class="attach-menu-option" onclick="triggerFilePicker()">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
+                                <span>Upload photos &amp; files</span>
+                            </button>
+                            <button type="button" class="attach-menu-option" onclick="openCamera()">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg>
+                                <span>Take photo</span>
+                            </button>
+                        </div>
+                    </div>
                     <div class="model-picker" id="modelPicker">
                         <button type="button" class="model-picker-btn" id="modelPickerBtn" onclick="toggleModelPicker(event)">
                             <img class="model-picker-logo" id="modelPickerLogo" src="logos/kimi.svg" alt="">
