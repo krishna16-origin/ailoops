@@ -553,6 +553,46 @@ def build_web_sources_markdown(links: list, images: list) -> str:
 
 sessions: Dict[str, Dict[str, Any]] = {}
 
+# Strong references for fire-and-forget background upload/indexing tasks.
+#
+# asyncio only holds a *weak* reference to a Task once nothing else refers to
+# it (see the "Important" note under asyncio.create_task in the stdlib docs).
+# The /upload endpoint below never awaits or stores the task it creates for
+# rag_engine.process_upload(...), so without this set the task object can be
+# garbage-collected mid-run under real load — silently killing the embedding
+# job partway through. When that happens the file's status stays "processing"
+# forever, and every subsequent chat turn that touches that session calls
+# rag_engine.wait_for_processing() and blocks for the *entire* timeout before
+# giving up and answering without that file's content. This is almost
+# certainly the root cause behind "RAG replies feel slow" reports that don't
+# reproduce consistently: it only bites after an upload whose indexing task
+# happened to get collected, and then it costs a full timeout on every turn
+# until the session is cleared.
+_background_tasks: "set[asyncio.Task]" = set()
+
+
+def _track_background_task(task: "asyncio.Task", on_error=None) -> "asyncio.Task":
+    """Keep a strong reference to a fire-and-forget task until it finishes,
+    and surface any exception that escaped it instead of letting asyncio's
+    default handler swallow it into an easy-to-miss log line."""
+    _background_tasks.add(task)
+
+    def _done(t: "asyncio.Task") -> None:
+        _background_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            print(f"[background task] {t.get_name()} failed: {exc}")
+            if on_error is not None:
+                try:
+                    on_error(exc)
+                except Exception:
+                    pass
+
+    task.add_done_callback(_done)
+    return task
+
 
 def trim_memory(messages: List[BaseMessage], limit: int = 10) -> List[BaseMessage]:
     """Keep recent messages without an extra summarization call."""
@@ -906,6 +946,39 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
         raise last_exc
 
 
+# rag_engine.wait_for_processing() defaults to a 120s ceiling per call site,
+# which is the right safety net for a genuinely huge upload but is way too
+# long for a chat reply to sit silently if something's slow — nothing was
+# ever streamed to the user while it waited. RAG_WAIT_TIMEOUT caps the block
+# to a much more ChatGPT-like budget, and _await_rag_indexing surfaces a
+# real status event the instant a file is still indexing, instead of the UI
+# looking frozen for however long the wait takes.
+RAG_WAIT_TIMEOUT = 25.0
+
+
+async def _await_rag_indexing(session: dict, attachment_ids: Optional[List[str]], progress=None, emit=None) -> None:
+    """Waits for any still-processing uploads, but (a) tells the caller about
+    it immediately instead of blocking silently, and (b) bounds the wait to
+    RAG_WAIT_TIMEOUT instead of rag_engine's full 120s default. Accepts
+    either the chat-mode `progress` (Queue/list, via publish_progress) or the
+    code-mode `emit` async callback, whichever the caller has on hand."""
+    allowed = set(attachment_ids) if attachment_ids else None
+    pending = [
+        f for f in rag_engine.list_files(session)
+        if f.get("status") == "processing" and (allowed is None or f.get("id") in allowed)
+    ]
+    if pending:
+        names = ", ".join(sorted({f["filename"] for f in pending}))
+        detail = f"Finishing indexing {names} before answering…"
+        if emit is not None:
+            await emit({"type": "activity_start", "action": "rag_wait", "file": names})
+        elif progress is not None:
+            await publish_progress(progress, "rag_wait", "rag_wait", detail)
+    await rag_engine.wait_for_processing(session, attachment_ids, timeout=RAG_WAIT_TIMEOUT)
+    if pending and emit is not None:
+        await emit({"type": "activity_complete", "action": "rag_wait", "file": ", ".join(sorted({f["filename"] for f in pending}))})
+
+
 async def chat_understand_node(request: "ChatRequest", session: dict, progress=None) -> dict:
     history = session["messages"]
     latest = history[-1].content if history else ""
@@ -938,7 +1011,7 @@ async def chat_context_node(state: dict, progress=None) -> dict:
     rag_text = ""
     session = state.get("session") or {}
     if rag_engine.has_files(session):
-        await rag_engine.wait_for_processing(session, state.get("attachment_ids"))
+        await _await_rag_indexing(session, state.get("attachment_ids"), progress)
         rag_text, rag_chunks = await rag_engine.build_context(session, latest, attachment_ids=state.get("attachment_ids"))
         if rag_chunks:
             names = ", ".join(sorted({c["filename"] for c in rag_chunks}))
@@ -1713,7 +1786,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
 
     rag_context_text = ""
     if rag_engine.has_files(session):
-        await rag_engine.wait_for_processing(session, getattr(request, "attachment_ids", None))
+        await _await_rag_indexing(session, getattr(request, "attachment_ids", None), emit=emit)
         rag_context_text, rag_chunks = await rag_engine.build_context(
             session, getattr(request, "message", ""), attachment_ids=getattr(request, "attachment_ids", None),
         )
@@ -2629,10 +2702,21 @@ async def upload_file(session_id: str = Form(...), file: UploadFile = File(...))
     if record["status"] == "processing":
         # Return the preview-ready record immediately. Vision analysis, parsing,
         # chunking, and embeddings continue without blocking the HTTP request.
-        asyncio.create_task(
-            rag_engine.process_upload(
-                file.filename or "upload", data, file.content_type or "", session, record=record
-            )
+        # The task is tracked (see _track_background_task) so it can't be
+        # garbage-collected mid-run and silently strand this file at
+        # "processing" forever — see the comment on _background_tasks above.
+        def _mark_failed(exc: Exception, record=record) -> None:
+            if record.get("status") == "processing":
+                record.update(status="error", error=f"Processing failed unexpectedly: {exc}"[:300])
+
+        _track_background_task(
+            asyncio.create_task(
+                rag_engine.process_upload(
+                    file.filename or "upload", data, file.content_type or "", session, record=record
+                ),
+                name=f"upload:{record['id']}",
+            ),
+            on_error=_mark_failed,
         )
     # `_content` is kept privately in the in-memory session for preview/download;
     # never send raw binary bytes through the JSON upload response.
