@@ -557,6 +557,13 @@
 
         .camera-modal { position:fixed; inset:0; background:rgba(0,0,0,0.92); z-index:90; display:flex; align-items:center; justify-content:center; }
         .camera-modal[hidden] { display:none; }
+        /* Inline full-size preview for an attached/sent image — opens over the
+           current page instead of navigating to a new browser tab. */
+        .image-preview-modal { position:fixed; inset:0; background:rgba(0,0,0,0.92); z-index:95; display:flex; align-items:center; justify-content:center; padding:24px; cursor:zoom-out; }
+        .image-preview-modal[hidden] { display:none; }
+        .image-preview-modal img { max-width:92vw; max-height:88vh; border-radius:12px; object-fit:contain; box-shadow:0 20px 60px rgba(0,0,0,0.5); cursor:default; }
+        .image-preview-close { position:absolute; top:18px; right:22px; width:40px; height:40px; border-radius:50%; border:none; background:rgba(255,255,255,0.12); color:#fff; font-size:22px; line-height:1; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+        .image-preview-close:hover { background:rgba(255,255,255,0.22); }
         .camera-modal-inner { position:relative; width:min(560px, 94vw); max-height:88vh; display:flex; flex-direction:column; align-items:center; gap:18px; }
         .camera-modal-inner video { width:100%; max-height:70vh; border-radius:16px; background:#000; object-fit:cover; transform:scaleX(-1); }
         .camera-modal-controls { display:flex; align-items:center; justify-content:center; gap:28px; width:100%; }
@@ -910,6 +917,10 @@
                 </button>
             </div>
         </div>
+    </div>
+    <div class="image-preview-modal" id="imagePreviewModal" hidden onclick="if(event.target===this) closeImagePreview()">
+        <button type="button" class="image-preview-close" onclick="closeImagePreview()" aria-label="Close preview">&times;</button>
+        <img id="imagePreviewImg" src="" alt="">
     </div>
     <section class="mcp-panel" id="mcpPanel" hidden aria-label="MCP integrations">
         <div class="mcp-panel-header"><span class="mcp-panel-title">Integrations</span><button type="button" class="icon-btn" onclick="toggleMcpPanel(false)" title="Close">×</button></div>
@@ -2621,6 +2632,54 @@
             return record;
         }
 
+        // Photos straight off a phone camera are commonly 3-12MB. Uploading that
+        // full-resolution original is the single biggest cause of an upload
+        // "feeling slow" — most of the wait is just the network transfer, before
+        // the server ever sees the file. Re-encode to a reasonable max dimension
+        // and JPEG quality in-browser first (this is what ChatGPT's web client
+        // does too), so what actually goes over the wire is typically 5-20x
+        // smaller with no visible quality loss for chat/vision purposes.
+        const IMAGE_UPLOAD_MAX_DIM = 1600;
+        const IMAGE_UPLOAD_QUALITY = 0.85;
+        const IMAGE_UPLOAD_SKIP_BYTES = 350 * 1024; // already small enough, don't bother
+
+        function compressImageForUpload(file) {
+            return new Promise((resolve) => {
+                if (!file.type.startsWith('image/') || file.type === 'image/gif' || file.size <= IMAGE_UPLOAD_SKIP_BYTES) {
+                    resolve(file);
+                    return;
+                }
+                const objectUrl = URL.createObjectURL(file);
+                const img = new Image();
+                img.onload = () => {
+                    try {
+                        const scale = Math.min(1, IMAGE_UPLOAD_MAX_DIM / Math.max(img.width, img.height));
+                        const w = Math.max(1, Math.round(img.width * scale));
+                        const h = Math.max(1, Math.round(img.height * scale));
+                        const canvas = document.createElement('canvas');
+                        canvas.width = w;
+                        canvas.height = h;
+                        const ctx = canvas.getContext('2d');
+                        ctx.drawImage(img, 0, 0, w, h);
+                        canvas.toBlob((blob) => {
+                            URL.revokeObjectURL(objectUrl);
+                            if (blob && blob.size < file.size) {
+                                const jpgName = (file.name || 'photo').replace(/\.(png|jpe?g|webp|bmp|tiff?)$/i, '') + '.jpg';
+                                resolve(new File([blob], jpgName, { type: 'image/jpeg' }));
+                            } else {
+                                resolve(file); // compression didn't actually help — send the original
+                            }
+                        }, 'image/jpeg', IMAGE_UPLOAD_QUALITY);
+                    } catch (e) {
+                        URL.revokeObjectURL(objectUrl);
+                        resolve(file);
+                    }
+                };
+                img.onerror = () => { URL.revokeObjectURL(objectUrl); resolve(file); };
+                img.src = objectUrl;
+            });
+        }
+
         async function uploadAttachment(file) {
             const localId = 'local-' + Math.random().toString(36).slice(2);
             const sessionId = modes[currentMode].sessionId;
@@ -2630,15 +2689,19 @@
                 kind: guessKindClient(file),
                 status: 'processing',
                 sessionId,
+                // Shown instantly from the raw file the user picked — this never
+                // waits on the network, so the picture appears the moment it's
+                // selected, exactly like the chip/preview UX in ChatGPT's composer.
                 localPreview: file.type.startsWith('image/') ? URL.createObjectURL(file) : null,
             };
             pendingAttachments.push(record);
             renderAttachmentChip(record);
             record.uploadPromise = (async () => {
               try {
+                const uploadFile = record.kind === 'image' ? await compressImageForUpload(file) : file;
                 const formData = new FormData();
                 formData.append('session_id', sessionId);
-                formData.append('file', file);
+                formData.append('file', uploadFile);
                 const res = await fetch(`${API_BASE}/upload`, { method: 'POST', body: formData });
                 if (!res.ok) throw new Error('Upload request failed');
                 const uploaded = await res.json();
@@ -2807,12 +2870,55 @@
                 const src = att.thumbnail || att.localPreview || att.previewUrl;
                 const href = att.previewUrl || src || '#';
                 const name = escapeHtml(att.filename || 'Attachment');
+                const localIdAttr = att.localId ? ` data-local-id="${escapeHtml(att.localId)}"` : '';
                 if (att.kind === 'image' && src) {
-                    return `<a class="message-attachment-chip image" href="${href}" target="_blank" rel="noopener" title="Open ${name}"><img src="${src}" alt="${name}"></a>`;
+                    // Opens inline in imagePreviewModal (below) instead of a new
+                    // browser tab — href is kept as a real fallback link (e.g. for
+                    // opening in a new tab manually / middle-click / no-JS).
+                    return `<a class="message-attachment-chip image" href="${href}" data-preview-src="${href}" data-preview-name="${name}"${localIdAttr} onclick="return openImagePreview(event, this)"><img src="${src}" alt="${name}"></a>`;
                 }
-                return `<a class="message-attachment-chip" href="${href}" target="_blank" rel="noopener" title="Open ${name}"><span class="message-attachment-icon">${attachmentChipIcon(att.kind)}</span><span class="message-attachment-name">${name}</span></a>`;
+                return `<a class="message-attachment-chip" href="${href}" target="_blank" rel="noopener" title="Open ${name}"${localIdAttr}><span class="message-attachment-icon">${attachmentChipIcon(att.kind)}</span><span class="message-attachment-name">${name}</span></a>`;
             }).join('')}</div>`;
         }
+
+        // Called once an attachment's server-side upload resolves, so the image
+        // already shown in the sent message bubble (rendered instantly from a
+        // local blob preview) gets swapped to the persistent thumbnail/URL
+        // before that local blob is revoked.
+        function updateMessageAttachmentPreview(rec) {
+            if (!rec || !rec.localId) return;
+            const newSrc = rec.thumbnail || rec.previewUrl || rec.localPreview;
+            if (!newSrc) return;
+            document.querySelectorAll(`.message-attachment-chip[data-local-id="${rec.localId}"]`).forEach((el) => {
+                const img = el.querySelector('img');
+                if (img && img.src !== newSrc) img.src = newSrc;
+                const href = rec.previewUrl || newSrc;
+                el.setAttribute('href', href);
+                el.setAttribute('data-preview-src', href);
+            });
+        }
+
+        function openImagePreview(event, anchorEl) {
+            if (event) event.preventDefault();
+            const src = anchorEl.getAttribute('data-preview-src') || anchorEl.getAttribute('href');
+            if (!src || src === '#') return false;
+            const modal = document.getElementById('imagePreviewModal');
+            const img = document.getElementById('imagePreviewImg');
+            img.src = src;
+            img.alt = anchorEl.getAttribute('data-preview-name') || '';
+            modal.hidden = false;
+            return false;
+        }
+
+        function closeImagePreview() {
+            const modal = document.getElementById('imagePreviewModal');
+            modal.hidden = true;
+            document.getElementById('imagePreviewImg').src = '';
+        }
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') closeImagePreview();
+        });
 
         function appendMessage(role, text, attachments = []) {
             modes[currentMode].hasMessages = true;
@@ -2983,11 +3089,6 @@
             if (isWaitingForResponse) return;
             const stagedAttachments = pendingAttachments.slice();
             if (!text && !stagedAttachments.length) return;
-            if (stagedAttachments.length) {
-                await Promise.all(stagedAttachments.map(a => a.uploadPromise).filter(Boolean));
-            }
-            const sentAttachments = stagedAttachments.filter(a => a.id && a.status !== 'error');
-            if (!text && !sentAttachments.length) return;
 
             const mode = currentMode;
             // Capture the Code hero circle position BEFORE appendMessage hides the
@@ -2996,12 +3097,50 @@
             if (mode === 'code' && isCodeHeroVisible()) {
                 try { codeHeroRect = codeHeroAvatar.getBoundingClientRect(); } catch (e) { codeHeroRect = null; }
             }
-            appendMessage('user', text, sentAttachments);
+
+            // Render the user's message — photos included — the instant Send is
+            // pressed, using each attachment's local in-browser preview. The
+            // network upload keeps running in the background; we only wait on it
+            // further down, right before the one request that actually needs the
+            // server-side file id (/chat or /code-chat). This is what makes
+            // sending feel instant instead of stalling while a photo uploads.
+            appendMessage('user', text, stagedAttachments);
             userInput.value = '';
             autoResize(userInput);
             sendBtn.disabled = true;
             isWaitingForResponse = true;
             if (mode === 'code') liveMonitorBeginTurn(text);
+
+            // Files/photos stay attached to the session for retrieval on every
+            // later turn too (see backend /upload), so the composer just needs to
+            // clear its own staged chips now that they've been folded into this
+            // message — no need to wait for the upload to finish first.
+            if (stagedAttachments.length) {
+                pendingAttachments = [];
+                const chips = document.getElementById('attachmentChips');
+                chips.innerHTML = '';
+                chips.hidden = true;
+            }
+
+            if (stagedAttachments.length) {
+                await Promise.all(stagedAttachments.map(a => a.uploadPromise).filter(Boolean));
+                // Swap each just-sent image over to its persistent server
+                // thumbnail/URL before its temporary local blob preview is freed.
+                stagedAttachments.forEach(a => {
+                    if (a.kind === 'image') updateMessageAttachmentPreview(a);
+                    if (a.localPreview) {
+                        try { URL.revokeObjectURL(a.localPreview); } catch (e) { /* best effort */ }
+                    }
+                });
+            }
+            const sentAttachments = stagedAttachments.filter(a => a.id && a.status !== 'error');
+            if (!text && !sentAttachments.length) {
+                // Every attachment failed to upload and there was no text — the
+                // message bubble already shown makes that visible; nothing to send.
+                sendBtn.disabled = false;
+                isWaitingForResponse = false;
+                return;
+            }
 
             let apiUrl, payload, useStream;
 
