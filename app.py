@@ -1971,7 +1971,20 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 "run_tests": command or "run_tests (auto-detect runner)",
                 "list_dir": f"find {path or '.'}",
             }.get(action, command)  # run_command / start_server just show the literal command
-            activities.append({"kind": "command", "text": display_text})
+            # Keep a live reference to this activity dict so the REAL output/exit
+            # code (once the sandbox actually returns them below) get written back
+            # into the SAME object that ends up in the persisted `activities` list
+            # sent to the frontend. Without this, the chat history only ever shows
+            # the command line — the real stdout/stderr/exit code existed only as
+            # an ephemeral SSE frame that's lost unless the Live Monitor panel
+            # happened to be open to catch it.
+            activity_entry = {
+                "kind": "command",
+                "text": display_text,
+                "action": action,
+                "is_test": action == "run_tests",
+            }
+            activities.append(activity_entry)
             await emit({"type": "activity_start", "action": action, "file": path, "command": display_text})
 
             async def _on_output(stream: str, text: str, _action=action):
@@ -2022,8 +2035,10 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 if action == "run_command":
                     exit_code, output = await sandbox_manager.run_command(session_id, command, on_output=_on_output)
                     tail = output[-4000:] if len(output) > 4000 else output
+                    activity_entry["output"] = tail
+                    activity_entry["exit_code"] = exit_code
                     pulled = await _pull_sandbox_changes()
-                    await emit({"type": "activity_complete", "action": action, "file": path, "exit_code": exit_code})
+                    await emit({"type": "activity_complete", "action": action, "file": path, "exit_code": exit_code, "output": tail})
                     pulled_note = (
                         f"\n{len(pulled)} project file(s) were created/updated on disk and are now available "
                         f"via read_file: {', '.join(pulled[:20])}" + (" …" if len(pulled) > 20 else "")
@@ -2038,8 +2053,10 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                         session_id, command, dest_path=path, on_output=_on_output
                     )
                     tail = output[-4000:] if len(output) > 4000 else output
+                    activity_entry["output"] = tail
+                    activity_entry["exit_code"] = exit_code
                     pulled = await _pull_sandbox_changes()
-                    await emit({"type": "activity_complete", "action": action, "file": dest, "exit_code": exit_code})
+                    await emit({"type": "activity_complete", "action": action, "file": dest, "exit_code": exit_code, "output": tail})
                     pulled_note = (
                         f"\n{len(pulled)} project file(s) were created/updated on disk and are now available "
                         f"via read_file: {', '.join(pulled[:20])}" + (" …" if len(pulled) > 20 else "")
@@ -2055,8 +2072,10 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                         session_id, path, dest_dir=(command or None), on_output=_on_output
                     )
                     tail = output[-4000:] if len(output) > 4000 else output
+                    activity_entry["output"] = tail
+                    activity_entry["exit_code"] = exit_code
                     pulled = await _pull_sandbox_changes()
-                    await emit({"type": "activity_complete", "action": action, "file": dest_dir, "exit_code": exit_code})
+                    await emit({"type": "activity_complete", "action": action, "file": dest_dir, "exit_code": exit_code, "output": tail})
                     pulled_note = (
                         f"\n{len(pulled)} project file(s) were created/updated on disk and are now available "
                         f"via read_file: {', '.join(pulled[:20])}" + (" …" if len(pulled) > 20 else "")
@@ -2072,8 +2091,12 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                         session_id, command=(command or None), on_output=_on_output
                     )
                     tail = output[-6000:] if len(output) > 6000 else output
+                    activity_entry["output"] = tail
+                    activity_entry["exit_code"] = exit_code
+                    activity_entry["passed"] = (exit_code == 0)
                     pulled = await _pull_sandbox_changes()
-                    await emit({"type": "activity_complete", "action": action, "exit_code": exit_code})
+                    await emit({"type": "activity_complete", "action": action, "exit_code": exit_code,
+                                "output": tail, "passed": exit_code == 0})
                     status = "passed" if exit_code == 0 else f"FAILED (exit code {exit_code})"
                     pulled_note = (
                         f"\n{len(pulled)} project file(s) changed on disk and are now available via "
@@ -2086,7 +2109,9 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 elif action == "list_dir":
                     exit_code, output = await sandbox_manager.list_dir(session_id, path=path or ".")
                     tail = output[-6000:] if len(output) > 6000 else output
-                    await emit({"type": "activity_complete", "action": action, "exit_code": exit_code})
+                    activity_entry["output"] = tail
+                    activity_entry["exit_code"] = exit_code
+                    await emit({"type": "activity_complete", "action": action, "exit_code": exit_code, "output": tail})
                     transcript.append(AIMessage(content=raw))
                     transcript.append(HumanMessage(content=(
                         f"TOOL RESULT: contents of {path or '.'} (may be truncated):\n```\n{tail or '(empty)'}\n```"
@@ -2103,19 +2128,25 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                         transcript.append(HumanMessage(content=f"TOOL RESULT: {msg}"))
                         continue
                     url = await sandbox_manager.start_server(session_id, command, port, on_output=_on_output)
+                    activity_entry["output"] = f"listening on port {port}"
+                    activity_entry["url"] = url
                     await _pull_sandbox_changes()
-                    await emit({"type": "activity_complete", "action": action, "file": path})
+                    await emit({"type": "activity_complete", "action": action, "file": path, "url": url})
                     await emit({"type": "sandbox_ready", "url": url, "port": port})
                     transcript.append(AIMessage(content=raw))
                     transcript.append(HumanMessage(content=(
                         f"TOOL RESULT: live server started on port {port}, publicly reachable at {url}."
                     )))
             except sandbox_manager.SandboxNotConfigured as exc:
+                activity_entry["error"] = str(exc)
+                activity_entry["exit_code"] = None
                 await emit({"type": "activity_error", "action": action, "message": str(exc)})
                 transcript.append(AIMessage(content=raw))
                 transcript.append(HumanMessage(content=f"TOOL RESULT: {exc}"))
             except Exception as exc:
                 err_text = str(exc)[:800]
+                activity_entry["error"] = err_text
+                activity_entry["exit_code"] = None
                 await emit({"type": "activity_error", "action": action, "message": err_text})
                 transcript.append(AIMessage(content=raw))
                 transcript.append(HumanMessage(content=f"TOOL RESULT: sandbox error: {err_text}"))
