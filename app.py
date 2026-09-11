@@ -616,7 +616,7 @@ def build_messages(history: List[BaseMessage], thinking_level: str, search_text:
     depth = THINKING_DEPTH_INSTRUCTIONS[level_key]
     curr_dt = get_current_datetime_str()
     system_text = (
-        build_constitution_block() + "\n\n"
+        build_constitution_block("chat") + "\n\n"
         "You are a sharp, genuinely helpful assistant with real step-by-step reasoning ability.\n"
         f"Before answering, think inside a single <think>...</think> block. {depth}\n"
         "Write that block as your own natural reasoning as you work through the problem — not a "
@@ -1195,11 +1195,12 @@ def _matching_skill_blocks(text: str) -> str:
 _PLAN_STEPS_DELIMITER = "===STEPS==="
 
 
-def build_plan_messages(history: List[BaseMessage], file_store: Dict[str, str], reasoning_level: str) -> List[BaseMessage]:
+def build_plan_messages(history: List[BaseMessage], file_store: Dict[str, str], reasoning_level: str, repo_context: str = "") -> List[BaseMessage]:
     latest_text = history[-1].content if history else ""
     skill_block = _matching_skill_blocks(latest_text)
+    repo_block = f"\n\nFETCHED REPOSITORY PREVIEW (read-only, Plan mode only):\n{repo_context}" if repo_context else ""
     system_text = (
-        build_constitution_block() + skill_block + "\n\n"
+        build_constitution_block("plan") + skill_block + "\n\n"
         "You are the planning stage of an autonomous coding agent. You do not write code here — only a plan.\n"
         "Write a SHORT, well-structured, skimmable plan in Markdown, in the voice of a product-minded engineer "
         "explaining their approach to the user — not a dry checklist. Model the plan on this shape (adapt the "
@@ -1228,6 +1229,7 @@ def build_plan_messages(history: List[BaseMessage], file_store: Dict[str, str], 
         + _security_block() + "\n"
         f"Current date and time: {get_current_datetime_str()}\n\n"
         f"EXISTING PROJECT FILES:\n{_file_listing(file_store)}"
+        f"{repo_block}"
     )
     messages: List[BaseMessage] = [SystemMessage(content=system_text)]
     messages.extend(trim_memory(history, limit=6))
@@ -1271,6 +1273,37 @@ def _demo_plan_display_text(latest_text: str) -> str:
     )
 
 
+_PLAN_REPO_PREVIEW_CHAR_LIMIT = 4000
+
+
+async def _maybe_fetch_plan_repo_context(session_id: Optional[str], latest_text: str, emit) -> str:
+    """Plan mode's one sandbox action: if the user's message points at a
+    GitHub repo and the live sandbox is configured, shallow-clone it
+    read-only and return a short file-tree + README summary for the
+    planning prompt. Returns "" whenever there's no repo URL, no sandbox, or
+    the fetch fails for any reason — Plan mode always falls back to planning
+    from the conversation alone rather than blocking on this."""
+    if not session_id:
+        return ""
+    repo_url = sandbox_manager.find_github_repo_url(latest_text)
+    if not repo_url or not sandbox_manager.sandbox_configured():
+        return ""
+    await emit({"type": "activity_start", "action": "fetch_repo", "file": repo_url})
+    try:
+        exit_code, output = await sandbox_manager.fetch_github_repo_preview(session_id, repo_url)
+    except sandbox_manager.SandboxNotConfigured:
+        await emit({"type": "activity_error", "action": "fetch_repo", "message": "Sandbox not configured."})
+        return ""
+    except Exception as exc:
+        await emit({"type": "activity_error", "action": "fetch_repo", "message": str(exc)[:300]})
+        return ""
+    if exit_code != 0:
+        await emit({"type": "activity_error", "action": "fetch_repo", "message": (output or "clone failed")[:300]})
+        return ""
+    await emit({"type": "activity_complete", "action": "fetch_repo", "file": repo_url, "exit_code": exit_code})
+    return (output or "").strip()[:_PLAN_REPO_PREVIEW_CHAR_LIMIT]
+
+
 def split_plan_output(raw_text: str) -> Tuple[str, List[str]]:
     """Split the planner's raw output into (display_markdown, execution_steps).
 
@@ -1302,7 +1335,7 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
     plan_block = "\n".join(f"{i+1}. {s}" for i, s in enumerate(plan_steps)) if plan_steps else "(no plan steps given)"
     skill_block = _matching_skill_blocks(latest_user_text)
     return (
-        build_constitution_block() + skill_block + "\n\n"
+        build_constitution_block(workflow_mode) + skill_block + "\n\n"
         "You are an autonomous coding agent working in a loop, one tool call per turn. Beyond the files "
         + ("below, you also have a real, live cloud sandbox with shell access — run_command, download_file, "
            "extract_archive, run_tests, list_dir, and start_server — plus web_search for live information. "
@@ -1634,7 +1667,9 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             ]
             display_text = _demo_plan_display_text(latest_text)
         else:
-            plan_messages = build_plan_messages(history, file_store, request.reasoning_level)
+            session_id = getattr(request, "session_id", None)
+            repo_context = await _maybe_fetch_plan_repo_context(session_id, latest_text, emit)
+            plan_messages = build_plan_messages(history, file_store, request.reasoning_level, repo_context)
             if _is_deepseek_model(model_name):
                 llm = get_code_llm(model_key, 0.2, _model_thinking_budget(model_name, request.reasoning_level, config["max_tokens"]))
                 plan_text = await invoke_model(
