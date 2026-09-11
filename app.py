@@ -938,6 +938,7 @@ async def chat_context_node(state: dict, progress=None) -> dict:
     rag_text = ""
     session = state.get("session") or {}
     if rag_engine.has_files(session):
+        await rag_engine.wait_for_processing(session, state.get("attachment_ids"))
         rag_text, rag_chunks = await rag_engine.build_context(session, latest, attachment_ids=state.get("attachment_ids"))
         if rag_chunks:
             names = ", ".join(sorted({c["filename"] for c in rag_chunks}))
@@ -1712,6 +1713,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
 
     rag_context_text = ""
     if rag_engine.has_files(session):
+        await rag_engine.wait_for_processing(session, getattr(request, "attachment_ids", None))
         rag_context_text, rag_chunks = await rag_engine.build_context(
             session, getattr(request, "message", ""), attachment_ids=getattr(request, "attachment_ids", None),
         )

@@ -2650,7 +2650,9 @@
                         : null,
                 });
                 updateAttachmentChip(localId, record);
-                if (record.status === 'processing') await waitForAttachmentReady(record, sessionId);
+                // The upload is complete once the server accepts the bytes. RAG
+                // indexing continues in the background and the response handler
+                // waits for it only when retrieval is actually needed.
               } catch (err) {
                 Object.assign(record, { status: 'error', error: 'Upload failed — check your connection.' });
                 updateAttachmentChip(localId, record);
@@ -2984,7 +2986,7 @@
             if (stagedAttachments.length) {
                 await Promise.all(stagedAttachments.map(a => a.uploadPromise).filter(Boolean));
             }
-            const sentAttachments = stagedAttachments.filter(a => a.status === 'ready' && a.id);
+            const sentAttachments = stagedAttachments.filter(a => a.id && a.status !== 'error');
             if (!text && !sentAttachments.length) return;
 
             const mode = currentMode;

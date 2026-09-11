@@ -427,12 +427,24 @@ def list_files(session: dict) -> List[dict]:
 def get_file_content(session: dict, file_id: str) -> Optional[Tuple[bytes, str, str]]:
     """Return raw attachment bytes plus metadata for a session-scoped preview."""
     record = (session.get("rag_files") or {}).get(file_id)
-    if not record or record.get("status") != "ready":
+    if not record or record.get("status") == "error":
         return None
     data = record.get("_content")
     if not isinstance(data, (bytes, bytearray)):
         return None
     return bytes(data), record.get("content_type") or "application/octet-stream", record.get("filename") or "download"
+
+
+async def wait_for_processing(session: dict, attachment_ids: Optional[List[str]] = None, timeout: float = 120.0) -> None:
+    """Wait for background indexing only when a response actually needs RAG."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    allowed = set(attachment_ids or [])
+    while asyncio.get_running_loop().time() < deadline:
+        files = session.get("rag_files") or {}
+        records = [rec for rec in files.values() if not allowed or rec.get("id") in allowed]
+        if not any(rec.get("status") == "processing" for rec in records):
+            return
+        await asyncio.sleep(0.1)
 
 
 def remove_file(session: dict, file_id: str) -> bool:
