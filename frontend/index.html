@@ -227,6 +227,27 @@
         .response-workflow-plain { color:var(--text-secondary); }
         .response-workflow-plain code { font:12px 'Courier New', Courier, monospace; background:var(--bg-hover); border:1px solid var(--border-color); border-radius:4px; padding:1px 5px; color:var(--text-primary); }
         .response-workflow-command-text { color:#d2a8ff; font:12.5px 'Courier New', Courier, monospace; }
+
+        /* Manus-style plan checklist: the 2-6 high-level steps for this turn,
+           shown once up front and ticked off live as the agent works through
+           them (see step_progress SSE events) — distinct from the granular
+           file/command activity log below it (.response-workflow). */
+        .plan-checklist { margin:2px 0 14px; }
+        .plan-checklist[hidden] { display:none; }
+        .plan-checklist-list { display:flex; flex-direction:column; gap:7px; }
+        .plan-checklist-item { display:flex; align-items:flex-start; gap:9px; font:13px/1.5 'Inter',sans-serif; color:var(--text-secondary); }
+        .plan-checklist-box { width:16px; height:16px; margin-top:1px; border-radius:5px; border:1.5px solid var(--border-color); flex-shrink:0; display:flex; align-items:center; justify-content:center; box-sizing:border-box; transition:background 0.2s ease, border-color 0.2s ease; }
+        .plan-checklist-box svg { width:10px; height:10px; color:#fff; }
+        .plan-checklist-item.is-done .plan-checklist-box { background:var(--accent); border-color:var(--accent); }
+        .plan-checklist-item.is-done .plan-checklist-text { color:var(--text-secondary); text-decoration:line-through; text-decoration-color:rgba(255,255,255,0.25); }
+        .plan-checklist-item.is-active .plan-checklist-box { border-color:var(--accent); }
+        .plan-checklist-item.is-active .plan-checklist-box svg { color:var(--accent); animation:planCheckSpin 0.8s linear infinite; transform-origin:center; }
+        .plan-checklist-item.is-active .plan-checklist-text { color:var(--text-primary); font-weight:500; }
+        @keyframes planCheckSpin { to { transform:rotate(360deg); } }
+        .plan-checklist-text { min-width:0; }
+        .plan-checklist-run-btn { margin-top:10px; background:var(--accent); color:#08110a; border:none; padding:7px 14px; border-radius:999px; font-size:12.5px; font-weight:600; cursor:pointer; transition:opacity 0.15s ease; }
+        .plan-checklist-run-btn:hover:not(:disabled) { opacity:0.88; }
+        .plan-checklist-run-btn:disabled { opacity:0.55; cursor:default; }
         .code-mode-message .message-prose,
         .code-mode-message .message-prose p { font-weight:600; color:var(--text-primary); }
 
@@ -1828,22 +1849,25 @@
         // with it — this never replaces that handling, only mirrors it here.
         function handleLiveMonitorEvent(parsed) {
             if (!parsed || !parsed.type) return;
+            // This panel is "the computer" — a real terminal, not a narration
+            // feed. Only genuine shell commands (run_command/start_server) and
+            // sandbox lifecycle events get a row here; thoughts, plan bullets,
+            // generic status chatter, and file-edit bookkeeping already have a
+            // home in the main chat's own workflow feed / plan checklist, so
+            // they're intentionally NOT mirrored into this panel too.
+            const isCommandAction = parsed.action === 'run_command' || parsed.action === 'start_server';
             switch (parsed.type) {
-                case 'status': {
-                    if (parsed.detail || parsed.label) liveMonitorAddRow('status', parsed.detail || parsed.label);
-                    break;
-                }
                 case 'activity_start': {
+                    if (!isCommandAction) break;
                     const kind = liveActionIconKind(parsed.action);
                     const row = liveMonitorAddRow(kind, liveActionLabel(parsed.action, parsed.file, false), { spinner: true });
                     liveMonitorActions.set(liveActionKey(parsed), { row, action: parsed.action, file: parsed.file });
                     if (liveMonitorStatusEl) liveMonitorStatusEl.textContent = LIVE_STATUS_PHRASES[kind] || 'Working…';
-                    if ((parsed.action === 'run_command' || parsed.action === 'start_server') && parsed.command) {
-                        liveMonitorSetPrompt(row, parsed.command);
-                    }
+                    if (parsed.command) liveMonitorSetPrompt(row, parsed.command);
                     break;
                 }
                 case 'activity_complete': {
+                    if (!isCommandAction) break;
                     const key = liveActionKey(parsed);
                     const entry = liveMonitorActions.get(key);
                     const label = liveActionLabel(parsed.action, parsed.file, true);
@@ -1859,6 +1883,7 @@
                     break;
                 }
                 case 'activity_error': {
+                    if (!isCommandAction) break;
                     const key = liveActionKey(parsed);
                     const entry = liveMonitorActions.get(key);
                     const message = parsed.message || `Couldn't finish that step.`;
@@ -1867,18 +1892,6 @@
                         liveMonitorActions.delete(key);
                     } else {
                         liveMonitorAddRow('error', message, { error: true });
-                    }
-                    break;
-                }
-                case 'file_created':
-                case 'file_edited': {
-                    for (const entry of liveMonitorActions.values()) {
-                        if (entry.file === parsed.file && (entry.action === 'edit' || entry.action === 'create')) {
-                            const bits = [];
-                            if (parsed.additions) bits.push(`+${parsed.additions}`);
-                            if (parsed.deletions) bits.push(`-${parsed.deletions}`);
-                            if (bits.length) liveMonitorSetDetail(entry.row, bits.join(' '));
-                        }
                     }
                     break;
                 }
@@ -1912,21 +1925,15 @@
                     if (parsed.message) liveMonitorAddRow('server', parsed.message);
                     break;
                 }
-                case 'plan_created': {
-                    if (Array.isArray(parsed.steps) && parsed.steps.length) {
-                        liveMonitorAddRow('plan', `Planned ${parsed.steps.length} step${parsed.steps.length === 1 ? '' : 's'}`);
-                        parsed.steps.forEach((step) => liveMonitorAddRow('plan', step));
+                case 'step_progress': {
+                    // Header status line only ("Live — step 2 of 4…") — not a row.
+                    // The actual checklist lives in the main chat (see
+                    // renderPlanChecklist/setPlanChecklistProgress).
+                    if (liveMonitorStatusEl && typeof parsed.index === 'number' && typeof parsed.total === 'number' && parsed.total > 0) {
+                        liveMonitorStatusEl.textContent = parsed.index >= parsed.total
+                            ? 'Live — wrapping up…'
+                            : `Live — step ${parsed.index + 1} of ${parsed.total}…`;
                     }
-                    break;
-                }
-                case 'agent_message': {
-                    if (parsed.text) liveMonitorAddRow('note', parsed.text);
-                    break;
-                }
-                case 'RETRY':
-                case 'ERROR': {
-                    const msg = parsed.message || parsed.reason || (parsed.type === 'ERROR' ? 'Something went wrong.' : 'Retrying…');
-                    liveMonitorAddRow(parsed.type === 'ERROR' ? 'error' : 'status', msg, { error: parsed.type === 'ERROR' });
                     break;
                 }
                 default:
@@ -1948,7 +1955,7 @@
             const empty = document.createElement('div');
             empty.className = 'live-monitor-empty';
             empty.id = 'liveMonitorEmpty';
-            empty.textContent = message || 'Nothing yet. Send a message in Code mode and the agent\'s actions — file edits, commands, sandbox status — will stream in here as they happen.';
+            empty.textContent = message || 'Nothing yet. Once the agent runs a real shell command — installing something, downloading a file, running tests — it\'ll stream in here live, like a real terminal.';
             liveMonitorFeed.appendChild(empty);
             if (liveMonitorJumpBtn) liveMonitorFeed.appendChild(liveMonitorJumpBtn);
         }
@@ -2397,6 +2404,13 @@
                 if (currentMode === 'code') {
                     contentDiv.classList.add('code-mode-message');
 
+                    const planChecklist = document.createElement('section');
+                    planChecklist.className = 'plan-checklist';
+                    planChecklist.hidden = true;
+                    planChecklist.setAttribute('aria-live', 'polite');
+                    planChecklist.innerHTML = `<div class="plan-checklist-list"></div>`;
+                    contentDiv.appendChild(planChecklist);
+
                     const workflow = document.createElement('section');
                     workflow.className = 'response-workflow';
                     workflow.hidden = true;
@@ -2550,6 +2564,7 @@
                     // No temperature — Code Mode intentionally omits it; backend applies its own default.
                 };
             }
+            const workflowSubmode = mode === 'code' ? payload.mode : null;
 
             const assistantBubble = appendMessage('assistant', '');
             const textContainer = assistantBubble.querySelector('.message-text');
@@ -2765,6 +2780,7 @@
                     scrollToBottom();
                 });
             }
+            const planChecklistEl = mode === 'code' ? assistantBubble.querySelector('.plan-checklist') : null;
             const workflowEl = mode === 'code' ? assistantBubble.querySelector('.response-workflow') : null;
             const fileCardsEl = mode === 'code' ? assistantBubble.querySelector('.response-file-cards') : null;
             const canvasEl = mode === 'code' ? assistantBubble.querySelector('.response-canvas') : null;
@@ -2806,6 +2822,58 @@
             }
             function inlineBackticks(str) {
                 return escapeHtml(str).replace(/`([^`]+)`/g, '<code>$1</code>');
+            }
+
+            const PLAN_CHECK_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5l3 3 7-7"/></svg>';
+            const PLAN_SPIN_ICON = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 2a6 6 0 1 1-6 6"/></svg>';
+
+            // Manus-style checklist: built once per turn from plan_created's
+            // `steps`, then ticked live by step_progress events as the agent
+            // works through them. Separate from the granular file/command log
+            // (createWorkflowRow below) so the two never fight over the same rows.
+            function renderPlanChecklist(steps) {
+                if (!planChecklistEl || !Array.isArray(steps) || !steps.length) return;
+                const listEl = planChecklistEl.querySelector('.plan-checklist-list');
+                if (!listEl || listEl.dataset.built) return; // build once, even if plan_created ever fires twice
+                listEl.dataset.built = '1';
+                steps.forEach((stepText, i) => {
+                    const item = document.createElement('div');
+                    item.className = 'plan-checklist-item';
+                    item.dataset.index = String(i);
+                    const box = document.createElement('span');
+                    box.className = 'plan-checklist-box';
+                    const text = document.createElement('span');
+                    text.className = 'plan-checklist-text';
+                    text.textContent = stepText;
+                    item.appendChild(box);
+                    item.appendChild(text);
+                    listEl.appendChild(item);
+                });
+                planChecklistEl.hidden = false;
+            }
+
+            // index === total means "all steps done" (final wrap-up), otherwise
+            // everything before `index` is done, `index` itself is in-progress,
+            // and everything after is still pending — a monotonic, live-advancing
+            // read exactly like Manus's own checkbox list.
+            function setPlanChecklistProgress(index, total) {
+                if (!planChecklistEl) return;
+                const items = planChecklistEl.querySelectorAll('.plan-checklist-item');
+                if (!items.length) return;
+                items.forEach((item) => {
+                    const idx = Number(item.dataset.index);
+                    const box = item.querySelector('.plan-checklist-box');
+                    item.classList.remove('is-done', 'is-active');
+                    if (idx < index || index >= total) {
+                        item.classList.add('is-done');
+                        box.innerHTML = PLAN_CHECK_ICON;
+                    } else if (idx === index) {
+                        item.classList.add('is-active');
+                        box.innerHTML = PLAN_SPIN_ICON;
+                    } else {
+                        box.innerHTML = '';
+                    }
+                });
             }
 
             // Shared row builder — used both by the final, authoritative
@@ -3388,16 +3456,13 @@
                                         scrollToBottom();
                                     }
                                 } else if (parsed.type === 'plan_created' && mode === 'code') {
-                                    // Claude-like plan: show steps early in the activity feed before edits stream
-                                    if (workflowEl && Array.isArray(parsed.steps) && parsed.steps.length) {
-                                        workflowEl.hidden = false;
-                                        const listEl = workflowEl.querySelector('.response-workflow-list');
-                                        parsed.steps.forEach((stepText) => {
-                                            const row = createWorkflowRow({ kind: 'plan', text: stepText });
-                                            listEl.appendChild(row);
-                                        });
-                                        scrollToBottom();
-                                    }
+                                    // Manus-like: the plan appears up front as a checklist, ticked off
+                                    // live as step_progress events arrive (see below) — not just a flat
+                                    // one-time log entry.
+                                    renderPlanChecklist(parsed.steps);
+                                    scrollToBottom();
+                                } else if (parsed.type === 'step_progress' && mode === 'code') {
+                                    setPlanChecklistProgress(parsed.index, parsed.total);
                                 } else if (parsed.type === 'RETRY' || parsed.type === 'ERROR') {
                                     addThought(parsed.type === 'ERROR' ? 'Code generation error' : 'Retrying', parsed.message || parsed.reason || '', parsed.type.toLowerCase());
                                 } else if (parsed.type === 'code_start') {
@@ -3549,6 +3614,8 @@
                                     }
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
+                                } else if (parsed.type === 'step_progress' && mode === 'code') {
+                                    setPlanChecklistProgress(parsed.index, parsed.total);
                                 } else if ((parsed.type === 'terminal_output' || parsed.type === 'sandbox_ready') && mode === 'code') {
                                     handleSandboxEvent(parsed);
                                 } else if (parsed.assistant_message) {
@@ -3593,6 +3660,26 @@
                 }
 
                 finishThinking(); // no-op if already collapsed when the answer started
+
+                // Plan mode is intentionally a dry run (no files touched, no sandbox
+                // commands run) — surface a direct way to actually execute it, so
+                // the person isn't left staring at an "Idle" computer panel and a
+                // plan that never runs, having to notice and flip the Plan/Build
+                // picker themselves.
+                if (mode === 'code' && workflowSubmode === 'plan' && planChecklistEl && !planChecklistEl.hidden && !planChecklistEl.querySelector('.plan-checklist-run-btn')) {
+                    const runBtn = document.createElement('button');
+                    runBtn.type = 'button';
+                    runBtn.className = 'plan-checklist-run-btn';
+                    runBtn.textContent = 'Build this now →';
+                    runBtn.addEventListener('click', () => {
+                        runBtn.disabled = true;
+                        runBtn.textContent = 'Building…';
+                        selectWorkflowMode('build');
+                        userInput.value = 'Build the plan above.';
+                        sendMessage();
+                    });
+                    planChecklistEl.appendChild(runBtn);
+                }
 
             } catch (error) {
                 console.error('Error:', error);
