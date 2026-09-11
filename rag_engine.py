@@ -200,11 +200,22 @@ def _downscale_image(data: bytes, max_dim: int = VISION_IMAGE_MAX_DIM, quality: 
         return data
     try:
         img = Image.open(io.BytesIO(data))
+        w, h = img.size
+        # For large JPEGs, ask libjpeg to decode straight to (roughly) the target
+        # size instead of decoding at full resolution and resizing afterwards.
+        # This is a large, well-known speedup (often several times faster) for
+        # multi-megapixel phone photos and is why a single upload could feel
+        # slow before: we were fully decoding the original photo twice (once
+        # for the small UI thumbnail, once again later for the vision model).
+        try:
+            img.draft("RGB", (max_dim, max_dim))
+        except Exception:
+            pass
         img = img.convert("RGB")
         w, h = img.size
         scale = min(1.0, max_dim / max(w, h)) if max(w, h) else 1.0
         if scale < 1.0:
-            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BILINEAR)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality)
         return buf.getvalue()
