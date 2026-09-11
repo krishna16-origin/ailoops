@@ -1,0 +1,278 @@
+diff --git a/app.py b/app.py
+index b16a11d..9e0a748 100644
+--- a/app.py
++++ b/app.py
+@@ -19,7 +19,7 @@ warnings.filterwarnings(
+ )
+ 
+ from dotenv import load_dotenv
+-from fastapi import FastAPI
++from fastapi import FastAPI, Header
+ from fastapi.middleware.cors import CORSMiddleware
+ from fastapi.responses import StreamingResponse, FileResponse
+ from fastapi.staticfiles import StaticFiles
+@@ -2491,38 +2491,55 @@ async def health():
+     return {"status": "ok"}
+ 
+ 
++def _mcp_scope(x_client_id: Optional[str]) -> str:
++    """Resolve which browser/device is making an MCP settings request.
++
++    All MCP server state (enabled/disabled toggles, custom registered servers)
++    used to live in one flat, process-wide dict with no notion of "whose"
++    setting it was — so toggling Wikipedia off in one browser silently toggled
++    it off for every other open browser/device hitting the same backend.
++    The frontend now sends a per-device id (generated once, persisted in
++    localStorage) as the `x-client-id` header on every /mcp/servers* call; we
++    fall back to a shared "default" scope only for old clients / direct API
++    calls that don't send it, so behavior stays backward compatible.
++    """
++    return (x_client_id or "").strip() or mcp_gateway._DEFAULT_SCOPE
++
++
+ @app.get("/mcp/servers")
+-async def mcp_servers():
++async def mcp_servers(x_client_id: Optional[str] = Header(default=None)):
+     """Return built-in and user-configured MCPs with secrets excluded."""
+-    return {"servers": mcp_gateway.list_servers()}
++    return {"servers": mcp_gateway.list_servers(_mcp_scope(x_client_id))}
+ 
+ 
+ @app.post("/mcp/servers")
+-async def mcp_register_server(payload: dict):
+-    return {"server": mcp_gateway.register_server(payload)}
++async def mcp_register_server(payload: dict, x_client_id: Optional[str] = Header(default=None)):
++    return {"server": mcp_gateway.register_server(payload, _mcp_scope(x_client_id))}
+ 
+ 
+ @app.patch("/mcp/servers/{server_id}")
+-async def mcp_update_server(server_id: str, payload: dict):
+-    return {"server": mcp_gateway.update_server(server_id, payload)}
++async def mcp_update_server(server_id: str, payload: dict, x_client_id: Optional[str] = Header(default=None)):
++    return {"server": mcp_gateway.update_server(server_id, payload, _mcp_scope(x_client_id))}
+ 
+ 
+ @app.delete("/mcp/servers/{server_id}")
+-async def mcp_delete_server(server_id: str):
+-    return {"deleted": mcp_gateway.delete_server(server_id)}
++async def mcp_delete_server(server_id: str, x_client_id: Optional[str] = Header(default=None)):
++    return {"deleted": mcp_gateway.delete_server(server_id, _mcp_scope(x_client_id))}
+ 
+ 
+ @app.get("/mcp/servers/{server_id}/tools")
+-async def mcp_server_tools(server_id: str):
+-    server = next((x for x in mcp_gateway.list_servers() if x["id"] == server_id), None)
++async def mcp_server_tools(server_id: str, x_client_id: Optional[str] = Header(default=None)):
++    scope = _mcp_scope(x_client_id)
++    server = next((x for x in mcp_gateway.list_servers(scope) if x["id"] == server_id), None)
+     if server is None:
+         return {"error": "Unknown MCP server"}
+     return {"server_id": server_id, "tools": server.get("tools", [])}
+ 
+ 
+ @app.post("/mcp/servers/{server_id}/test")
+-async def mcp_test_server(server_id: str, payload: dict = {}):
+-    tool = payload.get("tool") or (mcp_gateway.list_servers()[0].get("tools", [None])[0])
++async def mcp_test_server(server_id: str, payload: dict = {}, x_client_id: Optional[str] = Header(default=None)):
++    scope = _mcp_scope(x_client_id)
++    tool = payload.get("tool") or (mcp_gateway.list_servers(scope)[0].get("tools", [None])[0])
+     if server_id == "open-meteo":
+         tool, arguments = "geocode", {"name": "London"}
+     elif server_id == "wikipedia":
+diff --git a/frontend/index.html b/frontend/index.html
+index 23f7b22..c736ccc 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -1585,6 +1585,18 @@
+         }
+         function toggleSidebar() { sidebar.classList.toggle('collapsed'); syncSidebarBackdrop(); }
+ 
++        // Every /mcp/servers* call must carry this so the backend can keep each
++        // browser/device's integration toggles (and custom servers) separate.
++        // Without it, "enabled" state lived in one shared dict on the server, so
++        // turning Wikipedia off on one device turned it off for every device.
++        function getMcpClientId() {
++            let id = localStorage.getItem('mcpClientId');
++            if (!id) { id = generateUUID(); localStorage.setItem('mcpClientId', id); }
++            return id;
++        }
++        function mcpHeaders(extra) {
++            return Object.assign({ 'X-Client-Id': getMcpClientId() }, extra || {});
++        }
+         let mcpServers = [];
+         let mcpPanelOpen = false;
+         const mcpPanel = document.getElementById('mcpPanel');
+@@ -1620,17 +1632,17 @@
+             }).join('') || '<div class="mcp-entry-subtitle">No integrations match your search.</div>';
+         }
+         async function loadMcpServers() {
+-            try { const r = await fetch(`${API_BASE}/mcp/servers`); const data = await r.json(); mcpServers = data.servers || []; renderMcpServers(); }
++            try { const r = await fetch(`${API_BASE}/mcp/servers`, { headers: mcpHeaders() }); const data = await r.json(); mcpServers = data.servers || []; renderMcpServers(); }
+             catch (e) { if (mcpServerList) mcpServerList.innerHTML = '<div class="mcp-entry-subtitle">MCP endpoint unavailable.</div>'; }
+         }
+         async function setMcpEnabled(id, enabled) {
+-            try { await fetch(`${API_BASE}/mcp/servers/${encodeURIComponent(id)}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled}) }); const s = mcpServers.find(x => x.id === id); if (s) s.enabled = enabled; renderMcpServers(); }
++            try { await fetch(`${API_BASE}/mcp/servers/${encodeURIComponent(id)}`, { method:'PATCH', headers: mcpHeaders({'Content-Type':'application/json'}), body:JSON.stringify({enabled}) }); const s = mcpServers.find(x => x.id === id); if (s) s.enabled = enabled; renderMcpServers(); }
+             catch (e) { loadMcpServers(); }
+         }
+         async function testMcp(id) {
+             const button = [...document.querySelectorAll('.mcp-test-btn')].find(b => b.getAttribute('onclick') === `testMcp('${id}')`);
+             if (button) { button.disabled = true; button.textContent = '…'; }
+-            try { const r = await fetch(`${API_BASE}/mcp/servers/${encodeURIComponent(id)}/test`, {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); const data = await r.json(); alert(data.error ? data.message : `${id} responded successfully.`); }
++            try { const r = await fetch(`${API_BASE}/mcp/servers/${encodeURIComponent(id)}/test`, {method:'POST',headers: mcpHeaders({'Content-Type':'application/json'}),body:'{}'}); const data = await r.json(); alert(data.error ? data.message : `${id} responded successfully.`); }
+             catch (e) { alert(`MCP test failed: ${e.message}`); }
+             finally { if (button) { button.disabled = false; button.textContent = 'Test'; } }
+         }
+@@ -1645,7 +1657,7 @@
+             const name = document.getElementById('mcpCustomName')?.value.trim();
+             const url = document.getElementById('mcpCustomUrl')?.value.trim();
+             if (!name || !url) { alert('Enter an integration name and MCP URL.'); return; }
+-            try { const r = await fetch(`${API_BASE}/mcp/servers`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,url,transport:'http'})}); if (!r.ok) throw new Error('Could not add integration'); document.getElementById('mcpCustomName').value = ''; document.getElementById('mcpCustomUrl').value = ''; toggleCustomMcpForm(false); await loadMcpServers(); }
++            try { const r = await fetch(`${API_BASE}/mcp/servers`, {method:'POST',headers: mcpHeaders({'Content-Type':'application/json'}),body:JSON.stringify({name,url,transport:'http'})}); if (!r.ok) throw new Error('Could not add integration'); document.getElementById('mcpCustomName').value = ''; document.getElementById('mcpCustomUrl').value = ''; toggleCustomMcpForm(false); await loadMcpServers(); }
+             catch (e) { alert(e.message); }
+         }
+ 
+diff --git a/mcp_gateway.py b/mcp_gateway.py
+index 02500f1..2009c46 100644
+--- a/mcp_gateway.py
++++ b/mcp_gateway.py
+@@ -46,8 +46,15 @@ _DEFAULT_TOOLS = {
+     "wikipedia": ["search", "page", "entity"], "arxiv": ["search", "paper"],
+ }
+ 
+-_servers: Dict[str, dict] = {}
+-_builtin_overrides: Dict[str, dict] = {}
++_DEFAULT_SCOPE = "default"
++
++# All per-installation MCP state is partitioned by an opaque "scope" id (one per
++# browser/device — see app.py's x-client-id handling). Previously these were flat
++# dicts shared by every caller, so one person flipping a toggle silently changed
++# it for everyone else hitting the same backend process. Nest everything one
++# level deeper, keyed by scope, so each device gets its own independent state.
++_servers: Dict[str, Dict[str, dict]] = {}
++_builtin_overrides: Dict[str, Dict[str, dict]] = {}
+ _memory: Dict[str, Dict[str, dict]] = {}
+ 
+ 
+@@ -72,26 +79,35 @@ def _bounded(value: Any, limit: int = MAX_RESULT_CHARS) -> Any:
+     return text if len(text) <= limit else text[:limit] + "\n…[truncated]"
+ 
+ 
+-def _server(server_id: str) -> dict:
+-    if server_id not in _SERVER_META and server_id not in _servers:
++def _custom_servers(scope: str) -> Dict[str, dict]:
++    return _servers.setdefault(scope or _DEFAULT_SCOPE, {})
++
++
++def _overrides(scope: str) -> Dict[str, dict]:
++    return _builtin_overrides.setdefault(scope or _DEFAULT_SCOPE, {})
++
++
++def _server(server_id: str, scope: str = _DEFAULT_SCOPE) -> dict:
++    custom = _custom_servers(scope)
++    if server_id not in _SERVER_META and server_id not in custom:
+         raise ValueError(f"Unknown MCP server: {server_id}")
+-    if server_id in _servers:
+-        return _servers[server_id]
++    if server_id in custom:
++        return custom[server_id]
+     name, description, category = _SERVER_META[server_id]
+     item = {"id": server_id, "name": name, "description": description, "category": category,
+             "enabled": server_id not in {"playwright"}, "builtin": True, "status": "ready",
+             "tools": _DEFAULT_TOOLS.get(server_id, [])}
+-    item.update(_builtin_overrides.get(server_id, {}))
++    item.update(_overrides(scope).get(server_id, {}))
+     return item
+ 
+ 
+-def list_servers() -> list[dict]:
+-    return [{**_server(sid), "tools": list(_server(sid).get("tools", []))} for sid in _SERVER_META] + [
+-        dict(v) for sid, v in _servers.items() if sid not in _SERVER_META
++def list_servers(scope: str = _DEFAULT_SCOPE) -> list[dict]:
++    return [{**_server(sid, scope), "tools": list(_server(sid, scope).get("tools", []))} for sid in _SERVER_META] + [
++        dict(v) for sid, v in _custom_servers(scope).items() if sid not in _SERVER_META
+     ]
+ 
+ 
+-def register_server(payload: dict) -> dict:
++def register_server(payload: dict, scope: str = _DEFAULT_SCOPE) -> dict:
+     sid = re.sub(r"[^a-z0-9-]+", "-", str(payload.get("id") or payload.get("name") or "custom").lower()).strip("-")
+     if not sid or sid in _SERVER_META:
+         sid = f"custom-{uuid.uuid4().hex[:8]}"
+@@ -101,32 +117,33 @@ def register_server(payload: dict) -> dict:
+             "status": "disconnected", "transport": payload.get("transport", "http"),
+             "url": payload.get("url"), "command": payload.get("command"),
+             "tools": []}
+-    _servers[sid] = item
++    _custom_servers(scope)[sid] = item
+     return dict(item)
+ 
+ 
+-def update_server(server_id: str, patch: dict) -> dict:
+-    item = _server(server_id)
++def update_server(server_id: str, patch: dict, scope: str = _DEFAULT_SCOPE) -> dict:
++    item = _server(server_id, scope)
++    custom = _custom_servers(scope)
+     if server_id in _SERVER_META:
+         # Built-ins are mutable only for enablement, preserving safe metadata.
+         item = dict(item)
+         if "enabled" in patch: item["enabled"] = bool(patch["enabled"])
+-        _builtin_overrides[server_id] = {"enabled": item["enabled"]}
++        _overrides(scope)[server_id] = {"enabled": item["enabled"]}
+     else:
+-        item = _servers[server_id]
++        item = custom[server_id]
+         for key in ("enabled", "name", "description", "url", "transport", "command"):
+             if key in patch: item[key] = patch[key]
+-    if server_id in _servers: _servers[server_id] = item
++    if server_id in custom: custom[server_id] = item
+     return dict(item)
+ 
+ 
+-def delete_server(server_id: str) -> bool:
+-    return _servers.pop(server_id, None) is not None
++def delete_server(server_id: str, scope: str = _DEFAULT_SCOPE) -> bool:
++    return _custom_servers(scope).pop(server_id, None) is not None
+ 
+ 
+-def _enabled_ids(selected: Optional[list[str]]) -> list[str]:
+-    if selected is None: return [x["id"] for x in list_servers() if x.get("enabled")]
+-    return [sid for sid in selected if _server(sid).get("enabled") or sid in selected]
++def _enabled_ids(selected: Optional[list[str]], scope: str = _DEFAULT_SCOPE) -> list[str]:
++    if selected is None: return [x["id"] for x in list_servers(scope) if x.get("enabled")]
++    return [sid for sid in selected if _server(sid, scope).get("enabled") or sid in selected]
+ 
+ 
+ def _public_url(url: str) -> None:
+@@ -159,6 +176,10 @@ async def call_tool(server_id: str, tool_name: str, arguments: Optional[dict] =
+         return result
+     except Exception as exc:
+         error = {"server_id": server_id, "tool_name": tool_name, "call_id": call_id, "message": str(exc)[:500]}
++        # Previously this failure was only ever surfaced via `emit` (chat streaming),
++        # so background/test-less callers — and anyone reading server logs — had no
++        # way to see *why* a given MCP tool (e.g. wikipedia) came back empty.
++        print(f"[mcp] {server_id}.{tool_name} failed: {exc!r}")
+         if emit: await emit({"type": "tool_error", **error})
+         return {**error, "error": True}
+ 
+@@ -204,8 +225,19 @@ async def _call_builtin(server_id: str, tool: str, args: dict, session_id: str)
+     if server_id == "nominatim" and tool == "search_places":
+         return await _http_json("https://nominatim.openstreetmap.org/search", {"q": args.get("query", ""), "format": "jsonv2", "limit": 5})
+     if server_id == "wikipedia":
+-        if tool == "search": return await _http_json("https://en.wikipedia.org/w/api.php", {"action": "query", "list": "search", "srsearch": args.get("query", ""), "format": "json", "srlimit": 5})
++        if tool == "search": return await _http_json("https://en.wikipedia.org/w/api.php", {"action": "query", "list": "search", "srsearch": args.get("query", ""), "format": "json", "srlimit": min(int(args.get("limit", 5)), 10)})
+         if tool == "page": return await _http_json("https://en.wikipedia.org/w/api.php", {"action": "query", "prop": "extracts|info", "explaintext": 1, "inprop": "url", "titles": args["title"], "format": "json"})
++        # "entity" was listed in _DEFAULT_TOOLS and advertised in the UI's tool list,
++        # but never actually implemented here — any call to it fell through to the
++        # "Unknown tool wikipedia.entity" ValueError below and looked like Wikipedia
++        # itself was broken. Wire it up to Wikidata's entity search, as the plan doc
++        # (MCP_INTEGRATION_PLAN.md, section 9) originally described.
++        if tool == "entity":
++            return await _http_json("https://www.wikidata.org/w/api.php", {
++                "action": "wbsearchentities", "search": args.get("query", ""),
++                "language": args.get("language", "en"), "format": "json",
++                "limit": min(int(args.get("limit", 5)), 10),
++            })
+     if server_id == "arxiv":
+         if tool == "search": return await _http_json("https://export.arxiv.org/api/query", {"search_query": f"all:{args.get('query', '')}", "max_results": min(int(args.get("limit", 5)), 10)})
+         if tool == "paper": return await _http_json("https://export.arxiv.org/api/query", {"id_list": args["id"], "max_results": 1})
