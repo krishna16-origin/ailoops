@@ -1188,13 +1188,43 @@ def _matching_skill_blocks(text: str) -> str:
     return ("\n\n" + "\n\n".join(matched)) if matched else ""
 
 
+# Sentinel line that separates the human-facing plan (shown as the chat
+# response, rendered as markdown) from the short machine-facing step list
+# (used internally to drive the Build-mode agent loop). The sentinel itself
+# is stripped before either half is used.
+_PLAN_STEPS_DELIMITER = "===STEPS==="
+
+
 def build_plan_messages(history: List[BaseMessage], file_store: Dict[str, str], reasoning_level: str) -> List[BaseMessage]:
     latest_text = history[-1].content if history else ""
     skill_block = _matching_skill_blocks(latest_text)
     system_text = (
         build_constitution_block() + skill_block + "\n\n"
-        "You are the planning stage of an autonomous coding agent. You do not write code here — only a BRIEF step-by-step plan.\n"
-        "Given the user's latest request and the files that already exist, write exactly 2-5 VERY BRIEF numbered steps, each 8-15 words, step-by-step in execution order (e.g. `1. Read index.html to check layout`, `2. Create styles.css with dark theme`, `3. Edit script.js to add interactivity`). Keep it concise — no preamble, no explanation, no code, only the numbered steps.\n"
+        "You are the planning stage of an autonomous coding agent. You do not write code here — only a plan.\n"
+        "Write a SHORT, well-structured, skimmable plan in Markdown, in the voice of a product-minded engineer "
+        "explaining their approach to the user — not a dry checklist. Model the plan on this shape (adapt the "
+        "sections and emoji to whatever is actually being built — an API, a script, a website, etc. — never "
+        "force these exact headings onto an unrelated project):\n\n"
+        "  One upbeat sentence acknowledging the request, with the key idea in **bold**.\n\n"
+        "  ## <relevant emoji> <Project Name> — Project Plan\n\n"
+        "  ### 1. Main Goal\n"
+        "  A one-line bold statement of what's being built, then 2-4 short bullets, each with a "
+        "  **bold label** followed by what it covers.\n"
+        "  If a single-sentence synthesis helps, add:\n"
+        "  > Think of it as: A + B + C\n\n"
+        "  ---\n\n"
+        "  ### 2. <Next section — e.g. Structure / Key Features / Approach>\n"
+        "  A couple of short bullets or a brief sub-breakdown, same bold-label style.\n\n"
+        "  (Optionally one more short section like this if genuinely useful — Tech Stack, Data Model, etc.)\n\n"
+        "Keep the WHOLE plan brief and scannable — a busy person should read it in under 20 seconds. This is "
+        "an overview to align on direction, not a spec: no code, no file-by-file walkthrough, no long prose "
+        "paragraphs. Use bold, bullets, and short headers rather than dense sentences. 2-3 sections total is "
+        "usually enough; only add a third if it earns its place.\n\n"
+        f"After the plan, on its own line write exactly `{_PLAN_STEPS_DELIMITER}` and nothing else on that line. "
+        "Then, below it, write 2-5 VERY BRIEF numbered execution steps, each 8-15 words, in execution order "
+        "(e.g. `1. Read index.html to check layout`, `2. Create styles.css with dark theme`). These steps are "
+        "for an internal build agent, not the user — no preamble, no explanation, no code, only the numbered "
+        "steps.\n"
         + _security_block() + "\n"
         f"Current date and time: {get_current_datetime_str()}\n\n"
         f"EXISTING PROJECT FILES:\n{_file_listing(file_store)}"
@@ -1213,6 +1243,54 @@ def parse_plan(text: str) -> List[str]:
         m = re.match(r"^(?:\d+[.)]|[-*])\s*(.+)$", ln)
         steps.append(m.group(1).strip() if m else ln)
     return steps[:6]
+
+
+def _demo_plan_display_text(latest_text: str) -> str:
+    """Static, nicely-formatted plan shown when no NVIDIA_API_KEY is configured.
+    Mirrors the structure a real planning call would produce, so the demo still
+    shows the intended look-and-feel instead of a bare placeholder line."""
+    topic = (latest_text or "").strip()
+    if len(topic) > 70:
+        topic = topic[:67].rstrip() + "..."
+    topic = topic or "your project"
+    return (
+        f"Here's how I'd approach **{topic}** — structured as a real plan, not just a list of tasks.\n\n"
+        "## 🧩 Project Plan\n\n"
+        "### 1. Main Goal\n"
+        "Build a **clean, working first version** focused on the core behavior you asked for:\n"
+        "- **Structure** → organize files sensibly before writing code\n"
+        "- **Core feature** → implement the main behavior first\n"
+        "- **Polish** → styling and edge cases once it works\n\n"
+        "> Think of it as: Structure + Core Feature + Polish\n\n"
+        "---\n\n"
+        "### 2. Approach\n"
+        "- **Inspect** existing files and reuse what's already there\n"
+        "- **Implement** the requested change with minimal side effects\n"
+        "- **Verify** the result before handing it off to Build\n\n"
+        "*(Demo mode — set `NVIDIA_API_KEY` in `.env` for a plan tailored to your actual request.)*"
+    )
+
+
+def split_plan_output(raw_text: str) -> Tuple[str, List[str]]:
+    """Split the planner's raw output into (display_markdown, execution_steps).
+
+    The model is asked to put a `_PLAN_STEPS_DELIMITER` line between the
+    human-facing plan and the short internal step list. If the model didn't
+    include the delimiter (e.g. an older prompt path, or it just forgot),
+    fall back to treating the whole thing as both: show it as-is, and derive
+    steps from it with the existing line-based parser so Build mode still has
+    something to execute.
+    """
+    if not raw_text or not raw_text.strip():
+        return "", []
+    if _PLAN_STEPS_DELIMITER in raw_text:
+        display_part, _, steps_part = raw_text.partition(_PLAN_STEPS_DELIMITER)
+        display_text = display_part.strip()
+        steps = parse_plan(steps_part)
+        if not steps:
+            steps = parse_plan(display_text)
+        return display_text, steps
+    return raw_text.strip(), parse_plan(raw_text)
 
 
 # ---------------------------------------------------------------------------
@@ -1546,6 +1624,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         model_key = resolve_code_model_key(request.model)
         config = get_code_thinking_config(request.reasoning_level)
         model_name = CODE_MODEL_MAP.get(model_key, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
+        latest_text = history[-1].content if history else ""
         plan_steps: List[str] = []
         if not os.getenv("NVIDIA_API_KEY") or (os.getenv("NVIDIA_API_KEY") or "").strip().lower() in ("demo", ""):
             plan_steps = [
@@ -1553,6 +1632,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 "Implement the requested behavior while preserving unrelated functionality.",
                 "Validate the result and report the files and checks needed for the build.",
             ]
+            display_text = _demo_plan_display_text(latest_text)
         else:
             plan_messages = build_plan_messages(history, file_store, request.reasoning_level)
             if _is_deepseek_model(model_name):
@@ -1564,10 +1644,14 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             else:
                 llm = get_code_llm(model_key, 0.2, _model_thinking_budget(model_name, request.reasoning_level, config["max_tokens"]))
                 plan_text = await invoke_model(plan_messages, llm, None, thinking_mode=True)
-            plan_steps = parse_plan(plan_text)
+            display_text, plan_steps = split_plan_output(plan_text)
+            if not plan_steps:
+                plan_steps = ["Execute the user's request directly using the existing project files."]
+            if not display_text:
+                display_text = "Plan ready. Switch to Build to execute this plan without creating another plan."
         session["pending_plan"] = plan_steps
         await emit({"type": "plan_created", "steps": plan_steps, "mode": "plan"})
-        response = "Plan ready. Switch to Build to execute this plan without creating another plan."
+        response = display_text
         await emit({"type": "final_message", "text": response})
         await emit({"type": "complete"})
         return {
