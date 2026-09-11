@@ -2618,7 +2618,14 @@ async def upload_file(session_id: str = Form(...), file: UploadFile = File(...))
     this session, in both modes."""
     session = sessions.setdefault(session_id, {"messages": []})
     data = await file.read()
-    record = rag_engine.create_upload_record(file.filename or "upload", data, file.content_type or "", session)
+    # create_upload_record does CPU-bound image decode/resize (via Pillow) for
+    # thumbnails. Run it in a worker thread rather than inline on the event
+    # loop, so a big photo upload from one user can't stall every other
+    # request/stream currently being served (the real source of the app
+    # feeling "slow" for everyone during an upload, not just the uploader).
+    record = await asyncio.to_thread(
+        rag_engine.create_upload_record, file.filename or "upload", data, file.content_type or "", session
+    )
     if record["status"] == "processing":
         # Return the preview-ready record immediately. Vision analysis, parsing,
         # chunking, and embeddings continue without blocking the HTTP request.
