@@ -1821,6 +1821,10 @@
             delete: ['Deleting', 'Deleted'],
             run_command: ['Running a command', 'Ran a command'],
             start_server: ['Starting the server', 'Started the server'],
+            download_file: ['Downloading', 'Downloaded'],
+            extract_archive: ['Extracting archive', 'Extracted archive'],
+            run_tests: ['Running tests', 'Ran tests'],
+            list_dir: ['Listing files', 'Listed files'],
         };
         const LIVE_STATUS_PHRASES = {
             read: 'Using Files — reading',
@@ -1830,11 +1834,18 @@
             server: 'Starting a live server',
             status: 'Working…',
         };
+        // Real, live-sandbox shell operations — same "genuine terminal activity"
+        // bucket as run_command/start_server, just with their own tool names so
+        // the UI can label them precisely instead of lumping everything into
+        // "Running a command".
+        const LIVE_SANDBOX_ACTIONS = new Set([
+            'run_command', 'start_server', 'download_file', 'extract_archive', 'run_tests', 'list_dir',
+        ]);
         function liveActionIconKind(action) {
             if (action === 'read') return 'read';
             if (action === 'create' || action === 'edit') return 'edit';
             if (action === 'delete') return 'delete';
-            if (action === 'run_command' || action === 'start_server') return 'command';
+            if (LIVE_SANDBOX_ACTIONS.has(action)) return 'command';
             return 'status';
         }
         function liveActionLabel(action, file, done) {
@@ -1850,12 +1861,13 @@
         function handleLiveMonitorEvent(parsed) {
             if (!parsed || !parsed.type) return;
             // This panel is "the computer" — a real terminal, not a narration
-            // feed. Only genuine shell commands (run_command/start_server) and
-            // sandbox lifecycle events get a row here; thoughts, plan bullets,
-            // generic status chatter, and file-edit bookkeeping already have a
-            // home in the main chat's own workflow feed / plan checklist, so
-            // they're intentionally NOT mirrored into this panel too.
-            const isCommandAction = parsed.action === 'run_command' || parsed.action === 'start_server';
+            // feed. Only genuine shell/sandbox operations (run_command,
+            // start_server, download_file, extract_archive, run_tests, list_dir)
+            // and sandbox lifecycle events get a row here; thoughts, plan
+            // bullets, generic status chatter, and file-edit bookkeeping already
+            // have a home in the main chat's own workflow feed / plan checklist,
+            // so they're intentionally NOT mirrored into this panel too.
+            const isCommandAction = LIVE_SANDBOX_ACTIONS.has(parsed.action);
             switch (parsed.type) {
                 case 'activity_start': {
                     if (!isCommandAction) break;
@@ -1871,7 +1883,7 @@
                     const key = liveActionKey(parsed);
                     const entry = liveMonitorActions.get(key);
                     const label = liveActionLabel(parsed.action, parsed.file, true);
-                    if (parsed.action === 'run_command' && parsed.exit_code !== undefined && parsed.exit_code !== 0) {
+                    if (parsed.action !== 'start_server' && parsed.exit_code !== undefined && parsed.exit_code !== 0) {
                         label.suffix = ` (exit ${parsed.exit_code})`;
                     }
                     if (entry) {
@@ -1898,7 +1910,7 @@
                 case 'terminal_output': {
                     let entry = null;
                     for (const e of liveMonitorActions.values()) {
-                        if (e.action === 'run_command' || e.action === 'start_server') entry = e;
+                        if (LIVE_SANDBOX_ACTIONS.has(e.action)) entry = e;
                     }
                     const text = (parsed.text || '').replace(/\r/g, '');
                     if (!text) break;
