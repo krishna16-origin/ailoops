@@ -2616,7 +2616,15 @@ async def upload_file(session_id: str = Form(...), file: UploadFile = File(...))
     this session, in both modes."""
     session = sessions.setdefault(session_id, {"messages": []})
     data = await file.read()
-    record = await rag_engine.process_upload(file.filename or "upload", data, file.content_type or "", session)
+    record = rag_engine.create_upload_record(file.filename or "upload", data, file.content_type or "", session)
+    if record["status"] == "processing":
+        # Return the preview-ready record immediately. Vision analysis, parsing,
+        # chunking, and embeddings continue without blocking the HTTP request.
+        asyncio.create_task(
+            rag_engine.process_upload(
+                file.filename or "upload", data, file.content_type or "", session, record=record
+            )
+        )
     return record
 
 

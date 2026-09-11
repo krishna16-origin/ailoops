@@ -444,21 +444,16 @@ def remove_file(session: dict, file_id: str) -> bool:
     return True
 
 
-async def process_upload(filename: str, data: bytes, content_type: str, session: dict) -> dict:
-    """Main entry point: extract -> chunk -> embed -> store one uploaded file.
-    Always returns a record dict (never raises) so the API layer can surface
-    a clean per-file status even when this particular file failed."""
+def create_upload_record(filename: str, data: bytes, content_type: str, session: dict) -> dict:
+    """Create the lightweight record returned immediately by the upload API."""
     files = _files_store(session)
-    chunks = _chunks_store(session)
-
     file_id = uuid.uuid4().hex[:12]
     kind = classify(filename, content_type)
-    size = len(data)
     record: dict = {
         "id": file_id,
         "filename": filename,
         "kind": kind,
-        "size": size,
+        "size": len(data),
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "status": "processing",
         "summary": "",
@@ -470,6 +465,33 @@ async def process_upload(filename: str, data: bytes, content_type: str, session:
         "_content": data,
     }
     files[file_id] = record
+    if len(files) > MAX_FILES_PER_SESSION:
+        record.update(status="error", error=f"This session already has {MAX_FILES_PER_SESSION} files attached — remove one before adding more.")
+    elif len(data) > MAX_FILE_BYTES:
+        record.update(status="error", error=f"File exceeds the {MAX_FILE_BYTES // (1024 * 1024)}MB limit.")
+    elif kind == "unsupported":
+        record.update(status="error", error="Unsupported file type.")
+    elif kind == "image":
+        try:
+            thumb = _downscale_image(data, max_dim=THUMB_MAX_DIM, quality=70)
+            record["thumbnail"] = f"data:image/jpeg;base64,{base64.b64encode(thumb).decode('utf-8')}"
+        except Exception:
+            pass
+    return record
+
+
+async def process_upload(filename: str, data: bytes, content_type: str, session: dict, record: Optional[dict] = None) -> dict:
+    """Main entry point: extract -> chunk -> embed -> store one uploaded file.
+    Always returns a record dict (never raises) so the API layer can surface
+    a clean per-file status even when this particular file failed."""
+    files = _files_store(session)
+    chunks = _chunks_store(session)
+
+    if record is None:
+        record = create_upload_record(filename, data, content_type, session)
+    file_id = record["id"]
+    kind = record["kind"]
+    size = record["size"]
 
     if len(files) > MAX_FILES_PER_SESSION:
         record.update(status="error", error=f"This session already has {MAX_FILES_PER_SESSION} files attached — remove one before adding more.")
@@ -489,11 +511,6 @@ async def process_upload(filename: str, data: bytes, content_type: str, session:
             record["used_vision_model"] = analysis["used_vision_model"]
             raw_pieces = [(None, analysis["analysis"])]
             record["summary"] = _short_summary(analysis["analysis"])
-            try:
-                thumb = _downscale_image(data, max_dim=THUMB_MAX_DIM, quality=70)
-                record["thumbnail"] = f"data:image/jpeg;base64,{base64.b64encode(thumb).decode('utf-8')}"
-            except Exception:
-                pass
 
         elif kind == "pdf":
             pages = await _extract_pdf(data)

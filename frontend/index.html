@@ -2599,13 +2599,37 @@
             if (!chips.children.length) chips.hidden = true;
         }
 
+        async function waitForAttachmentReady(record, sessionId) {
+            for (let attempt = 0; attempt < 240; attempt++) {
+                await new Promise(resolve => setTimeout(resolve, 500));
+                try {
+                    const res = await fetch(`${API_BASE}/session-files/${encodeURIComponent(sessionId)}`);
+                    if (!res.ok) continue;
+                    const data = await res.json();
+                    const latest = (data.files || []).find(item => item.id === record.id);
+                    if (!latest) continue;
+                    Object.assign(record, latest, {
+                        previewUrl: record.previewUrl,
+                    });
+                    updateAttachmentChip(record.localId, record);
+                    if (record.status === 'ready' || record.status === 'error') return record;
+                } catch (err) { /* transient polling failure — try again */ }
+            }
+            record.status = 'error';
+            record.error = 'Attachment processing timed out.';
+            updateAttachmentChip(record.localId, record);
+            return record;
+        }
+
         async function uploadAttachment(file) {
             const localId = 'local-' + Math.random().toString(36).slice(2);
+            const sessionId = modes[currentMode].sessionId;
             const record = {
                 localId,
                 filename: file.name,
                 kind: guessKindClient(file),
                 status: 'processing',
+                sessionId,
                 localPreview: file.type.startsWith('image/') ? URL.createObjectURL(file) : null,
             };
             pendingAttachments.push(record);
@@ -2613,7 +2637,7 @@
             record.uploadPromise = (async () => {
               try {
                 const formData = new FormData();
-                formData.append('session_id', modes[currentMode].sessionId);
+                formData.append('session_id', sessionId);
                 formData.append('file', file);
                 const res = await fetch(`${API_BASE}/upload`, { method: 'POST', body: formData });
                 if (!res.ok) throw new Error('Upload request failed');
@@ -2622,10 +2646,11 @@
                     localId,
                     localPreview: record.localPreview,
                     previewUrl: uploaded.id
-                        ? `${API_BASE}/session-files/${encodeURIComponent(modes[currentMode].sessionId)}/${encodeURIComponent(uploaded.id)}/content`
+                        ? `${API_BASE}/session-files/${encodeURIComponent(sessionId)}/${encodeURIComponent(uploaded.id)}/content`
                         : null,
                 });
                 updateAttachmentChip(localId, record);
+                if (record.status === 'processing') await waitForAttachmentReady(record, sessionId);
               } catch (err) {
                 Object.assign(record, { status: 'error', error: 'Upload failed — check your connection.' });
                 updateAttachmentChip(localId, record);
