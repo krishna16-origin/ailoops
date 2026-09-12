@@ -319,15 +319,26 @@
         /* Response-level action row: sits after the fully-rendered answer (a
            sibling of .message-text inside .assistant-body, appended once per
            turn in appendMessage()) so it always renders "at last, after the
-           response" regardless of how long the answer is. Reuses the same
-           .copy-btn look as the per-code-block copy button above for a
-           consistent, already-established visual language, just laid out
-           on its own row instead of inside a card header. */
-        .message-footer { display:flex; align-items:center; gap:4px; margin-top:-2px; }
-        .message-footer .copy-btn { padding:6px 8px; }
-        /* Nothing to copy yet while the answer is still "Thinking" (.message-prose
-           has no rendered content) — hide the button until the first token lands,
-           rather than showing an action that would just copy an empty string. */
+           response" regardless of how long the answer is. Small icon-only
+           buttons (copy, read aloud, thumbs up/down, retry) — no text labels,
+           matching the compact action row style used beneath ChatGPT/Claude
+           responses. */
+        .message-footer { display:flex; align-items:center; gap:2px; margin-top:-2px; }
+        .message-footer .footer-icon-btn { display:flex; align-items:center; justify-content:center; background:transparent; border:none; color:var(--text-secondary); cursor:pointer; padding:6px; border-radius:6px; transition:background 0.2s, color 0.2s; }
+        .message-footer .footer-icon-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
+        .message-footer .footer-icon-btn svg { width:15px; height:15px; display:block; }
+        .message-footer .copy-btn .icon-check { display:none; color:var(--accent); }
+        .message-footer .copy-btn.copied .icon-copy { display:none; }
+        .message-footer .copy-btn.copied .icon-check { display:block; }
+        /* Thumbs and the read-aloud button are toggles — .active marks the
+           currently-selected/playing state. Thumbs up/down are mutually
+           exclusive (see JS), each in its own accent color like ChatGPT. */
+        .message-footer .like-btn.active { color:#10a37f; }
+        .message-footer .dislike-btn.active { color:#ef4444; }
+        .message-footer .speak-btn.active { color:var(--text-primary); }
+        /* Nothing to act on yet while the answer is still "Thinking" (.message-prose
+           has no rendered content) — hide the row until the first token lands,
+           rather than showing actions that would just operate on an empty string. */
         .assistant-body:has(.message-prose:empty) .message-footer { display:none; }
 
         /* ============== CODE MODE: workflow trace (steps) ============== */
@@ -1744,6 +1755,10 @@
         };
         let currentMode = 'chat';
         let isWaitingForResponse = false;
+        // Text of the most recent user turn, kept so the response footer's
+        // retry button can re-send it without the caller having to thread it
+        // through separately.
+        let lastUserMessageText = '';
         // Whether the view should keep auto-scrolling as new content streams in.
         // True as long as the user is at (or near) the bottom; false the instant
         // they scroll up to read something — same as ChatGPT, so a streaming
@@ -3218,28 +3233,86 @@
 
                 body.appendChild(contentDiv);
 
-                // Response-level copy button — placed after the full response (a
-                // sibling of contentDiv, appended last), matching ChatGPT's
-                // "copy the whole answer" action beneath a message. Reads the
-                // rendered prose text at click time rather than caching it, so
-                // it always copies whatever is currently on screen — no extra
-                // bookkeeping needed as the answer keeps streaming in.
+                // Response-level action row — placed after the full response (a
+                // sibling of contentDiv, appended last): copy, read aloud,
+                // thumbs up/down, retry. All read the rendered prose text (or
+                // the original user turn) at click time rather than caching
+                // it, so they always act on whatever is currently on screen —
+                // no extra bookkeeping needed as the answer keeps streaming in.
                 const footer = document.createElement('div');
                 footer.className = 'message-footer';
                 footer.innerHTML = `
-                    <button class="copy-btn" type="button" title="Copy response">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-                        <span>Copy</span>
+                    <button class="footer-icon-btn copy-btn" type="button" title="Copy">
+                        <svg class="icon-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                        <svg class="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                    </button>
+                    <button class="footer-icon-btn speak-btn" type="button" title="Read aloud">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>
+                    </button>
+                    <button class="footer-icon-btn like-btn" type="button" title="Good response">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path></svg>
+                    </button>
+                    <button class="footer-icon-btn dislike-btn" type="button" title="Bad response">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 15v4a3 3 0 0 0 3 3l4-9V2H5.72a2 2 0 0 0-2 1.7l-1.38 9a2 2 0 0 0 2 2.3zm7-13h2.67A2.31 2.31 0 0 1 22 4v7a2.31 2.31 0 0 1-2.33 2H17"></path></svg>
+                    </button>
+                    <button class="footer-icon-btn retry-btn" type="button" title="Retry">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
                     </button>
                 `;
                 const footerCopyBtn = footer.querySelector('.copy-btn');
-                const footerCopyLabel = footerCopyBtn.querySelector('span');
                 footerCopyBtn.addEventListener('click', () => {
                     const prose = contentDiv.querySelector('.message-prose');
                     navigator.clipboard.writeText(prose ? prose.innerText : '');
-                    footerCopyLabel.textContent = 'Copied!';
-                    setTimeout(() => { footerCopyLabel.textContent = 'Copy'; }, 1500);
+                    footerCopyBtn.classList.add('copied');
+                    setTimeout(() => footerCopyBtn.classList.remove('copied'), 1500);
                 });
+
+                // Read the response aloud using the browser's built-in speech
+                // synthesis — there's no backend TTS service, so this is
+                // purely client-side and stops itself when the message ends
+                // or the button is clicked again.
+                const speakBtn = footer.querySelector('.speak-btn');
+                speakBtn.addEventListener('click', () => {
+                    const wasActive = speakBtn.classList.contains('active');
+                    window.speechSynthesis.cancel();
+                    document.querySelectorAll('.speak-btn.active').forEach(b => b.classList.remove('active'));
+                    if (wasActive) return;
+                    const prose = contentDiv.querySelector('.message-prose');
+                    const utterance = new SpeechSynthesisUtterance(prose ? prose.innerText : '');
+                    utterance.onend = () => speakBtn.classList.remove('active');
+                    utterance.onerror = () => speakBtn.classList.remove('active');
+                    speakBtn.classList.add('active');
+                    window.speechSynthesis.speak(utterance);
+                });
+
+                // Thumbs up/down are mutually exclusive local feedback markers.
+                // There's no feedback endpoint on the backend yet, so this only
+                // reflects the choice visually rather than persisting it.
+                const likeBtn = footer.querySelector('.like-btn');
+                const dislikeBtn = footer.querySelector('.dislike-btn');
+                likeBtn.addEventListener('click', () => {
+                    const turningOn = !likeBtn.classList.contains('active');
+                    dislikeBtn.classList.remove('active');
+                    likeBtn.classList.toggle('active', turningOn);
+                });
+                dislikeBtn.addEventListener('click', () => {
+                    const turningOn = !dislikeBtn.classList.contains('active');
+                    likeBtn.classList.remove('active');
+                    dislikeBtn.classList.toggle('active', turningOn);
+                });
+
+                // Retry re-sends the turn's original user message through the
+                // normal sendMessage() flow. sendMessage() always appends a
+                // fresh user bubble, so this posts the question again rather
+                // than editing the existing exchange in place — the simplest
+                // option without a deeper rework of sendMessage().
+                const retryBtn = footer.querySelector('.retry-btn');
+                retryBtn.addEventListener('click', () => {
+                    if (isWaitingForResponse || !lastUserMessageText) return;
+                    userInput.value = lastUserMessageText;
+                    sendMessage();
+                });
+
                 body.appendChild(footer);
 
                 bubble.appendChild(avatar);
@@ -3319,6 +3392,7 @@
             // further down, right before the one request that actually needs the
             // server-side file id (/chat or /code-chat). This is what makes
             // sending feel instant instead of stalling while a photo uploads.
+            if (text) lastUserMessageText = text;
             appendMessage('user', text, stagedAttachments);
             userInput.value = '';
             autoResize(userInput);
