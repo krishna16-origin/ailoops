@@ -570,11 +570,16 @@
         .input-box:focus-within { border-color:rgba(255,255,255,0.3); box-shadow:0 4px 24px rgba(0,0,0,0.22); }
         .input-box textarea { flex:1; background:transparent; border:none; color:var(--text-primary); font-size:15.5px; resize:none; outline:none; max-height:200px; padding:8px 4px; line-height:1.5; }
         .input-box textarea::placeholder { color:var(--text-secondary); }
-        .send-btn { background:var(--text-primary); color:var(--bg-main); border:none; border-radius:50%; width:34px; height:34px; display:flex; align-items:center; justify-content:center; cursor:pointer; transition:opacity 0.2s, transform 0.2s var(--transition-bezier); flex-shrink:0; }
+        .send-btn { background:var(--text-primary); color:var(--bg-main); border:none; border-radius:50%; width:34px; height:34px; display:flex; align-items:center; justify-content:center; cursor:pointer; transition:opacity 0.2s, transform 0.2s var(--transition-bezier), background 0.15s; flex-shrink:0; }
         .send-btn:hover:not(:disabled) { transform:scale(1.06); }
         .send-btn:active:not(:disabled) { transform:scale(0.94); }
         .send-btn:disabled { opacity:0.3; cursor:not-allowed; }
         .send-btn svg { width:17px; height:17px; }
+        /* Same button, doubles as Stop while a response streams in (see
+           setSendButtonGenerating() / stopGeneration()) — a red hover tint is
+           the only extra affordance, so it doesn't look like a different
+           control, just the same one offering a different action right now. */
+        .send-btn.stop-mode:hover:not(:disabled) { background:#ef4444; color:#fff; }
 
         /* ============== MODEL / EFFORT PICKER (input-attached, ChatGPT/Claude-style) ============== */
         .composer-toolbar { display:flex; align-items:center; justify-content:space-between; margin-top:6px; padding-top:2px; }
@@ -1907,6 +1912,10 @@
         };
         let currentMode = 'chat';
         let isWaitingForResponse = false;
+        // Lets the same Send button interrupt an in-flight response instead of
+        // needing a separate Stop button — see stopGeneration() and the
+        // send-btn.stop-mode CSS/icon swap wired up in sendMessage() below.
+        let currentAbortController = null;
         // Text of the most recent user turn, kept so the response footer's
         // retry button can re-send it without the caller having to thread it
         // through separately.
@@ -3563,9 +3572,37 @@
             return prose;
         }
 
+        // Same physical Send button doubles as Stop while a response is
+        // streaming in — no second button. Swaps the icon/title/aria-label
+        // and toggles .stop-mode for the (red, square-icon) styling.
+        const SEND_ICON_HTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>';
+        const STOP_ICON_HTML = '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2.5"></rect></svg>';
+
+        function setSendButtonGenerating(isGenerating) {
+            sendBtn.innerHTML = isGenerating ? STOP_ICON_HTML : SEND_ICON_HTML;
+            sendBtn.classList.toggle('stop-mode', isGenerating);
+            sendBtn.title = isGenerating ? 'Stop generating' : 'Send';
+            sendBtn.setAttribute('aria-label', isGenerating ? 'Stop generating' : 'Send message');
+        }
+
+        // Aborting the fetch closes the SSE connection, which is also what lets
+        // the backend's StreamingResponse detect the disconnect and stop doing
+        // further work server-side — not just a client-side display change.
+        function stopGeneration() {
+            if (currentAbortController) {
+                try { currentAbortController.abort(); } catch (e) { /* no-op */ }
+            }
+        }
+
         async function sendMessage() {
+            // The button is never disabled while a response is in flight anymore
+            // (see setSendButtonGenerating) specifically so this branch is
+            // reachable — clicking Send mid-response now means "stop".
+            if (isWaitingForResponse) {
+                stopGeneration();
+                return;
+            }
             const text = userInput.value.trim();
-            if (isWaitingForResponse) return;
             const stagedAttachments = pendingAttachments.slice();
             if (!text && !stagedAttachments.length) return;
 
@@ -3587,7 +3624,8 @@
             appendMessage('user', text, stagedAttachments);
             userInput.value = '';
             autoResize(userInput);
-            sendBtn.disabled = true;
+            currentAbortController = new AbortController();
+            setSendButtonGenerating(true);
             isWaitingForResponse = true;
             if (mode === 'code') liveMonitorBeginTurn(text);
 
@@ -3617,8 +3655,9 @@
             if (!text && !sentAttachments.length) {
                 // Every attachment failed to upload and there was no text — the
                 // message bubble already shown makes that visible; nothing to send.
-                sendBtn.disabled = false;
+                setSendButtonGenerating(false);
                 isWaitingForResponse = false;
+                currentAbortController = null;
                 return;
             }
 
@@ -4596,7 +4635,8 @@
                 const response = await fetch(apiUrl, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
+                    body: JSON.stringify(payload),
+                    signal: currentAbortController.signal
                 });
 
                 if (!response.ok) throw new Error('Network response was not ok');
@@ -4878,16 +4918,29 @@
                 }
 
             } catch (error) {
-                console.error('Error:', error);
-                thinkingBlock.remove();
-                textContainer.innerHTML = `<span style="color: var(--text-secondary)">Could not reach the backend: ${DOMPurify.sanitize(error.message || String(error))}</span>`;
-                if (mode === 'code') liveMonitorAddRow('error', `Could not reach the backend: ${error.message || error}`, { error: true });
+                if (error && error.name === 'AbortError') {
+                    // User hit Stop — not a failure. Keep whatever partial answer
+                    // already streamed in as-is and just finalize its formatting
+                    // (syntax highlighting, table wrapping) in place, the same way
+                    // a normal completion does, instead of showing an error.
+                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : applySourcesSplit(assistantFullText);
+                    setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)));
+                    highlightCode(textContainer);
+                    if (mode === 'chat') wrapTables(textContainer);
+                } else {
+                    console.error('Error:', error);
+                    thinkingBlock.remove();
+                    textContainer.innerHTML = `<span style="color: var(--text-secondary)">Could not reach the backend: ${DOMPurify.sanitize(error.message || String(error))}</span>`;
+                    if (mode === 'code') liveMonitorAddRow('error', `Could not reach the backend: ${error.message || error}`, { error: true });
+                }
             } finally {
-                sendBtn.disabled = false;
+                setSendButtonGenerating(false);
                 isWaitingForResponse = false;
+                currentAbortController = null;
                 userInput.focus();
                 const cursor = textContainer.querySelector('.thinking-indicator');
                 if (cursor) cursor.remove();
+                finishThinking(); // no-op if already finalized; settles a stopped/errored turn's toggle too
                 modes[mode].html = chatContent.innerHTML;
                 if (mode === 'code') liveMonitorEndTurn();
             }
