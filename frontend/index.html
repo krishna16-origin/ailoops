@@ -292,7 +292,12 @@
         .message-text a:has(> img):hover img { opacity:0.85; border-color:rgba(255,255,255,0.3); }
 
         .message-text .code-card { margin:14px 0; border-radius:10px; overflow:hidden; border:1px solid var(--border-color); }
-        .message-text .code-card-header { display:flex; justify-content:space-between; align-items:center; background-color:#2a2a2a; padding:8px 16px; font-size:12px; color:var(--text-secondary); border-bottom:1px solid var(--border-color); }
+        /* Header/body now pull from the same theme variables as the rest of the
+           UI (--bg-input for the header, --bg-sidebar for the code body) instead
+           of one-off hex values (#2a2a2a / #111) that read as a colder, unrelated
+           "code editor" panel dropped into the chat — this keeps code blocks
+           visually part of the same dark UI as the sidebar/input/hover surfaces. */
+        .message-text .code-card-header { display:flex; justify-content:space-between; align-items:center; background-color:var(--bg-input); padding:8px 16px; font-size:12px; color:var(--text-secondary); border-bottom:1px solid var(--border-color); }
         .message-text .code-card-lang { font-family:'Courier New', Courier, monospace; text-transform:lowercase; }
         .message-text .artifact-tabs { display:flex; gap:2px; }
         .message-text .artifact-tab { background:transparent; border:none; color:var(--text-secondary); font-size:12px; padding:4px 10px; border-radius:6px; cursor:pointer; transition:background 0.2s, color 0.2s; }
@@ -306,10 +311,24 @@
         .message-text .copy-btn { display:flex; align-items:center; gap:6px; background:transparent; border:none; color:var(--text-secondary); font-size:12px; cursor:pointer; padding:4px 8px; border-radius:6px; transition:background 0.2s, color 0.2s; }
         .message-text .copy-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
         .message-text .copy-btn svg { width:14px; height:14px; }
-        .message-text pre { background-color:#111; padding:16px; overflow-x:auto; margin:0; border:none; border-radius:0; }
+        .message-text pre { background-color:var(--bg-sidebar); padding:16px; overflow-x:auto; margin:0; border:none; border-radius:0; }
         .message-text code { font-family:'Courier New', Courier, monospace; background-color:rgba(255,255,255,0.1); padding:2px 6px; border-radius:4px; font-size:0.9em; }
         .message-text pre code { background-color:transparent; padding:0; font-size:0.9em; border:none; }
         .message-text blockquote { border-left:4px solid var(--accent); padding-left:12px; color:var(--text-secondary); margin:12px 0; }
+
+        /* Response-level action row: sits after the fully-rendered answer (a
+           sibling of .message-text inside .assistant-body, appended once per
+           turn in appendMessage()) so it always renders "at last, after the
+           response" regardless of how long the answer is. Reuses the same
+           .copy-btn look as the per-code-block copy button above for a
+           consistent, already-established visual language, just laid out
+           on its own row instead of inside a card header. */
+        .message-footer { display:flex; align-items:center; gap:4px; margin-top:-2px; }
+        .message-footer .copy-btn { padding:6px 8px; }
+        /* Nothing to copy yet while the answer is still "Thinking" (.message-prose
+           has no rendered content) — hide the button until the first token lands,
+           rather than showing an action that would just copy an empty string. */
+        .assistant-body:has(.message-prose:empty) .message-footer { display:none; }
 
         /* ============== CODE MODE: workflow trace (steps) ============== */
         .response-workflow { margin-top:10px; padding-top:2px; }
@@ -3198,6 +3217,31 @@
                 }
 
                 body.appendChild(contentDiv);
+
+                // Response-level copy button — placed after the full response (a
+                // sibling of contentDiv, appended last), matching ChatGPT's
+                // "copy the whole answer" action beneath a message. Reads the
+                // rendered prose text at click time rather than caching it, so
+                // it always copies whatever is currently on screen — no extra
+                // bookkeeping needed as the answer keeps streaming in.
+                const footer = document.createElement('div');
+                footer.className = 'message-footer';
+                footer.innerHTML = `
+                    <button class="copy-btn" type="button" title="Copy response">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                        <span>Copy</span>
+                    </button>
+                `;
+                const footerCopyBtn = footer.querySelector('.copy-btn');
+                const footerCopyLabel = footerCopyBtn.querySelector('span');
+                footerCopyBtn.addEventListener('click', () => {
+                    const prose = contentDiv.querySelector('.message-prose');
+                    navigator.clipboard.writeText(prose ? prose.innerText : '');
+                    footerCopyLabel.textContent = 'Copied!';
+                    setTimeout(() => { footerCopyLabel.textContent = 'Copy'; }, 1500);
+                });
+                body.appendChild(footer);
+
                 bubble.appendChild(avatar);
                 bubble.appendChild(body);
             } else {
