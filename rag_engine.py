@@ -83,6 +83,16 @@ THUMB_MAX_DIM = 360                        # downscale for the small UI thumbnai
 
 NVIDIA_EMBED_MODEL = os.getenv("NVIDIA_EMBED_MODEL", "nvidia/nv-embedqa-e5-v5")
 VISION_MODEL = os.getenv("NVIDIA_VISION_MODEL", "meta/llama-3.2-90b-vision-instruct")
+# Nemotron Parse is a separate, purpose-built OCR/document-parsing pass that
+# runs on every image upload ALONGSIDE the general vision analysis above —
+# it is never exposed as a selectable chat model. It exists purely so the
+# text/tables/layout in a screenshot, scan, or photo of a document come
+# through verbatim in the RAG context that gets handed to whichever chat
+# model the user has actually picked (DeepSeek, Kimi, Gemma, a Nemotron chat
+# model, Poolside, ...) — the extraction happens here, once, in the shared
+# upload pipeline, so it "just works" no matter which model answers.
+PARSE_MODEL = os.getenv("NVIDIA_PARSE_MODEL", "nvidia/nemotron-parse-2.0")
+PARSE_IMAGE_MAX_DIM = 2200                 # OCR needs crisper text than general vision needs
 
 TEXT_EXTS = {".txt", ".md", ".markdown", ".rst", ".log", ".csv", ".tsv", ".json",
              ".yaml", ".yml", ".xml", ".ini", ".cfg", ".toml", ".env"}
@@ -288,6 +298,55 @@ async def _analyze_image(data: bytes, filename: str) -> dict:
         return {"analysis": fallback, "used_vision_model": False}
 
 
+# Nemotron Parse's required task prompt. Per NVIDIA's own NIM docs this model
+# accepts ONLY an image plus this exact kind of control-token string as the
+# text turn — no system prompt, no extra instructions, no conversation, no
+# tool calls, no follow-up questions (all unsupported by the model itself).
+# <predict_bbox><predict_classes><output_markdown> asks for layout-tagged,
+# markdown-formatted text; <predict_no_text_in_pic> lets it cleanly say
+# "no text here" for a photo instead of inventing something.
+_NEMOTRON_PARSE_PROMPT = "<predict_bbox><predict_classes><output_markdown><predict_no_text_in_pic>"
+
+# Nemotron Parse interleaves its actual output with layout/bbox/class control
+# tokens, e.g. <class_Title>, <bbox>...</bbox> — none of that is documented
+# down to an exact grammar, so rather than parsing it precisely this just
+# strips anything that looks like one of the model's own angle-bracket
+# tokens and collapses the leftover whitespace, keeping only the readable
+# text/markdown content.
+_PARSE_TAG_RE = re.compile(r"<[^>\n]{1,40}>")
+
+
+async def _parse_document_with_nemotron(data: bytes, filename: str) -> Optional[str]:
+    """Best-effort OCR/document-structure extraction via nvidia/nemotron-parse-2.0.
+
+    This is purely additive: it runs next to _analyze_image() (never instead
+    of it) for every image upload, regardless of which chat model the user
+    has selected, and is silently skipped on any failure — a document upload
+    should never fail just because this extra pass didn't come back."""
+    if not os.getenv("NVIDIA_API_KEY") or (os.getenv("NVIDIA_API_KEY") or "").strip().lower() in ("demo", ""):
+        return None
+    try:
+        small = _downscale_image(data, max_dim=PARSE_IMAGE_MAX_DIM, quality=90)
+        b64 = base64.b64encode(small).decode("utf-8")
+        llm = ChatNVIDIA(model=PARSE_MODEL, temperature=0.0, max_completion_tokens=3000, timeout=90)
+        # Single HumanMessage, no system prompt — Nemotron Parse doesn't
+        # support conversational instruction-following, so anything more
+        # than image + task prompt here would be ignored at best.
+        message = HumanMessage(content=[
+            {"type": "text", "text": _NEMOTRON_PARSE_PROMPT},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+        ])
+        result = await llm.ainvoke([message])
+        raw = _coerce_text(getattr(result, "content", "") or "").strip()
+        cleaned = _PARSE_TAG_RE.sub(" ", raw)
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned or None
+    except Exception as exc:
+        print(f"[rag_engine] Nemotron Parse extraction failed for {filename}: {exc}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Chunking — paragraph-aware, with a small char overlap carried across chunk
 # boundaries so retrieval doesn't lose context that straddles a split point.
@@ -487,6 +546,7 @@ def create_upload_record(filename: str, data: bytes, content_type: str, session:
         "error": None,
         "thumbnail": None,
         "used_vision_model": False,
+        "used_document_parser": False,
         "content_type": content_type or "application/octet-stream",
         "_content": data,
     }
@@ -533,9 +593,26 @@ async def process_upload(filename: str, data: bytes, content_type: str, session:
         raw_pieces: List[Tuple[Optional[int], str]] = []  # (page_number, text)
 
         if kind == "image":
-            analysis = await _analyze_image(data, filename)
+            # General scene/description analysis and the Nemotron Parse OCR/
+            # document-structure pass run concurrently — two independent
+            # NVIDIA vision calls over the same image, combined below. Either
+            # one can fail without affecting the other (see their own
+            # try/except blocks), and neither is ever surfaced as a "model"
+            # the user picks — this is pure backend preprocessing.
+            analysis, parsed_text = await asyncio.gather(
+                _analyze_image(data, filename),
+                _parse_document_with_nemotron(data, filename),
+            )
             record["used_vision_model"] = analysis["used_vision_model"]
-            raw_pieces = [(None, analysis["analysis"])]
+            record["used_document_parser"] = bool(parsed_text)
+            content = analysis["analysis"]
+            if parsed_text:
+                content += (
+                    "\n\n---\nDOCUMENT TEXT EXTRACTION (verbatim OCR via NVIDIA Nemotron "
+                    "Parse — trust this over the description above for exact wording, "
+                    "numbers, or table contents):\n" + parsed_text
+                )
+            raw_pieces = [(None, content)]
             record["summary"] = _short_summary(analysis["analysis"])
 
         elif kind == "pdf":
