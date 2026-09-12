@@ -1065,9 +1065,15 @@ async def chat_context_node(state: dict, progress=None) -> dict:
     if rag_engine.has_files(session):
         await _await_rag_indexing(session, state.get("attachment_ids"), progress)
         rag_text, rag_chunks = await rag_engine.build_context(session, latest, attachment_ids=state.get("attachment_ids"))
+        attached_now = state.get("attachment_ids") or []
+        if attached_now:
+            files_now = rag_engine.list_files(session)
+            names_now = ", ".join(sorted({f["filename"] for f in files_now if f.get("id") in set(attached_now)}))
+            if names_now:
+                await publish_progress(progress, "rag_context", "rag_context", f"Read the content of: {names_now}")
         if rag_chunks:
             names = ", ".join(sorted({c["filename"] for c in rag_chunks}))
-            await publish_progress(progress, "rag_context", "rag_context", f"Searched your uploaded files/images and pulled relevant content from: {names}")
+            await publish_progress(progress, "rag_context", "rag_context", f"Searched your other uploaded files/images and pulled relevant content from: {names}")
 
     state.update({"search_text": search_text, "links": links, "images": images, "mcp_context": mcp_context, "rag_text": rag_text})
     return state
@@ -1845,6 +1851,12 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         rag_context_text, rag_chunks = await rag_engine.build_context(
             session, getattr(request, "message", ""), attachment_ids=getattr(request, "attachment_ids", None),
         )
+        attached_now = getattr(request, "attachment_ids", None) or []
+        if attached_now:
+            files_now = rag_engine.list_files(session)
+            names_now = ", ".join(sorted({f["filename"] for f in files_now if f.get("id") in set(attached_now)}))
+            if names_now:
+                await emit({"type": "activity_complete", "action": "rag_context", "file": names_now})
         if rag_chunks:
             names = ", ".join(sorted({c["filename"] for c in rag_chunks}))
             await emit({"type": "activity_complete", "action": "rag_context", "file": names})
