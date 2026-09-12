@@ -563,22 +563,47 @@ async def process_upload(filename: str, data: bytes, content_type: str, session:
             record.update(status="error", error="No extractable content found in this file.")
             return record
 
-        texts = [p[1] for p in all_pieces]
-        vectors, space = await _embed_texts(texts)
-
-        for (page, text), vector in zip(all_pieces, vectors):
-            chunks.append({
+        # --- REAL FIX (see conversation) --------------------------------
+        # Publish the extracted chunks — vector=None, not yet embedded —
+        # and flip status to "ready" right here, BEFORE calling the
+        # embedding model. Content (the vision analysis / extracted text)
+        # is already fully available at this point; embedding is only
+        # needed for *semantic search across many older files later*, not
+        # for answering about the file you just attached in this same
+        # turn (build_context() takes a direct, non-semantic path for
+        # freshly-attached files — see get_all_text_for_files()). Splitting
+        # these means a chat reply about a just-uploaded file only ever
+        # waits on extraction (one vision call for images, near-instant
+        # local parsing for text/pdf/docx) instead of extraction PLUS an
+        # embedding network round-trip, which is what made this app feel
+        # slower than ChatGPT for "here's a file, tell me about it".
+        new_chunks = [
+            {
                 "id": uuid.uuid4().hex[:12],
                 "file_id": file_id,
                 "filename": filename,
                 "kind": kind,
                 "page": page,
                 "text": text,
-                "vector": vector,
-                "space": space,
-            })
-
+                "vector": None,
+                "space": "pending",
+            }
+            for page, text in all_pieces
+        ]
+        chunks.extend(new_chunks)
         record.update(status="ready", chunk_count=len(all_pieces))
+
+        # Embedding continues in the background (this coroutine keeps
+        # running as the tracked upload task) purely to make this file
+        # semantically searchable on LATER turns. Mutating the same dicts
+        # already in `chunks` in place means any concurrent reader sees
+        # the upgrade the instant it lands, with no extra bookkeeping.
+        texts = [c["text"] for c in new_chunks]
+        vectors, space = await _embed_texts(texts)
+        for chunk, vector in zip(new_chunks, vectors):
+            chunk["vector"] = vector
+            chunk["space"] = space
+
         return record
 
     except Exception as exc:
@@ -609,10 +634,22 @@ async def retrieve(session: dict, query: str, top_k: int = TOP_K_DEFAULT,
 
     by_space: Dict[str, List[dict]] = {}
     for c in all_chunks:
-        by_space.setdefault(c.get("space", "local"), []).append(c)
+        by_space.setdefault(c.get("space") or "local", []).append(c)
 
     scored: List[Tuple[float, dict]] = []
+    # Chunks whose background embedding hasn't landed yet ("pending", or any
+    # vector-less entry) can't get a semantic score — fall back to lexical
+    # overlap alone for those instead of dropping them from retrieval.
+    pending_group = by_space.pop("pending", [])
+    pending_group += [c for group in by_space.values() for c in group if c.get("vector") is None]
+    if pending_group:
+        lex = np.array([_lexical_overlap(query, c["text"]) for c in pending_group], dtype=np.float32)
+        scored.extend(zip(lex.tolist(), pending_group))
+
     for space, group in by_space.items():
+        group = [c for c in group if c.get("vector") is not None]
+        if not group:
+            continue
         qvec = np.array(await _embed_query(query, space), dtype=np.float32)
         mat = np.array([c["vector"] for c in group], dtype=np.float32)
         q_norm = float(np.linalg.norm(qvec)) or 1e-9
@@ -642,13 +679,54 @@ def format_context(chunks: List[dict], max_chars_per_chunk: int = MAX_CONTEXT_CH
     return "\n\n---\n\n".join(blocks)
 
 
+def get_all_text_for_files(session: dict, file_ids: List[str], max_chars_per_file: int = 6000) -> str:
+    """Direct, non-semantic context for files attached to THIS turn — no
+    embed-and-search round trip. If the user just uploaded a file and is
+    asking about it in the same message, it's already known to be relevant;
+    semantic retrieval exists to find the right needle in a haystack of
+    *older* uploads, not to re-confirm the one file just handed to you."""
+    if not file_ids:
+        return ""
+    wanted = set(file_ids)
+    chunks = [c for c in (session.get("rag_chunks") or []) if c["file_id"] in wanted]
+    if not chunks:
+        return ""
+    by_file: Dict[str, List[dict]] = {}
+    for c in chunks:
+        by_file.setdefault(c["file_id"], []).append(c)
+    blocks = []
+    for cs in by_file.values():
+        cs.sort(key=lambda c: c.get("page") or 0)
+        text = "\n\n".join(c["text"] for c in cs)
+        if len(text) > max_chars_per_file:
+            text = text[:max_chars_per_file].rstrip() + "…"
+        kind_tag = " (image analysis)" if cs[0].get("kind") == "image" else ""
+        blocks.append(f"[FILE: {cs[0]['filename']}{kind_tag}]\n{text}")
+    return "\n\n---\n\n".join(blocks)
+
+
 async def build_context(session: dict, query: str, attachment_ids: Optional[List[str]] = None,
                          top_k: int = TOP_K_DEFAULT) -> Tuple[str, List[dict]]:
     """Convenience wrapper: retrieve + format in one call. Returns
     (context_text, chunks_used) — chunks_used is [] and context_text is ""
     whenever the session has no uploaded files, so callers can skip the RAG
-    prompt block entirely without an extra has_files() check."""
+    prompt block entirely without an extra has_files() check.
+
+    Files named in attachment_ids (just attached this turn) go straight in
+    via get_all_text_for_files() — no embedding/search needed. Any other
+    files already in the session (older uploads not referenced this turn)
+    still go through normal semantic retrieve() so cross-turn recall keeps
+    working."""
     if not session.get("rag_chunks"):
         return "", []
-    chunks = await retrieve(session, query, top_k=top_k, attachment_ids=attachment_ids)
+    if attachment_ids:
+        direct_text = get_all_text_for_files(session, attachment_ids)
+        other_ids = {c["file_id"] for c in session["rag_chunks"]} - set(attachment_ids)
+        chunks, retrieved_text = [], ""
+        if other_ids:
+            chunks = await retrieve(session, query, top_k=top_k, attachment_ids=list(other_ids))
+            retrieved_text = format_context(chunks)
+        combined = "\n\n---\n\n".join(x for x in (direct_text, retrieved_text) if x)
+        return combined, chunks
+    chunks = await retrieve(session, query, top_k=top_k)
     return format_context(chunks), chunks
