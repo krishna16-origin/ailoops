@@ -3589,6 +3589,14 @@
                     renderScheduled = false;
                     const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : assistantFullText;
                     setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)));
+                    // Without this, a table renders as a raw, unconstrained <table> for the
+                    // entire time the answer is still streaming in (this render fires up to
+                    // 60x/sec) and only gets wrapped into its fixed, scrollable box once the
+                    // stream ends — so the whole response visibly shifts/reflows sideways
+                    // while generating. Wrapping on every live frame keeps the table boxed
+                    // and scrollable-in-place from the moment it first appears. Chat mode
+                    // only, matching the final-render call sites below.
+                    if (mode === 'chat') wrapTables(textContainer);
                     if (indicatorEl) textContainer.appendChild(indicatorEl);
                     scrollToBottom();
                 });
