@@ -248,14 +248,19 @@
         .message-text h3 { font-size:1.1em; }
         .message-text ul, .message-text ol { margin:10px 0; padding-left:22px; }
         .message-text li { margin-bottom:6px; }
-        /* Tables: previously `display:block; width:100%` on the <table> itself
-           forced the browser to squeeze every column down to fit the message
-           width, wrapping cell text awkwardly instead of scrolling. Now the
-           table renders at its natural width (wrapTables() below wraps every
-           rendered <table> in a .table-scroll div right after markdown parses
-           it) and only the wrapper scrolls horizontally when the table is
-           wider than the bubble — same behavior as ChatGPT's tables, on both
-           desktop and mobile. */
+        /* Tables (Chat mode only — see wrapTables() below): previously
+           `display:block; width:100%` on the <table> itself forced the browser
+           to squeeze every column down to fit the message width, wrapping cell
+           text awkwardly instead of scrolling. Now the table renders at its
+           natural width (wrapTables() wraps every rendered <table> in a
+           .table-scroll div right after markdown parses it) and only that
+           wrapper scrolls horizontally — via native overflow-x, swipeable on
+           touch — when the table is wider than the chat bubble/content area.
+           The wrapper's own width is constrained by its normal-flow ancestors
+           (.message-bubble's max-width, .chat-content's max-width, .assistant-body's
+           min-width:0), so a wide table only scrolls inside this box; it can
+           never force .chat-container or the page itself to scroll horizontally
+           — same behavior as ChatGPT's tables, on both desktop and mobile. */
         .message-text .table-scroll { margin:14px 0; overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid var(--border-color); border-radius:8px; background-color:rgba(0,0,0,0.15); }
         .message-text table { width:max-content; min-width:100%; border-collapse:collapse; }
         .message-text th, .message-text td { border:1px solid var(--border-color); padding:9px 13px; text-align:left; white-space:nowrap; }
@@ -1596,6 +1601,10 @@
         // just wraps cell text into an unreadable mess), wrap each table in a
         // horizontally-scrolling container and let it keep its natural width,
         // the same way ChatGPT handles wide tables on both desktop and mobile.
+        // Chat mode only: every call site below only invokes this when
+        // currentMode/mode === 'chat', so Code mode's generated tables are left
+        // with their previous (unwrapped) rendering — see the call sites in
+        // appendMessage() and sendMessage() for the mode checks.
         function wrapTables(el) {
             if (!el) return;
             el.querySelectorAll('table').forEach(table => {
@@ -3108,7 +3117,10 @@
                 // Prose is kept in its own child so streamed updates do not replace
                 // the Code mode diff box or the thinking panel.
                 contentDiv.innerHTML = `<div class="message-prose">${text ? DOMPurify.sanitize(marked.parse(normalizeMathDelimiters(text))) : ''}</div>`;
-                if (text) { highlightCode(contentDiv.querySelector('.message-prose')); wrapTables(contentDiv.querySelector('.message-prose')); }
+                // ChatGPT-style scrollable tables are a Chat mode-only treatment (see
+                // wrapTables() below) — Code mode's prose keeps its previous, unwrapped
+                // table rendering.
+                if (text) { highlightCode(contentDiv.querySelector('.message-prose')); if (currentMode === 'chat') wrapTables(contentDiv.querySelector('.message-prose')); }
 
                 // Thinking block starts EMPTY and expanded. It is only ever populated
                 // with real user-facing progress summaries from the backend,
@@ -4469,16 +4481,18 @@
                         }
                     }
 
+                    // ChatGPT-style scrollable tables (wrapTables()) are a Chat mode-only
+                    // treatment — Code mode responses (both the code-result branch and the
+                    // plain-prose branch below) keep their previous, unwrapped table rendering.
                     const hasCodeResult = codeResult && (codeResult.code || (codeResult.files && Object.keys(codeResult.files).length > 0));
                     if (mode === 'code' && hasCodeResult) {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText))));
                         highlightCode(textContainer);
-                        wrapTables(textContainer);
                         finalizeCodeResult(codeResult);
                     } else {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
                         highlightCode(textContainer);
-                        wrapTables(textContainer);
+                        if (mode === 'chat') wrapTables(textContainer);
                     }
 
                 } else {
@@ -4494,15 +4508,15 @@
                     }
                     assistantFullText = data.response;
                     const hasCode = data && (data.code || (data.files && Object.keys(data.files).length > 0));
+                    // Same Chat mode-only scoping as the streaming path above.
                     if (mode === 'code' && hasCode) {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText))));
                         highlightCode(textContainer);
-                        wrapTables(textContainer);
                         finalizeCodeResult(data);
                     } else {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
                         highlightCode(textContainer);
-                        wrapTables(textContainer);
+                        if (mode === 'chat') wrapTables(textContainer);
                     }
                 }
 
