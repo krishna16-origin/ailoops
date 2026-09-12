@@ -232,8 +232,17 @@
         .message-text h3 { font-size:1.1em; }
         .message-text ul, .message-text ol { margin:10px 0; padding-left:22px; }
         .message-text li { margin-bottom:6px; }
-        .message-text table { width:100%; border-collapse:collapse; margin:14px 0; background-color:rgba(0,0,0,0.15); border-radius:8px; overflow:hidden; display:block; overflow-x:auto; }
-        .message-text th, .message-text td { border:1px solid var(--border-color); padding:9px 13px; text-align:left; }
+        /* Tables: previously `display:block; width:100%` on the <table> itself
+           forced the browser to squeeze every column down to fit the message
+           width, wrapping cell text awkwardly instead of scrolling. Now the
+           table renders at its natural width (wrapTables() below wraps every
+           rendered <table> in a .table-scroll div right after markdown parses
+           it) and only the wrapper scrolls horizontally when the table is
+           wider than the bubble — same behavior as ChatGPT's tables, on both
+           desktop and mobile. */
+        .message-text .table-scroll { margin:14px 0; overflow-x:auto; -webkit-overflow-scrolling:touch; border:1px solid var(--border-color); border-radius:8px; background-color:rgba(0,0,0,0.15); }
+        .message-text table { width:max-content; min-width:100%; border-collapse:collapse; }
+        .message-text th, .message-text td { border:1px solid var(--border-color); padding:9px 13px; text-align:left; white-space:nowrap; }
         .message-text th { background-color:rgba(255,255,255,0.05); font-weight:600; }
 
         /* Links inside an assistant answer — plain browser blue/underline would clash
@@ -766,7 +775,6 @@
             .response-canvas-preview { height:50vh; height:50dvh; min-height:260px; }
             .response-canvas-tabs { gap:1px; padding:6px 6px 0; }
             .response-canvas-tab { padding:5px 8px; font-size:12px; }
-            .message-text table { display:block; width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
             .message-text pre { max-width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
         }
 
@@ -1563,6 +1571,23 @@
                 card.appendChild(header);
                 if (previewDiv) card.appendChild(previewDiv);
                 card.appendChild(pre);
+            });
+        }
+
+        // Markdown tables render as plain <table> elements with no control over
+        // how wide they end up — a table with 8 columns is naturally wider than
+        // a chat bubble. Rather than squeezing every column down to fit (which
+        // just wraps cell text into an unreadable mess), wrap each table in a
+        // horizontally-scrolling container and let it keep its natural width,
+        // the same way ChatGPT handles wide tables on both desktop and mobile.
+        function wrapTables(el) {
+            if (!el) return;
+            el.querySelectorAll('table').forEach(table => {
+                if (table.parentElement.classList.contains('table-scroll')) return;
+                const wrapper = document.createElement('div');
+                wrapper.className = 'table-scroll';
+                table.parentNode.insertBefore(wrapper, table);
+                wrapper.appendChild(table);
             });
         }
 
@@ -3047,7 +3072,7 @@
                 // Prose is kept in its own child so streamed updates do not replace
                 // the Code mode diff box or the thinking panel.
                 contentDiv.innerHTML = `<div class="message-prose">${text ? DOMPurify.sanitize(marked.parse(normalizeMathDelimiters(text))) : ''}</div>`;
-                if (text) highlightCode(contentDiv.querySelector('.message-prose'));
+                if (text) { highlightCode(contentDiv.querySelector('.message-prose')); wrapTables(contentDiv.querySelector('.message-prose')); }
 
                 // Thinking block starts EMPTY and expanded. It is only ever populated
                 // with real user-facing progress summaries from the backend,
@@ -4412,10 +4437,12 @@
                     if (mode === 'code' && hasCodeResult) {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText))));
                         highlightCode(textContainer);
+                        wrapTables(textContainer);
                         finalizeCodeResult(codeResult);
                     } else {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
                         highlightCode(textContainer);
+                        wrapTables(textContainer);
                     }
 
                 } else {
@@ -4434,10 +4461,12 @@
                     if (mode === 'code' && hasCode) {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(stripCodeFence(assistantFullText))));
                         highlightCode(textContainer);
+                        wrapTables(textContainer);
                         finalizeCodeResult(data);
                     } else {
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
                         highlightCode(textContainer);
+                        wrapTables(textContainer);
                     }
                 }
 
