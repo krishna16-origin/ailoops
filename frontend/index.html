@@ -802,6 +802,14 @@
                fast fling briefly rubber-bands the viewport, instead of momentarily
                scrolling out of reach or showing content bleeding through underneath. */
             .header { height:56px; padding:0 12px; position:sticky; top:0; z-index:20; background-color:var(--bg-main); flex-shrink:0; }
+            /* Without this, a message scrolling up disappears the instant it hits
+               the header's bottom edge — a visible hard line. This mirrors the
+               composer's own fade at the bottom of the screen (rgba(33,33,33,0) ->
+               var(--bg-main), same rgb channels as --bg-main so the gradient never
+               flashes grey mid-fade): it sits just below the sticky header, still
+               scrolls with it, and lets content dissolve into the header over ~28px
+               instead of getting clipped in one hard line. */
+            .header::after { content:''; position:absolute; top:100%; left:0; right:0; height:28px; background:linear-gradient(to bottom, var(--bg-main) 0%, rgba(33,33,33,0) 100%); pointer-events:none; }
             .header-left { gap:8px; }
             .sidebar-toggle-main { display:flex !important; opacity:1 !important; transform:scale(1) !important; }
             .mode-toggle button { padding:6px 10px; font-size:12px; }
