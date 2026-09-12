@@ -32,6 +32,7 @@ from constitution import build_constitution_block
 import sandbox_manager
 import mcp_gateway
 import rag_engine
+import session_store
 
 load_dotenv()
 
@@ -164,7 +165,9 @@ CODE_MODEL_MAP = {
     "super": "nvidia/nemotron-3-super-120b-a12b",
     "step-flash": "deepseek-ai/deepseek-v4-pro-0813",
 }
-DEFAULT_CODE_MODEL = "glimmer"
+DEFAULT_CODE_MODEL = "gemma"  # was "glimmer" (Kimi K3) — see the model_type comment
+# on ChatRequest: Kimi's always-on reasoning trades speed for depth, which isn't
+# the right unconfigured default for a "feels instant" chat/code experience.
 
 
 # --- Per-model compatibility helpers ---
@@ -552,6 +555,16 @@ def build_web_sources_markdown(links: list, images: list) -> str:
 
 
 sessions: Dict[str, Dict[str, Any]] = {}
+
+
+def get_session(session_id: str) -> Dict[str, Any]:
+    """Fetch-or-create a session dict, rehydrating rag_files/rag_chunks from
+    Redis if this process doesn't have them in memory (see session_store.py —
+    fixes RAG silently going blank after a Render free-tier spin-down wipes
+    the in-memory `sessions` dict)."""
+    session = sessions.setdefault(session_id, {"messages": [], "_session_id": session_id})
+    session_store.load_rag_state(session)
+    return session
 
 # Strong references for fire-and-forget background upload/indexing tasks.
 #
@@ -946,37 +959,76 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
         raise last_exc
 
 
-# rag_engine.wait_for_processing() defaults to a 120s ceiling per call site,
-# which is the right safety net for a genuinely huge upload but is way too
-# long for a chat reply to sit silently if something's slow — nothing was
-# ever streamed to the user while it waited. RAG_WAIT_TIMEOUT caps the block
-# to a much more ChatGPT-like budget, and _await_rag_indexing surfaces a
-# real status event the instant a file is still indexing, instead of the UI
-# looking frozen for however long the wait takes.
-RAG_WAIT_TIMEOUT = 25.0
+# --- BUGFIX (see conversation) --------------------------------------------
+# RAG_WAIT_TIMEOUT used to be 25s. That's shorter than the NVIDIA endpoints'
+# own worst-case processing time: ChatNVIDIA vision analysis is called with
+# timeout=90, and NVIDIAEmbeddings' underlying client defaults to a 60s poll
+# timeout (it's a Field default inside langchain_nvidia_ai_endpoints, not
+# something this code ever set). So on real, non-instant NVIDIA calls, a
+# 25s cap routinely gave up on a file that was still legitimately indexing.
+# build_context() only pulls chunks from files whose status is already
+# "ready" — a file still "processing" contributes nothing — so the model
+# would answer as if nothing had ever been uploaded, even though the upload
+# had succeeded and was quietly finishing in the background. That's the
+# "it says I didn't upload anything" report.
+#
+# The second half of that report — requests timing out — came from the fix
+# for the first half almost making things worse: naively raising this one
+# number to comfortably cover 90s of NVIDIA-side work means the wait can now
+# go a long time between events. Streaming responses stay open with no
+# bytes sent during that whole span, and reverse proxies / CDNs in front of
+# the app (Render, Railway, Cloudflare, nginx, etc.) commonly kill a
+# connection after ~30-60s of silence, which surfaces to the user as the
+# request simply timing out.
+#
+# Fixing both at once: raise the ceiling so processing actually gets time to
+# finish, but wait in short heartbeat slices and re-publish the "still
+# indexing" status on every slice, so a streaming connection never goes
+# quiet for longer than RAG_WAIT_HEARTBEAT seconds.
+RAG_WAIT_TIMEOUT = 100.0
+RAG_WAIT_HEARTBEAT = 8.0
 
 
 async def _await_rag_indexing(session: dict, attachment_ids: Optional[List[str]], progress=None, emit=None) -> None:
     """Waits for any still-processing uploads, but (a) tells the caller about
-    it immediately instead of blocking silently, and (b) bounds the wait to
-    RAG_WAIT_TIMEOUT instead of rag_engine's full 120s default. Accepts
+    it immediately instead of blocking silently, (b) re-announces that status
+    every RAG_WAIT_HEARTBEAT seconds so a streaming response never goes idle
+    long enough to look like a dead connection, and (c) bounds the total wait
+    to RAG_WAIT_TIMEOUT — now long enough to cover NVIDIA's own worst-case
+    vision/embedding turnaround instead of cutting it off mid-flight. Accepts
     either the chat-mode `progress` (Queue/list, via publish_progress) or the
     code-mode `emit` async callback, whichever the caller has on hand."""
     allowed = set(attachment_ids) if attachment_ids else None
-    pending = [
-        f for f in rag_engine.list_files(session)
-        if f.get("status") == "processing" and (allowed is None or f.get("id") in allowed)
-    ]
-    if pending:
-        names = ", ".join(sorted({f["filename"] for f in pending}))
-        detail = f"Finishing indexing {names} before answering…"
+
+    def _pending() -> List[dict]:
+        return [
+            f for f in rag_engine.list_files(session)
+            if f.get("status") == "processing" and (allowed is None or f.get("id") in allowed)
+        ]
+
+    pending = _pending()
+    if not pending:
+        return
+    names = ", ".join(sorted({f["filename"] for f in pending}))
+
+    async def _announce(elapsed: float) -> None:
+        suffix = f" ({int(elapsed)}s)" if elapsed else ""
+        detail = f"Finishing indexing {names} before answering…{suffix}"
         if emit is not None:
             await emit({"type": "activity_start", "action": "rag_wait", "file": names})
         elif progress is not None:
             await publish_progress(progress, "rag_wait", "rag_wait", detail)
-    await rag_engine.wait_for_processing(session, attachment_ids, timeout=RAG_WAIT_TIMEOUT)
-    if pending and emit is not None:
-        await emit({"type": "activity_complete", "action": "rag_wait", "file": ", ".join(sorted({f["filename"] for f in pending}))})
+
+    await _announce(0)
+    waited = 0.0
+    while waited < RAG_WAIT_TIMEOUT and _pending():
+        slice_timeout = min(RAG_WAIT_HEARTBEAT, RAG_WAIT_TIMEOUT - waited)
+        await rag_engine.wait_for_processing(session, attachment_ids, timeout=slice_timeout)
+        waited += slice_timeout
+        if _pending() and waited < RAG_WAIT_TIMEOUT:
+            await _announce(waited)
+    if emit is not None:
+        await emit({"type": "activity_complete", "action": "rag_wait", "file": names})
 
 
 async def chat_understand_node(request: "ChatRequest", session: dict, progress=None) -> dict:
@@ -1084,7 +1136,10 @@ async def serve_frontend():
 class ChatRequest(BaseModel):
     message: str
     session_id: str
-    model_type: str = "balanced"
+    model_type: str = "fast"  # was "balanced" (Kimi K3) — Kimi always reasons for
+    # potentially minutes before its first visible token (see get_llm()'s comment),
+    # so that default made every unconfigured request feel broken/slow. "fast"
+    # (Deepseek) matches the new frontend default and is what most callers want.
     stream: bool = False
     temperature: float = 0.7
     thinking_level: str = DEFAULT_THINKING_LEVEL
@@ -2679,6 +2734,7 @@ async def mcp_policies():
 @app.post("/clear-session")
 async def clear_session(request: ClearSessionRequest):
     sessions.pop(request.session_id, None)
+    session_store.clear_rag_state(request.session_id)
     return {"status": "success", "message": f"Session {request.session_id} cleared."}
 
 
@@ -2689,7 +2745,7 @@ async def upload_file(session_id: str = Form(...), file: UploadFile = File(...))
     button (files) and camera capture (photos) in both Chat and Code mode —
     the resulting content becomes retrievable on every subsequent turn in
     this session, in both modes."""
-    session = sessions.setdefault(session_id, {"messages": []})
+    session = get_session(session_id)
     data = await file.read()
     # create_upload_record does CPU-bound image decode/resize (via Pillow) for
     # thumbnails. Run it in a worker thread rather than inline on the event
@@ -2725,13 +2781,13 @@ async def upload_file(session_id: str = Form(...), file: UploadFile = File(...))
 
 @app.get("/session-files/{session_id}")
 async def list_session_files(session_id: str):
-    session = sessions.get(session_id) or {}
+    session = get_session(session_id)
     return {"session_id": session_id, "files": rag_engine.list_files(session)}
 
 
 @app.get("/session-files/{session_id}/{file_id}/content")
 async def session_file_content(session_id: str, file_id: str):
-    session = sessions.get(session_id)
+    session = get_session(session_id)
     content = rag_engine.get_file_content(session or {}, file_id)
     if not content:
         raise HTTPException(status_code=404, detail="File content not found in this session.")
@@ -2745,8 +2801,8 @@ async def session_file_content(session_id: str, file_id: str):
 
 @app.delete("/session-files/{session_id}/{file_id}")
 async def delete_session_file(session_id: str, file_id: str):
-    session = sessions.get(session_id)
-    if not session or not rag_engine.remove_file(session, file_id):
+    session = get_session(session_id)
+    if not rag_engine.remove_file(session, file_id):
         raise HTTPException(status_code=404, detail="File not found in this session.")
     return {"status": "success", "file_id": file_id}
 
@@ -2789,7 +2845,7 @@ async def generate_stream(request: ChatRequest, session: dict, session_id: str):
 
 @app.post("/code-chat")
 async def code_chat(request: CodeChatRequest):
-    session = sessions.setdefault(request.session_id, {"messages": []})
+    session = get_session(request.session_id)
     session["messages"] = trim_memory(session["messages"])
     session["messages"].append(HumanMessage(content=request.message))
     if request.stream:
@@ -2829,7 +2885,7 @@ async def code_chat(request: CodeChatRequest):
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    session = sessions.setdefault(request.session_id, {"messages": []})
+    session = get_session(request.session_id)
     session["messages"] = trim_memory(session["messages"])
     session["messages"].append(HumanMessage(content=request.message))
     if request.stream:
