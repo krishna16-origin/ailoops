@@ -666,6 +666,30 @@
         .image-preview-modal img { max-width:92vw; max-height:88vh; border-radius:12px; object-fit:contain; box-shadow:0 20px 60px rgba(0,0,0,0.5); cursor:default; }
         .image-preview-close { position:absolute; top:18px; right:22px; width:40px; height:40px; border-radius:50%; border:none; background:rgba(255,255,255,0.12); color:#fff; font-size:22px; line-height:1; cursor:pointer; display:flex; align-items:center; justify-content:center; }
         .image-preview-close:hover { background:rgba(255,255,255,0.22); }
+        /* "View sources" popup — opened from the small book icon in a response's
+           footer. Only the list inside the dialog scrolls; the backdrop and the
+           rest of the page stay fixed in place. */
+        .sources-modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:96; display:flex; align-items:center; justify-content:center; padding:24px; }
+        .sources-modal-overlay[hidden] { display:none; }
+        .sources-modal { width:100%; max-width:380px; max-height:min(70vh, 520px); background:var(--bg-sidebar); border:1px solid var(--border-color); border-radius:14px; display:flex; flex-direction:column; overflow:hidden; box-shadow:0 20px 60px rgba(0,0,0,0.5); }
+        .sources-modal-header { display:flex; align-items:center; justify-content:space-between; padding:14px 16px; border-bottom:1px solid var(--border-color); font-size:14px; font-weight:600; color:var(--text-primary); flex-shrink:0; }
+        .sources-modal-close { background:transparent; border:none; color:var(--text-secondary); font-size:20px; line-height:1; cursor:pointer; padding:2px 8px; border-radius:6px; }
+        .sources-modal-close:hover { background-color:var(--bg-hover); color:var(--text-primary); }
+        .sources-modal-body { overflow-y:auto; padding:8px; display:flex; flex-direction:column; gap:2px; }
+        .sources-modal-body::-webkit-scrollbar { width:8px; }
+        .sources-modal-body::-webkit-scrollbar-thumb { background-color:var(--scrollbar-thumb); border-radius:8px; }
+        .sources-modal-body::-webkit-scrollbar-thumb:hover { background-color:var(--scrollbar-thumb-hover); }
+        .sources-modal-item { display:flex; align-items:flex-start; gap:10px; padding:9px 8px; border-radius:10px; text-decoration:none; color:var(--text-primary); transition:background 0.15s; }
+        .sources-modal-item:hover { background-color:var(--bg-hover); }
+        .sources-modal-item-favicon { width:18px; height:18px; margin-top:2px; border-radius:4px; flex-shrink:0; object-fit:contain; background:var(--bg-input); }
+        .sources-modal-item-text { min-width:0; display:flex; flex-direction:column; gap:2px; }
+        .sources-modal-item-title { font-size:13.5px; line-height:1.35; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+        .sources-modal-item-domain { font-size:11.5px; color:var(--text-secondary); }
+        .sources-modal-section-label { font-size:11.5px; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-secondary); padding:12px 8px 4px; }
+        .sources-modal-image-grid { display:grid; grid-template-columns:repeat(3, 1fr); gap:6px; padding:2px 8px 8px; }
+        .sources-modal-image-item { display:block; border-radius:8px; overflow:hidden; aspect-ratio:1; background:var(--bg-input); }
+        .sources-modal-image-item img { width:100%; height:100%; object-fit:cover; display:block; }
+        .sources-modal-empty { padding:24px 16px; text-align:center; color:var(--text-secondary); font-size:13px; }
         .camera-modal-inner { position:relative; width:min(560px, 94vw); max-height:88vh; display:flex; flex-direction:column; align-items:center; gap:18px; }
         .camera-modal-inner video { width:100%; max-height:70vh; border-radius:16px; background:#000; object-fit:cover; transform:scaleX(-1); }
         .camera-modal-controls { display:flex; align-items:center; justify-content:center; gap:28px; width:100%; }
@@ -1034,6 +1058,17 @@
     <div class="image-preview-modal" id="imagePreviewModal" hidden onclick="if(event.target===this) closeImagePreview()">
         <button type="button" class="image-preview-close" onclick="closeImagePreview()" aria-label="Close preview">&times;</button>
         <img id="imagePreviewImg" src="" alt="">
+    </div>
+    <!-- "View sources" dialog, opened from the book icon in a response's footer.
+         Populated on demand by openSourcesModal(); only .sources-modal-body scrolls. -->
+    <div class="sources-modal-overlay" id="sourcesModal" hidden onclick="if(event.target===this) closeSourcesModal()">
+        <div class="sources-modal" role="dialog" aria-modal="true" aria-labelledby="sourcesModalTitle">
+            <div class="sources-modal-header">
+                <span id="sourcesModalTitle">Sources</span>
+                <button type="button" class="sources-modal-close" onclick="closeSourcesModal()" aria-label="Close sources">&times;</button>
+            </div>
+            <div class="sources-modal-body" id="sourcesModalBody"></div>
+        </div>
     </div>
     <section class="mcp-panel" id="mcpPanel" hidden aria-label="MCP integrations">
         <div class="mcp-panel-header"><span class="mcp-panel-title">Integrations</span><button type="button" class="icon-btn" onclick="toggleMcpPanel(false)" title="Close">×</button></div>
@@ -1670,6 +1705,90 @@
             const openMarker = cleaned.search(/(?:^|\n)[ \t]*FILE\s*:|```/i);
             if (openMarker !== -1) cleaned = cleaned.slice(0, openMarker);
             return cleaned.trim();
+        }
+
+        // Chat Mode's web search appends a trailing "---" + **Sources** (and
+        // optionally **Images**) markdown block to the answer (see
+        // build_web_sources_markdown in app.py). Rather than showing that list
+        // inline at the bottom of every searched reply, it's pulled out here so
+        // the response stays clean prose and the links/images can instead be
+        // surfaced through the small "view sources" icon in the footer. The cut
+        // only fires on the exact "\n\n---\n\n" + heading shape the backend
+        // produces, so a plain "---" divider the model writes on its own is left
+        // untouched.
+        function splitAssistantSources(fullText) {
+            const empty = { text: fullText || '', links: [], images: [] };
+            if (!fullText) return empty;
+            const cut = /\n\n---\n\n(?=\*\*Sources\*\*|\*\*Images\*\*)/.exec(fullText);
+            if (!cut) return empty;
+            const mainText = fullText.slice(0, cut.index);
+            const block = fullText.slice(cut.index + cut[0].length);
+
+            const links = [];
+            const sourcesSection = /\*\*Sources\*\*\n\n([\s\S]*?)(?:\n\n\*\*Images\*\*|$)/.exec(block);
+            if (sourcesSection) {
+                const lineRe = /^\d+\.\s*\[([^\]]*)\]\(([^)\s]+)\)/gm;
+                let m;
+                while ((m = lineRe.exec(sourcesSection[1])) !== null) {
+                    links.push({ title: m[1] || m[2], url: m[2] });
+                }
+            }
+
+            const images = [];
+            const imagesSection = /\*\*Images\*\*\n\n([\s\S]*)$/.exec(block);
+            if (imagesSection) {
+                const imgRe = /\[!\[([^\]]*)\]\(([^)\s]+)\)\]\(([^)\s]+)\)/g;
+                let m;
+                while ((m = imgRe.exec(imagesSection[1])) !== null) {
+                    images.push({ title: m[1], image: m[2], url: m[3] || m[2] });
+                }
+            }
+
+            return { text: mainText, links, images };
+        }
+
+        function sourceDomain(url) {
+            try { return new URL(url).hostname.replace(/^www\./, ''); }
+            catch (e) { return (url || '').replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0]; }
+        }
+
+        // Google's favicon service is used purely as a lightweight, keyless way
+        // to show each source's site logo — no separate backend endpoint needed.
+        function sourceFaviconUrl(domain) {
+            return `https://www.google.com/s2/favicons?sz=64&domain=${encodeURIComponent(domain)}`;
+        }
+
+        function closeSourcesModal() {
+            const modal = document.getElementById('sourcesModal');
+            if (modal) modal.hidden = true;
+        }
+
+        function openSourcesModal(links, images) {
+            const modal = document.getElementById('sourcesModal');
+            const body = document.getElementById('sourcesModalBody');
+            if (!modal || !body) return;
+            const parts = [];
+            if (links && links.length) {
+                parts.push(links.map((s) => {
+                    const domain = sourceDomain(s.url);
+                    return `<a class="sources-modal-item" href="${escapeHtml(s.url)}" target="_blank" rel="noopener">` +
+                        `<img class="sources-modal-item-favicon" src="${sourceFaviconUrl(domain)}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">` +
+                        `<span class="sources-modal-item-text">` +
+                        `<span class="sources-modal-item-title">${escapeHtml(s.title || domain)}</span>` +
+                        `<span class="sources-modal-item-domain">${escapeHtml(domain)}</span>` +
+                        `</span></a>`;
+                }).join(''));
+            }
+            if (images && images.length) {
+                parts.push(`<div class="sources-modal-section-label">Images</div>`);
+                parts.push(`<div class="sources-modal-image-grid">${images.map((img) => {
+                    const domain = sourceDomain(img.url);
+                    return `<a class="sources-modal-image-item" href="${escapeHtml(img.url)}" target="_blank" rel="noopener" title="${escapeHtml(img.title || domain)}">` +
+                        `<img src="${escapeHtml(img.image)}" alt="${escapeHtml(img.title || '')}" loading="lazy"></a>`;
+                }).join('')}</div>`);
+            }
+            body.innerHTML = parts.length ? parts.join('') : '<div class="sources-modal-empty">No sources for this response.</div>';
+            modal.hidden = false;
         }
 
         function renderPlanCard(container, plan) {
@@ -3119,7 +3238,7 @@
         }
 
         document.addEventListener('keydown', (event) => {
-            if (event.key === 'Escape') closeImagePreview();
+            if (event.key === 'Escape') { closeImagePreview(); closeSourcesModal(); }
         });
 
         function appendMessage(role, text, attachments = []) {
@@ -3249,6 +3368,9 @@
                     <button class="footer-icon-btn speak-btn" type="button" title="Read aloud">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>
                     </button>
+                    <button class="footer-icon-btn sources-btn" type="button" title="View sources" hidden>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 6.90909C10.8999 5.50893 9.20406 4.10877 5.00119 4.00602C4.72513 3.99928 4.5 4.22351 4.5 4.49965C4.5 6.54813 4.5 14.3034 4.5 16.597C4.5 16.8731 4.72515 17.09 5.00114 17.099C9.20405 17.2364 10.8999 19.0998 12 20.5M12 6.90909C13.1001 5.50893 14.7959 4.10877 18.9988 4.00602C19.2749 3.99928 19.5 4.21847 19.5 4.49461C19.5 6.78447 19.5 14.3064 19.5 16.5963C19.5 16.8724 19.2749 17.09 18.9989 17.099C14.796 17.2364 13.1001 19.0998 12 20.5M12 6.90909L12 20.5"></path><path d="M19.2353 6H21.5C21.7761 6 22 6.22386 22 6.5V19.539C22 19.9436 21.5233 20.2124 21.1535 20.0481C20.3584 19.6948 19.0315 19.2632 17.2941 19.2632C14.3529 19.2632 12 21 12 21C12 21 9.64706 19.2632 6.70588 19.2632C4.96845 19.2632 3.64156 19.6948 2.84647 20.0481C2.47668 20.2124 2 19.9436 2 19.539V6.5C2 6.22386 2.22386 6 2.5 6H4.76471"></path></svg>
+                    </button>
                     <button class="footer-icon-btn like-btn" type="button" title="Good response">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.28a2 2 0 0 0 2-1.7l1.38-9a2 2 0 0 0-2-2.3zM7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"></path></svg>
                     </button>
@@ -3283,6 +3405,14 @@
                     utterance.onerror = () => speakBtn.classList.remove('active');
                     speakBtn.classList.add('active');
                     window.speechSynthesis.speak(utterance);
+                });
+
+                // Opens the sources dialog with whatever links/images sendMessage()
+                // most recently attached to this button (see splitAssistantSources()
+                // below) — stays hidden entirely for turns with no web search.
+                const sourcesBtn = footer.querySelector('.sources-btn');
+                sourcesBtn.addEventListener('click', () => {
+                    openSourcesModal(sourcesBtn._sourceLinks || [], sourcesBtn._sourceImages || []);
                 });
 
                 // Thumbs up/down are mutually exclusive local feedback markers.
@@ -3484,10 +3614,27 @@
 
             const assistantBubble = appendMessage('assistant', '');
             const textContainer = assistantBubble.querySelector('.message-text');
+            const sourcesBtnEl = assistantBubble.querySelector('.sources-btn');
             const thinkingBlock = assistantBubble.querySelector('.thinking-block');
             const thinkingToggle = thinkingBlock.querySelector('.thinking-toggle');
             const thinkingContent = thinkingBlock.querySelector('.thinking-content');
             const thinkingStartTime = Date.now();
+
+            // Pulls any trailing **Sources**/**Images** block out of the raw answer
+            // text and stashes it on the footer's book icon so it renders as a
+            // popup instead of inline prose. Returns the cleaned text to display.
+            // No-op (returns text unchanged) outside Chat mode, where the backend
+            // never appends that block in the first place.
+            function applySourcesSplit(text) {
+                if (mode !== 'chat') return text;
+                const { text: mainText, links, images } = splitAssistantSources(text);
+                if (sourcesBtnEl) {
+                    sourcesBtnEl._sourceLinks = links;
+                    sourcesBtnEl._sourceImages = images;
+                    sourcesBtnEl.hidden = !(links.length || images.length);
+                }
+                return mainText;
+            }
 
             // Show "Thinking" the instant the request goes out — like Claude.ai — rather
             // than waiting for a real backend status event, which may never arrive for
@@ -3705,7 +3852,7 @@
                 renderScheduled = true;
                 requestAnimationFrame(() => {
                     renderScheduled = false;
-                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : assistantFullText;
+                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : applySourcesSplit(assistantFullText);
                     setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)));
                     // Without this, a table renders as a raw, unconstrained <table> for the
                     // entire time the answer is still streaming in (this render fires up to
@@ -4525,6 +4672,7 @@
                                     // explicitly asks the client to reset it.
                                     assistantFullText = '';
                                     setProse(textContainer, '');
+                                    if (sourcesBtnEl) { sourcesBtnEl.hidden = true; sourcesBtnEl._sourceLinks = []; sourcesBtnEl._sourceImages = []; }
                                     if (indicatorEl) indicatorEl.remove();
                                     if (mode === 'code') {
                                         indicatorEl = null;
@@ -4616,7 +4764,7 @@
                         highlightCode(textContainer);
                         finalizeCodeResult(codeResult);
                     } else {
-                        setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
+                        setProse(textContainer, marked.parse(normalizeMathDelimiters(applySourcesSplit(assistantFullText))));
                         highlightCode(textContainer);
                         if (mode === 'chat') wrapTables(textContainer);
                     }
@@ -4640,7 +4788,7 @@
                         highlightCode(textContainer);
                         finalizeCodeResult(data);
                     } else {
-                        setProse(textContainer, marked.parse(normalizeMathDelimiters(assistantFullText)));
+                        setProse(textContainer, marked.parse(normalizeMathDelimiters(applySourcesSplit(assistantFullText))));
                         highlightCode(textContainer);
                         if (mode === 'chat') wrapTables(textContainer);
                     }
