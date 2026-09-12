@@ -1,0 +1,177 @@
+diff --git a/app.py b/app.py
+index 2c4484d..55ca681 100644
+--- a/app.py
++++ b/app.py
+@@ -164,7 +164,9 @@ CODE_MODEL_MAP = {
+     "super": "nvidia/nemotron-3-super-120b-a12b",
+     "step-flash": "deepseek-ai/deepseek-v4-pro-0813",
+ }
+-DEFAULT_CODE_MODEL = "glimmer"
++DEFAULT_CODE_MODEL = "gemma"  # was "glimmer" (Kimi K3) — see the model_type comment
++# on ChatRequest: Kimi's always-on reasoning trades speed for depth, which isn't
++# the right unconfigured default for a "feels instant" chat/code experience.
+ 
+ 
+ # --- Per-model compatibility helpers ---
+@@ -946,37 +948,76 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
+         raise last_exc
+ 
+ 
+-# rag_engine.wait_for_processing() defaults to a 120s ceiling per call site,
+-# which is the right safety net for a genuinely huge upload but is way too
+-# long for a chat reply to sit silently if something's slow — nothing was
+-# ever streamed to the user while it waited. RAG_WAIT_TIMEOUT caps the block
+-# to a much more ChatGPT-like budget, and _await_rag_indexing surfaces a
+-# real status event the instant a file is still indexing, instead of the UI
+-# looking frozen for however long the wait takes.
+-RAG_WAIT_TIMEOUT = 25.0
++# --- BUGFIX (see conversation) --------------------------------------------
++# RAG_WAIT_TIMEOUT used to be 25s. That's shorter than the NVIDIA endpoints'
++# own worst-case processing time: ChatNVIDIA vision analysis is called with
++# timeout=90, and NVIDIAEmbeddings' underlying client defaults to a 60s poll
++# timeout (it's a Field default inside langchain_nvidia_ai_endpoints, not
++# something this code ever set). So on real, non-instant NVIDIA calls, a
++# 25s cap routinely gave up on a file that was still legitimately indexing.
++# build_context() only pulls chunks from files whose status is already
++# "ready" — a file still "processing" contributes nothing — so the model
++# would answer as if nothing had ever been uploaded, even though the upload
++# had succeeded and was quietly finishing in the background. That's the
++# "it says I didn't upload anything" report.
++#
++# The second half of that report — requests timing out — came from the fix
++# for the first half almost making things worse: naively raising this one
++# number to comfortably cover 90s of NVIDIA-side work means the wait can now
++# go a long time between events. Streaming responses stay open with no
++# bytes sent during that whole span, and reverse proxies / CDNs in front of
++# the app (Render, Railway, Cloudflare, nginx, etc.) commonly kill a
++# connection after ~30-60s of silence, which surfaces to the user as the
++# request simply timing out.
++#
++# Fixing both at once: raise the ceiling so processing actually gets time to
++# finish, but wait in short heartbeat slices and re-publish the "still
++# indexing" status on every slice, so a streaming connection never goes
++# quiet for longer than RAG_WAIT_HEARTBEAT seconds.
++RAG_WAIT_TIMEOUT = 100.0
++RAG_WAIT_HEARTBEAT = 8.0
+ 
+ 
+ async def _await_rag_indexing(session: dict, attachment_ids: Optional[List[str]], progress=None, emit=None) -> None:
+     """Waits for any still-processing uploads, but (a) tells the caller about
+-    it immediately instead of blocking silently, and (b) bounds the wait to
+-    RAG_WAIT_TIMEOUT instead of rag_engine's full 120s default. Accepts
++    it immediately instead of blocking silently, (b) re-announces that status
++    every RAG_WAIT_HEARTBEAT seconds so a streaming response never goes idle
++    long enough to look like a dead connection, and (c) bounds the total wait
++    to RAG_WAIT_TIMEOUT — now long enough to cover NVIDIA's own worst-case
++    vision/embedding turnaround instead of cutting it off mid-flight. Accepts
+     either the chat-mode `progress` (Queue/list, via publish_progress) or the
+     code-mode `emit` async callback, whichever the caller has on hand."""
+     allowed = set(attachment_ids) if attachment_ids else None
+-    pending = [
+-        f for f in rag_engine.list_files(session)
+-        if f.get("status") == "processing" and (allowed is None or f.get("id") in allowed)
+-    ]
+-    if pending:
+-        names = ", ".join(sorted({f["filename"] for f in pending}))
+-        detail = f"Finishing indexing {names} before answering…"
++
++    def _pending() -> List[dict]:
++        return [
++            f for f in rag_engine.list_files(session)
++            if f.get("status") == "processing" and (allowed is None or f.get("id") in allowed)
++        ]
++
++    pending = _pending()
++    if not pending:
++        return
++    names = ", ".join(sorted({f["filename"] for f in pending}))
++
++    async def _announce(elapsed: float) -> None:
++        suffix = f" ({int(elapsed)}s)" if elapsed else ""
++        detail = f"Finishing indexing {names} before answering…{suffix}"
+         if emit is not None:
+             await emit({"type": "activity_start", "action": "rag_wait", "file": names})
+         elif progress is not None:
+             await publish_progress(progress, "rag_wait", "rag_wait", detail)
+-    await rag_engine.wait_for_processing(session, attachment_ids, timeout=RAG_WAIT_TIMEOUT)
+-    if pending and emit is not None:
+-        await emit({"type": "activity_complete", "action": "rag_wait", "file": ", ".join(sorted({f["filename"] for f in pending}))})
++
++    await _announce(0)
++    waited = 0.0
++    while waited < RAG_WAIT_TIMEOUT and _pending():
++        slice_timeout = min(RAG_WAIT_HEARTBEAT, RAG_WAIT_TIMEOUT - waited)
++        await rag_engine.wait_for_processing(session, attachment_ids, timeout=slice_timeout)
++        waited += slice_timeout
++        if _pending() and waited < RAG_WAIT_TIMEOUT:
++            await _announce(waited)
++    if emit is not None:
++        await emit({"type": "activity_complete", "action": "rag_wait", "file": names})
+ 
+ 
+ async def chat_understand_node(request: "ChatRequest", session: dict, progress=None) -> dict:
+@@ -1084,7 +1125,10 @@ async def serve_frontend():
+ class ChatRequest(BaseModel):
+     message: str
+     session_id: str
+-    model_type: str = "balanced"
++    model_type: str = "fast"  # was "balanced" (Kimi K3) — Kimi always reasons for
++    # potentially minutes before its first visible token (see get_llm()'s comment),
++    # so that default made every unconfigured request feel broken/slow. "fast"
++    # (Deepseek) matches the new frontend default and is what most callers want.
+     stream: bool = False
+     temperature: float = 0.7
+     thinking_level: str = DEFAULT_THINKING_LEVEL
+diff --git a/frontend/index.html b/frontend/index.html
+index 4314925..33fc955 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -1204,21 +1204,31 @@
+              now driven by the picker above instead of being shown directly. -->
+         <div id="hiddenModelInputs" style="display:none" aria-hidden="true">
+             <select id="modelType">
+-                <option value="fast">Deepseek V4 Pro</option>
+-                <option value="balanced" selected>Kimi K3</option>
++                <!-- Defaulting to Deepseek (fast) instead of Kimi K3: Kimi is a
++                     native "thinking always on" reasoning model that can spend
++                     minutes reasoning before it writes a single visible answer
++                     token (see get_llm() in app.py) — that made every default,
++                     unconfigured chat feel broken/slow instead of ChatGPT-fast.
++                     Kimi/Amun-Ra are still one click away for people who want
++                     to trade speed for deeper reasoning. -->
++                <option value="fast" selected>Deepseek V4 Pro</option>
++                <option value="balanced">Kimi K3</option>
+                 <option value="reasoning">Amun-Ra</option>
+             </select>
+             <select id="tempSetting">
+-                <option value="low">Low</option>
+-                <option value="medium" selected>Medium</option>
++                <option value="low" selected>Low</option>
++                <option value="medium">Medium</option>
+                 <option value="high">High</option>
+                 <option value="extra">Extra</option>
+                 <option value="max">Max</option>
+             </select>
+             <select id="codeModel">
+-                <option value="gemma">Gemma-4</option>
++                <!-- Same fix as modelType above: default to the fast model,
++                     not the always-reasoning Kimi K3, so Code mode starts out
++                     ChatGPT-speed too. -->
++                <option value="gemma" selected>Gemma-4</option>
+                 <option value="fast">Gemma-4</option>
+-                <option value="glimmer" selected>Kimi K3</option>
++                <option value="glimmer">Kimi K3</option>
+                 <option value="medium">Kimi K3</option>
+                 <option value="ultra">Nemotron Ultra</option>
+                 <option value="strong">Nemotron Ultra</option>
+@@ -1231,8 +1241,8 @@
+                 <option value="build" selected>Build</option>
+             </select>
+             <select id="codeReasoningLevel">
+-                <option value="low">Low</option>
+-                <option value="medium" selected>Medium</option>
++                <option value="low" selected>Low</option>
++                <option value="medium">Medium</option>
+                 <option value="high">High</option>
+                 <option value="extra">Extra</option>
+                 <option value="max">Max</option>
