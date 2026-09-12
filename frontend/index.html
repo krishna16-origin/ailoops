@@ -228,8 +228,12 @@
         /* Long pasted user prompts collapse to a fixed number of lines with a
            "Show more" toggle beneath — see toggleUserMessageExpand(). Only the
            text itself clamps; the bubble's own white-space:pre-wrap (above)
-           still governs wrapping/newlines either way. */
-        .message-attachment-text.truncated { display:-webkit-box; -webkit-line-clamp:6; -webkit-box-orient:vertical; overflow:hidden; }
+           still governs wrapping/newlines either way. The ::after overlay fades
+           the last visible line into the bubble's own background instead of
+           the line-clamp's abrupt hard edge — cropped text looks intentional,
+           not cut off mid-thought. */
+        .message-attachment-text.truncated { display:-webkit-box; -webkit-line-clamp:6; -webkit-box-orient:vertical; overflow:hidden; position:relative; }
+        .message-attachment-text.truncated::after { content:''; position:absolute; left:0; right:0; bottom:0; height:1.7em; background:linear-gradient(to bottom, rgba(47,47,47,0) 0%, var(--bg-input) 85%); pointer-events:none; }
         .user-message-show-more { display:block; margin-top:8px; margin-left:auto; background:transparent; border:none; padding:0; font-size:13px; font-weight:600; color:var(--accent); cursor:pointer; }
         .user-message-show-more:hover { text-decoration:underline; }
 
