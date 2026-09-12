@@ -187,10 +187,26 @@
         .chat-container { flex:1; overflow-y:auto; display:flex; flex-direction:column; align-items:center; scroll-behavior:smooth; }
         .chat-content { width:100%; max-width:760px; padding:20px; display:flex; flex-direction:column; gap:26px; padding-bottom:150px; }
         .opening-scene { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; width:100%; text-align:center; padding:0 20px; }
-        .mono-logo-container { margin-bottom:20px; opacity:0; transform:scale(0.85) translateY(15px); animation:popFadeIn 0.6s var(--transition-bezier) forwards; }
+        .mono-logo-container { display:none; margin-bottom:20px; opacity:0; transform:scale(0.85) translateY(15px); animation:popFadeIn 0.6s var(--transition-bezier) forwards; }
         .mono-logo { width:56px; height:56px; color:var(--text-primary); }
         .swirl-spin { animation:spin 3s linear infinite; }
         .opening-title { font-size:24px; font-weight:600; margin-bottom:10px; opacity:0; transform:translateY(12px); animation:slideFadeIn 0.6s var(--transition-bezier) 0.1s forwards; transition:opacity 0.2s ease; }
+        /* Time-of-day chat greeting: a single consistent display font for every
+           greeting string. "Sinistre" (Collletttivo, free/OFL) is referenced
+           first — drop its webfont files into a local fonts/ folder and
+           uncomment the @font-face below to use the real typeface. Until then
+           it gracefully falls back to a similar-feeling serif. */
+        /*
+        @font-face {
+            font-family: 'Sinistre';
+            src: url('fonts/Sinistre-Regular.woff2') format('woff2'),
+                 url('fonts/Sinistre-Regular.woff') format('woff');
+            font-weight: normal;
+            font-style: normal;
+            font-display: swap;
+        }
+        */
+        .opening-title.greeting-style { font-family:'Sinistre','Cormorant Garamond','Playfair Display',Georgia,serif; font-weight:500; letter-spacing:0.01em; }
         .opening-subtitle { color:var(--text-secondary); font-size:14px; opacity:0; transform:translateY(12px); animation:slideFadeIn 0.6s var(--transition-bezier) 0.2s forwards; transition:opacity 0.2s ease; }
         @keyframes popFadeIn { to { opacity:1; transform:scale(1) translateY(0); } }
         @keyframes slideFadeIn { to { opacity:1; transform:translateY(0); } }
@@ -1099,8 +1115,8 @@
                         <polyline points="2 17 12 22 22 17"></polyline>
                     </svg>
                 </div>
-                <h1 class="opening-title" id="openingTitle">How can I help you achieve your goal?</h1>
-                <p class="opening-subtitle" id="openingSubtitle">Execution destroys all excuses</p>
+                <h1 class="opening-title greeting-style" id="openingTitle"></h1>
+                <p class="opening-subtitle" id="openingSubtitle"></p>
             </div>
             <div class="chat-content" id="chatContent" style="display: none;"></div>
         </div>
@@ -1670,11 +1686,28 @@
             });
         }
 
+        // ---------- Chat-mode opening greeting: swaps by time of day. ----------
+        // 7–9   Coffee with Max        9–12   Back at it, Legend
+        // 12–3  Good afternoon         3–5    Ready When you are...
+        // 5–8   Evening Thoughts?      8–12   Hey Night Owl
+        // 12–4  Late night Dreams...   4–7    Good Morning, Son
+        function getChatGreeting() {
+            const hour = new Date().getHours();
+            if (hour >= 4 && hour < 7) return 'Good Morning, Son';
+            if (hour >= 7 && hour < 9) return 'Coffee with Max';
+            if (hour >= 9 && hour < 12) return 'Back at it, Legend';
+            if (hour >= 12 && hour < 15) return 'Good afternoon';
+            if (hour >= 15 && hour < 17) return 'Ready When you are...';
+            if (hour >= 17 && hour < 20) return 'Evening Thoughts?';
+            if (hour >= 20 && hour < 24) return 'Hey Night Owl';
+            return 'Late night Dreams...'; // 12am – 4am
+        }
+
         // ---------- Mode state: Chat and Code keep fully independent
         // sessions, transcripts, and opening-scene text. Switching modes
         // just swaps which one is visible; nothing is destroyed. ----------
         const MODE_COPY = {
-            chat: { title: 'How can I help?', subtitle: 'Clear answers, one direct pass', placeholder: 'Ask anything...' },
+            chat: { get title() { return getChatGreeting(); }, subtitle: '', placeholder: 'Ask anything...' },
             code: { title: 'What do you want to build?', subtitle: 'Code with reasoning, previewed instantly', placeholder: 'Describe the code you need...' }
         };
         const modes = {
@@ -1697,6 +1730,8 @@
         const openingScene = document.getElementById('openingScene');
         const openingTitle = document.getElementById('openingTitle');
         const openingSubtitle = document.getElementById('openingSubtitle');
+        openingTitle.textContent = MODE_COPY.chat.title;
+        openingSubtitle.textContent = MODE_COPY.chat.subtitle;
         const userInput = document.getElementById('userInput');
         const sendBtn = document.getElementById('sendBtn');
         const modeToggle = document.getElementById('modeToggle');
@@ -2943,6 +2978,7 @@
             setTimeout(() => {
                 openingTitle.textContent = copy.title;
                 openingSubtitle.textContent = copy.subtitle;
+                openingTitle.classList.toggle('greeting-style', mode === 'chat');
                 openingTitle.style.opacity = 1;
                 openingSubtitle.style.opacity = 1;
             }, 150);
