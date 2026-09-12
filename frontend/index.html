@@ -54,14 +54,22 @@
         *::-webkit-scrollbar-corner { background:transparent; }
 
         * { box-sizing:border-box; margin:0; padding:0; font-family:'Inter',sans-serif; }
-        html { -webkit-text-size-adjust:100%; }
+        html { -webkit-text-size-adjust:100%; height:100%; overscroll-behavior:none; }
         /* Instant taps: without this, mobile browsers wait ~300ms after a tap
            on any button/link to see if a second tap is coming (to double-tap
            zoom), which is exactly the sluggishness that makes a web page feel
            like a web page instead of an app. Scoped to actual controls so
            pinch-zoom and text selection elsewhere on the page still work. */
         button, a, input, textarea, select, [onclick] { touch-action:manipulation; }
-        body { background-color:var(--bg-main); color:var(--text-primary); display:flex; height:100vh; height:100dvh; min-height:100vh; min-height:100dvh; overflow:hidden; -webkit-tap-highlight-color:transparent; }
+        /* overscroll-behavior:none stops the classic mobile-Safari/Android
+           "scroll chaining" bug: flinging a long response to the very top or
+           bottom of .chat-container's own scroll area would otherwise hand the
+           gesture off to the page underneath, rubber-banding the whole layout
+           (including the header's sidebar toggle and Chat/Code switch, and the
+           composer) up off-screen for a moment. With this, only the intended
+           inner panel ever scrolls/bounces — the header and input bar stay put
+           no matter how hard or fast the response area is scrolled. */
+        body { background-color:var(--bg-main); color:var(--text-primary); display:flex; height:100vh; height:100dvh; min-height:100vh; min-height:100dvh; overflow:hidden; overscroll-behavior:none; -webkit-tap-highlight-color:transparent; }
         @supports (height:100dvh) { body { height:100dvh; min-height:100dvh; } }
 
         /* ============== SPLASH SCREEN ============== */
@@ -119,7 +127,7 @@
         .new-chat-btn { flex:1; display:flex; align-items:center; justify-content:space-between; padding:10px 12px; background-color:transparent; color:var(--text-primary); border:1px solid var(--border-color); border-radius:8px; cursor:pointer; font-size:14px; font-weight:500; transition:background 0.2s ease, transform 0.15s ease; }
         .new-chat-btn:hover { background-color:var(--bg-hover); }
         .new-chat-btn:active { transform:scale(0.98); }
-        .history-list { flex:1; overflow-y:auto; -webkit-overflow-scrolling:touch; display:flex; flex-direction:column; gap:5px; }
+        .history-list { flex:1; overflow-y:auto; overscroll-behavior:contain; -webkit-overflow-scrolling:touch; display:flex; flex-direction:column; gap:5px; }
         .history-item { padding:12px; border-radius:8px; cursor:pointer; font-size:14px; overflow:hidden; text-overflow:ellipsis; color:var(--text-secondary); transition:background 0.2s, color 0.2s; }
         .history-item:hover { background-color:var(--bg-hover); color:var(--text-primary); }
         .sidebar-settings { margin-top:auto; padding-top:16px; border-top:1px solid var(--border-color); display:flex; flex-direction:column; gap:12px; }
@@ -184,7 +192,7 @@
         .mode-toggle.code-active .mode-toggle-pill { transform:translateX(100%); }
 
         /* ============== CHAT AREA (simplified) ============== */
-        .chat-container { flex:1; overflow-y:auto; display:flex; flex-direction:column; align-items:center; scroll-behavior:smooth; }
+        .chat-container { flex:1; overflow-y:auto; overscroll-behavior-y:contain; display:flex; flex-direction:column; align-items:center; scroll-behavior:smooth; }
         .chat-content { width:100%; max-width:760px; padding:20px; display:flex; flex-direction:column; gap:26px; padding-bottom:150px; }
         .opening-scene { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; width:100%; text-align:center; padding:0 20px; }
         .mono-logo-container { display:none; margin-bottom:20px; opacity:0; transform:scale(0.85) translateY(15px); animation:popFadeIn 0.6s var(--transition-bezier) forwards; }
@@ -216,6 +224,14 @@
         .message-row.assistant { justify-content:flex-start; }
         .message-bubble { max-width:88%; padding:14px 18px; font-size:15px; line-height:1.6; }
         .user .message-bubble { background-color:var(--bg-input); border-radius:20px 20px 6px 20px; white-space:pre-wrap; }
+
+        /* Long pasted user prompts collapse to a fixed number of lines with a
+           "Show more" toggle beneath — see toggleUserMessageExpand(). Only the
+           text itself clamps; the bubble's own white-space:pre-wrap (above)
+           still governs wrapping/newlines either way. */
+        .message-attachment-text.truncated { display:-webkit-box; -webkit-line-clamp:6; -webkit-box-orient:vertical; overflow:hidden; }
+        .user-message-show-more { display:block; margin-top:8px; margin-left:auto; background:transparent; border:none; padding:0; font-size:13px; font-weight:600; color:var(--accent); cursor:pointer; }
+        .user-message-show-more:hover { text-decoration:underline; }
 
         /* Simplified assistant message: no repeated title per bubble, just a small quiet avatar */
         .assistant .message-bubble { background-color:transparent; border-radius:8px; color:var(--text-primary); display:flex; gap:12px; padding-left:0; align-items:flex-start; }
@@ -775,8 +791,13 @@
 
         /* ============== RESPONSIVE: MOBILE + TABLET (<=768px) ============== */
         @media (max-width: 768px) {
-            /* Header: keep toggle visible on mobile (drawer mode), tighten spacing */
-            .header { height:56px; padding:0 12px; }
+            /* Header: keep toggle visible on mobile (drawer mode), tighten spacing.
+               position:sticky + a solid background is belt-and-suspenders on top of
+               body/.chat-container's overscroll-behavior above — it keeps the
+               sidebar toggle and Chat/Code switch pinned and fully opaque even if a
+               fast fling briefly rubber-bands the viewport, instead of momentarily
+               scrolling out of reach or showing content bleeding through underneath. */
+            .header { height:56px; padding:0 12px; position:sticky; top:0; z-index:20; background-color:var(--bg-main); flex-shrink:0; }
             .header-left { gap:8px; }
             .sidebar-toggle-main { display:flex !important; opacity:1 !important; transform:scale(1) !important; }
             .mode-toggle button { padding:6px 10px; font-size:12px; }
@@ -3241,6 +3262,17 @@
             if (event.key === 'Escape') { closeImagePreview(); closeSourcesModal(); }
         });
 
+        // Expands/collapses a long user message that was clamped to a few lines
+        // on send (see the .truncated class applied in appendMessage()).
+        function toggleUserMessageExpand(btn) {
+            const wrap = btn.closest('.user-text-wrap');
+            const textEl = wrap ? wrap.querySelector('.message-attachment-text') : null;
+            if (!textEl) return;
+            textEl.classList.toggle('truncated');
+            const isExpanded = !textEl.classList.contains('truncated');
+            btn.textContent = isExpanded ? 'Show less' : 'Show more';
+        }
+
         function appendMessage(role, text, attachments = []) {
             modes[currentMode].hasMessages = true;
             openingScene.style.display = 'none';
@@ -3448,7 +3480,24 @@
                 bubble.appendChild(avatar);
                 bubble.appendChild(body);
             } else {
-                bubble.innerHTML = renderMessageAttachments(attachments) + (text ? `<div class="message-attachment-text">${escapeHtml(text)}</div>` : '');
+                // Long pasted prompts/messages are collapsed to a handful of lines
+                // with a "Show more" toggle, so a giant paste doesn't push the rest
+                // of the conversation off-screen. Short messages render unchanged.
+                const attachmentsHtml = renderMessageAttachments(attachments);
+                if (text) {
+                    const isLong = text.length > 480 || (text.match(/\n/g) || []).length >= 6;
+                    if (isLong) {
+                        bubble.innerHTML = attachmentsHtml +
+                            `<div class="user-text-wrap">` +
+                            `<div class="message-attachment-text truncated">${escapeHtml(text)}</div>` +
+                            `<button type="button" class="user-message-show-more" onclick="toggleUserMessageExpand(this)">Show more</button>` +
+                            `</div>`;
+                    } else {
+                        bubble.innerHTML = attachmentsHtml + `<div class="message-attachment-text">${escapeHtml(text)}</div>`;
+                    }
+                } else {
+                    bubble.innerHTML = attachmentsHtml;
+                }
             }
 
             row.appendChild(bubble);
