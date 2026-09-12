@@ -50,6 +50,8 @@ import numpy as np
 from langchain_core.messages import HumanMessage
 from langchain_nvidia_ai_endpoints import ChatNVIDIA, NVIDIAEmbeddings
 
+import session_store
+
 try:
     import pypdf
 except Exception:  # pragma: no cover - optional at import time
@@ -464,6 +466,7 @@ def remove_file(session: dict, file_id: str) -> bool:
         return False
     files.pop(file_id, None)
     session["rag_chunks"] = [c for c in (session.get("rag_chunks") or []) if c["file_id"] != file_id]
+    session_store.save_rag_state(session)
     return True
 
 
@@ -516,17 +519,17 @@ async def process_upload(filename: str, data: bytes, content_type: str, session:
     kind = record["kind"]
     size = record["size"]
 
-    if len(files) > MAX_FILES_PER_SESSION:
-        record.update(status="error", error=f"This session already has {MAX_FILES_PER_SESSION} files attached — remove one before adding more.")
-        return record
-    if size > MAX_FILE_BYTES:
-        record.update(status="error", error=f"File exceeds the {MAX_FILE_BYTES // (1024 * 1024)}MB limit.")
-        return record
-    if kind == "unsupported":
-        record.update(status="error", error="Unsupported file type.")
-        return record
-
     try:
+        if len(files) > MAX_FILES_PER_SESSION:
+            record.update(status="error", error=f"This session already has {MAX_FILES_PER_SESSION} files attached — remove one before adding more.")
+            return record
+        if size > MAX_FILE_BYTES:
+            record.update(status="error", error=f"File exceeds the {MAX_FILE_BYTES // (1024 * 1024)}MB limit.")
+            return record
+        if kind == "unsupported":
+            record.update(status="error", error="Unsupported file type.")
+            return record
+
         raw_pieces: List[Tuple[Optional[int], str]] = []  # (page_number, text)
 
         if kind == "image":
@@ -582,6 +585,11 @@ async def process_upload(filename: str, data: bytes, content_type: str, session:
         traceback.print_exc()
         record.update(status="error", error=str(exc)[:300])
         return record
+    finally:
+        # Mirror rag_files/rag_chunks to Redis (no-op if REDIS_URL isn't set) so
+        # retrieval survives a process restart/spin-down instead of silently
+        # going blank — see session_store.py.
+        session_store.save_rag_state(session)
 
 
 # ---------------------------------------------------------------------------
