@@ -33,6 +33,7 @@ import sandbox_manager
 import mcp_gateway
 import rag_engine
 import session_store
+import file_generator
 
 load_dotenv()
 
@@ -665,6 +666,29 @@ def _guess_raw_code_language(line: str) -> str:
     return ''
 
 
+FILE_CREATION_PROMPT_BLOCK = (
+    "FILE CREATION: You can hand the user a real, downloadable file — this is a genuine capability, not a "
+    "hypothetical. To create one, wrap its content in this exact marker pair, naming the file yourself with a "
+    "sensible name and extension:\n"
+    "<<<FILE:filename.ext>>>\n"
+    "...full file content...\n"
+    "<<<END_FILE>>>\n"
+    "ONLY do this when the user explicitly asked for something to download, save, export, or create as a file — "
+    "phrases like 'make me a PDF', 'save this as a Word doc', 'give me this as a markdown file', 'export as CSV', "
+    "'create a spreadsheet of this', 'can I get a file for this'. Never use this marker for an ordinary answer, "
+    "a code snippet the user just wants to read, or proactively when nothing was asked for — a normal request "
+    "gets a normal text answer, not a file. If it's genuinely ambiguous whether they want a file or just an "
+    "in-chat answer, answer in chat and don't create a file.\n"
+    "Supported extensions: .md .txt .csv .json .html .css .js .py .xml .yaml .yml .sql (written out exactly as "
+    "the final file content, verbatim) and .pdf .docx .xlsx (rendered automatically — for these, write the "
+    "CONTENT as plain markdown-style text: '# '/'## ' headings, '- ' bullets, '1. ' numbered lists, '**bold**', "
+    "'*italic*', blank lines between paragraphs; for .xlsx write comma-separated rows instead, one row per line). "
+    "You may create more than one file in the same answer if more than one was requested. Always write a short "
+    "sentence introducing what you made — never let the marker block be the entire answer with no context. "
+    "Never nest one <<<FILE:...>>> block inside another."
+)
+
+
 def build_messages(history: List[BaseMessage], thinking_level: str, search_text: str = "", rag_text: str = "") -> List[BaseMessage]:
     level_key = normalize_thinking_level(thinking_level)
     config = THINKING_LEVELS[level_key]
@@ -691,7 +715,8 @@ def build_messages(history: List[BaseMessage], thinking_level: str, search_text:
         "ALWAYS give the user a real, substantive, best-effort answer. Never reply with a bare refusal, a bare "
         "'I don't have real-time access', or 'I cannot verify this' with nothing else. If you have fresh search "
         "results, lead with them. If you don't, answer from your own knowledge and add one short caveat that it "
-        "may not reflect the very latest developments — but still answer."
+        "may not reflect the very latest developments — but still answer.\n\n"
+        + FILE_CREATION_PROMPT_BLOCK
     )
     if search_text:
         system_text += (
@@ -1087,13 +1112,41 @@ async def chat_compose_node(request: "ChatRequest", state: dict, progress=None) 
     _chat_messages = build_messages(state["history"], request.thinking_level, combined_context, state.get("rag_text", ""))
     _chat_budget = _model_thinking_budget(_chat_model_name, request.thinking_level, config["max_tokens"])
     llm = get_llm(request.model_type, request.temperature, _chat_budget)
+    session = state.get("session") or {}
+    session_id = state.get("session_id") or "default"
+    invoke_kwargs: Dict[str, Any] = {}
+    file_finalize = None
+    if isinstance(progress, asyncio.Queue):
+        # Streaming turn: intercept live answer text so a <<<FILE:...>>> block
+        # the model writes never flashes onto the screen as raw content — see
+        # file_generator.make_stream_watcher for how the swap to a clean
+        # Markdown download link happens the instant the block closes.
+        file_watcher, file_finalize = file_generator.make_stream_watcher(
+            lambda text: publish_token(progress, text), session, session_id,
+        )
+        invoke_kwargs["on_answer_piece"] = file_watcher
     if _is_deepseek_model(_chat_model_name):
         response = await invoke_model(
             _chat_messages, llm, progress,
             reasoning_effort=_map_reasoning_effort(request.thinking_level, _chat_model_name),
+            **invoke_kwargs,
         )
     else:
-        response = await invoke_model(_chat_messages, llm, progress)
+        response = await invoke_model(_chat_messages, llm, progress, **invoke_kwargs)
+    if file_finalize is not None:
+        # Flush any text the watcher held back for marker-boundary safety, or
+        # salvage an unterminated <<<FILE:...>>> block, before this turn ends.
+        # The watcher already built+stored every file and forwarded a clean,
+        # link-swapped version of the text as live tokens (that's what ends
+        # up in the visible stream and the persisted chat history for this
+        # turn) — so the raw `response` string below, which still has the
+        # original markers, must NOT be run through the builder again here,
+        # or every file in this turn would get stored a second time.
+        await file_finalize()
+    elif response:
+        # Non-streaming turn: no live tokens were ever sent, so do the whole
+        # find-build-store-and-replace pass in one shot on the complete text.
+        response = file_generator.store_file_blocks_and_clean(response, session, session_id)
     state["response"] = response or "I apologize, I encountered an issue formulating my answer."
     return state
 
@@ -2817,6 +2870,32 @@ async def delete_session_file(session_id: str, file_id: str):
     if not rag_engine.remove_file(session, file_id):
         raise HTTPException(status_code=404, detail="File not found in this session.")
     return {"status": "success", "file_id": file_id}
+
+
+@app.get("/generated-files/{session_id}")
+async def list_generated_files(session_id: str):
+    """List files Chat mode has created (via <<<FILE:...>>>) in this session —
+    see file_generator.py."""
+    session = get_session(session_id)
+    return {"session_id": session_id, "files": file_generator.list_generated_files(session)}
+
+
+@app.get("/generated-files/{session_id}/{file_id}/{filename}")
+async def download_generated_file(session_id: str, file_id: str, filename: str):
+    """Serves a file Chat mode created for the user this session. `filename`
+    in the path is cosmetic (so the browser's save dialog shows a sensible
+    name) — the file_id alone identifies the actual stored bytes."""
+    session = get_session(session_id)
+    content = file_generator.get_generated_file(session, file_id)
+    if not content:
+        raise HTTPException(status_code=404, detail="This file is no longer available in this session.")
+    data, content_type, real_filename = content
+    safe_name = real_filename.replace('"', "")
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+    )
 
 
 async def generate_stream(request: ChatRequest, session: dict, session_id: str):
