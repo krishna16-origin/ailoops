@@ -16,3 +16,4 @@ python-docx
 Pillow
 numpy
 redis
+reportlab 
