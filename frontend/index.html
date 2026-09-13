@@ -188,8 +188,79 @@
         .mode-toggle button { position:relative; z-index:1; border:none; background:transparent; color:var(--text-secondary); font-size:13px; font-weight:500; padding:7px 16px; border-radius:999px; cursor:pointer; transition:color 0.25s ease; display:flex; align-items:center; gap:6px; }
         .mode-toggle button svg { width:14px; height:14px; }
         .mode-toggle button.active { color:var(--bg-main); }
-        .mode-toggle-pill { position:absolute; top:3px; left:3px; height:calc(100% - 6px); width:calc(50% - 3px); background-color:var(--text-primary); border-radius:999px; transition:transform 0.3s var(--transition-bezier); z-index:0; }
-        .mode-toggle.code-active .mode-toggle-pill { transform:translateX(100%); }
+        /* Pill position/width is now set directly (inline left/width, in px) by
+           updateModePill() in JS, measured off the active button's own
+           offsetLeft/offsetWidth. That works for any number of mode buttons
+           with any (possibly unequal) widths — e.g. "Images 1.2" is wider than
+           "Chat" — instead of the old 2-button-only 50%/translateX(100%) math. */
+        .mode-toggle-pill { position:absolute; top:3px; left:3px; height:calc(100% - 6px); width:calc(50% - 3px); background-color:var(--text-primary); border-radius:999px; transition:left 0.3s var(--transition-bezier), width 0.3s var(--transition-bezier); z-index:0; }
+
+        /* ============== IMAGES MODE (Images-1.2) ============== */
+        /* Sidebar nav entry — lives under "New session", separate from the
+           Chat/Code toggle up top, styled like a small "app" row. */
+        .sidebar-nav-item { width:100%; display:flex; align-items:center; gap:10px; padding:9px 10px; margin-bottom:6px; border:0; border-radius:8px; background:transparent; color:var(--text-primary); cursor:pointer; text-align:left; transition:background .2s,color .2s; }
+        .sidebar-nav-item:hover { background:var(--bg-hover); }
+        .sidebar-nav-item.active { background:var(--bg-input); }
+        .sidebar-nav-item-copy { display:flex; flex-direction:column; gap:1px; min-width:0; }
+        .sidebar-nav-item-title { font-size:13px; font-weight:600; }
+        .sidebar-nav-item-subtitle { font-size:11px; color:var(--text-secondary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .image-mode-logo-badge { width:26px; height:26px; border-radius:7px; flex-shrink:0; display:inline-flex; align-items:center; justify-content:center; background:linear-gradient(135deg,#f59e0b,#ec4899 55%,#8b5cf6); }
+        .image-mode-logo-badge svg { width:15px; height:15px; color:#fff; }
+
+        /* Sidebar note shown under New Session while Images mode is active */
+        .image-mode-note { display:flex; gap:8px; align-items:flex-start; font-size:12px; line-height:1.5; color:var(--text-secondary); background:var(--bg-main); border:1px solid var(--border-color); border-radius:10px; padding:10px 12px; }
+        .image-mode-note svg { flex-shrink:0; width:14px; height:14px; margin-top:1px; color:#f59e0b; }
+
+        /* ---- The 1:1 generation frame — the "square box" images render into ---- */
+        .image-gen-wrap { max-width:min(420px, 100%); width:100%; }
+        .image-gen-frame {
+            position:relative; width:100%; aspect-ratio:1/1; border-radius:16px; overflow:hidden;
+            background:#0f0f10; border:1px solid var(--border-color);
+            box-shadow:0 10px 30px rgba(0,0,0,0.35);
+            display:flex; align-items:center; justify-content:center;
+        }
+        .image-gen-frame img.image-gen-img { width:100%; height:100%; object-fit:cover; display:block; opacity:0; transition:opacity 0.45s ease; }
+        .image-gen-frame img.image-gen-img.loaded { opacity:1; }
+
+        /* Shimmer skeleton shown while generation is in flight */
+        .image-gen-shimmer { position:absolute; inset:0; background:linear-gradient(90deg, #1a1a1c 25%, #2a2a2e 37%, #1a1a1c 63%); background-size:400% 100%; animation:imageShimmerSweep 1.6s ease-in-out infinite; }
+        .image-gen-frame[data-state="done"] .image-gen-shimmer, .image-gen-frame[data-state="error"] .image-gen-shimmer { display:none; }
+        @keyframes imageShimmerSweep { 0% { background-position:100% 0; } 100% { background-position:0 0; } }
+
+        /* Small pulsing square-icon placeholder centered on the shimmer, plus the
+           progress caption underneath it. */
+        .image-gen-placeholder { position:relative; z-index:1; display:flex; flex-direction:column; align-items:center; gap:10px; color:var(--text-secondary); }
+        .image-gen-placeholder svg { width:34px; height:34px; opacity:0.55; animation:imagePlaceholderPulse 1.8s ease-in-out infinite; }
+        @keyframes imagePlaceholderPulse { 0%,100% { opacity:0.35; transform:scale(0.94); } 50% { opacity:0.65; transform:scale(1); } }
+        .image-gen-status-text { font-size:12.5px; font-weight:500; }
+
+        /* "Picture frame" nameplate — a small caption chip pinned to the top-left
+           corner of the square, over the image/shimmer, like a museum placard.
+           Shows the backend/model response (which model generated it) while
+           loading it shows the live status word instead. */
+        .image-gen-plate {
+            position:absolute; top:10px; left:10px; z-index:2; max-width:calc(100% - 20px);
+            display:flex; align-items:center; gap:6px; padding:5px 10px 5px 6px;
+            background:rgba(15,15,16,0.72); backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
+            border:1px solid rgba(255,255,255,0.12); border-radius:999px;
+            font-size:11.5px; font-weight:600; color:var(--text-primary);
+            box-shadow:0 4px 14px rgba(0,0,0,0.3);
+        }
+        .image-gen-plate img { width:16px; height:16px; border-radius:50%; flex-shrink:0; background:#fff; padding:1.5px; }
+        .image-gen-plate .image-gen-plate-dot { width:6px; height:6px; border-radius:50%; background:#f59e0b; flex-shrink:0; animation:imageDotPulse 1s ease-in-out infinite; }
+        .image-gen-frame[data-state="done"] .image-gen-plate .image-gen-plate-dot { background:#10a37f; animation:none; }
+        @keyframes imageDotPulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
+        .image-gen-plate span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+        .image-gen-frame.image-gen-error { display:flex; flex-direction:column; gap:8px; padding:20px; text-align:center; color:var(--text-secondary); font-size:13px; }
+        .image-gen-frame.image-gen-error svg { width:26px; height:26px; color:#f87171; }
+
+        .image-gen-meta { display:flex; align-items:center; justify-content:flex-end; gap:10px; margin-top:10px; font-size:12px; color:var(--text-secondary); }
+        .image-gen-actions { display:flex; gap:6px; flex-shrink:0; }
+        .image-gen-actions button { display:inline-flex; align-items:center; gap:4px; background:var(--bg-input); border:1px solid transparent; color:var(--text-secondary); font-size:12px; font-weight:500; padding:5px 10px; border-radius:8px; cursor:pointer; transition:background 0.2s,color 0.2s; }
+        .image-gen-actions button:hover:not(:disabled) { background:var(--bg-hover); color:var(--text-primary); }
+        .image-gen-actions button:disabled { opacity:0.5; cursor:default; }
+        .image-gen-actions button svg { width:13px; height:13px; }
 
         /* ============== CHAT AREA (simplified) ============== */
         .chat-container { flex:1; overflow-y:auto; overscroll-behavior-y:contain; display:flex; flex-direction:column; align-items:center; scroll-behavior:smooth; }
@@ -1053,6 +1124,18 @@
                 </svg>
             </button>
         </div>
+        <!-- Images-1.2 lives here in the sidebar as its own entry (not folded
+             into the Chat/Code toggle up top) — clicking it calls the same
+             switchMode('image') used everywhere else. -->
+        <button type="button" class="sidebar-nav-item" id="imageModeNavBtn" data-mode="image" onclick="switchMode('image')" title="Images-1.2 — free AI image generation">
+            <span class="image-mode-logo-badge" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"></rect><circle cx="8.5" cy="9.5" r="1.6" fill="currentColor" stroke="none"></circle><path d="M21 15l-5-5-9 9" fill="none"></path></svg>
+            </span>
+            <span class="sidebar-nav-item-copy">
+                <span class="sidebar-nav-item-title">Images 1.2</span>
+                <span class="sidebar-nav-item-subtitle">Free AI image generation</span>
+            </span>
+        </button>
         <div class="history-list" id="historyList"></div>
         <button type="button" class="mcp-entry" onclick="toggleMcpPanel()" title="Manage MCP integrations">
             <span class="mcp-entry-copy"><span class="mcp-entry-title">MCP integrations</span><span class="mcp-entry-subtitle" id="mcpEntrySubtitle">Loading integrations…</span></span>
@@ -1073,6 +1156,18 @@
                 <div class="sidebar-setting-item">
                     <label title="Stream Response Tokens">Stream Response</label>
                     <input type="checkbox" id="codeStreamSetting" checked>
+                </div>
+            </div>
+
+            <!-- Images mode settings — Model/Quality live in the composer picker
+                 like Chat and Code. Generation runs entirely client-side via
+                 Puter.js (puter.ai.txt2img), so there's no backend/API key —
+                 just a short note explaining that the first image may prompt a
+                 free, one-click Puter sign-in. -->
+            <div class="settings-panel" id="imageSettings" hidden>
+                <div class="image-mode-note">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+                    <span>Square (1:1) 1024&times;1024 images, generated free via Puter.js. First generation may open a quick, free Puter sign-in popup.</span>
                 </div>
             </div>
         </div>
@@ -1369,6 +1464,21 @@
                 <option value="extra">Extra</option>
                 <option value="max">Max</option>
             </select>
+            <!-- Images mode: model + quality passed straight into Puter.js's
+                 puter.ai.txt2img(prompt, { model, quality }). Default is
+                 FLUX.2 [pro] (Black Forest Labs) — the strongest free model
+                 Puter.js exposes for general-purpose text-to-image. -->
+            <select id="imageModel">
+                <option value="black-forest-labs/flux-2-pro" selected>FLUX.2 Pro</option>
+                <option value="google/gemini-3-pro-image-preview">Nano Banana Pro</option>
+                <option value="openai/gpt-image-1.5">GPT Image 1.5</option>
+                <option value="black-forest-labs/flux-schnell">FLUX Schnell</option>
+            </select>
+            <select id="imageQuality">
+                <option value="low">Low</option>
+                <option value="medium" selected>Medium</option>
+                <option value="high">High</option>
+            </select>
         </div>
     </div>
 
@@ -1378,6 +1488,10 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.5/purify.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <!-- Puter.js — powers Images-1.2 mode's puter.ai.txt2img() calls. Entirely
+         client-side: no backend route, no API key. Free via Puter's
+         "User-Pays" model (a one-click, free Puter account). -->
+    <script src="https://js.puter.com/v2/"></script>
 
     <script>
         if (typeof marked !== 'undefined' && typeof markedKatex !== 'undefined') {
@@ -1904,11 +2018,13 @@
         // just swaps which one is visible; nothing is destroyed. ----------
         const MODE_COPY = {
             chat: { get title() { return getChatGreeting(); }, subtitle: '', placeholder: 'Ask anything...' },
-            code: { title: 'What do you want to build?', subtitle: 'Code with reasoning, previewed instantly', placeholder: 'Describe the code you need...' }
+            code: { title: 'What do you want to build?', subtitle: 'Code with reasoning, previewed instantly', placeholder: 'Describe the code you need...' },
+            image: { title: 'What should we create?', subtitle: 'Square 1:1 images — 1024 \u00d7 1024px, generated free', placeholder: 'Describe the image you want to generate...' }
         };
         const modes = {
             chat: { sessionId: generateUUID(), html: '', hasMessages: false },
-            code: { sessionId: generateUUID(), html: '', hasMessages: false }
+            code: { sessionId: generateUUID(), html: '', hasMessages: false },
+            image: { sessionId: generateUUID(), html: '', hasMessages: false }
         };
         let currentMode = 'chat';
         let isWaitingForResponse = false;
@@ -1939,8 +2055,13 @@
         const userInput = document.getElementById('userInput');
         const sendBtn = document.getElementById('sendBtn');
         const modeToggle = document.getElementById('modeToggle');
+        // Position the pill under "Chat" (the initially-active button) once the
+        // toggle has real layout — updateModePill() itself is defined further
+        // down, so this call is deferred a tick past initial synchronous layout.
+        requestAnimationFrame(() => { if (typeof updateModePill === 'function') updateModePill(); });
         const chatSettings = document.getElementById('chatSettings');
         const codeSettings = document.getElementById('codeSettings');
+        const imageSettings = document.getElementById('imageSettings');
         const codeHeroAvatar = document.getElementById('codeHeroAvatar');
         // Code-only hero circle above "What do you want to build?". Shown only on
         // the empty Code screen; hidden in Chat mode and once messages exist.
@@ -2593,6 +2714,16 @@
                 { value: 'fast', name: 'Gemma', desc: 'Gemma-4 — fastest, best for quick edits', logo: 'logos/gemma.svg' },
                 { value: 'medium', name: 'Kimi K3', desc: 'Moonshot AI — balanced speed and quality', logo: 'logos/kimi.svg' },
                 { value: 'strong', name: 'Nemotron Ultra', desc: 'nvidia/nemotron-3-ultra-550b-a55b — strongest, best for hard problems', logo: 'logos/nvidia.svg' }
+            ],
+            // Images-1.2 — routed through Puter.js's puter.ai.txt2img(), which is
+            // free (no API key, no backend) via Puter's User-Pays model. FLUX.2
+            // Pro is the flagship/best-quality option Puter.js exposes for
+            // general text-to-image, so it's the default.
+            image: [
+                { value: 'black-forest-labs/flux-2-pro', name: 'FLUX.2 Pro', desc: 'Black Forest Labs — best overall quality', logo: 'logos/flux.svg' },
+                { value: 'google/gemini-3-pro-image-preview', name: 'Nano Banana Pro', desc: 'Google — great detailed-prompt following', logo: 'logos/gemini.svg' },
+                { value: 'openai/gpt-image-1.5', name: 'GPT Image 1.5', desc: 'OpenAI — great text & typography in-image', logo: 'logos/gptimage.svg' },
+                { value: 'black-forest-labs/flux-schnell', name: 'FLUX Schnell', desc: 'Black Forest Labs — fastest, great for drafts', logo: 'logos/flux.svg' }
             ]
         };
         // Normal catalog for Code mode — no long-horizon distinction
@@ -2627,6 +2758,15 @@
                     { value: 'extra', label: 'Extra' },
                     { value: 'max', label: 'Max' }
                 ]
+            },
+            image: {
+                label: 'Quality',
+                desc: 'Higher quality looks better but takes longer to generate.',
+                options: [
+                    { value: 'low', label: 'Low' },
+                    { value: 'medium', label: 'Medium', isDefault: true },
+                    { value: 'high', label: 'High' }
+                ]
             }
         };
 
@@ -2657,8 +2797,16 @@
             build: { label: 'Build' }
         };
 
-        function activeModelField() { return currentMode === 'code' ? document.getElementById('codeModel') : document.getElementById('modelType'); }
-        function activeLevelField() { return currentMode === 'code' ? document.getElementById('codeReasoningLevel') : document.getElementById('tempSetting'); }
+        function activeModelField() {
+            if (currentMode === 'code') return document.getElementById('codeModel');
+            if (currentMode === 'image') return document.getElementById('imageModel');
+            return document.getElementById('modelType');
+        }
+        function activeLevelField() {
+            if (currentMode === 'code') return document.getElementById('codeReasoningLevel');
+            if (currentMode === 'image') return document.getElementById('imageQuality');
+            return document.getElementById('tempSetting');
+        }
 
         function currentLevelLabel() {
             const cfg = LEVEL_OPTIONS[currentMode];
@@ -3156,6 +3304,20 @@
             updateCodeHeroVisibility();
         }
 
+        // Slides .mode-toggle-pill under whichever button is .active, sized to
+        // that button's own width. Driven by measured px (offsetLeft/offsetWidth)
+        // rather than fixed 50%/100% CSS math, so it works for any number of
+        // mode buttons of any (possibly unequal) width — e.g. "Images 1.2" is
+        // wider than "Chat" or "Code".
+        function updateModePill() {
+            const pill = modeToggle.querySelector('.mode-toggle-pill');
+            const activeBtn = modeToggle.querySelector('button.active');
+            if (!pill || !activeBtn) return;
+            pill.style.left = activeBtn.offsetLeft + 'px';
+            pill.style.width = activeBtn.offsetWidth + 'px';
+        }
+        window.addEventListener('resize', updateModePill);
+
         function switchMode(mode) {
             if (mode === currentMode || isWaitingForResponse) return;
 
@@ -3163,13 +3325,16 @@
             modes[currentMode].html = chatContent.innerHTML;
 
             currentMode = mode;
-            modeToggle.classList.toggle('code-active', mode === 'code');
             modeToggle.querySelectorAll('button').forEach(btn => {
                 btn.classList.toggle('active', btn.dataset.mode === mode);
             });
+            updateModePill();
+            const imageNavBtn = document.getElementById('imageModeNavBtn');
+            if (imageNavBtn) imageNavBtn.classList.toggle('active', mode === 'image');
 
             chatSettings.hidden = mode !== 'chat';
             codeSettings.hidden = mode !== 'code';
+            imageSettings.hidden = mode !== 'image';
             closeModelPicker();
             closeWorkflowPicker();
             updateModelPickerLabel();
@@ -3217,7 +3382,7 @@
             const historyList = document.getElementById('historyList');
             const item = document.createElement('div');
             item.className = 'history-item';
-            item.textContent = currentMode === 'code' ? 'New Code Session' : 'New Chat';
+            item.textContent = currentMode === 'code' ? 'New Code Session' : (currentMode === 'image' ? 'New Image Session' : 'New Chat');
             historyList.prepend(item);
         }
 
@@ -3589,6 +3754,15 @@
         // the backend's StreamingResponse detect the disconnect and stop doing
         // further work server-side — not just a client-side display change.
         function stopGeneration() {
+            if (imageGenCancelToken) {
+                imageGenCancelToken.cancelled = true;
+                if (imageGenCancelToken.frame) errorImageFrame(imageGenCancelToken.frame, 'Cancelled.');
+                imageGenCancelToken = null;
+                setSendButtonGenerating(false);
+                isWaitingForResponse = false;
+                currentAbortController = null;
+                return;
+            }
             if (currentAbortController) {
                 try { currentAbortController.abort(); } catch (e) { /* no-op */ }
             }
@@ -3607,6 +3781,20 @@
             if (!text && !stagedAttachments.length) return;
 
             const mode = currentMode;
+
+            // Images-1.2 is prompt-only and runs entirely client-side via
+            // Puter.js — no session/attachments/SSE plumbing needed, so it
+            // short-circuits out of the chat/code request pipeline entirely.
+            if (mode === 'image') {
+                if (!text) return;
+                lastUserMessageText = text;
+                appendMessage('user', text, []);
+                userInput.value = '';
+                autoResize(userInput);
+                generateImageTurn(text);
+                return;
+            }
+
             // Capture the Code hero circle position BEFORE appendMessage hides the
             // opening scene, so it can fly to the thinking slot below.
             let codeHeroRect = null;
@@ -4943,6 +5131,150 @@
                 finishThinking(); // no-op if already finalized; settles a stopped/errored turn's toggle too
                 modes[mode].html = chatContent.innerHTML;
                 if (mode === 'code') liveMonitorEndTurn();
+            }
+        }
+
+        // ============== IMAGES-1.2 (Puter.js client-side generation) ==============
+        // Tracks the in-flight generation so the Send/Stop button can cancel it —
+        // there's no fetch/SSE to abort here (puter.ai.txt2img manages its own
+        // request under the hood), so this is a cooperative cancel flag instead.
+        let imageGenCancelToken = null;
+
+        function appendImageAssistantBubble(modelMeta, prompt) {
+            modes.image.hasMessages = true;
+            openingScene.style.display = 'none';
+            chatContent.style.display = 'flex';
+
+            const row = document.createElement('div');
+            row.className = 'message-row assistant';
+            const bubble = document.createElement('div');
+            bubble.className = 'message-bubble';
+            const avatar = createAvatarLogo();
+            const body = document.createElement('div');
+            body.className = 'assistant-body';
+            body.innerHTML = `
+                <div class="image-gen-wrap">
+                    <div class="image-gen-frame" data-state="loading">
+                        <div class="image-gen-shimmer"></div>
+                        <div class="image-gen-placeholder">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"></rect><circle cx="8.5" cy="9.5" r="1.6"></circle><path d="M21 15l-5-5-9 9"></path></svg>
+                            <span class="image-gen-status-text">Generating\u2026</span>
+                        </div>
+                        <img class="image-gen-img" alt="" hidden>
+                        <div class="image-gen-plate">
+                            <span class="image-gen-plate-dot"></span>
+                            <img src="${modelMeta.logo}" alt="" onerror="this.style.display='none'">
+                            <span>${escapeHtml(modelMeta.name)}</span>
+                        </div>
+                    </div>
+                    <div class="image-gen-meta">
+                        <div class="image-gen-actions">
+                            <button type="button" class="image-gen-download-btn" disabled>
+                                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8m0 0 3-3m-3 3L5 7"/><path d="M2.5 11v1.5A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5V11"/></svg>
+                                Download
+                            </button>
+                            <button type="button" class="image-gen-regen-btn">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+                                Regenerate
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `;
+            body.querySelector('.image-gen-regen-btn').addEventListener('click', () => {
+                if (isWaitingForResponse) return;
+                generateImageTurn(prompt);
+            });
+
+            bubble.appendChild(avatar);
+            bubble.appendChild(body);
+            row.appendChild(bubble);
+            chatContent.appendChild(row);
+            scrollToBottom(true);
+            return body.querySelector('.image-gen-frame');
+        }
+
+        function finishImageFrame(frame, src, modelMeta, prompt) {
+            frame.dataset.state = 'done';
+            const img = frame.querySelector('.image-gen-img');
+            img.src = src;
+            img.alt = prompt;
+            img.hidden = false;
+            requestAnimationFrame(() => img.classList.add('loaded'));
+            const plateText = frame.querySelector('.image-gen-plate span:last-child');
+            if (plateText) plateText.textContent = modelMeta.name;
+            const statusText = frame.querySelector('.image-gen-status-text');
+            if (statusText) statusText.textContent = 'Done';
+            const wrap = frame.closest('.image-gen-wrap');
+            const downloadBtn = wrap ? wrap.querySelector('.image-gen-download-btn') : null;
+            if (downloadBtn) {
+                downloadBtn.disabled = false;
+                downloadBtn.onclick = () => {
+                    const a = document.createElement('a');
+                    a.href = src;
+                    a.download = `ailoops-image-${Date.now()}.png`;
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                };
+            }
+            modes.image.html = chatContent.innerHTML;
+            scrollToBottom();
+        }
+
+        function errorImageFrame(frame, message) {
+            frame.dataset.state = 'error';
+            frame.classList.add('image-gen-error');
+            frame.innerHTML = `
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+                <span>${escapeHtml(message)}</span>
+            `;
+            modes.image.html = chatContent.innerHTML;
+        }
+
+        // Generates one image via Puter.js's puter.ai.txt2img() — no backend
+        // route and no API key: Puter handles the model call and billing
+        // against the visitor's own free Puter account (their "User-Pays"
+        // model), prompting a quick one-click sign-in the first time.
+        async function generateImageTurn(prompt) {
+            setSendButtonGenerating(true);
+            isWaitingForResponse = true;
+            currentAbortController = { abort() {} }; // no real fetch to abort; stopGeneration() below handles cancellation via the flag
+
+            const cancelToken = { cancelled: false };
+            imageGenCancelToken = cancelToken;
+
+            const modelValue = document.getElementById('imageModel').value;
+            const modelMeta = MODEL_OPTIONS.image.find(m => m.value === modelValue) || MODEL_OPTIONS.image[0];
+            const quality = document.getElementById('imageQuality').value;
+
+            const frame = appendImageAssistantBubble(modelMeta, prompt);
+            cancelToken.frame = frame;
+
+            try {
+                if (typeof puter === 'undefined' || !puter.ai || typeof puter.ai.txt2img !== 'function') {
+                    throw new Error('Puter.js failed to load — check your connection (or ad-blocker) and try again.');
+                }
+                // Square 1:1 output as requested. "quality" is only meaningful to
+                // the gpt-image-* family on Puter.js today; other models ignore
+                // unknown options safely, but we only send it where it applies.
+                const options = { model: modelValue, width: 1024, height: 1024 };
+                if (modelValue.indexOf('gpt-image') !== -1) options.quality = quality;
+
+                const imageEl = await puter.ai.txt2img(prompt, options);
+                if (cancelToken.cancelled) return;
+                finishImageFrame(frame, imageEl.src, modelMeta, prompt);
+            } catch (err) {
+                if (cancelToken.cancelled) return;
+                errorImageFrame(frame, (err && err.message) ? err.message : 'Image generation failed. Please try again.');
+            } finally {
+                if (!cancelToken.cancelled) {
+                    setSendButtonGenerating(false);
+                    isWaitingForResponse = false;
+                    currentAbortController = null;
+                    imageGenCancelToken = null;
+                    userInput.focus();
+                }
             }
         }
 
