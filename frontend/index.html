@@ -207,9 +207,30 @@
         .image-mode-logo-badge { width:26px; height:26px; border-radius:7px; flex-shrink:0; display:inline-flex; align-items:center; justify-content:center; background:linear-gradient(135deg,#f59e0b,#ec4899 55%,#8b5cf6); }
         .image-mode-logo-badge svg { width:15px; height:15px; color:#fff; }
 
-        /* Sidebar note shown under New Session while Images mode is active */
-        .image-mode-note { display:flex; gap:8px; align-items:flex-start; font-size:12px; line-height:1.5; color:var(--text-secondary); background:var(--bg-main); border:1px solid var(--border-color); border-radius:10px; padding:10px 12px; }
-        .image-mode-note svg { flex-shrink:0; width:14px; height:14px; margin-top:1px; color:#f59e0b; }
+        /* Shimmer sweep — a soft light band drifts across a note on a loop
+           to draw a little attention to it without being an alert/warning.
+           Shared by the opening-scene image note below. */
+        @keyframes image-note-shimmer {
+            0%   { left: -60%; }
+            60%  { left: 130%; }
+            100% { left: 130%; }
+        }
+
+        /* Note shown centered under "What should we create?" on the
+           Images-1.2 opening scene (empty-state) rather than in the sidebar. */
+        .opening-image-note { position:relative; overflow:hidden; display:flex; gap:8px; align-items:flex-start; text-align:left; font-size:13px; line-height:1.5; color:var(--text-secondary); background:var(--bg-main); border:1px solid var(--border-color); border-radius:12px; padding:12px 14px; max-width:380px; width:100%; margin:16px auto 0; }
+        .opening-image-note[hidden] { display:none; }
+        .opening-image-note svg { flex-shrink:0; width:15px; height:15px; margin-top:1px; color:#f59e0b; }
+        .opening-image-note-text { display:flex; flex-direction:column; gap:3px; }
+        .opening-image-note::after {
+            content: "";
+            position: absolute;
+            top: 0; left: -60%;
+            width: 45%; height: 100%;
+            background: linear-gradient(100deg, transparent, rgba(255,255,255,0.16) 45%, rgba(255,255,255,0.3) 50%, rgba(255,255,255,0.16) 55%, transparent);
+            animation: image-note-shimmer 3.2s ease-in-out infinite;
+            pointer-events: none;
+        }
 
         /* ---- The 1:1 generation frame — the "square box" images render into ---- */
         .image-gen-wrap { max-width:min(420px, 100%); width:100%; }
@@ -1161,14 +1182,10 @@
 
             <!-- Images mode settings — Model/Quality live in the composer picker
                  like Chat and Code. Generation runs entirely client-side via
-                 Puter.js (puter.ai.txt2img), so there's no backend/API key —
-                 just a short note explaining that the first image may prompt a
-                 free, one-click Puter sign-in. -->
+                 Puter.js (puter.ai.txt2img), so there's no backend/API key.
+                 The explanatory note now lives on the opening scene instead
+                 (see #openingImageNote), not in this sidebar panel. -->
             <div class="settings-panel" id="imageSettings" hidden>
-                <div class="image-mode-note">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
-                    <span>Square (1:1) 1024&times;1024 images, generated free via Puter.js. First generation may open a quick, free Puter sign-in popup.</span>
-                </div>
             </div>
         </div>
     </div>
@@ -1320,6 +1337,14 @@
                 </div>
                 <h1 class="opening-title greeting-style" id="openingTitle"></h1>
                 <p class="opening-subtitle" id="openingSubtitle"></p>
+                <div class="opening-image-note" id="openingImageNote" hidden>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+                    <div class="opening-image-note-text">
+                        <span>Image generation is powered by Puter.js.</span>
+                        <span>The first generation will prompt a brief Puter sign-in, separate from your account here.</span>
+                        <span>Included at no cost within your Puter account's monthly allowance.</span>
+                    </div>
+                </div>
             </div>
             <div class="chat-content" id="chatContent" style="display: none;"></div>
         </div>
@@ -2019,7 +2044,7 @@
         const MODE_COPY = {
             chat: { get title() { return getChatGreeting(); }, subtitle: '', placeholder: 'Ask anything...' },
             code: { title: 'What do you want to build?', subtitle: 'Code with reasoning, previewed instantly', placeholder: 'Describe the code you need...' },
-            image: { title: 'What should we create?', subtitle: 'Square 1:1 images — 1024 \u00d7 1024px, generated free', placeholder: 'Describe the image you want to generate...' }
+            image: { title: 'What should we create?', subtitle: '', placeholder: 'Describe the image you want to generate...' }
         };
         const modes = {
             chat: { sessionId: generateUUID(), html: '', hasMessages: false },
@@ -2050,6 +2075,7 @@
         const openingScene = document.getElementById('openingScene');
         const openingTitle = document.getElementById('openingTitle');
         const openingSubtitle = document.getElementById('openingSubtitle');
+        const openingImageNote = document.getElementById('openingImageNote');
         openingTitle.textContent = MODE_COPY.chat.title;
         openingSubtitle.textContent = MODE_COPY.chat.subtitle;
         const userInput = document.getElementById('userInput');
@@ -3335,6 +3361,7 @@
             chatSettings.hidden = mode !== 'chat';
             codeSettings.hidden = mode !== 'code';
             imageSettings.hidden = mode !== 'image';
+            openingImageNote.hidden = mode !== 'image';
             closeModelPicker();
             closeWorkflowPicker();
             updateModelPickerLabel();
