@@ -621,20 +621,6 @@ def request_excerpt(text: str, limit: int = 180) -> str:
     return clean[: limit - 1].rstrip() + "…"
 
 
-MAX_STATUS_WORDS = 15  # hard ceiling for any activity-feed line, model-written or not
-
-
-def _cap_words(text: str, limit: int = MAX_STATUS_WORDS) -> str:
-    """Safety net, not a source of wording: trims a status phrase to `limit`
-    words without inventing any new text. Applied to real data (a query, a
-    filename) and to the model's own reasoning alike — never to a canned
-    sentence, because none should reach here anymore."""
-    words = (text or "").split()
-    if len(words) <= limit:
-        return (text or "").strip()
-    return " ".join(words[:limit]).rstrip(",;:") + "…"
-
-
 async def publish_progress(progress, step: str, label: str, detail: str) -> None:
     """Publish a concrete backend event to a queue or collect it for non-streaming replies."""
     event = {"type": "status", "step": step, "label": label, "detail": detail}
@@ -892,28 +878,6 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
     full = ""
     buffer = ""
     in_thought = False
-    reasoning_head_words: List[str] = []
-    reasoning_head_done = False
-
-    async def _note_reasoning_for_status(piece: str) -> None:
-        """Turns the model's own live reasoning into the compose step's
-        activity-feed line — the actual first ~15 words of what it's really
-        thinking, not a template. Fires once per turn, the moment enough
-        real reasoning text has arrived, then stands down. If the model
-        never streams reasoning (some don't), this simply never fires and
-        the fact-only line from chat_compose_node is what the user sees —
-        no invented sentence fills the gap."""
-        nonlocal reasoning_head_words, reasoning_head_done
-        if reasoning_head_done or not piece:
-            return
-        reasoning_head_words.extend(piece.split())
-        if len(reasoning_head_words) >= MAX_STATUS_WORDS or piece.rstrip().endswith((".", "!", "?")):
-            reasoning_head_done = True
-            await publish_progress(
-                progress, "chat_compose_node", "chat_compose_node",
-                _cap_words(" ".join(reasoning_head_words)),
-            )
-
     answer_started = False  # True the instant real visible answer text has been
                              # emitted — once true, the thinking-budget watchdog
                              # below stands down, since the model is no longer
@@ -960,14 +924,12 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
                     if send_len > 0:
                         if not reasoning_seen:
                             await publish_thought(progress, buffer[:send_len])
-                            await _note_reasoning_for_status(buffer[:send_len])
                             think_chars += send_len
                         buffer = buffer[send_len:]
                     return
                 if idx:
                     if not reasoning_seen:
                         await publish_thought(progress, buffer[:idx])
-                        await _note_reasoning_for_status(buffer[:idx])
                         think_chars += idx
                 tag = next(t for t in CLOSE_TAGS if buffer[idx:].startswith(t))
                 buffer = buffer[idx + len(tag):]
@@ -991,7 +953,6 @@ async def invoke_model(messages: List[BaseMessage], llm: ChatNVIDIA, progress=No
                 if reasoning_piece:
                     reasoning_seen = True
                     await publish_thought(progress, reasoning_piece)
-                    await _note_reasoning_for_status(reasoning_piece)
                     think_chars += len(reasoning_piece)
                     check_think_budget()
 
@@ -1083,7 +1044,7 @@ async def _await_rag_indexing(session: dict, attachment_ids: Optional[List[str]]
 
     async def _announce(elapsed: float) -> None:
         suffix = f" ({int(elapsed)}s)" if elapsed else ""
-        detail = _cap_words(f"Indexing {names}{suffix}")
+        detail = f"Finishing indexing {names} before answering…{suffix}"
         if emit is not None:
             await emit({"type": "activity_start", "action": "rag_wait", "file": names})
         elif progress is not None:
@@ -1106,7 +1067,7 @@ async def chat_understand_node(request: "ChatRequest", session: dict, progress=N
     latest = history[-1].content if history else ""
     config = get_thinking_config(request.thinking_level)
     excerpt = request_excerpt(latest)
-    await publish_progress(progress, "chat_understand_node", "chat_understand_node", _cap_words(f"Request: {excerpt}"))
+    await publish_progress(progress, "chat_understand_node", "chat_understand_node", f"Read the latest user request and isolated the topic: “{excerpt}”")
     return {"history": history, "latest": latest, "config": config, "session": session}
 
 
@@ -1118,18 +1079,17 @@ async def chat_context_node(state: dict, progress=None) -> dict:
     images = []
     if needs_web_search(latest):
         query = resolve_search_query(history, latest)
-        await publish_progress(progress, "chat_context_node", "chat_context_node", _cap_words(f"Web search: {query}"))
+        await publish_progress(progress, "chat_context_node", "chat_context_node", f"Detected a current-information request and searched for: {query}")
         (search_text, links), images = await asyncio.gather(web_search(query), web_image_search(query))
-        await publish_progress(progress, "chat_context_result", "chat_context_result", _cap_words(f"Found {len(links)} source(s)"))
+        await publish_progress(progress, "chat_context_result", "chat_context_result", f"Collected {len(links)} source result(s) for the response context.")
     else:
-        await publish_progress(progress, "chat_context_node", "chat_context_node", "No web search needed")
+        await publish_progress(progress, "chat_context_node", "chat_context_node", "No web lookup was required; continuing with the conversation context.")
     mcp_context = await mcp_gateway.context_for_message(
         latest, state.get("mcp_servers"), state.get("session_id", "default"), "chat",
         emit=(lambda event: publish_event(progress, event)) if progress is not None else None,
     )
     if mcp_context:
-        servers = ", ".join(state.get("mcp_servers") or []) or "connected server"
-        await publish_progress(progress, "mcp_context", "MCP context", _cap_words(f"MCP: {servers}"))
+        await publish_progress(progress, "mcp_context", "MCP context", "Fetched context from an enabled MCP integration.")
 
     rag_text = ""
     session = state.get("session") or {}
@@ -1141,10 +1101,10 @@ async def chat_context_node(state: dict, progress=None) -> dict:
             files_now = rag_engine.list_files(session)
             names_now = ", ".join(sorted({f["filename"] for f in files_now if f.get("id") in set(attached_now)}))
             if names_now:
-                await publish_progress(progress, "rag_context", "rag_context", _cap_words(f"Read: {names_now}"))
+                await publish_progress(progress, "rag_context", "rag_context", f"Read the content of: {names_now}")
         if rag_chunks:
             names = ", ".join(sorted({c["filename"] for c in rag_chunks}))
-            await publish_progress(progress, "rag_context", "rag_context", _cap_words(f"Pulled from: {names}"))
+            await publish_progress(progress, "rag_context", "rag_context", f"Searched your other uploaded files/images and pulled relevant content from: {names}")
 
     state.update({"search_text": search_text, "links": links, "images": images, "mcp_context": mcp_context, "rag_text": rag_text})
     return state
@@ -1152,11 +1112,7 @@ async def chat_context_node(state: dict, progress=None) -> dict:
 
 async def chat_compose_node(request: "ChatRequest", state: dict, progress=None) -> dict:
     config = state["config"]
-    # Fact-only placeholder, shown the instant generation starts — replaced a
-    # canned sentence. If the model streams real reasoning (see
-    # invoke_model._note_reasoning_for_status), a second, genuinely
-    # model-written line follows this one and that's the one worth reading.
-    await publish_progress(progress, "chat_compose_node", "chat_compose_node", f"{config['label']} thinking · {config['max_tokens']} tokens")
+    await publish_progress(progress, "chat_compose_node", "chat_compose_node", f"Invoking the model with {config['label']} thinking and a {config['max_tokens']}-token budget.")
     _chat_model_name = _resolve_chat_model_name(request.model_type)
     combined_context = "\n\n".join(x for x in (state["search_text"], state.get("mcp_context", "")) if x)
     _chat_messages = build_messages(state["history"], request.thinking_level, combined_context, state.get("rag_text", ""))
@@ -1207,9 +1163,7 @@ async def chat_finalize_node(state: dict, progress=None) -> str:
     if sources:
         response += sources
         await publish_token(progress, sources)
-    # No status line here on purpose: this step has no real per-turn data to
-    # report (it's pure formatting), and a fixed sentence with nothing real
-    # in it is exactly the kind of canned phrase being removed elsewhere.
+    await publish_progress(progress, "chat_finalize_node", "chat_finalize_node", "Validated the response format and prepared the final answer for display.")
     return response
 
 
