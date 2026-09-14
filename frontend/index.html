@@ -4044,6 +4044,22 @@
                 thinkingToggle.classList.add('shimmer');
             }
 
+            // The small heading above each activity bubble used to be the raw
+            // internal step key (e.g. "chat_context_node") dumped straight into
+            // the UI — never written for display. This builds a real heading
+            // from the actual sentence instead: the leading word(s) up to the
+            // first colon if the line is "Category: real data" shaped, else
+            // just the first few words. Either way it comes from genuine
+            // per-turn content, never a lookup table keyed on the step name.
+            function deriveHeading(text) {
+                const clean = String(text || '').replace(/\s+/g, ' ').trim();
+                if (!clean) return 'Working';
+                const colonIdx = clean.indexOf(':');
+                if (colonIdx > 0 && colonIdx <= 24) return clean.slice(0, colonIdx);
+                const words = clean.split(' ').slice(0, 4).join(' ');
+                return words.length < clean.length ? words + '…' : words;
+            }
+
             function addThought(label, detail, step) {
                 if (thinkingDone) return;
                 thinkingBlock.style.display = 'block';
@@ -4076,7 +4092,7 @@
 
                 const node = document.createElement('span');
                 node.className = 'thought-node';
-                node.textContent = step || 'backend_node';
+                node.textContent = deriveHeading(detail || label);
                 item.appendChild(node);
 
                 const content = document.createElement('div');
