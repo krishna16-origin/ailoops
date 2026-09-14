@@ -4021,10 +4021,33 @@
                                         // Real backend progress event for the direct response pass. Reveals the block
             // and keeps it expanded while it grows. Shared by both modes.
 
+            // Keeps the shimmering toggle line readable when a real backend/model
+            // sentence is longer than one line's worth of room — never invents or
+            // rewrites the text, just caps how much of the real sentence shows here.
+            function truncateForToggle(text) {
+                if (!text) return text;
+                const clean = String(text).replace(/\s+/g, ' ').trim();
+                return clean.length > 72 ? clean.slice(0, 69) + '…' : clean;
+            }
+
+            // Lightweight version of addThought: updates ONLY the shimmering toggle
+            // line with a real, live sentence about current background work (e.g. the
+            // model's own THOUGHT for this step, or "Reading app.py" built from a real
+            // activity_start event) — without adding a bubble to the expandable
+            // Thinking panel. Code mode already logs the fuller trail in its workflow
+            // panel, so this just keeps the always-visible toggle in sync with genuine
+            // current activity instead of sitting on a static "Thinking".
+            function pulseThinkingLabel(text) {
+                if (thinkingDone || !text) return;
+                thinkingBlock.style.display = 'block';
+                thinkingToggle.textContent = truncateForToggle(text);
+                thinkingToggle.classList.add('shimmer');
+            }
+
             function addThought(label, detail, step) {
                 if (thinkingDone) return;
                 thinkingBlock.style.display = 'block';
-                thinkingToggle.textContent = label || 'Thinking';
+                thinkingToggle.textContent = truncateForToggle(label) || 'Thinking';
                 thinkingToggle.classList.add('shimmer');
 
                 // A 'thinking' step is a spinner_tick heartbeat — the backend hasn't
@@ -4906,11 +4929,15 @@
                                 if (mode === 'code') handleLiveMonitorEvent(parsed);
                                 handleMcpEvent(parsed);
                                 if (parsed.type === 'status') {
-                                    // Backend node narration ("chat_understand_node", "Invoking the
-                                    // model with...", etc.) is intentionally not shown here anymore —
-                                    // the Thinking panel now only ever displays the model's own real
-                                    // reasoning trace (see the 'thought' branch below), matching
-                                    // Claude.ai instead of a synthesized step-by-step log.
+                                    // Real backend narration for this exact request (chat mode's
+                                    // understand/search/compose/finalize pipeline) — parsed.detail is
+                                    // generated fresh per turn (e.g. the actual search query used, the
+                                    // actual file names read), never a canned phrase. Drives the
+                                    // shimmering toggle so it shows genuine current work instead of a
+                                    // static "Thinking", and logs the same real sentence as an
+                                    // expandable bubble.
+                                    const sentence = parsed.detail || parsed.label;
+                                    if (sentence) addThought(sentence, sentence, parsed.step);
                                 } else if (parsed.type === 'thought') {
                                     appendLiveThought(parsed.text);
                                 } else if (parsed.type === 'agent_message' && mode === 'code') {
@@ -4924,6 +4951,19 @@
                                         const row = createWorkflowRow({ kind: isPlan ? 'plan' : 'note', text: parsed.text });
                                         listEl.appendChild(row);
                                         scrollToBottom();
+                                    }
+                                    // Also mirror this real, model-written sentence into the shimmering
+                                    // toggle line, so it reflects genuine current work turn by turn
+                                    // instead of sitting on a static "Thinking".
+                                    if (parsed.text) pulseThinkingLabel(parsed.text);
+                                } else if (parsed.type === 'activity_start' && mode === 'code') {
+                                    // Real, granular background work between THOUGHT turns — built from
+                                    // the actual file/query in the event, not a canned phrase (e.g.
+                                    // "Reading app.py", "Searching the web for react hooks").
+                                    const verbPair = LIVE_ACTION_VERBS[parsed.action];
+                                    if (verbPair) {
+                                        const subject = parsed.file || parsed.query || '';
+                                        pulseThinkingLabel(subject ? `${verbPair[0]} ${subject}` : verbPair[0]);
                                     }
                                 } else if (parsed.type === 'plan_created' && mode === 'code') {
                                     // Manus-like: the plan appears up front as a checklist, ticked off
@@ -5082,6 +5122,13 @@
                                         const row = createWorkflowRow({ kind: isPlan ? 'plan' : 'note', text: parsed.text });
                                         listEl.appendChild(row);
                                         scrollToBottom();
+                                    }
+                                    if (parsed.text) pulseThinkingLabel(parsed.text);
+                                } else if (parsed.type === 'activity_start' && mode === 'code') {
+                                    const verbPair = LIVE_ACTION_VERBS[parsed.action];
+                                    if (verbPair) {
+                                        const subject = parsed.file || parsed.query || '';
+                                        pulseThinkingLabel(subject ? `${verbPair[0]} ${subject}` : verbPair[0]);
                                     }
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
