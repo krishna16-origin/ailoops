@@ -1,0 +1,116 @@
+diff --git a/app.py b/app.py
+index 820eb39..9ab7f46 100644
+--- a/app.py
++++ b/app.py
+@@ -21,7 +21,8 @@ warnings.filterwarnings(
+ from dotenv import load_dotenv
+ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+ from fastapi.middleware.cors import CORSMiddleware
+-from fastapi.responses import StreamingResponse, FileResponse, Response
++from fastapi.middleware.gzip import GZipMiddleware
++from fastapi.responses import StreamingResponse, FileResponse, Response, ORJSONResponse
+ from fastapi.staticfiles import StaticFiles
+ from pydantic import BaseModel
+ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+@@ -1172,7 +1173,14 @@ async def generate_response_once(request: "ChatRequest", session: dict, progress
+ 
+ 
+ 
+-app = FastAPI(title="AI Assistant")
++# ORJSONResponse is a drop-in for FastAPI's default (stdlib json-based)
++# JSONResponse: same dict/list/str/int/etc. input, but serializes in a
++# native Rust extension instead of pure Python, which is the standard
++# "make FastAPI JSON responses fast" lever. Only affects plain JSON
++# endpoints (session/file listings, MCP config, the non-streaming /chat
++# reply, etc.) — every SSE endpoint below builds its own StreamingResponse
++# and is untouched by this.
++app = FastAPI(title="AI Assistant", default_response_class=ORJSONResponse)
+ 
+ app.add_middleware(
+     CORSMiddleware,
+@@ -1182,6 +1190,15 @@ app.add_middleware(
+     allow_headers=["*"],
+ )
+ 
++# Compresses text-based responses (the ~350KB frontend HTML, JSON API
++# replies) before they go over the wire — typically a 70-80% size cut for
++# text, which is most of what makes the page's first load feel slow on a
++# real connection. Starlette's GZipMiddleware already excludes
++# text/event-stream (and images) by content-type, so this never touches
++# the SSE chat/agent streams below — live token-by-token output is
++# unaffected either way.
++app.add_middleware(GZipMiddleware, minimum_size=1000)
++
+ # Static frontend served after middleware so CORS headers apply correctly.
+ app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
+ 
+@@ -3012,6 +3029,19 @@ async def chat(request: ChatRequest):
+     }
+ 
+ 
++# Fallback static mount for root-relative asset paths that index.html
++# actually requests — e.g. <link href="/icon.png"> and logo images
++# referenced as "logos/kimi.svg" (which resolve to /logos/kimi.svg against
++# the page's "/" URL, not /frontend/logos/kimi.svg). Those previously 404'd
++# on every load because only /frontend/* was mounted, which silently broke
++# the favicon and every model-picker logo image and cost a wasted
++# round trip per broken request. Starlette matches routes in registration
++# order, so placing this mount dead last means every API route and the
++# explicit "/" handler above still wins for its own path; this only ever
++# serves paths nothing else claimed.
++app.mount("/", StaticFiles(directory="frontend"), name="frontend_root")
++
++
+ if __name__ == "__main__":
+     import uvicorn
+     port = int(os.environ.get("PORT", 8000))
+diff --git a/frontend/index.html b/frontend/index.html
+index f02c648..9203869 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -27,10 +27,32 @@
+     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+     <meta name="apple-mobile-web-app-title" content="Maximus">
+ 
++    <!-- Preconnect to every external host this page fetches from, as early in
++         <head> as possible. DNS + TLS handshake for these happens in parallel
++         with the rest of the page loading instead of only starting once the
++         browser reaches each <link>/<script> tag that references them —
++         cdn.jsdelivr.net and cdnjs.cloudflare.com in particular are each hit
++         by several separate script/style requests below, so warming the
++         connection once here saves a round trip on every one of them. -->
++    <link rel="preconnect" href="https://fonts.googleapis.com">
++    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
++    <link rel="preconnect" href="https://cdn.jsdelivr.net">
++    <link rel="preconnect" href="https://cdnjs.cloudflare.com">
++    <link rel="preconnect" href="https://js.puter.com">
++
++    <!-- A real <link> (rather than a CSS @import inside the <style> block
++         below) so the browser discovers and starts fetching this stylesheet
++         immediately while parsing <head>. @import forces a serial
++         waterfall — parse HTML, then parse this CSS, then discover the
++         @import, then fetch it, then discover the actual font file URLs
++         inside THAT response, then fetch those — adding two extra
++         round trips before the intended font can render (the page falls
++         back to a system font and reflows once Inter finally arrives). -->
++    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap">
+     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.8/dist/katex.min.css">
+     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+     <style>
+-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
++
+         :root { --bg-main:#212121; --bg-sidebar:#171717; --bg-input:#2f2f2f; --bg-hover:#2f2f2f; --text-primary:#ececec; --text-secondary:#b4b4b4; --accent:#10a37f; --border-color:rgba(255,255,255,0.1); --transition-bezier:cubic-bezier(0.2,0.8,0.2,1); --scrollbar-thumb:rgba(255,255,255,0.18); --scrollbar-thumb-hover:rgba(255,255,255,0.32); }
+ 
+         /* ============== GLOBAL SCROLLBAR THEME ==============
+diff --git a/requirements.txt b/requirements.txt
+index 95fa09e..294162c 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,5 +1,6 @@
+ fastapi
+-uvicorn
++uvicorn[standard]
++orjson
+ pydantic
+ langchain
+ langchain-core>=1.0
