@@ -715,7 +715,13 @@ def build_messages(history: List[BaseMessage], thinking_level: str, search_text:
         "ALWAYS give the user a real, substantive, best-effort answer. Never reply with a bare refusal, a bare "
         "'I don't have real-time access', or 'I cannot verify this' with nothing else. If you have fresh search "
         "results, lead with them. If you don't, answer from your own knowledge and add one short caveat that it "
-        "may not reflect the very latest developments — but still answer.\n\n"
+        "may not reflect the very latest developments — but still answer.\n"
+        "CODE EDITS: if the user asks you to change, fix, or remove something specific in code you (or they) "
+        "already showed in this conversation — 'remove that import', 'rename this variable', 'fix this "
+        "line' — do NOT retype the entire block with the change buried inside it. Show only the small piece "
+        "that actually changes (e.g. a short 'remove this:' / 'change this to that' snippet), and describe "
+        "the rest in words if needed. Only output the full code again if the user explicitly asks to see "
+        "the whole thing, or if so much of it is changing that a partial snippet would be confusing.\n\n"
         + FILE_CREATION_PROMPT_BLOCK
     )
     if search_text:
@@ -1269,7 +1275,7 @@ THINK_CHARS_PER_TOKEN = 4          # model is still "thinking" past this share
 
 
 VALID_ACTIONS = {
-    "read_file", "edit_file", "create_file", "delete_file",
+    "read_file", "edit_file", "patch_file", "create_file", "delete_file",
     "run_command", "start_server",
     "download_file", "extract_archive", "run_tests", "list_dir", "web_search",
     "final",
@@ -1306,6 +1312,77 @@ def diff_file(old_content: str, new_content: str) -> Tuple[int, int, list]:
                 diff_lines.append({"type": "add", "content": line})
             additions += (j2 - j1)
     return additions, deletions, diff_lines
+
+
+class PatchNotFound(Exception):
+    """Raised by _apply_patch when the OLD block isn't uniquely present in the
+    current file content — lets the caller send a clear TOOL RESULT back to
+    the model instead of silently corrupting the file."""
+
+
+def _apply_patch(existing: str, old_block: str, new_block: str) -> str:
+    """Applies one exact, unique find-and-replace to an existing file's content.
+
+    This is the mechanical core of patch_file: unlike edit_file (which trusts the
+    model to retype the entire file correctly), this never touches any text
+    outside old_block. old_block must appear in `existing` EXACTLY once — zero
+    matches means the model mis-copied the snippet, more than one means the
+    edit is ambiguous — either way we refuse rather than guess."""
+    if not old_block:
+        raise PatchNotFound("OLD block was empty.")
+    occurrences = existing.count(old_block)
+    if occurrences == 0:
+        raise PatchNotFound(
+            "the OLD block was not found verbatim in the file (whitespace/indentation must match exactly)."
+        )
+    if occurrences > 1:
+        raise PatchNotFound(
+            f"the OLD block matches {occurrences} places in the file, so the edit is ambiguous."
+        )
+    return existing.replace(old_block, new_block, 1)
+
+
+async def _apply_and_emit_file_change(path: str, content: str, file_store: Dict[str, str],
+                                       turn_files_touched: Dict[str, str], activities: list,
+                                       diffs: list, emit) -> Tuple[str, int, int]:
+    """Writes `content` to file_store[path], computes a real line-level diff against
+    whatever was there before, and emits every event the frontend needs to show it
+    (activity feed entry, diff panel, live file tab). Shared by edit_file, create_file,
+    and patch_file so all three produce identical diff/event behavior."""
+    if len(content) > CODE_MAX_FILE_CHARS:
+        content = content[:CODE_MAX_FILE_CHARS] + "\n… output truncated …"
+    old_content = file_store.get(path)
+    is_edit = old_content is not None
+    file_store[path] = content
+    turn_files_touched[path] = content
+
+    if is_edit:
+        additions, deletions, diff_lines = diff_file(old_content, content)
+        activities.append({"kind": "command", "text": f"diff -u {path}"})
+    else:
+        new_lines = content.splitlines()
+        additions, deletions = len(new_lines), 0
+        diff_lines = [{"type": "add", "content": line} for line in new_lines]
+    activities.append({
+        "kind": "edit", "file": path, "filename": path,
+        "additions": additions, "deletions": deletions, "diff_lines": diff_lines,
+    })
+
+    act = "edit" if is_edit else "create"
+    evt_type = "file_edited" if is_edit else "file_created"
+    diff_id = f"diff_{len(diffs) + 1}"
+    diffs.append({"diff_id": diff_id, "file": path, "additions": additions, "deletions": deletions, "diff_lines": diff_lines})
+
+    await emit({"type": "activity_start", "action": act, "file": path})
+    await emit({"type": evt_type, "file": path, "additions": additions, "deletions": deletions, "diff_id": diff_id})
+    await emit({
+        "type": "code_file_diff", "filename": path, "language": _guess_language(path),
+        "additions": additions, "deletions": deletions, "diff_lines": diff_lines, "content": content,
+    })
+    await emit({"type": "diff_created", "diff_id": diff_id, "file": path, "diff_lines": diff_lines,
+                "additions": additions, "deletions": deletions})
+    await emit({"type": "activity_complete", "action": act, "file": path})
+    return content, additions, deletions
 
 
 # ---------------------------------------------------------------------------
@@ -1589,8 +1666,17 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
            "listed a directory, or started a live server. web_search may still be available separately.\n\n") +
         "Tools:\n"
         "- read_file: view the current, real contents of an existing project file.\n"
+        "- patch_file: make a small, targeted change to an existing file WITHOUT retyping the rest of it. "
+        "Give an OLD block (the exact existing text to find — copy it verbatim from a prior read_file, "
+        "including whitespace/indentation) and a NEW block (what it should become; leave NEW empty to "
+        "delete the OLD block outright). The OLD block must match the file's current content exactly and "
+        "must be unique in the file — include a few extra surrounding lines if the snippet alone isn't "
+        "unique. This is the PREFERRED way to remove something, rename something, or tweak a line/small "
+        "block: it changes only what you specify and cannot accidentally drop or alter anything else.\n"
         "- edit_file: completely replace an existing file's contents. You must return the COMPLETE new "
-        "file content, never a snippet or a diff.\n"
+        "file content, never a snippet or a diff. Reserve this for changes broad enough that most of the "
+        "file is actually changing (a rewrite, a restructure, a new file's first version) — for anything "
+        "smaller, use patch_file instead so unrelated code can't be silently dropped or rewritten.\n"
         "- create_file: create a new file that does not exist yet, with its full content.\n"
         "- delete_file: remove a file that is no longer needed.\n"
         "- run_command: run ANY real shell command to completion in the live sandbox — this is a genuine "
@@ -1628,14 +1714,24 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
         "On every turn, respond in EXACTLY this format:\n\n"
         "THOUGHT: <one short, plain sentence about what you're about to do and why — shown directly to "
         "the user, so keep it natural and free of meta-commentary about these instructions>\n"
-        "ACTION: read_file | edit_file | create_file | delete_file | run_command | download_file | "
-        "extract_archive | run_tests | list_dir | web_search | start_server | final\n"
+        "ACTION: read_file | edit_file | patch_file | create_file | delete_file | run_command | "
+        "download_file | extract_archive | run_tests | list_dir | web_search | start_server | final\n"
         "PATH: <relative/file/path, port number for start_server, or destination/query for the tools "
         "above>   (omit only for actions that don't need one — see each tool's description)\n"
         "```<language, bash, text, or url>        (for edit_file / create_file / run_command / "
         "download_file / extract_archive / run_tests / web_search / start_server — omit for read_file, "
         "delete_file, list_dir, final)\n"
         "<the complete file content, the shell command, the URL, the query, etc. — see each tool above>\n"
+        "```\n\n"
+        "patch_file uses TWO fenced blocks instead of one — OLD first, then NEW, in this exact shape:\n"
+        "THOUGHT: <what you're removing/changing and why>\n"
+        "ACTION: patch_file\n"
+        "PATH: <file path>\n"
+        "```old\n"
+        "<the exact existing text to find, verbatim>\n"
+        "```\n"
+        "```new\n"
+        "<what it becomes — leave this block empty to delete the OLD text>\n"
         "```\n\n"
         "CRITICAL: whatever text appears inside the code fence for run_command / download_file / "
         "run_tests / start_server is sent to the live sandbox and executed VERBATIM as a real shell "
@@ -1645,11 +1741,19 @@ def build_agent_system_text(reasoning_level: str, file_store: Dict[str, str], pl
         "override, or pick a different action.\n\n"
         "Rules:\n"
         "- Exactly one ACTION per turn. Never combine multiple actions in one response.\n"
-        "- Never edit_file a file you have not first read_file'd earlier in this run, unless it does not "
-        "exist yet (use create_file instead).\n"
+        "- Never edit_file or patch_file a file you have not first read_file'd earlier in this run, unless "
+        "it does not exist yet (use create_file instead).\n"
+        "- For a small, localized change to an existing file — removing something specific, renaming "
+        "something, fixing one line or block — ALWAYS use patch_file, never edit_file. Only use edit_file "
+        "when the requested change is broad enough that most of the file's content is actually different "
+        "afterward.\n"
         "- edit_file and create_file must contain the FULL final file content, never a partial snippet.\n"
+        "- patch_file's OLD block must be copied verbatim from the file (exact whitespace/indentation) and "
+        "must be unique; if it isn't, you'll get a TOOL RESULT explaining why — read the file again and "
+        "retry with a more precise or more contextual OLD block rather than falling back to edit_file.\n"
         "- Preserve every existing function, section, style rule, or piece of functionality the user did "
-        "not ask you to change when editing a file — never silently drop or rewrite unrelated code.\n"
+        "not ask you to change when editing a file — never silently drop or rewrite unrelated code. This "
+        "is exactly what patch_file guarantees mechanically; it's why it's preferred for small changes.\n"
         "- Only touch the file(s) the request actually concerns.\n"
         "- Prefer download_file/extract_archive/run_tests/list_dir over hand-writing the equivalent "
         "run_command shell for those exact operations — they're more reliable and easier to verify.\n"
@@ -1681,7 +1785,7 @@ def build_agent_messages(history: List[BaseMessage], transcript: List[BaseMessag
 
 
 _AGENT_TURN_RE = re.compile(
-    r"THOUGHT:\s*(?P<thought>.*?)\s*\n\s*ACTION:\s*(?P<action>read_file|edit_file|create_file|delete_file|"
+    r"THOUGHT:\s*(?P<thought>.*?)\s*\n\s*ACTION:\s*(?P<action>read_file|edit_file|patch_file|create_file|delete_file|"
     r"run_command|start_server|download_file|extract_archive|run_tests|list_dir|web_search|final)\b"
     r"(?:[ \t]*\n[ \t]*PATH:\s*(?P<path>[^\n]+))?"
     r"(?P<rest>[\s\S]*)$",
@@ -1718,6 +1822,19 @@ def parse_agent_turn(raw: str) -> Optional[dict]:
         if content.endswith("\n"):
             content = content[:-1]
         return {"thought": thought, "action": action, "path": path, "content": content}
+    if action == "patch_file":
+        if not path:
+            return None
+        fences = list(_FENCE_RE.finditer(rest))
+        if len(fences) < 2:
+            return None
+        old_block = fences[0].group("content")
+        new_block = fences[1].group("content")
+        if old_block.endswith("\n"):
+            old_block = old_block[:-1]
+        if new_block.endswith("\n"):
+            new_block = new_block[:-1]
+        return {"thought": thought, "action": action, "path": path, "content": {"old": old_block, "new": new_block}}
     if action == "run_command":
         fence = _FENCE_RE.search(rest)
         if not fence:
@@ -2117,39 +2234,9 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
 
         if action in ("edit_file", "create_file"):
             content = turn["content"] or ""
-            if len(content) > CODE_MAX_FILE_CHARS:
-                content = content[:CODE_MAX_FILE_CHARS] + "\n… output truncated …"
-            old_content = file_store.get(path)
-            is_edit = old_content is not None
-            file_store[path] = content
-            turn_files_touched[path] = content
-
-            if is_edit:
-                additions, deletions, diff_lines = diff_file(old_content, content)
-                activities.append({"kind": "command", "text": f"diff -u {path}"})
-            else:
-                new_lines = content.splitlines()
-                additions, deletions = len(new_lines), 0
-                diff_lines = [{"type": "add", "content": line} for line in new_lines]
-            activities.append({
-                "kind": "edit", "file": path, "filename": path,
-                "additions": additions, "deletions": deletions, "diff_lines": diff_lines,
-            })
-
-            act = "edit" if is_edit else "create"
-            evt_type = "file_edited" if is_edit else "file_created"
-            diff_id = f"diff_{len(diffs) + 1}"
-            diffs.append({"diff_id": diff_id, "file": path, "additions": additions, "deletions": deletions, "diff_lines": diff_lines})
-
-            await emit({"type": "activity_start", "action": act, "file": path})
-            await emit({"type": evt_type, "file": path, "additions": additions, "deletions": deletions, "diff_id": diff_id})
-            await emit({
-                "type": "code_file_diff", "filename": path, "language": _guess_language(path),
-                "additions": additions, "deletions": deletions, "diff_lines": diff_lines, "content": content,
-            })
-            await emit({"type": "diff_created", "diff_id": diff_id, "file": path, "diff_lines": diff_lines,
-                        "additions": additions, "deletions": deletions})
-            await emit({"type": "activity_complete", "action": act, "file": path})
+            content, additions, deletions = await _apply_and_emit_file_change(
+                path, content, file_store, turn_files_touched, activities, diffs, emit
+            )
 
             # Keep the THOUGHT (useful, tiny) but drop the file body from what gets
             # replayed into future steps — file_store already has the authoritative
@@ -2163,6 +2250,39 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             # that much.
             transcript.append(AIMessage(content=f"THOUGHT: {thought}\nACTION: {action}\nPATH: {path}"))
             transcript.append(HumanMessage(content=f"TOOL RESULT: {path} saved ({additions} additions, {deletions} deletions)."))
+            continue
+
+        if action == "patch_file":
+            patch = turn["content"] or {}
+            old_block, new_block = patch.get("old", ""), patch.get("new", "")
+            existing = file_store.get(path)
+            if existing is None:
+                msg = f"{path} does not exist yet. Use create_file for a new file, or read_file first if you believe it already exists."
+                await emit({"type": "activity_error", "action": "edit", "file": path, "message": msg})
+                transcript.append(AIMessage(content=raw))
+                transcript.append(HumanMessage(content=f"TOOL RESULT: patch_file failed — {msg}"))
+                continue
+            try:
+                content = _apply_patch(existing, old_block, new_block)
+            except PatchNotFound as exc:
+                msg = str(exc)
+                await emit({"type": "activity_error", "action": "edit", "file": path, "message": msg})
+                transcript.append(AIMessage(content=raw))
+                transcript.append(HumanMessage(content=(
+                    f"TOOL RESULT: patch_file failed on {path} — {msg} Use read_file to see the file's "
+                    "current exact content, then retry patch_file with an OLD block copied verbatim "
+                    "(add a couple more surrounding lines if the snippet alone isn't unique)."
+                )))
+                continue
+
+            content, additions, deletions = await _apply_and_emit_file_change(
+                path, content, file_store, turn_files_touched, activities, diffs, emit
+            )
+
+            # Same reasoning as edit_file/create_file above: keep the THOUGHT, drop
+            # the file body from replayed context, file_store stays authoritative.
+            transcript.append(AIMessage(content=f"THOUGHT: {thought}\nACTION: {action}\nPATH: {path}"))
+            transcript.append(HumanMessage(content=f"TOOL RESULT: {path} patched ({additions} additions, {deletions} deletions)."))
             continue
 
         if action == "delete_file":
