@@ -1,0 +1,197 @@
+diff --git a/file_generator.py b/file_generator.py
+index b89fee5..29f0884 100644
+--- a/file_generator.py
++++ b/file_generator.py
+@@ -53,6 +53,7 @@ import uuid
+ from datetime import datetime, timezone
+ from io import StringIO
+ from typing import Any, Dict, List, Optional, Tuple
++from urllib.parse import quote
+ 
+ MAX_GENERATED_FILE_CHARS = 300_000          # ~300KB of raw text content per file
+ MAX_GENERATED_FILES_PER_SESSION = 100
+@@ -424,7 +425,14 @@ def _build_and_store(session: dict, session_id: str, filename: str, raw_content:
+         "_data": data,
+     }
+     files[file_id] = record
+-    download_url = f"/generated-files/{session_id}/{file_id}/{clean_name}"
++    # `clean_name` may contain spaces (sanitize_filename allows them) — quote
++    # it in the URL path so the Markdown link the model's answer embeds is
++    # well-formed (an unescaped space breaks Markdown link syntax and the
++    # frontend's generated-file-card regex, which stops at whitespace) and so
++    # the href is a valid URL to begin with. Purely cosmetic: the download
++    # route below identifies the file by `file_id` alone and ignores this
++    # segment's value.
++    download_url = f"/generated-files/{session_id}/{file_id}/{quote(clean_name)}"
+     markdown = f"\n\n\U0001F4CE **[{clean_name}]({download_url})** ({human_size(len(data))}) — ready to download.\n"
+     return {"error": False, "id": file_id, "filename": clean_name, "size": len(data), "download_url": download_url, "markdown": markdown}
+ 
+diff --git a/frontend/index.html b/frontend/index.html
+index 74f97de..f7fa9b8 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -1563,7 +1563,19 @@
+             if (!text) return text;
+             return text
+                 .replace(/\\\[([\s\S]*?)\\\]/g, (_, expr) => `$$${expr}$$`)
+-                .replace(/\\\(([\s\S]*?)\\\)/g, (_, expr) => `$${expr}$`);
++                .replace(/\\\(([\s\S]*?)\\\)/g, (_, expr) => `$${expr}$`)
++                // Chat mode's file_generator.py hands back a deliberately *relative*
++                // "/generated-files/<session>/<id>/<name>" download link (the backend
++                // has no idea what origin the frontend is served from). That's fine
++                // when frontend and backend share an origin, but this app's frontend
++                // (Vercel) and backend (Render, API_BASE below) don't — a bare
++                // relative href would resolve against the frontend's own origin and
++                // 404 instead of ever reaching the API. Absolutize it against
++                // API_BASE, the same origin every other fetch() in this file already
++                // targets, right before the text is handed to marked(). Runs on every
++                // render path (streaming, non-streaming, history, abort) since they
++                // all funnel through this one function first.
++                .replace(/(\]\()(\/generated-files\/[^)\s]+)(\))/g, (_, open, path, close) => `${open}${API_BASE}${path}${close}`);
+         }
+ 
+         // Nexus-spark indicator (replaces the old 8-petal flower). Shown wherever
+@@ -3564,6 +3576,23 @@
+ 
+                 body.appendChild(statusDiv);
+ 
++                // File-download cards: available in both modes. Code mode fills these
++                // from in-memory generated text (client-side Blob download); Chat mode
++                // fills them from real server-stored files created via <<<FILE:...>>>
++                // (see file_generator.py + renderChatFileCards below) — same card UI,
++                // different source of truth, so downloads look and work identically.
++                const fileCards = document.createElement('section');
++                fileCards.className = 'response-file-cards';
++                fileCards.hidden = true;
++                fileCards.innerHTML = `
++                    <div class="response-file-card-list"></div>
++                    <button type="button" class="response-file-cards-download-all">
++                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8m0 0 3-3m-3 3L5 7"/><path d="M2.5 11v1.5A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5V11"/></svg>
++                        Download all
++                    </button>
++                `;
++                contentDiv.appendChild(fileCards);
++
+                 if (currentMode === 'code') {
+                     contentDiv.classList.add('code-mode-message');
+ 
+@@ -3584,18 +3613,6 @@
+                     `;
+                     contentDiv.appendChild(workflow);
+ 
+-                    const fileCards = document.createElement('section');
+-                    fileCards.className = 'response-file-cards';
+-                    fileCards.hidden = true;
+-                    fileCards.innerHTML = `
+-                        <div class="response-file-card-list"></div>
+-                        <button type="button" class="response-file-cards-download-all">
+-                            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8m0 0 3-3m-3 3L5 7"/><path d="M2.5 11v1.5A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5V11"/></svg>
+-                            Download all
+-                        </button>
+-                    `;
+-                    contentDiv.appendChild(fileCards);
+-
+                     const canvas = document.createElement('section');
+                     canvas.className = 'response-canvas';
+                     canvas.hidden = true;
+@@ -4203,13 +4220,16 @@
+                     // and scrollable-in-place from the moment it first appears. Chat mode
+                     // only, matching the final-render call sites below.
+                     if (mode === 'chat') wrapTables(textContainer);
++                    if (mode === 'chat') renderChatFileCards(normalizeMathDelimiters(assistantFullText));
+                     if (indicatorEl) textContainer.appendChild(indicatorEl);
+                     scrollToBottom();
+                 });
+             }
+             const planChecklistEl = mode === 'code' ? assistantBubble.querySelector('.plan-checklist') : null;
+             const workflowEl = mode === 'code' ? assistantBubble.querySelector('.response-workflow') : null;
+-            const fileCardsEl = mode === 'code' ? assistantBubble.querySelector('.response-file-cards') : null;
++            // Unlike planChecklistEl/workflowEl/canvasEl, this one isn't code-only —
++            // Chat mode uses it too (see renderChatFileCards below).
++            const fileCardsEl = assistantBubble.querySelector('.response-file-cards');
+             const canvasEl = mode === 'code' ? assistantBubble.querySelector('.response-canvas') : null;
+             // Per-file canvas state for this one assistant turn: filename -> { language,
+             // additions, deletions, diffLines, content, streaming }. Populated live as
+@@ -4855,6 +4875,58 @@
+                 renderCanvasFromResult(result);
+             }
+ 
++            // Chat mode's <<<FILE:...>>> blocks become real, server-stored files
++            // (PDF/DOCX/XLSX/etc. — see file_generator.py), announced in the answer
++            // text as a "📎 **[name](url)** (size) — ready to download." line. This
++            // is called with the RAW assistantFullText (never itself rewritten —
++            // only a rendered copy passed to marked() goes through
++            // normalizeMathDelimiters), so it still has the original *relative*
++            // "/generated-files/..." path; match that directly and absolutize it
++            // against API_BASE here, the same way normalizeMathDelimiters does for
++            // the prose link. Unlike renderFileCards() above, there's no in-memory
++            // content to zip up or preview — a card here just links straight to
++            // that URL and lets the browser's own Content-Disposition: attachment
++            // header handle the download, the same way clicking the plain Markdown
++            // link already did; this only adds the matching visual card so Chat
++            // mode presents downloads identically to Code mode instead of a bare
++            // link buried in prose.
++            const GENERATED_FILE_LINK_RE = /\[([^\]]+)\]\((\/generated-files\/[^\s)]+)\)\*\*\s*\(([^()]+)\)/g;
++            function renderChatFileCards(text) {
++                if (!fileCardsEl) return;
++                const matches = [...String(text || '').matchAll(GENERATED_FILE_LINK_RE)];
++                if (!matches.length) {
++                    fileCardsEl.hidden = true;
++                    return;
++                }
++                fileCardsEl.hidden = false;
++                const listEl = fileCardsEl.querySelector('.response-file-card-list');
++                listEl.replaceChildren();
++                const urls = [];
++                matches.forEach(([, filename, path, size]) => {
++                    const url = `${API_BASE}${path}`;
++                    urls.push(url);
++                    const extension = (filename.split('.').pop() || '').toLowerCase();
++                    const card = document.createElement('a');
++                    card.className = 'response-file-card';
++                    card.href = url;
++                    card.target = '_blank';
++                    card.rel = 'noopener';
++                    card.innerHTML = `
++                        <span class="response-file-card-icon">${FILE_ICON.plain}</span>
++                        <span class="response-file-card-meta">
++                            <div class="response-file-card-name"></div>
++                            <div class="response-file-card-type">${extension.toUpperCase()}${size ? ` · ${size}` : ''}</div>
++                        </span>
++                        <span class="response-file-card-download">Download</span>
++                    `;
++                    card.querySelector('.response-file-card-name').textContent = filename;
++                    listEl.appendChild(card);
++                });
++                const downloadAllBtn = fileCardsEl.querySelector('.response-file-cards-download-all');
++                downloadAllBtn.style.display = urls.length > 1 ? '' : 'none';
++                downloadAllBtn.onclick = () => urls.forEach((url) => window.open(url, '_blank', 'noopener'));
++            }
++
+             // Avatar lives inside the message's .assistant-avatar circle. Code mode
+             // replaces the spark inside that existing circle (see appendMessage);
+             // there is no second indicator appended to the message body.
+@@ -5109,6 +5181,7 @@
+                         setProse(textContainer, marked.parse(normalizeMathDelimiters(applySourcesSplit(assistantFullText))));
+                         highlightCode(textContainer);
+                         if (mode === 'chat') wrapTables(textContainer);
++                        if (mode === 'chat') renderChatFileCards(normalizeMathDelimiters(assistantFullText));
+                     }
+ 
+                 } else {
+@@ -5133,6 +5206,7 @@
+                         setProse(textContainer, marked.parse(normalizeMathDelimiters(applySourcesSplit(assistantFullText))));
+                         highlightCode(textContainer);
+                         if (mode === 'chat') wrapTables(textContainer);
++                        if (mode === 'chat') renderChatFileCards(normalizeMathDelimiters(assistantFullText));
+                     }
+                 }
+ 
+@@ -5168,6 +5242,7 @@
+                     setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)));
+                     highlightCode(textContainer);
+                     if (mode === 'chat') wrapTables(textContainer);
++                    if (mode === 'chat') renderChatFileCards(normalizeMathDelimiters(assistantFullText));
+                 } else {
+                     console.error('Error:', error);
+                     thinkingBlock.remove();
