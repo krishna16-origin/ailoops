@@ -1563,7 +1563,19 @@
             if (!text) return text;
             return text
                 .replace(/\\\[([\s\S]*?)\\\]/g, (_, expr) => `$$${expr}$$`)
-                .replace(/\\\(([\s\S]*?)\\\)/g, (_, expr) => `$${expr}$`);
+                .replace(/\\\(([\s\S]*?)\\\)/g, (_, expr) => `$${expr}$`)
+                // Chat mode's file_generator.py hands back a deliberately *relative*
+                // "/generated-files/<session>/<id>/<name>" download link (the backend
+                // has no idea what origin the frontend is served from). That's fine
+                // when frontend and backend share an origin, but this app's frontend
+                // (Vercel) and backend (Render, API_BASE below) don't — a bare
+                // relative href would resolve against the frontend's own origin and
+                // 404 instead of ever reaching the API. Absolutize it against
+                // API_BASE, the same origin every other fetch() in this file already
+                // targets, right before the text is handed to marked(). Runs on every
+                // render path (streaming, non-streaming, history, abort) since they
+                // all funnel through this one function first.
+                .replace(/(\]\()(\/generated-files\/[^)\s]+)(\))/g, (_, open, path, close) => `${open}${API_BASE}${path}${close}`);
         }
 
         // Nexus-spark indicator (replaces the old 8-petal flower). Shown wherever
@@ -3564,6 +3576,23 @@
 
                 body.appendChild(statusDiv);
 
+                // File-download cards: available in both modes. Code mode fills these
+                // from in-memory generated text (client-side Blob download); Chat mode
+                // fills them from real server-stored files created via <<<FILE:...>>>
+                // (see file_generator.py + renderChatFileCards below) — same card UI,
+                // different source of truth, so downloads look and work identically.
+                const fileCards = document.createElement('section');
+                fileCards.className = 'response-file-cards';
+                fileCards.hidden = true;
+                fileCards.innerHTML = `
+                    <div class="response-file-card-list"></div>
+                    <button type="button" class="response-file-cards-download-all">
+                        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8m0 0 3-3m-3 3L5 7"/><path d="M2.5 11v1.5A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5V11"/></svg>
+                        Download all
+                    </button>
+                `;
+                contentDiv.appendChild(fileCards);
+
                 if (currentMode === 'code') {
                     contentDiv.classList.add('code-mode-message');
 
@@ -3583,18 +3612,6 @@
                         <div class="response-workflow-list"></div>
                     `;
                     contentDiv.appendChild(workflow);
-
-                    const fileCards = document.createElement('section');
-                    fileCards.className = 'response-file-cards';
-                    fileCards.hidden = true;
-                    fileCards.innerHTML = `
-                        <div class="response-file-card-list"></div>
-                        <button type="button" class="response-file-cards-download-all">
-                            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8m0 0 3-3m-3 3L5 7"/><path d="M2.5 11v1.5A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5V11"/></svg>
-                            Download all
-                        </button>
-                    `;
-                    contentDiv.appendChild(fileCards);
 
                     const canvas = document.createElement('section');
                     canvas.className = 'response-canvas';
@@ -4021,33 +4038,10 @@
                                         // Real backend progress event for the direct response pass. Reveals the block
             // and keeps it expanded while it grows. Shared by both modes.
 
-            // Keeps the shimmering toggle line readable when a real backend/model
-            // sentence is longer than one line's worth of room — never invents or
-            // rewrites the text, just caps how much of the real sentence shows here.
-            function truncateForToggle(text) {
-                if (!text) return text;
-                const clean = String(text).replace(/\s+/g, ' ').trim();
-                return clean.length > 72 ? clean.slice(0, 69) + '…' : clean;
-            }
-
-            // Lightweight version of addThought: updates ONLY the shimmering toggle
-            // line with a real, live sentence about current background work (e.g. the
-            // model's own THOUGHT for this step, or "Reading app.py" built from a real
-            // activity_start event) — without adding a bubble to the expandable
-            // Thinking panel. Code mode already logs the fuller trail in its workflow
-            // panel, so this just keeps the always-visible toggle in sync with genuine
-            // current activity instead of sitting on a static "Thinking".
-            function pulseThinkingLabel(text) {
-                if (thinkingDone || !text) return;
-                thinkingBlock.style.display = 'block';
-                thinkingToggle.textContent = truncateForToggle(text);
-                thinkingToggle.classList.add('shimmer');
-            }
-
             function addThought(label, detail, step) {
                 if (thinkingDone) return;
                 thinkingBlock.style.display = 'block';
-                thinkingToggle.textContent = truncateForToggle(label) || 'Thinking';
+                thinkingToggle.textContent = label || 'Thinking';
                 thinkingToggle.classList.add('shimmer');
 
                 // A 'thinking' step is a spinner_tick heartbeat — the backend hasn't
@@ -4226,13 +4220,16 @@
                     // and scrollable-in-place from the moment it first appears. Chat mode
                     // only, matching the final-render call sites below.
                     if (mode === 'chat') wrapTables(textContainer);
+                    if (mode === 'chat') renderChatFileCards(normalizeMathDelimiters(assistantFullText));
                     if (indicatorEl) textContainer.appendChild(indicatorEl);
                     scrollToBottom();
                 });
             }
             const planChecklistEl = mode === 'code' ? assistantBubble.querySelector('.plan-checklist') : null;
             const workflowEl = mode === 'code' ? assistantBubble.querySelector('.response-workflow') : null;
-            const fileCardsEl = mode === 'code' ? assistantBubble.querySelector('.response-file-cards') : null;
+            // Unlike planChecklistEl/workflowEl/canvasEl, this one isn't code-only —
+            // Chat mode uses it too (see renderChatFileCards below).
+            const fileCardsEl = assistantBubble.querySelector('.response-file-cards');
             const canvasEl = mode === 'code' ? assistantBubble.querySelector('.response-canvas') : null;
             // Per-file canvas state for this one assistant turn: filename -> { language,
             // additions, deletions, diffLines, content, streaming }. Populated live as
@@ -4878,6 +4875,58 @@
                 renderCanvasFromResult(result);
             }
 
+            // Chat mode's <<<FILE:...>>> blocks become real, server-stored files
+            // (PDF/DOCX/XLSX/etc. — see file_generator.py), announced in the answer
+            // text as a "📎 **[name](url)** (size) — ready to download." line. This
+            // is called with the RAW assistantFullText (never itself rewritten —
+            // only a rendered copy passed to marked() goes through
+            // normalizeMathDelimiters), so it still has the original *relative*
+            // "/generated-files/..." path; match that directly and absolutize it
+            // against API_BASE here, the same way normalizeMathDelimiters does for
+            // the prose link. Unlike renderFileCards() above, there's no in-memory
+            // content to zip up or preview — a card here just links straight to
+            // that URL and lets the browser's own Content-Disposition: attachment
+            // header handle the download, the same way clicking the plain Markdown
+            // link already did; this only adds the matching visual card so Chat
+            // mode presents downloads identically to Code mode instead of a bare
+            // link buried in prose.
+            const GENERATED_FILE_LINK_RE = /\[([^\]]+)\]\((\/generated-files\/[^\s)]+)\)\*\*\s*\(([^()]+)\)/g;
+            function renderChatFileCards(text) {
+                if (!fileCardsEl) return;
+                const matches = [...String(text || '').matchAll(GENERATED_FILE_LINK_RE)];
+                if (!matches.length) {
+                    fileCardsEl.hidden = true;
+                    return;
+                }
+                fileCardsEl.hidden = false;
+                const listEl = fileCardsEl.querySelector('.response-file-card-list');
+                listEl.replaceChildren();
+                const urls = [];
+                matches.forEach(([, filename, path, size]) => {
+                    const url = `${API_BASE}${path}`;
+                    urls.push(url);
+                    const extension = (filename.split('.').pop() || '').toLowerCase();
+                    const card = document.createElement('a');
+                    card.className = 'response-file-card';
+                    card.href = url;
+                    card.target = '_blank';
+                    card.rel = 'noopener';
+                    card.innerHTML = `
+                        <span class="response-file-card-icon">${FILE_ICON.plain}</span>
+                        <span class="response-file-card-meta">
+                            <div class="response-file-card-name"></div>
+                            <div class="response-file-card-type">${extension.toUpperCase()}${size ? ` · ${size}` : ''}</div>
+                        </span>
+                        <span class="response-file-card-download">Download</span>
+                    `;
+                    card.querySelector('.response-file-card-name').textContent = filename;
+                    listEl.appendChild(card);
+                });
+                const downloadAllBtn = fileCardsEl.querySelector('.response-file-cards-download-all');
+                downloadAllBtn.style.display = urls.length > 1 ? '' : 'none';
+                downloadAllBtn.onclick = () => urls.forEach((url) => window.open(url, '_blank', 'noopener'));
+            }
+
             // Avatar lives inside the message's .assistant-avatar circle. Code mode
             // replaces the spark inside that existing circle (see appendMessage);
             // there is no second indicator appended to the message body.
@@ -4929,15 +4978,11 @@
                                 if (mode === 'code') handleLiveMonitorEvent(parsed);
                                 handleMcpEvent(parsed);
                                 if (parsed.type === 'status') {
-                                    // Real backend narration for this exact request (chat mode's
-                                    // understand/search/compose/finalize pipeline) — parsed.detail is
-                                    // generated fresh per turn (e.g. the actual search query used, the
-                                    // actual file names read), never a canned phrase. Drives the
-                                    // shimmering toggle so it shows genuine current work instead of a
-                                    // static "Thinking", and logs the same real sentence as an
-                                    // expandable bubble.
-                                    const sentence = parsed.detail || parsed.label;
-                                    if (sentence) addThought(sentence, sentence, parsed.step);
+                                    // Backend node narration ("chat_understand_node", "Invoking the
+                                    // model with...", etc.) is intentionally not shown here anymore —
+                                    // the Thinking panel now only ever displays the model's own real
+                                    // reasoning trace (see the 'thought' branch below), matching
+                                    // Claude.ai instead of a synthesized step-by-step log.
                                 } else if (parsed.type === 'thought') {
                                     appendLiveThought(parsed.text);
                                 } else if (parsed.type === 'agent_message' && mode === 'code') {
@@ -4951,19 +4996,6 @@
                                         const row = createWorkflowRow({ kind: isPlan ? 'plan' : 'note', text: parsed.text });
                                         listEl.appendChild(row);
                                         scrollToBottom();
-                                    }
-                                    // Also mirror this real, model-written sentence into the shimmering
-                                    // toggle line, so it reflects genuine current work turn by turn
-                                    // instead of sitting on a static "Thinking".
-                                    if (parsed.text) pulseThinkingLabel(parsed.text);
-                                } else if (parsed.type === 'activity_start' && mode === 'code') {
-                                    // Real, granular background work between THOUGHT turns — built from
-                                    // the actual file/query in the event, not a canned phrase (e.g.
-                                    // "Reading app.py", "Searching the web for react hooks").
-                                    const verbPair = LIVE_ACTION_VERBS[parsed.action];
-                                    if (verbPair) {
-                                        const subject = parsed.file || parsed.query || '';
-                                        pulseThinkingLabel(subject ? `${verbPair[0]} ${subject}` : verbPair[0]);
                                     }
                                 } else if (parsed.type === 'plan_created' && mode === 'code') {
                                     // Manus-like: the plan appears up front as a checklist, ticked off
@@ -5123,13 +5155,6 @@
                                         listEl.appendChild(row);
                                         scrollToBottom();
                                     }
-                                    if (parsed.text) pulseThinkingLabel(parsed.text);
-                                } else if (parsed.type === 'activity_start' && mode === 'code') {
-                                    const verbPair = LIVE_ACTION_VERBS[parsed.action];
-                                    if (verbPair) {
-                                        const subject = parsed.file || parsed.query || '';
-                                        pulseThinkingLabel(subject ? `${verbPair[0]} ${subject}` : verbPair[0]);
-                                    }
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
                                 } else if (parsed.type === 'step_progress' && mode === 'code') {
@@ -5156,6 +5181,7 @@
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(applySourcesSplit(assistantFullText))));
                         highlightCode(textContainer);
                         if (mode === 'chat') wrapTables(textContainer);
+                        if (mode === 'chat') renderChatFileCards(normalizeMathDelimiters(assistantFullText));
                     }
 
                 } else {
@@ -5180,6 +5206,7 @@
                         setProse(textContainer, marked.parse(normalizeMathDelimiters(applySourcesSplit(assistantFullText))));
                         highlightCode(textContainer);
                         if (mode === 'chat') wrapTables(textContainer);
+                        if (mode === 'chat') renderChatFileCards(normalizeMathDelimiters(assistantFullText));
                     }
                 }
 
@@ -5215,6 +5242,7 @@
                     setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)));
                     highlightCode(textContainer);
                     if (mode === 'chat') wrapTables(textContainer);
+                    if (mode === 'chat') renderChatFileCards(normalizeMathDelimiters(assistantFullText));
                 } else {
                     console.error('Error:', error);
                     thinkingBlock.remove();
