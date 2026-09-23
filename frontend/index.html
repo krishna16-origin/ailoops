@@ -5208,7 +5208,11 @@
             // link already did; this only adds the matching visual card so Chat
             // mode presents downloads identically to Code mode instead of a bare
             // link buried in prose.
-            const GENERATED_FILE_LINK_RE = /\[([^\]]+)\]\((\/generated-files\/[^\s)]+)\)\*\*\s*\(([^()]+)\)/g;
+            // Accept the backend's normal `**[name](relative-url)** (size)`
+            // form, plus absolute API URLs and minor Markdown variations. The
+            // card should depend on the generated-files URL, not on emphasis or
+            // the optional human-readable size suffix.
+            const GENERATED_FILE_LINK_RE = /(?:\*\*)?\[([^\]]+)\]\(((?:https?:\/\/[^)\s]+)?\/generated-files\/[^)\s]+)\)(?:\*\*)?(?:\s*\(([^()\n]+)\))?/g;
             function renderChatFileCards(text) {
                 if (!fileCardsEl) return;
                 const matches = [...String(text || '').matchAll(GENERATED_FILE_LINK_RE)];
@@ -5221,7 +5225,7 @@
                 listEl.replaceChildren();
                 const urls = [];
                 matches.forEach(([, filename, path, size]) => {
-                    const url = `${API_BASE}${path}`;
+                    const url = /^https?:\/\//i.test(path) ? path : `${API_BASE}${path}`;
                     urls.push(url);
                     const extension = (filename.split('.').pop() || '').toLowerCase();
                     const card = document.createElement('a');
