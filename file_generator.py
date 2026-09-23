@@ -53,6 +53,7 @@ import uuid
 from datetime import datetime, timezone
 from io import StringIO
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 MAX_GENERATED_FILE_CHARS = 300_000          # ~300KB of raw text content per file
 MAX_GENERATED_FILES_PER_SESSION = 100
@@ -424,7 +425,10 @@ def _build_and_store(session: dict, session_id: str, filename: str, raw_content:
         "_data": data,
     }
     files[file_id] = record
-    download_url = f"/generated-files/{session_id}/{file_id}/{clean_name}"
+    # Keep the cosmetic filename segment URL-safe. The download endpoint uses
+    # file_id as the source of truth, but an unescaped space would break the
+    # Markdown link and the frontend's generated-file-card parser.
+    download_url = f"/generated-files/{session_id}/{file_id}/{quote(clean_name)}"
     markdown = f"\n\n\U0001F4CE **[{clean_name}]({download_url})** ({human_size(len(data))}) — ready to download.\n"
     return {"error": False, "id": file_id, "filename": clean_name, "size": len(data), "download_url": download_url, "markdown": markdown}
 

@@ -561,9 +561,17 @@
         .response-file-cards { margin-top:14px; }
         .response-file-cards[hidden] { display:none; }
         .response-file-card-list { display:flex; flex-direction:column; gap:8px; }
-        .response-file-card { display:flex; align-items:center; gap:12px; padding:11px 14px; border:1px solid var(--border-color); border-radius:10px; background-color:var(--bg-hover); }
-        .response-file-card-icon { flex:0 0 34px; width:34px; height:34px; border-radius:8px; background-color:var(--bg-main); display:flex; align-items:center; justify-content:center; color:var(--text-secondary); }
+        .response-file-card { display:flex; align-items:center; gap:12px; padding:11px 14px; border:1px solid var(--border-color); border-radius:10px; background-color:var(--bg-hover); transition:background-color .18s ease, border-color .18s ease, transform .18s ease; }
+        .response-file-card-icon { flex:0 0 34px; width:34px; height:34px; border-radius:8px; background-color:var(--bg-main); display:flex; align-items:center; justify-content:center; color:var(--text-secondary); position:relative; overflow:hidden; transition:background-color .18s ease, color .18s ease; }
         .response-file-card-icon svg { width:16px; height:16px; }
+        .response-file-card-icon-face, .response-file-card-icon-hover { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; transition:opacity .18s ease, transform .18s ease; }
+        .response-file-card-icon-face { opacity:1; transform:translateY(0); }
+        .response-file-card-icon-hover { opacity:0; transform:translateY(7px); color:var(--accent); }
+        .response-file-card:hover { background-color:var(--bg-input); border-color:color-mix(in srgb, var(--border-color) 70%, var(--accent)); transform:translateY(-1px); }
+        .response-file-card:hover .response-file-card-icon { background-color:var(--bg-input); color:var(--accent); }
+        .response-file-card:hover .response-file-card-icon-face { opacity:0; transform:translateY(-7px); }
+        .response-file-card:hover .response-file-card-icon-hover { opacity:1; transform:translateY(0); }
+        .response-file-card:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
         .response-file-card-meta { flex:1 1 auto; min-width:0; }
         .response-file-card-name { color:var(--text-primary); font:13.5px 'Inter',sans-serif; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
         .response-file-card-type { color:var(--text-secondary); font:11.5px 'Inter',sans-serif; margin-top:2px; }
@@ -572,8 +580,7 @@
         .response-file-cards-download-all { margin-top:10px; display:inline-flex; align-items:center; gap:7px; border:1px solid var(--border-color); border-radius:7px; padding:7px 14px; background:var(--bg-hover); color:var(--text-primary); font:12.5px 'Inter',sans-serif; font-weight:500; cursor:pointer; }
         .response-file-cards-download-all:hover { background-color:var(--bg-input); }
         .response-file-cards-download-all svg { width:14px; height:14px; }
-        .response-file-card { cursor:pointer; }
-        .response-file-card:hover { background-color:var(--bg-input); }
+        .response-file-card { cursor:pointer; text-decoration:none; }
 
         /* ============== CODE MODE: live diff + preview canvas ============== */
         .response-canvas { margin-top:14px; border:1px solid var(--border-color); border-radius:10px; overflow:hidden; background-color:var(--bg-main); }
@@ -4558,7 +4565,11 @@
             const FILE_ICON = {
                 code: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 2 5.5 4.5 8M11.5 3 14 5.5 11.5 8M9.5 2.5l-3 8"/></svg>',
                 plain: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 1.5h5.5L13 5v9.5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-12a1 1 0 0 1 1-1Z"/><path d="M9.5 1.5V5H13"/></svg>',
+                download: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8m0 0 3-3m-3 3L5 7"/><path d="M2.5 11v1.5A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5V11"/></svg>',
             };
+            function fileCardIconHTML(faceSvg) {
+                return `<span class="response-file-card-icon-face">${faceSvg}</span><span class="response-file-card-icon-hover">${FILE_ICON.download}</span>`;
+            }
             const CODE_EXTENSIONS = new Set(['html', 'htm', 'css', 'js', 'jsx', 'ts', 'tsx', 'py', 'json', 'java', 'c', 'cpp', 'go', 'rb', 'php', 'swift', 'rs', 'sql', 'sh']);
 
             function escapeHtml(str) {
@@ -5142,7 +5153,7 @@
                     const card = document.createElement('div');
                     card.className = 'response-file-card';
                     card.innerHTML = `
-                        <span class="response-file-card-icon">${isCode ? FILE_ICON.code : FILE_ICON.plain}</span>
+                        <span class="response-file-card-icon">${fileCardIconHTML(isCode ? FILE_ICON.code : FILE_ICON.plain)}</span>
                         <span class="response-file-card-meta">
                             <div class="response-file-card-name"></div>
                             <div class="response-file-card-type">${isCode ? `Code · ${extension.toUpperCase()}` : extension.toUpperCase()}${statsHtml}</div>
@@ -5209,7 +5220,7 @@
                     card.target = '_blank';
                     card.rel = 'noopener';
                     card.innerHTML = `
-                        <span class="response-file-card-icon">${FILE_ICON.plain}</span>
+                        <span class="response-file-card-icon">${fileCardIconHTML(FILE_ICON.plain)}</span>
                         <span class="response-file-card-meta">
                             <div class="response-file-card-name"></div>
                             <div class="response-file-card-type">${extension.toUpperCase()}${size ? ` · ${size}` : ''}</div>
