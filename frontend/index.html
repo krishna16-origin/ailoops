@@ -1673,6 +1673,14 @@
                 // all funnel through this one function first.
                 .replace(/(\]\()(\/generated-files\/[^)\s]+)(\))/g, (_, open, path, close) => `${open}${API_BASE}${path}${close}`);
         }
+        // Generated-file links are transport markup. Chat mode presents them as
+        // the dedicated card below the answer instead of leaving this line inline.
+        function stripGeneratedFileDownloadLines(text) {
+            return String(text || '').replace(/^\s*(?:📎\s*)?\*\*\[[^\]]+\]\([^\s)]+\)\*\*\s*\([^()\n]+\)\s*[—-]\s*ready to download\.?\s*$/gm, '');
+        }
+        function chatDisplayText(text) {
+            return applySourcesSplit(stripGeneratedFileDownloadLines(text));
+        }
 
         // Nexus-spark indicator (replaces the old 8-petal flower). Shown wherever
         // the old blinking text cursor used to appear while a response streams.
@@ -4514,7 +4522,7 @@
                 renderScheduled = true;
                 requestAnimationFrame(() => {
                     renderScheduled = false;
-                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : applySourcesSplit(assistantFullText);
+                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : chatDisplayText(assistantFullText);
                     setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)));
                     // Without this, a table renders as a raw, unconstrained <table> for the
                     // entire time the answer is still streaming in (this render fires up to
@@ -4524,7 +4532,7 @@
                     // and scrollable-in-place from the moment it first appears. Chat mode
                     // only, matching the final-render call sites below.
                     if (mode === 'chat') wrapTables(textContainer);
-                    if (mode === 'chat') renderChatFileCards(normalizeMathDelimiters(assistantFullText));
+                    if (mode === 'chat') renderChatFileCards(assistantFullText);
                     if (indicatorEl) textContainer.appendChild(indicatorEl);
                     scrollToBottom();
                 });
@@ -5486,10 +5494,10 @@
                         highlightCode(textContainer);
                         finalizeCodeResult(codeResult);
                     } else {
-                        setProse(textContainer, marked.parse(normalizeMathDelimiters(applySourcesSplit(assistantFullText))));
+                        setProse(textContainer, marked.parse(normalizeMathDelimiters(chatDisplayText(assistantFullText))));
                         highlightCode(textContainer);
                         if (mode === 'chat') wrapTables(textContainer);
-                        if (mode === 'chat') renderChatFileCards(normalizeMathDelimiters(assistantFullText));
+                        if (mode === 'chat') renderChatFileCards(assistantFullText);
                     }
 
                 } else {
@@ -5511,10 +5519,10 @@
                         highlightCode(textContainer);
                         finalizeCodeResult(data);
                     } else {
-                        setProse(textContainer, marked.parse(normalizeMathDelimiters(applySourcesSplit(assistantFullText))));
+                        setProse(textContainer, marked.parse(normalizeMathDelimiters(chatDisplayText(assistantFullText))));
                         highlightCode(textContainer);
                         if (mode === 'chat') wrapTables(textContainer);
-                        if (mode === 'chat') renderChatFileCards(normalizeMathDelimiters(assistantFullText));
+                        if (mode === 'chat') renderChatFileCards(assistantFullText);
                     }
                 }
 
@@ -5546,11 +5554,11 @@
                     // already streamed in as-is and just finalize its formatting
                     // (syntax highlighting, table wrapping) in place, the same way
                     // a normal completion does, instead of showing an error.
-                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : applySourcesSplit(assistantFullText);
+                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : chatDisplayText(assistantFullText);
                     setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)));
                     highlightCode(textContainer);
                     if (mode === 'chat') wrapTables(textContainer);
-                    if (mode === 'chat') renderChatFileCards(normalizeMathDelimiters(assistantFullText));
+                    if (mode === 'chat') renderChatFileCards(assistantFullText);
                 } else {
                     console.error('Error:', error);
                     thinkingBlock.remove();
