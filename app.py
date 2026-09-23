@@ -138,11 +138,12 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
     elif model_type_clean == "balanced":
         model_name = KIMI_MODEL
-    # Kimi and GLM 5.3 now share Nemotron's fast, standard-transport path:
-    # the user-supplied temperature is used as-is (no forced 1.0 override)
-    # and the normal 300s transport timeout applies to every model, so all
-    # three respond at the same speed with no long-running special case.
-    if _is_long_running_reasoning_model(model_name):
+    # Kimi and GLM 5.3 share Nemotron's fast, standard 300s transport
+    # timeout (see _is_long_running_reasoning_model) — but their temperature
+    # still gets pinned to 1.0 where their NIM endpoint requires it for
+    # coherent output (see _requires_fixed_temperature). Speed and
+    # correctness are separate switches on purpose.
+    if _requires_fixed_temperature(model_name):
         temperature = 1.0
     max_tokens = _clamp_max_tokens(model_name, max_tokens)
     transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_long_running_reasoning_model(model_name) else 300
@@ -176,10 +177,19 @@ def _is_kimi_model(model_name: str) -> bool:
 
 
 def _is_long_running_reasoning_model(model_name: str) -> bool:
-    """No model is currently pinned to the long transport timeout / forced
-    temperature=1.0 path. Kimi and GLM 5.3 respond on the same fast,
-    standard-timeout path as Nemotron."""
+    """No model is currently pinned to the long transport timeout. Kimi and
+    GLM 5.3 respond on the same fast, standard-timeout path as Nemotron."""
     return False
+
+
+def _requires_fixed_temperature(model_name: str) -> bool:
+    """Kimi and GLM 5.3 both return degraded/garbled output on their NVIDIA
+    NIM endpoints unless temperature is pinned to 1.0 (per their own
+    published sample payloads and benchmark methodology). This is a
+    correctness requirement, independent of transport speed — both models
+    still use the fast, standard timeout even though their temperature
+    stays pinned."""
+    return _is_kimi_model(model_name) or _is_glm_model(model_name)
 
 
 def _is_429_error(exc: Exception) -> bool:
@@ -273,7 +283,7 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
     """Create the selected Code-mode model."""
     model_type_clean = (model_type or DEFAULT_CODE_MODEL).strip().lower()
     model_name = CODE_MODEL_MAP.get(model_type_clean, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
-    if _is_long_running_reasoning_model(model_name):
+    if _requires_fixed_temperature(model_name):
         temperature = 1.0
     max_tokens = _clamp_max_tokens(model_name, max_tokens)
     transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_long_running_reasoning_model(model_name) else 300
