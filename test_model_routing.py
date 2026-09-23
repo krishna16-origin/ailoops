@@ -106,13 +106,19 @@ class ModelRoutingTests(unittest.TestCase):
                 budget,
             )
 
-    def test_kimi_and_glm_no_longer_force_temperature_1(self):
-        # Kimi and GLM 5.3 now take the caller's temperature as-is, same as
-        # Nemotron, instead of being pinned to 1.0.
-        self.assertEqual(app.get_llm("balanced", 0.2, 128).temperature, 0.2)
-        self.assertEqual(app.get_llm("fast", 0.7, 128).temperature, 0.7)
-        self.assertEqual(app.get_code_llm("glimmer", 0.3, 128).temperature, 0.3)
-        self.assertEqual(app.get_code_llm("step-flash", 0.5, 128).temperature, 0.5)
+    def test_kimi_and_glm_force_temperature_1_but_use_fast_timeout(self):
+        # Correctness (temperature pin) and speed (timeout) are separate
+        # concerns: both models keep the 1.0 temperature their NIM endpoint
+        # needs for coherent output, but neither is pinned to the old 24h
+        # long-running timeout anymore — that part now matches Nemotron.
+        for llm in (
+            app.get_llm("balanced", 0.2, 128),
+            app.get_llm("fast", 0.7, 128),
+            app.get_code_llm("glimmer", 0.3, 128),
+            app.get_code_llm("step-flash", 0.5, 128),
+        ):
+            self.assertEqual(llm.temperature, 1.0)
+            self.assertEqual(llm._client.timeout, 300)
 
 
 if __name__ == "__main__":
