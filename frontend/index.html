@@ -1179,6 +1179,14 @@
         }
         @media (min-width:769px) { .live-monitor-backdrop { display:none !important; } }
 
+
+        /* ============== TOOLTIPS ==============
+           Native title="" tooltips are drawn by the browser/OS in a light
+           style that can't be themed, so setupUiTooltips() (JS) swaps them for
+           this one element. It uses the same surface, border line, radius and
+           shadow as the app's other popup panels (.picker-more-panel). */
+        .ui-tooltip { position:fixed; left:0; top:0; z-index:2147483647; max-width:260px; padding:6px 10px; background:#262626; color:var(--text-primary); border:1px solid var(--border-color); border-radius:8px; box-shadow:0 6px 20px rgba(0,0,0,0.4); font-family:inherit; font-size:12px; font-weight:500; line-height:1.4; pointer-events:none; opacity:0; visibility:hidden; transform:translateY(2px); transition:opacity 0.14s ease, transform 0.14s ease, visibility 0.14s; }
+        .ui-tooltip.show { opacity:1; visibility:visible; transform:translateY(0); }
     </style>
 </head>
 <body>
@@ -2301,6 +2309,83 @@
             sidebarBackdrop.hidden = sidebar.classList.contains('collapsed');
         }
         function toggleSidebar() { sidebar.classList.toggle('collapsed'); syncSidebarBackdrop(); }
+
+        // ---- Themed tooltips ----
+        // Replaces every native title="" tooltip (including ones added later,
+        // like the message action buttons) with a single dark tooltip that
+        // matches the rest of the UI. Works by event delegation, so no markup
+        // needs to change; title is moved to data-tip on first hover, and
+        // aria-label is kept for icon-only controls so they stay accessible.
+        (function setupUiTooltips() {
+            const canHover = window.matchMedia && window.matchMedia('(hover: hover)').matches;
+            const tip = document.createElement('div');
+            tip.className = 'ui-tooltip';
+            tip.setAttribute('role', 'tooltip');
+            document.body.appendChild(tip);
+            let target = null, timer = null, lastHidden = 0;
+
+            function stash(el) {
+                if (!el.hasAttribute('title')) return;
+                const t = el.getAttribute('title');
+                el.removeAttribute('title');           // suppress the native tooltip
+                if (t && t.trim()) {
+                    el.dataset.tip = t;
+                    if (!el.hasAttribute('aria-label') && !el.textContent.trim()) el.setAttribute('aria-label', t);
+                }
+            }
+            function place() {
+                const r = target.getBoundingClientRect();
+                const w = tip.offsetWidth, h = tip.offsetHeight, gap = 8, m = 8;
+                let top = r.bottom + gap;
+                if (top + h > window.innerHeight - m) top = r.top - gap - h;   // flip above near the bottom edge
+                top = Math.max(m, top);
+                const left = Math.max(m, Math.min(r.left + r.width / 2 - w / 2, window.innerWidth - w - m));
+                tip.style.left = left + 'px';
+                tip.style.top = top + 'px';
+            }
+            function show() {
+                if (!target || !target.isConnected || !target.dataset.tip) return;
+                tip.textContent = target.dataset.tip;
+                place();
+                tip.classList.add('show');
+            }
+            function hide() {
+                clearTimeout(timer);
+                if (tip.classList.contains('show')) lastHidden = Date.now();
+                tip.classList.remove('show');
+                target = null;
+            }
+            function begin(el, instant) {
+                if (el === target) return;
+                hide();
+                stash(el);
+                if (!el.dataset.tip) return;
+                target = el;
+                // short delay like a native tooltip, but instant when moving between neighbouring controls
+                const wait = instant || Date.now() - lastHidden < 300 ? 0 : 400;
+                timer = setTimeout(show, wait);
+            }
+
+            if (canHover) {
+                document.addEventListener('mouseover', (e) => {
+                    const el = e.target.closest && e.target.closest('[title],[data-tip]');
+                    if (el) begin(el, false);
+                });
+                document.addEventListener('mouseout', (e) => {
+                    if (target && !target.contains(e.relatedTarget)) hide();
+                });
+            }
+            // keyboard focus shows it too
+            document.addEventListener('focusin', (e) => {
+                const el = e.target.closest && e.target.closest('[title],[data-tip]');
+                if (el && el.matches(':focus-visible')) begin(el, true);
+            });
+            document.addEventListener('focusout', hide);
+            document.addEventListener('mousedown', hide, true);
+            document.addEventListener('scroll', hide, true);
+            document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hide(); });
+            window.addEventListener('resize', hide);
+        })();
 
         // ---- Mobile edge-swipe for the sidebar ----
         // A tiny 44px header icon is precise-tap-only; swiping in from the screen
