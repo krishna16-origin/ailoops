@@ -1290,7 +1290,7 @@ class ChatRequest(BaseModel):
     # (GLM 5.3) matches the new frontend default and is what most callers want.
     stream: bool = False
     temperature: float = 0.7
-    thinking_level: str = DEFAULT_THINKING_LEVEL
+    thinking_level: str = "medium"
     # Chat mode only (see ChatEstimateRequest/DEEP_THINK_* above): an
     # independent on/off override from the composer's "+" menu that, when
     # true, always wins over thinking_level and asks every Chat-mode model
@@ -1309,7 +1309,7 @@ class ChatEstimateRequest(BaseModel):
     these settings will take, used purely to drive the frontend's live
     Deep Think countdown badge."""
     model_type: str = "fast"
-    thinking_level: str = DEFAULT_THINKING_LEVEL
+    thinking_level: str = "medium"
     deep_think: bool = False
 
 
