@@ -88,7 +88,7 @@ VISION_MODEL = os.getenv("NVIDIA_VISION_MODEL", "meta/llama-3.2-90b-vision-instr
 # it is never exposed as a selectable chat model. It exists purely so the
 # text/tables/layout in a screenshot, scan, or photo of a document come
 # through verbatim in the RAG context that gets handed to whichever chat
-# model the user has actually picked (DeepSeek, Kimi, Gemma, a Nemotron chat
+# model the user has actually picked (GLM 5.3, Kimi, Gemma, a Nemotron chat
 # model, Poolside, ...) — the extraction happens here, once, in the shared
 # upload pipeline, so it "just works" no matter which model answers.
 PARSE_MODEL = os.getenv("NVIDIA_PARSE_MODEL", "nvidia/nemotron-parse-2.0")
