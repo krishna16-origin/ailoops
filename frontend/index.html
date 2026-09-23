@@ -709,7 +709,7 @@
 
         /* ============== INPUT ============== */
         .input-container { position:absolute; bottom:0; left:0; width:100%; padding:22px; background:linear-gradient(180deg, rgba(33,33,33,0) 0%, var(--bg-main) 40%); display:flex; justify-content:center; }
-        .input-box { width:100%; max-width:760px; background-color:var(--bg-input); border-radius:22px; border:1px solid var(--border-color); display:flex; flex-direction:column; align-items:stretch; padding:11px 15px; box-shadow:0 4px 20px rgba(0,0,0,0.15); transition:border-color 0.25s ease, box-shadow 0.25s ease; }
+        .input-box { position:relative; width:100%; max-width:760px; background-color:var(--bg-input); border-radius:22px; border:1px solid var(--border-color); display:flex; flex-direction:column; align-items:stretch; padding:11px 15px; box-shadow:0 4px 20px rgba(0,0,0,0.15); transition:border-color 0.25s ease, box-shadow 0.25s ease; }
         .input-box:focus-within { border-color:rgba(255,255,255,0.3); box-shadow:0 4px 24px rgba(0,0,0,0.22); }
         .input-box textarea { flex:1; background:transparent; border:none; color:var(--text-primary); font-size:15.5px; resize:none; outline:none; max-height:200px; padding:8px 4px; line-height:1.5; }
         .input-box textarea::placeholder { color:var(--text-secondary); }
@@ -819,9 +819,27 @@
         .deep-think-chip:hover { background-color:rgba(var(--deep-accent-rgb),0.26); }
         .deep-think-chip svg { width:13px; height:13px; flex-shrink:0; }
         .deep-think-chip[hidden] { display:none; }
-        .deep-think-timer { align-self:flex-end; display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--deep-accent); background-color:rgba(var(--deep-accent-rgb),0.14); border:1px solid rgba(var(--deep-accent-rgb),0.4); padding:4px 11px 4px 9px; border-radius:999px; }
-        .deep-think-timer svg { width:13px; height:13px; flex-shrink:0; }
-        .deep-think-timer[hidden] { display:none; }
+        /* ---- Deep Think island (iPhone Dynamic Island-style floating pill,
+           anchored to a small gap above the input box, pure dark regardless
+           of accent color). Stays in the DOM at all times so it can animate
+           smoothly in/out instead of popping with [hidden]; the collapsed
+           state below IS its "closed" look. ---- */
+        .deep-think-island {
+            position:absolute; left:50%; bottom:100%; margin-bottom:10px;
+            display:inline-flex; align-items:center; gap:7px;
+            background-color:#000; color:#f5f5f5;
+            border:1px solid rgba(255,255,255,0.08);
+            padding:8px 16px 8px 12px; border-radius:999px;
+            font-size:12.5px; font-weight:500; white-space:nowrap;
+            box-shadow:0 12px 28px rgba(0,0,0,0.55), 0 2px 10px rgba(0,0,0,0.4);
+            transform:translateX(-50%) scale(0.35); transform-origin:center bottom;
+            opacity:0; pointer-events:none; z-index:40;
+            transition:transform 0.55s cubic-bezier(0.34,1.56,0.64,1), opacity 0.3s ease;
+        }
+        .deep-think-island.is-visible { opacity:1; transform:translateX(-50%) scale(1); pointer-events:auto; }
+        .deep-think-island.is-closing { transition:transform 0.4s cubic-bezier(0.4,0,0.2,1), opacity 0.32s ease; }
+        .deep-think-island .deep-think-island-dot { width:7px; height:7px; border-radius:50%; background:var(--deep-accent); flex-shrink:0; animation:deep-think-island-pulse 1.4s ease-in-out infinite; }
+        @keyframes deep-think-island-pulse { 0%,100% { opacity:1; transform:scale(1); } 50% { opacity:0.35; transform:scale(0.7); } }
 
         .attachment-chips { display:flex; flex-wrap:wrap; gap:8px; padding:2px 2px 8px; }
         .attachment-chips[hidden] { display:none; }
@@ -1425,6 +1443,15 @@
 
         <div class="input-container">
             <div class="input-box">
+                <!-- Deep Think live countdown — a single persistent Dynamic
+                     Island-style pill floating a small gap above the input
+                     box (not per-message; see startDeepThinkCountdown()).
+                     Always in the DOM so .is-visible can animate it open and
+                     removing that class animates it smoothly closed. -->
+                <div class="deep-think-island" id="deepThinkIsland">
+                    <span class="deep-think-island-dot"></span>
+                    <span class="deep-think-island-text" id="deepThinkIslandText"></span>
+                </div>
                 <div class="attachment-chips" id="attachmentChips" hidden></div>
                 <textarea id="userInput" rows="1" placeholder="Describe your objective..." oninput="autoResize(this)" onkeydown="handleEnter(event)"></textarea>
                 <input type="file" id="fileAttachInput" multiple hidden accept=".pdf,.docx,.txt,.md,.markdown,.rst,.log,.csv,.tsv,.json,.yaml,.yml,.xml,.ini,.cfg,.toml,.py,.js,.jsx,.ts,.tsx,.java,.c,.cpp,.h,.hpp,.cs,.go,.rs,.rb,.php,.swift,.kt,.sql,.sh,.bash,.html,.css,.scss,.vue,.svelte,.png,.jpg,.jpeg,.gif,.webp,.bmp" onchange="handleFileInputChange(event)">
@@ -3716,19 +3743,6 @@
                 const body = document.createElement('div');
                 body.className = 'assistant-body';
 
-                // Deep Think live countdown badge — top-right of this message, above
-                // the thinking block. Created hidden for every assistant message;
-                // sendMessage() only ever reveals/starts it for a turn sent with
-                // Deep Think on (see startDeepThinkCountdown()).
-                const deepThinkTimerDiv = document.createElement('div');
-                deepThinkTimerDiv.className = 'deep-think-timer';
-                deepThinkTimerDiv.hidden = true;
-                deepThinkTimerDiv.innerHTML = `
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><polyline points="12 7 12 12 15 14"></polyline></svg>
-                    <span class="deep-think-timer-text"></span>
-                `;
-                body.appendChild(deepThinkTimerDiv);
-
                 const contentDiv = document.createElement('div');
                 contentDiv.className = 'message-text';
                 // Prose is kept in its own child so streamed updates do not replace
@@ -4191,16 +4205,18 @@
             const thinkingStartTime = Date.now();
 
             // ============== DEEP THINK live countdown (Chat mode only) ==============
-            // Shows a real-time "counting down" badge, top-right of this message,
-            // while a Deep Think turn is in flight. The number it counts down from
-            // comes from the backend's /chat/estimate — computed fresh from the
-            // actual model + token budget this turn will use, never hardcoded — and
-            // the countdown itself ticks off the wall clock (Date.now()), not a
-            // fixed-duration CSS animation, so it stays accurate even if the tab
-            // is backgrounded or a frame is dropped.
-            const deepThinkTimerEl = assistantBubble.querySelector('.deep-think-timer');
-            const deepThinkTimerTextEl = deepThinkTimerEl ? deepThinkTimerEl.querySelector('.deep-think-timer-text') : null;
+            // Shows a real-time "counting down" badge in the single Dynamic
+            // Island-style pill that floats a small gap above the input box
+            // (not per-message). The number it counts down from comes from
+            // the backend's /chat/estimate — computed fresh from the actual
+            // model + token budget this turn will use, never hardcoded — and
+            // the countdown itself ticks off the wall clock (Date.now()), not
+            // a fixed-duration CSS animation, so it stays accurate even if
+            // the tab is backgrounded or a frame is dropped.
+            const deepThinkTimerEl = document.getElementById('deepThinkIsland');
+            const deepThinkTimerTextEl = document.getElementById('deepThinkIslandText');
             let deepThinkCountdownInterval = null;
+            let deepThinkCloseTimeout = null;
 
             function formatDeepThinkDuration(totalSeconds) {
                 const s = Math.max(0, Math.round(totalSeconds));
@@ -4212,7 +4228,12 @@
             function startDeepThinkCountdown(estimatedSeconds) {
                 if (!deepThinkTimerEl || !deepThinkTimerTextEl || !estimatedSeconds || estimatedSeconds <= 0) return;
                 const startedAt = Date.now();
-                deepThinkTimerEl.hidden = false;
+                if (deepThinkCloseTimeout) { clearTimeout(deepThinkCloseTimeout); deepThinkCloseTimeout = null; }
+                deepThinkTimerEl.classList.remove('is-closing');
+                // Next frame, so the browser registers the pre-open (scaled down)
+                // state before flipping to .is-visible — this is what makes the
+                // island spring open from a small dot instead of just popping in.
+                requestAnimationFrame(() => deepThinkTimerEl.classList.add('is-visible'));
                 const tick = () => {
                     const elapsed = (Date.now() - startedAt) / 1000;
                     const remaining = estimatedSeconds - elapsed;
@@ -4229,7 +4250,14 @@
                     clearInterval(deepThinkCountdownInterval);
                     deepThinkCountdownInterval = null;
                 }
-                if (deepThinkTimerEl) deepThinkTimerEl.hidden = true;
+                if (deepThinkTimerEl && deepThinkTimerEl.classList.contains('is-visible')) {
+                    deepThinkTimerEl.classList.add('is-closing');
+                    deepThinkTimerEl.classList.remove('is-visible');
+                    deepThinkCloseTimeout = setTimeout(() => {
+                        deepThinkTimerEl.classList.remove('is-closing');
+                        deepThinkCloseTimeout = null;
+                    }, 450);
+                }
             }
 
             // Kicked off in parallel with the real request below — /chat/estimate
