@@ -55,6 +55,28 @@ THINKING_LEVELS = {
 }
 DEFAULT_THINKING_LEVEL = "low"
 
+# Deep Think — Chat mode only. A standalone on/off override (composer "+"
+# menu), independent of the five-level slider above: when enabled it always
+# wins, on whichever chat model is currently selected, and pushes the
+# completion budget and reasoning instructions well past "Max". It is
+# intentionally NOT a key in THINKING_LEVELS — normalize_thinking_level()
+# only ever folds onto low/medium/high/extra/max, so there is no string a
+# client could pass as thinking_level/reasoning_level to reach it; the only
+# way in is the explicit ChatRequest.deep_think boolean, which CodeChatRequest
+# does not have, keeping this out of Code mode entirely.
+DEEP_THINK_LABEL = "Deep Think"
+DEEP_THINK_DESCRIPTION = "Extremely deep, exhaustive reasoning — thinks far longer than Max before answering"
+DEEP_THINK_MAX_TOKENS = 60000
+DEEP_THINK_KIMI_BUDGET = 60000  # within _KIMI_MAX_TOKENS (65536) below
+DEEP_THINK_DEPTH_INSTRUCTION = (
+    "This is Deep Think mode: think with extreme depth and rigor, well beyond your normal maximum effort. "
+    "Treat this as the hardest, highest-stakes problem you will work on today. Fully decompose it, examine it "
+    "from multiple independent angles, deliberately search for flaws or gaps in your own reasoning and correct "
+    "them, consider and rule out plausible alternative answers or approaches, double- and triple-check any "
+    "facts, numbers, or logic before committing, and do not rush to a conclusion. Take all the space you need "
+    "inside your <think> block to reason this thoroughly before giving your final answer."
+)
+
 KIMI_MODEL = "moonshotai/kimi-k3"
 GLM_MODEL = "z-ai/glm-5.3"
 
@@ -101,6 +123,15 @@ def get_thinking_config(level: str) -> dict:
     return THINKING_LEVELS[normalize_thinking_level(level)]
 
 
+def get_effective_thinking_config(thinking_level: str, deep_think: bool = False) -> dict:
+    """Return the thinking config to actually use for a Chat-mode turn.
+    Deep Think is a standalone override — enabling it always wins over
+    whatever the five-level slider is set to, for every Chat-mode model."""
+    if deep_think:
+        return {"label": DEEP_THINK_LABEL, "max_tokens": DEEP_THINK_MAX_TOKENS, "description": DEEP_THINK_DESCRIPTION}
+    return get_thinking_config(thinking_level)
+
+
 
 # langchain-nvidia-ai-endpoints ships a local registry of known model ids
 # (determine_model()). Nemotron/Gemma are in it, so building a ChatNVIDIA for
@@ -128,7 +159,7 @@ def _get_chat_nvidia_client(model_name: str, temperature: float, max_tokens: int
     return client
 
 
-def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
+def get_llm(model_type: str, temperature: float, max_tokens: int, deep_think: bool = False) -> ChatNVIDIA:
     """Create the selected Chat-mode model (GLM 5.3 / Nemotron / Kimi)."""
     model_name = KIMI_MODEL
     model_type_clean = (model_type or "balanced").strip().lower()
@@ -146,7 +177,10 @@ def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
     if _requires_fixed_temperature(model_name):
         temperature = 1.0
     max_tokens = _clamp_max_tokens(model_name, max_tokens)
-    transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_long_running_reasoning_model(model_name) else 300
+    # Deep Think's much bigger completion budget can genuinely take a long
+    # time to finish, on any Chat-mode model — give it the long transport
+    # window regardless of which model would normally get the fast one.
+    transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if (deep_think or _is_long_running_reasoning_model(model_name)) else 300
     return _get_chat_nvidia_client(model_name, temperature, max_tokens, transport_timeout)
 
 
@@ -236,9 +270,11 @@ _KIMI_LEVEL_BUDGETS = {
 }
 
 
-def _model_thinking_budget(model_name: str, level: str, requested: int) -> int:
+def _model_thinking_budget(model_name: str, level: str, requested: int, deep_think: bool = False) -> int:
     """Return the completion budget for a model/effort pair."""
     if _is_kimi_model(model_name):
+        if deep_think:
+            return DEEP_THINK_KIMI_BUDGET
         return _KIMI_LEVEL_BUDGETS[normalize_thinking_level(level)]
     return max(1, int(requested or 1024))
 
@@ -253,8 +289,10 @@ def _clamp_max_tokens(model_name: str, max_tokens: int) -> int:
     return n
 
 
-def _map_reasoning_effort(level: str, model_name: str = "") -> str:
+def _map_reasoning_effort(level: str, model_name: str = "", deep_think: bool = False) -> str:
     """Map 5-level thinking scale to the effort enum the target model accepts."""
+    if deep_think:
+        return "max"
     lvl = normalize_thinking_level(level)
     if _is_glm_model(model_name):
         if lvl == "low":
@@ -277,6 +315,30 @@ def _resolve_chat_model_name(model_type: str) -> str:
     if model_type_clean == "reasoning":
         return "nvidia/nemotron-3-ultra-550b-a55b"
     return KIMI_MODEL
+
+
+# Rough generation throughput per model, used only to produce a "how long will
+# this take" estimate for the frontend's live Deep Think countdown. These are
+# not guarantees — actual NVIDIA NIM latency varies with load — but the
+# estimate itself is computed fresh from the real token budget being sent for
+# this request, not a fixed/hardcoded number, so it tracks the model, thinking
+# level, and Deep Think state the person actually picked.
+_MODEL_TOKENS_PER_SECOND = {
+    GLM_MODEL: 45.0,
+    KIMI_MODEL: 22.0,
+    "nvidia/nemotron-3-ultra-550b-a55b": 18.0,
+}
+_ESTIMATE_DEFAULT_TOKENS_PER_SECOND = 20.0
+_ESTIMATE_NETWORK_OVERHEAD_SECONDS = 3.0
+_ESTIMATE_MIN_SECONDS = 5
+
+
+def estimate_response_seconds(model_name: str, token_budget: int) -> int:
+    """Estimate wall-clock seconds for a Chat-mode completion with this
+    model/token budget, for the UI countdown only."""
+    rate = _MODEL_TOKENS_PER_SECOND.get(model_name, _ESTIMATE_DEFAULT_TOKENS_PER_SECOND)
+    seconds = _ESTIMATE_NETWORK_OVERHEAD_SECONDS + (max(1, int(token_budget or 1)) / rate)
+    return max(_ESTIMATE_MIN_SECONDS, round(seconds))
 
 
 def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
@@ -693,10 +755,14 @@ FILE_CREATION_PROMPT_BLOCK = (
 )
 
 
-def build_messages(history: List[BaseMessage], thinking_level: str, search_text: str = "", rag_text: str = "") -> List[BaseMessage]:
-    level_key = normalize_thinking_level(thinking_level)
-    config = THINKING_LEVELS[level_key]
-    depth = THINKING_DEPTH_INSTRUCTIONS[level_key]
+def build_messages(history: List[BaseMessage], thinking_level: str, search_text: str = "", rag_text: str = "", deep_think: bool = False) -> List[BaseMessage]:
+    if deep_think:
+        config = {"label": DEEP_THINK_LABEL, "max_tokens": DEEP_THINK_MAX_TOKENS, "description": DEEP_THINK_DESCRIPTION}
+        depth = DEEP_THINK_DEPTH_INSTRUCTION
+    else:
+        level_key = normalize_thinking_level(thinking_level)
+        config = THINKING_LEVELS[level_key]
+        depth = THINKING_DEPTH_INSTRUCTIONS[level_key]
     curr_dt = get_current_datetime_str()
     system_text = (
         build_constitution_block("chat") + "\n\n"
@@ -1069,7 +1135,7 @@ async def _await_rag_indexing(session: dict, attachment_ids: Optional[List[str]]
 async def chat_understand_node(request: "ChatRequest", session: dict, progress=None) -> dict:
     history = session["messages"]
     latest = history[-1].content if history else ""
-    config = get_thinking_config(request.thinking_level)
+    config = get_effective_thinking_config(request.thinking_level, request.deep_think)
     excerpt = request_excerpt(latest)
     await publish_progress(progress, "chat_understand_node", "chat_understand_node", f"Read the latest user request and isolated the topic: “{excerpt}”")
     return {"history": history, "latest": latest, "config": config, "session": session}
@@ -1119,9 +1185,9 @@ async def chat_compose_node(request: "ChatRequest", state: dict, progress=None) 
     await publish_progress(progress, "chat_compose_node", "chat_compose_node", f"Invoking the model with {config['label']} thinking and a {config['max_tokens']}-token budget.")
     _chat_model_name = _resolve_chat_model_name(request.model_type)
     combined_context = "\n\n".join(x for x in (state["search_text"], state.get("mcp_context", "")) if x)
-    _chat_messages = build_messages(state["history"], request.thinking_level, combined_context, state.get("rag_text", ""))
-    _chat_budget = _model_thinking_budget(_chat_model_name, request.thinking_level, config["max_tokens"])
-    llm = get_llm(request.model_type, request.temperature, _chat_budget)
+    _chat_messages = build_messages(state["history"], request.thinking_level, combined_context, state.get("rag_text", ""), deep_think=request.deep_think)
+    _chat_budget = _model_thinking_budget(_chat_model_name, request.thinking_level, config["max_tokens"], deep_think=request.deep_think)
+    llm = get_llm(request.model_type, request.temperature, _chat_budget, deep_think=request.deep_think)
     session = state.get("session") or {}
     session_id = state.get("session_id") or "default"
     invoke_kwargs: Dict[str, Any] = {}
@@ -1138,7 +1204,7 @@ async def chat_compose_node(request: "ChatRequest", state: dict, progress=None) 
     if _is_glm_model(_chat_model_name):
         response = await invoke_model(
             _chat_messages, llm, progress,
-            reasoning_effort=_map_reasoning_effort(request.thinking_level, _chat_model_name),
+            reasoning_effort=_map_reasoning_effort(request.thinking_level, _chat_model_name, deep_think=request.deep_think),
             **invoke_kwargs,
         )
     else:
@@ -1212,11 +1278,25 @@ class ChatRequest(BaseModel):
     stream: bool = False
     temperature: float = 0.7
     thinking_level: str = DEFAULT_THINKING_LEVEL
+    # Chat mode only (see ChatEstimateRequest/DEEP_THINK_* above): an
+    # independent on/off override from the composer's "+" menu that, when
+    # true, always wins over thinking_level and pushes every Chat-mode model
+    # to reason far past "Max" before answering.
+    deep_think: bool = False
     mcp_servers: Optional[List[str]] = None
     # Optional: restrict RAG retrieval to specific uploaded file ids for this
     # turn. When omitted/empty, retrieval searches every file uploaded so far
     # in this session — upload once, ask about it across multiple turns.
     attachment_ids: Optional[List[str]] = None
+
+
+class ChatEstimateRequest(BaseModel):
+    """Chat mode only. Cheap, no-LLM-call estimate of how long a turn with
+    these settings will take, used purely to drive the frontend's live
+    Deep Think countdown badge."""
+    model_type: str = "fast"
+    thinking_level: str = DEFAULT_THINKING_LEVEL
+    deep_think: bool = False
 
 
 class ClearSessionRequest(BaseModel):
@@ -3098,6 +3178,26 @@ async def code_chat(request: CodeChatRequest):
     return {"session_id": request.session_id, **result}
 
 
+@app.post("/chat/estimate")
+async def chat_estimate(request: ChatEstimateRequest):
+    """Chat mode only. Instant, no-LLM-call estimate of how long a turn with
+    these settings will take — mirrors the exact model/budget resolution
+    chat_compose_node uses for the real call, so the number the frontend's
+    Deep Think countdown starts from tracks what will actually be sent,
+    rather than a hardcoded guess."""
+    model_name = _resolve_chat_model_name(request.model_type)
+    config = get_effective_thinking_config(request.thinking_level, request.deep_think)
+    budget = _clamp_max_tokens(
+        model_name,
+        _model_thinking_budget(model_name, request.thinking_level, config["max_tokens"], deep_think=request.deep_think),
+    )
+    return {
+        "estimated_seconds": estimate_response_seconds(model_name, budget),
+        "thinking_level": config["label"],
+        "max_tokens": budget,
+    }
+
+
 @app.post("/chat")
 async def chat(request: ChatRequest):
     session = get_session(request.session_id)
@@ -3125,7 +3225,7 @@ async def chat(request: ChatRequest):
     ).strip()
     assistant_kwargs = {"reasoning_content": reasoning_content} if reasoning_content else {}
     session["messages"].append(AIMessage(content=response, additional_kwargs=assistant_kwargs))
-    config = get_thinking_config(request.thinking_level)
+    config = get_effective_thinking_config(request.thinking_level, request.deep_think)
     return {
         "response": response,
         "session_id": request.session_id,
