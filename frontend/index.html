@@ -1679,7 +1679,9 @@
             return String(text || '').replace(/^\s*(?:📎\s*)?\*\*\[[^\]]+\]\([^\s)]+\)\*\*\s*\([^()\n]+\)\s*[—-]\s*ready to download\.?\s*$/gm, '');
         }
         function chatDisplayText(text) {
-            return applySourcesSplit(stripGeneratedFileDownloadLines(text));
+            // applySourcesSplit() is scoped to the active sendMessage() turn;
+            // keep this global helper independent of that local function.
+            return stripGeneratedFileDownloadLines(text);
         }
 
         // Nexus-spark indicator (replaces the old 8-petal flower). Shown wherever
@@ -4522,7 +4524,7 @@
                 renderScheduled = true;
                 requestAnimationFrame(() => {
                     renderScheduled = false;
-                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : chatDisplayText(assistantFullText);
+                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : applySourcesSplit(chatDisplayText(assistantFullText));
                     setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)));
                     // Without this, a table renders as a raw, unconstrained <table> for the
                     // entire time the answer is still streaming in (this render fires up to
@@ -5494,7 +5496,7 @@
                         highlightCode(textContainer);
                         finalizeCodeResult(codeResult);
                     } else {
-                        setProse(textContainer, marked.parse(normalizeMathDelimiters(chatDisplayText(assistantFullText))));
+                        setProse(textContainer, marked.parse(normalizeMathDelimiters(applySourcesSplit(chatDisplayText(assistantFullText)))));
                         highlightCode(textContainer);
                         if (mode === 'chat') wrapTables(textContainer);
                         if (mode === 'chat') renderChatFileCards(assistantFullText);
@@ -5519,7 +5521,7 @@
                         highlightCode(textContainer);
                         finalizeCodeResult(data);
                     } else {
-                        setProse(textContainer, marked.parse(normalizeMathDelimiters(chatDisplayText(assistantFullText))));
+                        setProse(textContainer, marked.parse(normalizeMathDelimiters(applySourcesSplit(chatDisplayText(assistantFullText)))));
                         highlightCode(textContainer);
                         if (mode === 'chat') wrapTables(textContainer);
                         if (mode === 'chat') renderChatFileCards(assistantFullText);
@@ -5554,7 +5556,7 @@
                     // already streamed in as-is and just finalize its formatting
                     // (syntax highlighting, table wrapping) in place, the same way
                     // a normal completion does, instead of showing an error.
-                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : chatDisplayText(assistantFullText);
+                    const liveText = (mode === 'code') ? stripCodeFence(assistantFullText) : applySourcesSplit(chatDisplayText(assistantFullText));
                     setProse(textContainer, marked.parse(normalizeMathDelimiters(liveText)));
                     highlightCode(textContainer);
                     if (mode === 'chat') wrapTables(textContainer);
