@@ -57,24 +57,31 @@ DEFAULT_THINKING_LEVEL = "low"
 
 # Deep Think — Chat mode only. A standalone on/off override (composer "+"
 # menu), independent of the five-level slider above: when enabled it always
-# wins, on whichever chat model is currently selected, and pushes the
-# completion budget and reasoning instructions well past "Max". It is
-# intentionally NOT a key in THINKING_LEVELS — normalize_thinking_level()
-# only ever folds onto low/medium/high/extra/max, so there is no string a
-# client could pass as thinking_level/reasoning_level to reach it; the only
-# way in is the explicit ChatRequest.deep_think boolean, which CodeChatRequest
-# does not have, keeping this out of Code mode entirely.
+# wins, on whichever chat model is currently selected, and asks for extra
+# rigor within a time-boxed budget. It is intentionally NOT a key in
+# THINKING_LEVELS — normalize_thinking_level() only ever folds onto
+# low/medium/high/extra/max, so there is no string a client could pass as
+# thinking_level/reasoning_level to reach it; the only way in is the explicit
+# ChatRequest.deep_think boolean, which CodeChatRequest does not have,
+# keeping this out of Code mode entirely.
 DEEP_THINK_LABEL = "Deep Think"
-DEEP_THINK_DESCRIPTION = "Extremely deep, exhaustive reasoning — thinks far longer than Max before answering"
-DEEP_THINK_MAX_TOKENS = 60000
-DEEP_THINK_KIMI_BUDGET = 60000  # within _KIMI_MAX_TOKENS (65536) below
+DEEP_THINK_DESCRIPTION = "Extra-rigorous, double-checked reasoning, time-boxed to answer quickly"
+# Budget is chosen so a full-budget answer stays under an ~8 minute hard
+# ceiling even on the slowest Chat-mode model (Reasoning/Nemotron @ ~18
+# tok/s: 8000/18 + overhead ~= 7.5 min), while the common case — the model
+# not needing the whole budget, or a faster model (Kimi/GLM) — lands under
+# 5 minutes. (Previously 60000, which is what produced the ~55 minute
+# worst case on the Reasoning model.)
+DEEP_THINK_MAX_TOKENS = 8000
+DEEP_THINK_KIMI_BUDGET = 8000  # within _KIMI_MAX_TOKENS (65536) below, above _KIMI_MIN_TOKENS (8000)
 DEEP_THINK_DEPTH_INSTRUCTION = (
     "This is Deep Think mode: think with extreme depth and rigor, well beyond your normal maximum effort. "
     "Treat this as the hardest, highest-stakes problem you will work on today. Fully decompose it, examine it "
     "from multiple independent angles, deliberately search for flaws or gaps in your own reasoning and correct "
     "them, consider and rule out plausible alternative answers or approaches, double- and triple-check any "
-    "facts, numbers, or logic before committing, and do not rush to a conclusion. Take all the space you need "
-    "inside your <think> block to reason this thoroughly before giving your final answer."
+    "facts, numbers, or logic before committing, and do not rush to a conclusion. Your thinking budget is limited, "
+    "so be thorough but economical: do not pad or repeat yourself, and always leave enough of your budget unused "
+    "to write out a complete final answer — an unfinished answer is worse than a slightly less exhaustive one."
 )
 
 KIMI_MODEL = "moonshotai/kimi-k3"
@@ -1280,8 +1287,9 @@ class ChatRequest(BaseModel):
     thinking_level: str = DEFAULT_THINKING_LEVEL
     # Chat mode only (see ChatEstimateRequest/DEEP_THINK_* above): an
     # independent on/off override from the composer's "+" menu that, when
-    # true, always wins over thinking_level and pushes every Chat-mode model
-    # to reason far past "Max" before answering.
+    # true, always wins over thinking_level and asks every Chat-mode model
+    # to reason with extra rigor, within a time-boxed budget (see
+    # DEEP_THINK_MAX_TOKENS).
     deep_think: bool = False
     mcp_servers: Optional[List[str]] = None
     # Optional: restrict RAG retrieval to specific uploaded file ids for this
