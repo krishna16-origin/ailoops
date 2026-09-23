@@ -355,6 +355,34 @@
         .user-message-show-more { display:block; margin-top:8px; margin-left:auto; background:transparent; border:none; padding:0; font-size:13px; font-weight:600; color:var(--accent); cursor:pointer; }
         .user-message-show-more:hover { text-decoration:underline; }
 
+        /* Hover-fade Copy/Edit row for user messages. Hidden by default and
+           faded in only while the pointer is over that specific message row
+           (or, for keyboard users, while something inside it has focus) —
+           mirrors the assistant's always-visible .message-footer buttons
+           but scoped per-message and hidden until hovered. */
+        .user-message-actions { display:flex; align-items:center; justify-content:flex-end; gap:2px; margin-top:6px; opacity:0; transition:opacity 0.15s ease; }
+        .message-row.user:hover .user-message-actions,
+        .message-row.user:focus-within .user-message-actions { opacity:1; }
+        .user-message-actions .footer-icon-btn { display:flex; align-items:center; justify-content:center; background:transparent; border:none; color:var(--text-secondary); cursor:pointer; padding:6px; border-radius:6px; transition:background 0.2s, color 0.2s; }
+        .user-message-actions .footer-icon-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
+        .user-message-actions .footer-icon-btn svg { width:14px; height:14px; display:block; }
+        .user-message-actions .copy-btn .icon-check { display:none; color:var(--accent); }
+        .user-message-actions .copy-btn.copied .icon-copy { display:none; }
+        .user-message-actions .copy-btn.copied .icon-check { display:block; }
+
+        /* In-place ChatGPT-style edit — the rendered text swaps for this
+           textarea (see startEditingUserMessage()) sized to blend into the
+           same bubble rather than looking like a separate control. */
+        .user-edit-wrap { width:100%; }
+        .user-edit-textarea { width:100%; min-width:220px; background:transparent; border:1px solid var(--border-color); border-radius:12px; color:var(--text-primary); font:inherit; line-height:1.6; padding:10px 12px; resize:none; outline:none; box-sizing:border-box; }
+        .user-edit-textarea:focus { border-color:var(--accent); }
+        .user-edit-controls { display:flex; justify-content:flex-end; gap:8px; margin-top:8px; }
+        .user-edit-controls button { border:none; border-radius:14px; padding:6px 14px; font-size:13px; font-weight:600; cursor:pointer; transition:background 0.2s, opacity 0.2s; }
+        .user-edit-cancel-btn { background:transparent; color:var(--text-secondary); }
+        .user-edit-cancel-btn:hover { color:var(--text-primary); }
+        .user-edit-save-btn { background:var(--accent); color:#fff; }
+        .user-edit-save-btn:hover { opacity:0.9; }
+
         /* Simplified assistant message: no repeated title per bubble, just a small quiet avatar */
         .assistant .message-bubble { background-color:transparent; border-radius:8px; color:var(--text-primary); display:flex; gap:12px; padding-left:0; align-items:flex-start; }
         .assistant-avatar { flex-shrink:0; width:26px; height:26px; padding:5px; border-radius:50%; border:1px solid var(--border-color); color:var(--text-secondary); margin-top:2px; position:relative; overflow:hidden; }
@@ -3524,6 +3552,71 @@
             btn.textContent = isExpanded ? 'Show less' : 'Show more';
         }
 
+        // ChatGPT-style in-place edit for a user message. Swaps the rendered
+        // text for a textarea; Save cosmetically removes this turn and every
+        // turn after it from the visible thread, then resends the edited
+        // text through the exact same path the Retry button uses. Note: the
+        // backend session (modes.*.sessionId) is untouched, so its stored
+        // history still has the original exchange underneath — an accepted
+        // tradeoff for keeping this a frontend-only change.
+        function startEditingUserMessage(row, bubble, textSlot, actions, originalText) {
+            // Already editing this bubble — don't stack a second textarea.
+            if (bubble.querySelector('.user-edit-wrap')) return;
+
+            textSlot.style.display = 'none';
+            actions.style.display = 'none';
+
+            const editWrap = document.createElement('div');
+            editWrap.className = 'user-edit-wrap';
+            editWrap.innerHTML = `
+                <textarea class="user-edit-textarea" rows="1"></textarea>
+                <div class="user-edit-controls">
+                    <button type="button" class="user-edit-cancel-btn">Cancel</button>
+                    <button type="button" class="user-edit-save-btn">Save &amp; submit</button>
+                </div>
+            `;
+            bubble.insertBefore(editWrap, actions);
+
+            const textarea = editWrap.querySelector('.user-edit-textarea');
+            textarea.value = originalText;
+            autoResize(textarea);
+            textarea.focus();
+            textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+            textarea.addEventListener('input', () => autoResize(textarea));
+
+            function cleanupEdit() {
+                editWrap.remove();
+                textSlot.style.display = '';
+                actions.style.display = '';
+            }
+
+            function commitEdit() {
+                const newText = textarea.value.trim();
+                if (!newText || isWaitingForResponse) return;
+
+                // Drop this row and every message row after it from the
+                // visible thread before resending.
+                let sibling = row.nextSibling;
+                while (sibling) {
+                    const toRemove = sibling;
+                    sibling = sibling.nextSibling;
+                    toRemove.remove();
+                }
+                row.remove();
+
+                userInput.value = newText;
+                autoResize(userInput);
+                sendMessage();
+            }
+
+            editWrap.querySelector('.user-edit-cancel-btn').addEventListener('click', cleanupEdit);
+            editWrap.querySelector('.user-edit-save-btn').addEventListener('click', commitEdit);
+            textarea.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') { e.preventDefault(); cleanupEdit(); }
+                else if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commitEdit(); }
+            });
+        }
+
         function appendMessage(role, text, attachments = []) {
             modes[currentMode].hasMessages = true;
             openingScene.style.display = 'none';
@@ -3740,19 +3833,48 @@
                 // with a "Show more" toggle, so a giant paste doesn't push the rest
                 // of the conversation off-screen. Short messages render unchanged.
                 const attachmentsHtml = renderMessageAttachments(attachments);
+                let textSlotHtml = '';
                 if (text) {
                     const isLong = text.length > 480 || (text.match(/\n/g) || []).length >= 6;
-                    if (isLong) {
-                        bubble.innerHTML = attachmentsHtml +
-                            `<div class="user-text-wrap">` +
-                            `<div class="message-attachment-text truncated">${escapeHtml(text)}</div>` +
-                            `<button type="button" class="user-message-show-more" onclick="toggleUserMessageExpand(this)">Show more</button>` +
-                            `</div>`;
-                    } else {
-                        bubble.innerHTML = attachmentsHtml + `<div class="message-attachment-text">${escapeHtml(text)}</div>`;
-                    }
-                } else {
-                    bubble.innerHTML = attachmentsHtml;
+                    textSlotHtml = isLong
+                        ? `<div class="user-text-wrap">` +
+                          `<div class="message-attachment-text truncated">${escapeHtml(text)}</div>` +
+                          `<button type="button" class="user-message-show-more" onclick="toggleUserMessageExpand(this)">Show more</button>` +
+                          `</div>`
+                        : `<div class="message-attachment-text">${escapeHtml(text)}</div>`;
+                }
+                // The text lives inside its own ".user-message-text-slot" wrapper
+                // (rather than directly in the bubble) so startEditingUserMessage()
+                // has a single, stable element to hide/restore when it swaps in
+                // the edit textarea below.
+                bubble.innerHTML = attachmentsHtml + (text ? `<div class="user-message-text-slot">${textSlotHtml}</div>` : '');
+
+                // Hover-fade Copy/Edit row — only meaningful when there's text to
+                // copy or edit; an attachment-only message skips it entirely.
+                if (text) {
+                    const textSlot = bubble.querySelector('.user-message-text-slot');
+                    const actions = document.createElement('div');
+                    actions.className = 'user-message-actions';
+                    actions.innerHTML = `
+                        <button class="footer-icon-btn copy-btn" type="button" title="Copy">
+                            <svg class="icon-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                            <svg class="icon-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                        </button>
+                        <button class="footer-icon-btn edit-btn" type="button" title="Edit">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>
+                        </button>
+                    `;
+                    bubble.appendChild(actions);
+
+                    const userCopyBtn = actions.querySelector('.copy-btn');
+                    userCopyBtn.addEventListener('click', () => {
+                        navigator.clipboard.writeText(text);
+                        userCopyBtn.classList.add('copied');
+                        setTimeout(() => userCopyBtn.classList.remove('copied'), 1500);
+                    });
+
+                    const userEditBtn = actions.querySelector('.edit-btn');
+                    userEditBtn.addEventListener('click', () => startEditingUserMessage(row, bubble, textSlot, actions, text));
                 }
             }
 
