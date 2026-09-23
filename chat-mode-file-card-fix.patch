@@ -1,0 +1,104 @@
+diff --git a/app.py b/app.py
+index 9907b43..d3ba026 100644
+--- a/app.py
++++ b/app.py
+@@ -757,6 +757,11 @@ FILE_CREATION_PROMPT_BLOCK = (
+     "the final file content, verbatim) and .pdf .docx .xlsx (rendered automatically — for these, write the "
+     "CONTENT as plain markdown-style text: '# '/'## ' headings, '- ' bullets, '1. ' numbered lists, '**bold**', "
+     "'*italic*', blank lines between paragraphs; for .xlsx write comma-separated rows instead, one row per line). "
++    "Structure every generated document like a real deliverable, not a wall of text: open with a short title/"
++    "heading, break the body into labeled sections with '## ' subheadings where the content has more than one "
++    "part, and use bullets, numbered steps, or tables instead of long paragraphs wherever the information is a "
++    "list, sequence, or comparison. A one-paragraph answer with no natural sections can stay a single block — "
++    "don't invent headings just to have them. "
+     "You may create more than one file in the same answer if more than one was requested. Always write a short "
+     "sentence introducing what you made — never let the marker block be the entire answer with no context. "
+     "Never nest one <<<FILE:...>>> block inside another."
+diff --git a/file_generator.py b/file_generator.py
+index b89fee5..d7ce0b2 100644
+--- a/file_generator.py
++++ b/file_generator.py
+@@ -53,6 +53,7 @@ import uuid
+ from datetime import datetime, timezone
+ from io import StringIO
+ from typing import Any, Dict, List, Optional, Tuple
++from urllib.parse import quote
+ 
+ MAX_GENERATED_FILE_CHARS = 300_000          # ~300KB of raw text content per file
+ MAX_GENERATED_FILES_PER_SESSION = 100
+@@ -424,7 +425,14 @@ def _build_and_store(session: dict, session_id: str, filename: str, raw_content:
+         "_data": data,
+     }
+     files[file_id] = record
+-    download_url = f"/generated-files/{session_id}/{file_id}/{clean_name}"
++    # `clean_name` may contain spaces (sanitize_filename allows them) — quote it
++    # in the URL path so the Markdown link stays well-formed (an unescaped
++    # space breaks Markdown link parsing and the frontend's file-card regex,
++    # which stops at whitespace, so the download card silently fails to
++    # appear) and so the href is a valid URL to begin with. Purely cosmetic:
++    # the download route below identifies the file by `file_id` alone and
++    # ignores this last path segment's value.
++    download_url = f"/generated-files/{session_id}/{file_id}/{quote(clean_name)}"
+     markdown = f"\n\n\U0001F4CE **[{clean_name}]({download_url})** ({human_size(len(data))}) — ready to download.\n"
+     return {"error": False, "id": file_id, "filename": clean_name, "size": len(data), "download_url": download_url, "markdown": markdown}
+ 
+diff --git a/frontend/index.html b/frontend/index.html
+index 04daad8..53733d3 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -562,8 +562,18 @@
+         .response-file-cards[hidden] { display:none; }
+         .response-file-card-list { display:flex; flex-direction:column; gap:8px; }
+         .response-file-card { display:flex; align-items:center; gap:12px; padding:11px 14px; border:1px solid var(--border-color); border-radius:10px; background-color:var(--bg-hover); }
+-        .response-file-card-icon { flex:0 0 34px; width:34px; height:34px; border-radius:8px; background-color:var(--bg-main); display:flex; align-items:center; justify-content:center; color:var(--text-secondary); }
++        .response-file-card-icon { flex:0 0 34px; width:34px; height:34px; border-radius:8px; background-color:var(--bg-main); display:flex; align-items:center; justify-content:center; color:var(--text-secondary); position:relative; overflow:hidden; transition:background-color 0.2s; }
+         .response-file-card-icon svg { width:16px; height:16px; }
++        /* Two stacked icons (file-type glyph + download arrow) cross-fade/slide
++           on hover, so the card's icon visibly "animates" instead of the type
++           glyph just sitting static — same fade+move language as the
++           message-row hover actions elsewhere in this file. */
++        .response-file-card-icon-face, .response-file-card-icon-hover { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; transition:opacity 0.18s ease, transform 0.18s ease; }
++        .response-file-card-icon-face { opacity:1; transform:translateY(0); }
++        .response-file-card-icon-hover { opacity:0; transform:translateY(7px); color:var(--accent); }
++        .response-file-card:hover .response-file-card-icon-face { opacity:0; transform:translateY(-7px); }
++        .response-file-card:hover .response-file-card-icon-hover { opacity:1; transform:translateY(0); }
++        .response-file-card:hover .response-file-card-icon { background-color:var(--bg-input); }
+         .response-file-card-meta { flex:1 1 auto; min-width:0; }
+         .response-file-card-name { color:var(--text-primary); font:13.5px 'Inter',sans-serif; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+         .response-file-card-type { color:var(--text-secondary); font:11.5px 'Inter',sans-serif; margin-top:2px; }
+@@ -4558,7 +4568,17 @@
+             const FILE_ICON = {
+                 code: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 3 2 5.5 4.5 8M11.5 3 14 5.5 11.5 8M9.5 2.5l-3 8"/></svg>',
+                 plain: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 1.5h5.5L13 5v9.5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-12a1 1 0 0 1 1-1Z"/><path d="M9.5 1.5V5H13"/></svg>',
++                // Shown only on hover, swapped in over the type glyph above (see
++                // .response-file-card-icon-hover) so the card reads as "about to
++                // download" the moment the pointer lands on it.
++                download: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v8m0 0 3-3m-3 3L5 7"/><path d="M2.5 11v1.5A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5V11"/></svg>',
+             };
++            // Shared markup for a file card's icon slot: the file-type glyph and
++            // a download-arrow glyph stacked in the same spot, cross-fading on
++            // `.response-file-card:hover` via the CSS above.
++            function fileCardIconHTML(faceSvg) {
++                return `<span class="response-file-card-icon-face">${faceSvg}</span><span class="response-file-card-icon-hover">${FILE_ICON.download}</span>`;
++            }
+             const CODE_EXTENSIONS = new Set(['html', 'htm', 'css', 'js', 'jsx', 'ts', 'tsx', 'py', 'json', 'java', 'c', 'cpp', 'go', 'rb', 'php', 'swift', 'rs', 'sql', 'sh']);
+ 
+             function escapeHtml(str) {
+@@ -5142,7 +5162,7 @@
+                     const card = document.createElement('div');
+                     card.className = 'response-file-card';
+                     card.innerHTML = `
+-                        <span class="response-file-card-icon">${isCode ? FILE_ICON.code : FILE_ICON.plain}</span>
++                        <span class="response-file-card-icon">${fileCardIconHTML(isCode ? FILE_ICON.code : FILE_ICON.plain)}</span>
+                         <span class="response-file-card-meta">
+                             <div class="response-file-card-name"></div>
+                             <div class="response-file-card-type">${isCode ? `Code · ${extension.toUpperCase()}` : extension.toUpperCase()}${statsHtml}</div>
+@@ -5209,7 +5229,7 @@
+                     card.target = '_blank';
+                     card.rel = 'noopener';
+                     card.innerHTML = `
+-                        <span class="response-file-card-icon">${FILE_ICON.plain}</span>
++                        <span class="response-file-card-icon">${fileCardIconHTML(FILE_ICON.plain)}</span>
+                         <span class="response-file-card-meta">
+                             <div class="response-file-card-name"></div>
+                             <div class="response-file-card-type">${extension.toUpperCase()}${size ? ` · ${size}` : ''}</div>
