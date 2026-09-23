@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 
 # Silence the known-benign ChatNVIDIA registry warning for kimi-k3 /
-# deepseek-v4-pro-0813 ("type is unknown and inference may fail"). It fires on
+# glm-5.3 ("type is unknown and inference may fail"). It fires on
 # every ChatNVIDIA(...) construction even when inference succeeds, and buries
 # the real error lines in deploy logs (e.g. Render).
 warnings.filterwarnings(
@@ -56,6 +56,7 @@ THINKING_LEVELS = {
 DEFAULT_THINKING_LEVEL = "low"
 
 KIMI_MODEL = "moonshotai/kimi-k3"
+GLM_MODEL = "z-ai/glm-5.3"
 
 # ChatNVIDIA builds both requests and aiohttp clients. A zero timeout disables
 # aiohttp reads but is invalid for requests, so use a long valid transport
@@ -103,12 +104,12 @@ def get_thinking_config(level: str) -> dict:
 
 # langchain-nvidia-ai-endpoints ships a local registry of known model ids
 # (determine_model()). Nemotron/Gemma are in it, so building a ChatNVIDIA for
-# them resolves instantly with no network call. Kimi K3 and DeepSeek V4 Pro
+# them resolves instantly with no network call. Kimi K3 and GLM 5.3
 # are NOT in the installed package's registry (they shipped after this pip
 # version), so ChatNVIDIA._finalize() falls back to a LIVE GET /v1/models
 # call every single time one of those clients is constructed, just to check
 # the id is real. get_llm()/get_code_llm() used to build a brand-new
-# ChatNVIDIA per chat message, so every Kimi/DeepSeek message was secretly
+# ChatNVIDIA per chat message, so every Kimi/GLM message was secretly
 # costing 2 NVIDIA API calls (the /v1/models check + the actual completion)
 # instead of 1 — burning through NVIDIA's per-model rate limit twice as fast
 # and surfacing as 429 Too Many Requests specifically on those two models.
@@ -128,28 +129,22 @@ def _get_chat_nvidia_client(model_name: str, temperature: float, max_tokens: int
 
 
 def get_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNVIDIA:
-    """Create the selected Chat-mode model (Deepseek / Nemotron / Kimi)."""
+    """Create the selected Chat-mode model (GLM 5.3 / Nemotron / Kimi)."""
     model_name = KIMI_MODEL
     model_type_clean = (model_type or "balanced").strip().lower()
     if model_type_clean == "fast":
-        model_name = "deepseek-ai/deepseek-v4-pro-0813"
+        model_name = GLM_MODEL
     elif model_type_clean == "reasoning":
         model_name = "nvidia/nemotron-3-ultra-550b-a55b"
     elif model_type_clean == "balanced":
         model_name = KIMI_MODEL
-    # DeepSeek AND Kimi via NVIDIA NIM both require fixed temperature=1.0 —
-    # Kimi's own NVIDIA-published sample payloads and benchmark methodology
-    # use temperature 1.0, and deviating from it produces degraded/garbled
-    # output on their NIM endpoint.
+    # Kimi and GLM 5.3 now share Nemotron's fast, standard-transport path:
+    # the user-supplied temperature is used as-is (no forced 1.0 override)
+    # and the normal 300s transport timeout applies to every model, so all
+    # three respond at the same speed with no long-running special case.
     if _is_long_running_reasoning_model(model_name):
         temperature = 1.0
     max_tokens = _clamp_max_tokens(model_name, max_tokens)
-    # Kimi is a native "thinking is always enabled" reasoning model (per
-    # NVIDIA's own model card), same as DeepSeek — it can legitimately spend
-    # minutes reasoning before writing a single visible answer token. A short
-    # 300s transport timeout on either model aborts that call mid-thought and
-    # is exactly what previously surfaced to users as Kimi "not generating a
-    # response" in both Chat and Code mode (both default to Kimi).
     transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_long_running_reasoning_model(model_name) else 300
     return _get_chat_nvidia_client(model_name, temperature, max_tokens, transport_timeout)
 
@@ -164,7 +159,7 @@ CODE_MODEL_MAP = {
     "strong": "nvidia/nemotron-3-ultra-550b-a55b",
     "laguna": "poolside/laguna-xs-2.1",
     "super": "nvidia/nemotron-3-super-120b-a12b",
-    "step-flash": "deepseek-ai/deepseek-v4-pro-0813",
+    "step-flash": GLM_MODEL,
 }
 DEFAULT_CODE_MODEL = "gemma"  # was "glimmer" (Kimi K3) — see the model_type comment
 # on ChatRequest: Kimi's always-on reasoning trades speed for depth, which isn't
@@ -172,8 +167,8 @@ DEFAULT_CODE_MODEL = "gemma"  # was "glimmer" (Kimi K3) — see the model_type c
 
 
 # --- Per-model compatibility helpers ---
-def _is_deepseek_model(model_name: str) -> bool:
-    return "deepseek" in (model_name or "").lower()
+def _is_glm_model(model_name: str) -> bool:
+    return "glm" in (model_name or "").lower()
 
 
 def _is_kimi_model(model_name: str) -> bool:
@@ -181,11 +176,10 @@ def _is_kimi_model(model_name: str) -> bool:
 
 
 def _is_long_running_reasoning_model(model_name: str) -> bool:
-    """DeepSeek and Kimi both reason internally before answering and can take
-    far longer than a typical completion — they need the long transport
-    timeout and forced temperature=1.0 that other (non-reasoning-by-default)
-    models on this NIM deployment don't."""
-    return _is_deepseek_model(model_name) or _is_kimi_model(model_name)
+    """No model is currently pinned to the long transport timeout / forced
+    temperature=1.0 path. Kimi and GLM 5.3 respond on the same fast,
+    standard-timeout path as Nemotron."""
+    return False
 
 
 def _is_429_error(exc: Exception) -> bool:
@@ -211,11 +205,11 @@ def _get_retry_delay(attempt: int, retry_after: Optional[str] = None) -> float:
 
 
 # NVIDIA NIM hard ceilings (docs.api.nvidia.com, 2026-08):
-#   deepseek-v4-pro-0813  max_tokens 1..16384, reasoning_effort: none|high|max
-#   kimi-k3               thinking is always on; give it enough headroom to
-#                          think AND answer, but keep a ceiling so a verbose
-#                          reasoning pass can't eat the whole transport window.
-_DEEPSEEK_MAX_TOKENS = 16384
+#   glm-5.3    max_tokens 1..16384, reasoning_effort: none|high|max
+#   kimi-k3    thinking is always on; give it enough headroom to
+#              think AND answer, but keep a ceiling so a verbose
+#              reasoning pass can't eat the whole transport window.
+_GLM_MAX_TOKENS = 16384
 _KIMI_MIN_TOKENS = 8000
 _KIMI_MAX_TOKENS = 65536
 
@@ -242,8 +236,8 @@ def _model_thinking_budget(model_name: str, level: str, requested: int) -> int:
 def _clamp_max_tokens(model_name: str, max_tokens: int) -> int:
     """Clamp requested completion budget to the model's NVIDIA NIM hard limits."""
     n = max(1, int(max_tokens or 1024))
-    if _is_deepseek_model(model_name):
-        return min(n, _DEEPSEEK_MAX_TOKENS)
+    if _is_glm_model(model_name):
+        return min(n, _GLM_MAX_TOKENS)
     if _is_kimi_model(model_name):
         return max(min(n, _KIMI_MAX_TOKENS), _KIMI_MIN_TOKENS)
     return n
@@ -252,7 +246,7 @@ def _clamp_max_tokens(model_name: str, max_tokens: int) -> int:
 def _map_reasoning_effort(level: str, model_name: str = "") -> str:
     """Map 5-level thinking scale to the effort enum the target model accepts."""
     lvl = normalize_thinking_level(level)
-    if _is_deepseek_model(model_name):
+    if _is_glm_model(model_name):
         if lvl == "low":
             return "none"
         if lvl in ("medium", "high"):
@@ -269,7 +263,7 @@ def _resolve_chat_model_name(model_type: str) -> str:
     """Resolve a Chat-mode model_type to its NIM model id (API key auth via env)."""
     model_type_clean = (model_type or "balanced").strip().lower()
     if model_type_clean == "fast":
-        return "deepseek-ai/deepseek-v4-pro-0813"
+        return GLM_MODEL
     if model_type_clean == "reasoning":
         return "nvidia/nemotron-3-ultra-550b-a55b"
     return KIMI_MODEL
@@ -1131,7 +1125,7 @@ async def chat_compose_node(request: "ChatRequest", state: dict, progress=None) 
             lambda text: publish_token(progress, text), session, session_id,
         )
         invoke_kwargs["on_answer_piece"] = file_watcher
-    if _is_deepseek_model(_chat_model_name):
+    if _is_glm_model(_chat_model_name):
         response = await invoke_model(
             _chat_messages, llm, progress,
             reasoning_effort=_map_reasoning_effort(request.thinking_level, _chat_model_name),
@@ -1204,7 +1198,7 @@ class ChatRequest(BaseModel):
     model_type: str = "fast"  # was "balanced" (Kimi K3) — Kimi always reasons for
     # potentially minutes before its first visible token (see get_llm()'s comment),
     # so that default made every unconfigured request feel broken/slow. "fast"
-    # (Deepseek) matches the new frontend default and is what most callers want.
+    # (GLM 5.3) matches the new frontend default and is what most callers want.
     stream: bool = False
     temperature: float = 0.7
     thinking_level: str = DEFAULT_THINKING_LEVEL
@@ -2052,7 +2046,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             plan_messages = build_plan_messages(history, file_store, request.reasoning_level, repo_context, rag_context_text)
             if mcp_context:
                 plan_messages.append(SystemMessage(content=mcp_context))
-            if _is_deepseek_model(model_name):
+            if _is_glm_model(model_name):
                 llm = get_code_llm(model_key, 0.2, _model_thinking_budget(model_name, request.reasoning_level, config["max_tokens"]))
                 plan_text = await invoke_model(
                     plan_messages, llm, None,
@@ -2104,8 +2098,8 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     model_key = resolve_code_model_key(request.model)
     config = get_code_thinking_config(reasoning_level)
     _code_model_name = CODE_MODEL_MAP.get(model_key, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
-    _is_deepseek = _is_deepseek_model(_code_model_name)
-    _kd_effort = "none" if _is_deepseek else None
+    _is_glm = _is_glm_model(_code_model_name)
+    _glm_effort = "none" if _is_glm else None
     _code_budget = _model_thinking_budget(_code_model_name, reasoning_level, config["max_tokens"])
     llm = get_code_llm(model_key, 0.2, _code_budget)
     max_think_chars = int(_code_budget * THINK_BUDGET_FRACTION * THINK_CHARS_PER_TOKEN)
@@ -2138,7 +2132,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         agent_messages = build_agent_messages(history, transcript, file_store, plan_steps, reasoning_level, step, rag_context_text)
         if mcp_context:
             agent_messages.append(SystemMessage(content=mcp_context))
-        if _is_deepseek:
+        if _is_glm:
             agent_messages.append(SystemMessage(content=(
                 "FAST CODE EXECUTION: Think internally, then write exactly one short THOUGHT sentence. "
                 "Immediately follow it with the required ACTION and complete file content. Do not add a "
@@ -2148,10 +2142,10 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
 
         malformed_retry_note = None
         try:
-            if _is_deepseek:
+            if _is_glm:
                 raw = await invoke_model(
                     agent_messages, llm, emit.queue,
-                    on_answer_piece=watcher, reasoning_effort=_kd_effort, max_think_chars=max_think_chars,
+                    on_answer_piece=watcher, reasoning_effort=_glm_effort, max_think_chars=max_think_chars,
                 )
             else:
                 raw = await invoke_model(
@@ -2159,7 +2153,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                     on_answer_piece=watcher, thinking_mode=False, max_think_chars=max_think_chars,
                 )
         except ThinkingBudgetExceeded:
-            if _is_deepseek:
+            if _is_glm:
                 raw = await invoke_model(
                     agent_messages + [SystemMessage(content=(
                         "Stop planning. Respond immediately in the required THOUGHT/ACTION format with a single "
@@ -2167,7 +2161,7 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                     ))],
                     llm, emit.queue,
                     on_answer_piece=make_agent_stream_watcher(emit.queue),
-                    reasoning_effort=_kd_effort,
+                    reasoning_effort=_glm_effort,
                 )
             else:
                 raw = await invoke_model(
@@ -2548,8 +2542,8 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
                 "You are out of tool-call turns. Respond now with ACTION: final and a short explanation of "
                 "what was accomplished."
             )))
-            if _is_deepseek:
-                raw = await invoke_model(wrap_messages, llm, None, reasoning_effort=_kd_effort)
+            if _is_glm:
+                raw = await invoke_model(wrap_messages, llm, None, reasoning_effort=_glm_effort)
             else:
                 raw = await invoke_model(wrap_messages, llm, None, thinking_mode=False)
             turn = parse_agent_turn(raw)
