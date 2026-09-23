@@ -25,21 +25,25 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertIn('<select id="tempSetting">\n                <option value="low" selected>', html)
         self.assertIn('<select id="codeReasoningLevel">\n                <option value="low" selected>', html)
 
-    def test_kimi_and_glm_now_use_standard_transport_timeout(self):
-        # Kimi and GLM 5.3 respond on the same fast, standard-timeout path as
-        # Nemotron now — no model is pinned to the long-running 24h transport
-        # window anymore.
+    def test_chat_models_use_unbounded_transport_timeout(self):
+        # Chat responses should not be cut off by an arbitrary 300-second
+        # ceiling. Normal mode remains fast through its direct-answer prompt.
         for llm in (
             app.get_llm("balanced", 0.2, 128),
             app.get_llm("fast", 0.2, 128),
-            app.get_code_llm("medium", 0.2, 128),
-            app.get_code_llm("step-flash", 0.2, 128),
+            app.get_llm("reasoning", 0.2, 128),
         ):
-            self.assertEqual(llm._client.timeout, 300)
+            self.assertEqual(llm._client.timeout, app.LONG_GENERATION_TRANSPORT_TIMEOUT)
 
-    def test_non_reasoning_models_keep_transport_timeout(self):
-        self.assertEqual(app.get_llm("reasoning", 0.2, 128)._client.timeout, 300)
+    def test_code_models_keep_standard_transport_timeout(self):
         self.assertEqual(app.get_code_llm("gemma", 0.2, 128)._client.timeout, 300)
+
+    def test_deep_think_toggle_controls_reasoning_prompt(self):
+        normal = app.build_messages([], "low", deep_think=False)[0].content
+        deep = app.build_messages([], "low", deep_think=True)[0].content
+        self.assertIn("Answer directly and clearly", normal)
+        self.assertNotIn("Before answering, think inside", normal)
+        self.assertIn("Before answering, think inside", deep)
 
     def test_frontend_has_no_stale_deepseek_id(self):
         frontend = pathlib.Path(__file__).with_name("frontend") / "index.html"
@@ -106,11 +110,10 @@ class ModelRoutingTests(unittest.TestCase):
                 budget,
             )
 
-    def test_kimi_and_glm_force_temperature_1_but_use_fast_timeout(self):
-        # Correctness (temperature pin) and speed (timeout) are separate
+    def test_kimi_and_glm_force_temperature_1_but_chat_timeout_is_unbounded(self):
+        # Correctness (temperature pin) and transport behavior are separate
         # concerns: both models keep the 1.0 temperature their NIM endpoint
-        # needs for coherent output, but neither is pinned to the old 24h
-        # long-running timeout anymore — that part now matches Nemotron.
+        # needs for coherent output, while Chat mode has no finite ceiling.
         for llm in (
             app.get_llm("balanced", 0.2, 128),
             app.get_llm("fast", 0.7, 128),
@@ -118,7 +121,10 @@ class ModelRoutingTests(unittest.TestCase):
             app.get_code_llm("step-flash", 0.5, 128),
         ):
             self.assertEqual(llm.temperature, 1.0)
-            self.assertEqual(llm._client.timeout, 300)
+            if llm.model in (app.KIMI_MODEL, app.GLM_MODEL):
+                self.assertEqual(llm._client.timeout, app.LONG_GENERATION_TRANSPORT_TIMEOUT)
+            else:
+                self.assertEqual(llm._client.timeout, 300)
 
 
 if __name__ == "__main__":
