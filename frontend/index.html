@@ -1507,7 +1507,7 @@
              now driven by the picker above instead of being shown directly. -->
         <div id="hiddenModelInputs" style="display:none" aria-hidden="true">
             <select id="modelType">
-                <option value="fast">Deepseek V4 Pro</option>
+                <option value="fast">GLM 5.3</option>
                 <option value="balanced" selected>Kimi K3</option>
                 <option value="reasoning">Amun-Ra</option>
             </select>
@@ -1527,7 +1527,7 @@
                 <option value="strong">Nemotron Ultra</option>
                 <option value="laguna">Laguna XS 2.1</option>
                 <option value="super">Nemotron Super</option>
-                <option value="step-flash">Deepseek V4 Pro</option>
+                <option value="step-flash">GLM 5.3</option>
             </select>
             <select id="codeWorkflowMode">
                 <option value="plan">Plan</option>
@@ -2795,7 +2795,7 @@
         // app.py:_resolve_chat_model_name) — so it wears the NVIDIA mark too.
         const MODEL_OPTIONS = {
             chat: [
-                { value: 'fast', name: 'Deepseek V4 Pro', desc: 'Fastest for quick answers', logo: 'logos/deepseek.svg' },
+                { value: 'fast', name: 'GLM 5.3', desc: 'Fastest for quick answers', logo: 'logos/glm.svg' },
                 { value: 'balanced', name: 'Kimi K3', desc: 'Most efficient for everyday tasks', logo: 'logos/kimi.svg' },
                 { value: 'reasoning', name: 'Amun-Ra', desc: 'For complex requests', logo: 'logos/nvidia.svg' }
             ],
@@ -2822,7 +2822,7 @@
             { value: 'ultra', name: 'Nemotron Ultra', provider: 'NVIDIA', desc: 'nvidia/nemotron-3-ultra-550b-a55b — strongest', strength: 'strong', logo: 'logos/nvidia.svg' },
             { value: 'laguna', name: 'Laguna XS 2.1', provider: 'Poolside', desc: 'poolside/laguna-xs-2.1', strength: 'strong', logo: 'logos/poolside.svg' },
             { value: 'super', name: 'Nemotron Super', provider: 'NVIDIA', desc: 'nvidia/nemotron-3-super-120b-a12b', strength: 'strong', logo: 'logos/nvidia.svg' },
-            { value: 'step-flash', name: 'Deepseek V4 Pro', provider: 'DeepSeek', desc: 'deepseek-ai/deepseek-v4-pro-0813', strength: 'strong', logo: 'logos/deepseek.svg' }
+            { value: 'step-flash', name: 'GLM 5.3', provider: 'Z.ai', desc: 'z-ai/glm-5.3', strength: 'strong', logo: 'logos/glm.svg' }
         ];
 
         const LEVEL_OPTIONS = {
