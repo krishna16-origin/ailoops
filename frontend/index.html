@@ -338,7 +338,7 @@
         @keyframes slideFadeIn { to { opacity:1; transform:translateY(0); } }
 
         .message-row { display:flex; width:100%; opacity:0; transform:translateY(10px); animation:slideFadeIn 0.4s var(--transition-bezier) forwards; }
-        .message-row.user { justify-content:flex-end; }
+        .message-row.user { flex-direction:column; align-items:flex-end; }
         .message-row.assistant { justify-content:flex-start; }
         .message-bubble { max-width:88%; padding:14px 18px; font-size:15px; line-height:1.6; }
         .user .message-bubble { background-color:var(--bg-input); border-radius:20px 20px 6px 20px; white-space:pre-wrap; }
@@ -360,12 +360,12 @@
            (or, for keyboard users, while something inside it has focus) —
            mirrors the assistant's always-visible .message-footer buttons
            but scoped per-message and hidden until hovered. */
-        .user-message-actions { display:flex; align-items:center; justify-content:flex-end; gap:2px; margin-top:6px; opacity:0; transition:opacity 0.15s ease; }
+        .user-message-actions { display:flex; align-items:center; justify-content:flex-end; gap:2px; margin-top:4px; opacity:0; transition:opacity 0.15s ease; }
         .message-row.user:hover .user-message-actions,
         .message-row.user:focus-within .user-message-actions { opacity:1; }
         .user-message-actions .footer-icon-btn { display:flex; align-items:center; justify-content:center; background:transparent; border:none; color:var(--text-secondary); cursor:pointer; padding:6px; border-radius:6px; transition:background 0.2s, color 0.2s; }
         .user-message-actions .footer-icon-btn:hover { background-color:var(--bg-hover); color:var(--text-primary); }
-        .user-message-actions .footer-icon-btn svg { width:14px; height:14px; display:block; }
+        .user-message-actions .footer-icon-btn svg { width:15px; height:15px; display:block; }
         .user-message-actions .copy-btn .icon-check { display:none; color:var(--accent); }
         .user-message-actions .copy-btn.copied .icon-copy { display:none; }
         .user-message-actions .copy-btn.copied .icon-check { display:block; }
@@ -377,11 +377,8 @@
         .user-edit-textarea { width:100%; min-width:220px; background:transparent; border:1px solid var(--border-color); border-radius:12px; color:var(--text-primary); font:inherit; line-height:1.6; padding:10px 12px; resize:none; outline:none; box-sizing:border-box; }
         .user-edit-textarea:focus { border-color:var(--accent); }
         .user-edit-controls { display:flex; justify-content:flex-end; gap:8px; margin-top:8px; }
-        .user-edit-controls button { border:none; border-radius:14px; padding:6px 14px; font-size:13px; font-weight:600; cursor:pointer; transition:background 0.2s, opacity 0.2s; }
-        .user-edit-cancel-btn { background:transparent; color:var(--text-secondary); }
+        .user-edit-cancel-btn { border:none; background:transparent; color:var(--text-secondary); border-radius:14px; padding:6px 14px; font-size:13px; font-weight:600; cursor:pointer; transition:color 0.2s; }
         .user-edit-cancel-btn:hover { color:var(--text-primary); }
-        .user-edit-save-btn { background:var(--accent); color:#fff; }
-        .user-edit-save-btn:hover { opacity:0.9; }
 
         /* Simplified assistant message: no repeated title per bubble, just a small quiet avatar */
         .assistant .message-bubble { background-color:transparent; border-radius:8px; color:var(--text-primary); display:flex; gap:12px; padding-left:0; align-items:flex-start; }
@@ -3553,12 +3550,13 @@
         }
 
         // ChatGPT-style in-place edit for a user message. Swaps the rendered
-        // text for a textarea; Save cosmetically removes this turn and every
-        // turn after it from the visible thread, then resends the edited
-        // text through the exact same path the Retry button uses. Note: the
-        // backend session (modes.*.sessionId) is untouched, so its stored
-        // history still has the original exchange underneath — an accepted
-        // tradeoff for keeping this a frontend-only change.
+        // text for a textarea; pressing Enter sends the edit immediately.
+        // Saving cosmetically removes this turn and every turn after it from
+        // the visible thread, then resends the edited text through the exact
+        // same path the Retry button uses. Note: the backend session
+        // (modes.*.sessionId) is untouched, so its stored history still has
+        // the original exchange underneath — an accepted tradeoff for
+        // keeping this a frontend-only change.
         function startEditingUserMessage(row, bubble, textSlot, actions, originalText) {
             // Already editing this bubble — don't stack a second textarea.
             if (bubble.querySelector('.user-edit-wrap')) return;
@@ -3572,10 +3570,9 @@
                 <textarea class="user-edit-textarea" rows="1"></textarea>
                 <div class="user-edit-controls">
                     <button type="button" class="user-edit-cancel-btn">Cancel</button>
-                    <button type="button" class="user-edit-save-btn">Save &amp; submit</button>
                 </div>
             `;
-            bubble.insertBefore(editWrap, actions);
+            bubble.appendChild(editWrap);
 
             const textarea = editWrap.querySelector('.user-edit-textarea');
             textarea.value = originalText;
@@ -3610,7 +3607,6 @@
             }
 
             editWrap.querySelector('.user-edit-cancel-btn').addEventListener('click', cleanupEdit);
-            editWrap.querySelector('.user-edit-save-btn').addEventListener('click', commitEdit);
             textarea.addEventListener('keydown', (e) => {
                 if (e.key === 'Escape') { e.preventDefault(); cleanupEdit(); }
                 else if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commitEdit(); }
@@ -3626,6 +3622,11 @@
             row.className = `message-row ${role}`;
             const bubble = document.createElement('div');
             bubble.className = 'message-bubble';
+            // Set below (user branch only) when there's text to copy/edit — kept
+            // outside the bubble entirely and appended as its own row so it sits
+            // on the page background under the message, matching ChatGPT's hover
+            // action row rather than looking boxed into the bubble's own color.
+            let userActionsEl = null;
 
             if (role === 'assistant') {
                 let avatar;
@@ -3864,7 +3865,7 @@
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>
                         </button>
                     `;
-                    bubble.appendChild(actions);
+                    userActionsEl = actions;
 
                     const userCopyBtn = actions.querySelector('.copy-btn');
                     userCopyBtn.addEventListener('click', () => {
@@ -3879,6 +3880,7 @@
             }
 
             row.appendChild(bubble);
+            if (userActionsEl) row.appendChild(userActionsEl);
             chatContent.appendChild(row);
             scrollToBottom(true); // new message = always jump down and re-pin
 
