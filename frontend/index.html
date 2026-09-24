@@ -179,6 +179,8 @@
         .mcp-test-btn:hover { color:var(--text-primary); border-color:var(--accent); }
         .mcp-status { font-size:10px; color:var(--accent); min-width:42px; text-align:right; }
         .mcp-status.off { color:var(--text-secondary); }
+        .mcp-toggle { border:1px solid var(--border-color); background:transparent; color:var(--text-secondary); border-radius:6px; padding:4px 7px; cursor:pointer; font-size:11px; text-align:left; }
+        .mcp-toggle.is-on { color:var(--accent); border-color:var(--accent); }
         .mcp-custom-card { margin-top:18px; padding:14px; background:var(--bg-hover); border:1px solid var(--border-color); border-radius:11px; }
         .mcp-custom-card strong { display:block; font-size:13px; margin-bottom:4px; }
         .mcp-custom-card p { color:var(--text-secondary); font-size:11px; line-height:1.45; margin:0 0 11px; }
@@ -196,7 +198,7 @@
         .sidebar-setting-item { display:flex; justify-content:space-between; align-items:center; color:var(--text-secondary); font-size:13px; gap:10px; }
         .sidebar-setting-item input[type="number"] { width:50px; background-color:var(--bg-main); color:var(--text-primary); border:1px solid transparent; padding:4px 8px; border-radius:6px; outline:none; transition:background 0.2s, border-color 0.2s; }
         .sidebar-setting-item input[type="number"]:hover, .sidebar-setting-item input[type="number"]:focus { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); }
-        .sidebar-setting-item input[type="checkbox"] { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; }
+        .stream-setting-status { color:var(--accent); font-size:12px; font-weight:600; }
         .sidebar-setting-item select { background-color:var(--bg-main); color:var(--text-primary); border:1px solid transparent; padding:4px 8px; border-radius:6px; outline:none; font-size:13px; cursor:pointer; transition:background 0.2s, border-color 0.2s; max-width:150px; }
         .sidebar-setting-item select:hover, .sidebar-setting-item select:focus { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); }
 
@@ -544,12 +546,11 @@
         .plan-checklist[hidden] { display:none; }
         .plan-checklist-list { display:flex; flex-direction:column; gap:7px; }
         .plan-checklist-item { display:flex; align-items:flex-start; gap:9px; font:13px/1.5 'Inter',sans-serif; color:var(--text-secondary); }
-        .plan-checklist-box { width:16px; height:16px; margin-top:1px; border-radius:5px; border:1.5px solid var(--border-color); flex-shrink:0; display:flex; align-items:center; justify-content:center; box-sizing:border-box; transition:background 0.2s ease, border-color 0.2s ease; }
-        .plan-checklist-box svg { width:10px; height:10px; color:#fff; }
-        .plan-checklist-item.is-done .plan-checklist-box { background:var(--accent); border-color:var(--accent); }
+        .plan-checklist-status { width:8px; height:8px; margin:5px 4px 0; border-radius:50%; background:var(--border-color); flex-shrink:0; display:flex; align-items:center; justify-content:center; box-sizing:border-box; transition:background 0.2s ease, transform 0.2s ease; }
+        .plan-checklist-status svg { width:10px; height:10px; color:#fff; }
+        .plan-checklist-item.is-done .plan-checklist-status { background:var(--accent); transform:scale(1.15); }
         .plan-checklist-item.is-done .plan-checklist-text { color:var(--text-secondary); text-decoration:line-through; text-decoration-color:rgba(255,255,255,0.25); }
-        .plan-checklist-item.is-active .plan-checklist-box { border-color:var(--accent); }
-        .plan-checklist-item.is-active .plan-checklist-box svg { color:var(--accent); animation:planCheckSpin 0.8s linear infinite; transform-origin:center; }
+        .plan-checklist-item.is-active .plan-checklist-status { background:var(--accent); animation:planCheckSpin 0.8s linear infinite; transform-origin:center; }
         .plan-checklist-item.is-active .plan-checklist-text { color:var(--text-primary); font-weight:500; }
         @keyframes planCheckSpin { to { transform:rotate(360deg); } }
         .plan-checklist-text { min-width:0; }
@@ -655,6 +656,9 @@
             0% { background-position: 200% 0; }
             100% { background-position: -200% 0; }
         }
+        .thinking-toggle.code-live { display:inline-flex; align-items:center; gap:7px; max-width:min(82vw, 620px); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:left; }
+        .thinking-toggle.code-live::before { content:'✳'; display:inline-block; flex:none; color:var(--text-secondary); -webkit-text-fill-color:var(--text-secondary); animation:codeThoughtSpin 1.2s ease-in-out infinite; }
+        @keyframes codeThoughtSpin { 0%,100% { opacity:.45; transform:rotate(0deg) scale(.86); } 50% { opacity:1; transform:rotate(45deg) scale(1); } }
         .thinking-content { display:none; margin:10px 0 10px 12px; padding-left:22px; border-left:1px solid var(--border-color); font-size:14px; line-height:1.6; color:var(--text-secondary); }
         .thinking-content.expanded { display:block; }
         .thought-item { position: relative; margin-bottom: 14px; }
@@ -1277,7 +1281,7 @@
             <div class="settings-panel" id="chatSettings">
                 <div class="sidebar-setting-item">
                     <label title="Stream Response Tokens">Stream Response</label>
-                    <input type="checkbox" id="streamSetting" checked>
+                    <span class="stream-setting-status" aria-label="Response streaming is always enabled">Live</span>
                 </div>
             </div>
 
@@ -1285,7 +1289,7 @@
             <div class="settings-panel" id="codeSettings" hidden>
                 <div class="sidebar-setting-item">
                     <label title="Stream Response Tokens">Stream Response</label>
-                    <input type="checkbox" id="codeStreamSetting" checked>
+                    <span class="stream-setting-status" aria-label="Code streaming is always enabled">Live</span>
                 </div>
             </div>
 
@@ -1597,8 +1601,8 @@
                 <option value="reasoning">Amun-Ra</option>
             </select>
             <select id="tempSetting">
-                <option value="low">Low</option>
-                <option value="medium" selected>Medium</option>
+                <option value="low" selected>Low</option>
+                <option value="medium">Medium</option>
                 <option value="high">High</option>
                 <option value="extra">Extra</option>
                 <option value="max">Max</option>
@@ -1619,8 +1623,8 @@
                 <option value="build" selected>Build</option>
             </select>
             <select id="codeReasoningLevel">
-                <option value="low">Low</option>
-                <option value="medium" selected>Medium</option>
+                <option value="low" selected>Low</option>
+                <option value="medium">Medium</option>
                 <option value="high">High</option>
                 <option value="extra">Extra</option>
                 <option value="max">Max</option>
@@ -2457,10 +2461,9 @@
                 const items = visible.filter(s => (s.category || 'custom') === category);
                 if (!items.length) return '';
                 return `<div class="mcp-section-label">${label}</div>` + items.map(s => `<div class="mcp-server-row">
-                    <label style="display:flex;align-items:center;gap:10px;min-width:0;flex:1;cursor:pointer">
-                        <input type="checkbox" ${s.enabled ? 'checked' : ''} onchange="setMcpEnabled('${s.id}', this.checked)">
+                    <button type="button" class="mcp-toggle ${s.enabled ? 'is-on' : ''}" aria-pressed="${s.enabled ? 'true' : 'false'}" onclick="setMcpEnabled('${s.id}', ${!s.enabled})">
                         <span><span class="mcp-server-name">${escapeHtml(s.name)}</span><span class="mcp-server-desc">${escapeHtml(s.description || '')}</span></span>
-                    </label>
+                    </button>
                     <span class="mcp-server-actions"><span class="mcp-status ${s.enabled ? '' : 'off'}">${s.enabled ? 'On' : 'Off'}</span><button class="mcp-test-btn" onclick="testMcp('${s.id}')">Test</button></span>
                 </div>`).join('');
             }).join('') || '<div class="mcp-entry-subtitle">No integrations match your search.</div>';
@@ -4257,7 +4260,7 @@
             if (mode === 'chat') {
                 const modelType = document.getElementById('modelType').value;
                 const thinkingLevel = document.getElementById('tempSetting').value;
-                useStream = document.getElementById('streamSetting').checked;
+                useStream = true;
                 apiUrl = `${API_BASE}/chat`;
                 payload = {
                     message: text,
@@ -4273,7 +4276,7 @@
             } else {
                 const codeModel = document.getElementById('codeModel').value;
                 const reasoningLevel = document.getElementById('codeReasoningLevel').value;
-                useStream = document.getElementById('codeStreamSetting').checked;
+                useStream = true;
                 apiUrl = `${API_BASE}/code-chat`;
                 payload = {
                     message: text,
@@ -4560,6 +4563,21 @@
                 scrollToBottom();
             }
 
+            // Code mode receives short, real per-step agent messages. Claude keeps
+            // this kind of progress in one compact shimmering line and replaces it
+            // in place instead of fabricating a new progress row for every update.
+            function setCodeLiveStatus(text) {
+                if (mode !== 'code' || thinkingDone || !text) return;
+                const status = text.trim();
+                if (!status) return;
+                thinkingBlock.style.display = 'block';
+                thinkingContent.classList.add('expanded');
+                thinkingToggle.textContent = status;
+                thinkingToggle.classList.add('shimmer', 'code-live');
+                thinkingToggle.title = status;
+                scrollToBottom();
+            }
+
             // Called the moment the answer actually starts streaming. Switches the main
             // toggle from a shimmering "Thinking" to a shimmering "Answering" and
             // collapses the thought log, but doesn't settle the final label yet.
@@ -4567,6 +4585,7 @@
                 if (thinkingDone) return;
                 thinkingDone = true;
                 thinkingToggle.textContent = 'Answering';
+                thinkingToggle.classList.remove('code-live');
                 thinkingToggle.classList.add('shimmer');
                 thinkingContent.classList.remove('expanded');
                 const cursor = liveThoughtEl ? liveThoughtEl.querySelector('.thought-live-cursor') : null;
@@ -4583,7 +4602,8 @@
                 stopDeepThinkCountdown(); // covers normal completion, streamed answer start, abort, and error alike
                 const seconds = Math.max(1, Math.round((Date.now() - thinkingStartTime) / 1000));
                 thinkingToggle.textContent = `Thought for ${seconds}s`;
-                thinkingToggle.classList.remove('shimmer');
+                thinkingToggle.classList.remove('shimmer', 'code-live');
+                thinkingToggle.title = '';
                 thinkingContent.classList.remove('expanded');
                 const liveCursor = liveThoughtEl ? liveThoughtEl.querySelector('.thought-live-cursor') : null;
                 if (liveCursor) liveCursor.remove();
@@ -4697,7 +4717,7 @@
                     item.className = 'plan-checklist-item';
                     item.dataset.index = String(i);
                     const box = document.createElement('span');
-                    box.className = 'plan-checklist-box';
+                    box.className = 'plan-checklist-status';
                     const text = document.createElement('span');
                     text.className = 'plan-checklist-text';
                     text.textContent = stepText;
@@ -4711,14 +4731,14 @@
             // index === total means "all steps done" (final wrap-up), otherwise
             // everything before `index` is done, `index` itself is in-progress,
             // and everything after is still pending — a monotonic, live-advancing
-            // read exactly like Manus's own checkbox list.
+            // read as a compact live status list without checkbox controls.
             function setPlanChecklistProgress(index, total) {
                 if (!planChecklistEl) return;
                 const items = planChecklistEl.querySelectorAll('.plan-checklist-item');
                 if (!items.length) return;
                 items.forEach((item) => {
                     const idx = Number(item.dataset.index);
-                    const box = item.querySelector('.plan-checklist-box');
+                    const box = item.querySelector('.plan-checklist-status');
                     item.classList.remove('is-done', 'is-active');
                     if (idx < index || index >= total) {
                         item.classList.add('is-done');
@@ -5399,6 +5419,7 @@
                                 } else if (parsed.type === 'thought') {
                                     appendLiveThought(parsed.text);
                                 } else if (parsed.type === 'agent_message' && mode === 'code') {
+                                    setCodeLiveStatus(parsed.text);
                                     // Claude-like: per-step THOUGHT (what I'll do next) goes to workflow, NOT thinking block.
                                     // Thinking block is only for live reasoning (`thought` type).
                                     if (parsed.text && workflowEl) {
@@ -5559,6 +5580,7 @@
                                 } else if (parsed.type === 'thought') {
                                     appendLiveThought(parsed.text);
                                 } else if (parsed.type === 'agent_message' && mode === 'code') {
+                                    setCodeLiveStatus(parsed.text);
                                     if (parsed.text && workflowEl) {
                                         workflowEl.hidden = false;
                                         const listEl = workflowEl.querySelector('.response-workflow-list');

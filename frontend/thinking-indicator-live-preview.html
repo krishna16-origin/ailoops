@@ -49,7 +49,7 @@
         .sidebar-setting-item { display:flex; justify-content:space-between; align-items:center; color:var(--text-secondary); font-size:13px; gap:10px; }
         .sidebar-setting-item input[type="number"] { width:50px; background-color:var(--bg-main); color:var(--text-primary); border:1px solid transparent; padding:4px 8px; border-radius:6px; outline:none; transition:background 0.2s, border-color 0.2s; }
         .sidebar-setting-item input[type="number"]:hover, .sidebar-setting-item input[type="number"]:focus { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); }
-        .sidebar-setting-item input[type="checkbox"] { width:16px; height:16px; accent-color:var(--accent); cursor:pointer; }
+        .stream-setting-status { color:var(--accent); font-size:12px; font-weight:600; }
         .sidebar-setting-item select { background-color:var(--bg-main); color:var(--text-primary); border:1px solid transparent; padding:4px 8px; border-radius:6px; outline:none; font-size:13px; cursor:pointer; transition:background 0.2s, border-color 0.2s; max-width:150px; }
         .sidebar-setting-item select:hover, .sidebar-setting-item select:focus { background-color:var(--bg-hover); border-color:rgba(255,255,255,0.2); }
 
@@ -330,7 +330,7 @@
                 </div>
                 <div class="sidebar-setting-item">
                     <label title="Stream Response Tokens">Stream Response</label>
-                    <input type="checkbox" id="streamSetting" checked>
+                    <span class="stream-setting-status" aria-label="Response streaming is always enabled">Live</span>
                 </div>
             </div>
 
@@ -355,7 +355,7 @@
                 </div>
                 <div class="sidebar-setting-item">
                     <label title="Stream Response Tokens">Stream Response</label>
-                    <input type="checkbox" id="codeStreamSetting" checked>
+                    <span class="stream-setting-status" aria-label="Code streaming is always enabled">Live</span>
                 </div>
             </div>
         </div>
@@ -1142,7 +1142,7 @@
                 const modelType = document.getElementById('modelType').value;
                 const temp = parseFloat(document.getElementById('tempSetting').value);
                 const maxIters = parseInt(document.getElementById('iterSetting').value);
-                useStream = document.getElementById('streamSetting').checked;
+                useStream = true;
                 apiUrl = `${API_BASE}/chat`;
                 payload = {
                     message: text,
@@ -1155,7 +1155,7 @@
             } else {
                 const codeModel = document.getElementById('codeModel').value;
                 const reasoningLevel = document.getElementById('codeReasoningLevel').value;
-                useStream = document.getElementById('codeStreamSetting').checked;
+                useStream = true;
                 apiUrl = `${API_BASE}/code-chat`;
                 payload = {
                     message: text,
@@ -1386,8 +1386,9 @@
                                     startCodeCanvasStream(parsed.language, parsed.filename);
                                     inlineCodeState = startInlineCodeStream(textContainer, parsed.language, parsed.filename);
                                 } else if (parsed.type === 'code_delta') {
-                                    appendCodeCanvasStream(parsed.delta);
-                                    appendInlineCodeStream(inlineCodeState, parsed.delta);
+                                    const delta = parsed.text || parsed.delta || '';
+                                    appendCodeCanvasStream(delta);
+                                    appendInlineCodeStream(inlineCodeState, delta);
                                 } else if (parsed.type === 'code_result') {
                                     codeResult = parsed;
                                 } else if (parsed.type === 'message_reset') {

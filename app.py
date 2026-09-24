@@ -356,7 +356,11 @@ def get_code_llm(model_type: str, temperature: float, max_tokens: int) -> ChatNV
     if _requires_fixed_temperature(model_name):
         temperature = 1.0
     max_tokens = _clamp_max_tokens(model_name, max_tokens)
-    transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if _is_long_running_reasoning_model(model_name) else 300
+    transport_timeout = LONG_GENERATION_TRANSPORT_TIMEOUT if (
+        _is_long_running_reasoning_model(model_name)
+        or _is_kimi_model(model_name)
+        or _is_glm_model(model_name)
+    ) else 300
     return _get_chat_nvidia_client(model_name, temperature, max_tokens, transport_timeout)
 
 
@@ -2136,34 +2140,25 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
         config = get_code_thinking_config(request.reasoning_level)
         model_name = CODE_MODEL_MAP.get(model_key, CODE_MODEL_MAP[DEFAULT_CODE_MODEL])
         latest_text = history[-1].content if history else ""
-        plan_steps: List[str] = []
-        if not os.getenv("NVIDIA_API_KEY") or (os.getenv("NVIDIA_API_KEY") or "").strip().lower() in ("demo", ""):
-            plan_steps = [
-                "Inspect the existing project files and identify the smallest set of files that must change.",
-                "Implement the requested behavior while preserving unrelated functionality.",
-                "Validate the result and report the files and checks needed for the build.",
-            ]
-            display_text = _demo_plan_display_text(latest_text)
+        session_id = getattr(request, "session_id", None)
+        repo_context = await _maybe_fetch_plan_repo_context(session_id, latest_text, emit)
+        plan_messages = build_plan_messages(history, file_store, request.reasoning_level, repo_context, rag_context_text)
+        if mcp_context:
+            plan_messages.append(SystemMessage(content=mcp_context))
+        if _is_glm_model(model_name):
+            llm = get_code_llm(model_key, 0.2, _model_thinking_budget(model_name, request.reasoning_level, config["max_tokens"]))
+            plan_text = await invoke_model(
+                plan_messages, llm, None,
+                reasoning_effort=_map_reasoning_effort(request.reasoning_level, model_name),
+            )
         else:
-            session_id = getattr(request, "session_id", None)
-            repo_context = await _maybe_fetch_plan_repo_context(session_id, latest_text, emit)
-            plan_messages = build_plan_messages(history, file_store, request.reasoning_level, repo_context, rag_context_text)
-            if mcp_context:
-                plan_messages.append(SystemMessage(content=mcp_context))
-            if _is_glm_model(model_name):
-                llm = get_code_llm(model_key, 0.2, _model_thinking_budget(model_name, request.reasoning_level, config["max_tokens"]))
-                plan_text = await invoke_model(
-                    plan_messages, llm, None,
-                    reasoning_effort=_map_reasoning_effort(request.reasoning_level, model_name),
-                )
-            else:
-                llm = get_code_llm(model_key, 0.2, _model_thinking_budget(model_name, request.reasoning_level, config["max_tokens"]))
-                plan_text = await invoke_model(plan_messages, llm, None, thinking_mode=True)
-            display_text, plan_steps = split_plan_output(plan_text)
-            if not plan_steps:
-                plan_steps = ["Execute the user's request directly using the existing project files."]
-            if not display_text:
-                display_text = "Plan ready. Switch to Build to execute this plan without creating another plan."
+            llm = get_code_llm(model_key, 0.2, _model_thinking_budget(model_name, request.reasoning_level, config["max_tokens"]))
+            plan_text = await invoke_model(plan_messages, llm, None, thinking_mode=True)
+        display_text, plan_steps = split_plan_output(plan_text)
+        if not plan_steps:
+            plan_steps = ["Execute the user's request directly using the existing project files."]
+        if not display_text:
+            display_text = "Plan ready. Switch to Build to execute this plan without creating another plan."
         session["pending_plan"] = plan_steps
         await emit({"type": "plan_created", "steps": plan_steps, "mode": "plan"})
         response = display_text
@@ -2177,27 +2172,6 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             "plan": plan_steps, "diffs": [],
         }, []
 
-    # DEMO fallback when NVIDIA_API_KEY is missing — still streams a full Claude-like trace so the UI can be demoed
-    if not os.getenv("NVIDIA_API_KEY") or (os.getenv("NVIDIA_API_KEY") or "").strip().lower() in ("demo", ""):
-        demo_steps = ["Create index.html with dark glass hero and responsive grid", "Add styles and preview-ready layout", "Finalize and prepare download"]
-        await emit({"type": "plan_created", "steps": demo_steps})
-        await emit({"type": "thought", "text": "Demo mode: NVIDIA_API_KEY not set — streaming a sample build to showcase the live workflow. "})
-        await asyncio.sleep(0.3)
-        demo_filename = "index.html"
-        demo_content = """<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Demo — Dark Glass SaaS</title><style>:root{--bg:#08090b;--surface:#101216;--text:#f4f4f5;--muted:#9298a3;--line:rgba(255,255,255,.12);--accent:#8cff00}*{box-sizing:border-box;margin:0;padding:0;font-family:Inter,system-ui}body{background:var(--bg);color:var(--text);line-height:1.6}.hero{padding:80px 24px;text-align:center;border-bottom:1px solid var(--line)}.hero h1{font-size:42px;margin-bottom:12px}.hero p{color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;max-width:1000px;margin:40px auto;padding:0 24px}.card{background:rgba(255,255,255,.055);border:1px solid var(--line);backdrop-filter:blur(12px);border-radius:16px;padding:20px}</style></head><body><section class=hero><h1>Demo Build — Code Mode</h1><p>Live Claude-like workflow: Thinking → Plan → Edited files → Preview</p></section><section class=grid><div class=card><h3>Glass UI</h3><p>Blur + subtle border</p></div><div class=card><h3>Responsive</h3><p>Grid collapses on mobile</p></div><div class=card><h3>Live Preview</h3><p>Rendered in canvas iframe</p></div></section></body></html>"""
-        await emit({"type": "code_file_start", "filename": demo_filename, "language": "html"})
-        await asyncio.sleep(0.4)
-        old = file_store.get(demo_filename, "")
-        additions, deletions, diff_lines = diff_file(old, demo_content)
-        file_store[demo_filename] = demo_content
-        diff_id = "diff_1"
-        await emit({"type": "file_created", "file": demo_filename, "additions": additions, "deletions": deletions, "diff_id": diff_id})
-        await emit({"type": "code_file_diff", "filename": demo_filename, "language": "html", "additions": additions, "deletions": deletions, "diff_lines": diff_lines, "content": demo_content})
-        await emit({"type": "diff_created", "diff_id": diff_id, "file": demo_filename, "diff_lines": diff_lines, "additions": additions, "deletions": deletions})
-        await emit({"type": "artifact_created", "files": [demo_filename]})
-        await emit({"type": "complete"})
-        activities_demo = [{"kind": "plan", "text": s} for s in demo_steps] + [{"kind": "edit", "file": demo_filename, "filename": demo_filename, "additions": additions, "deletions": deletions, "diff_lines": diff_lines}]
-        return {"response": "Demo build complete — set NVIDIA_API_KEY in .env for real generation. This sample shows the full live workflow.", "code": demo_content, "language": "html", "files": {demo_filename: demo_content}, "file_languages": {demo_filename: "html"}, "show_preview": True, "activities": activities_demo, "activity_summary": {"commands": 1, "files_edited": 1, "files_viewed": 0, "notes": len(demo_steps)}, "plan": demo_steps, "diffs": [{"diff_id": diff_id, "file": demo_filename, "additions": additions, "deletions": deletions, "diff_lines": diff_lines}]}, []
     reasoning_level = request.reasoning_level
     model_key = resolve_code_model_key(request.model)
     config = get_code_thinking_config(reasoning_level)
