@@ -2155,8 +2155,11 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
             llm = get_code_llm(model_key, 0.2, _model_thinking_budget(model_name, request.reasoning_level, config["max_tokens"]))
             plan_text = await invoke_model(plan_messages, llm, None, thinking_mode=True)
         display_text, plan_steps = split_plan_output(plan_text)
-        if not plan_steps:
-            plan_steps = ["Execute the user's request directly using the existing project files."]
+        # No fabricated placeholder step here: if the model didn't return a
+        # structured plan, plan_steps stays genuinely empty rather than
+        # showing a fake, hardcoded "step" the model never actually produced.
+        # build_agent_system_text() and the UI both already handle an empty
+        # plan_steps list gracefully.
         if not display_text:
             display_text = "Plan ready. Switch to Build to execute this plan without creating another plan."
         session["pending_plan"] = plan_steps
@@ -2186,10 +2189,15 @@ async def _run_agent(request: Any, session: dict, emit) -> dict:
     # in this session; if none exists, the user's request is treated as the
     # already-approved instruction rather than being planned again.
     plan_steps: List[str] = list(session.get("pending_plan") or [])
-    if not plan_steps:
-        plan_steps = ["Execute the user's request directly using the existing project files."]
+    # No pending plan (the user went straight to Build, or Plan produced no
+    # structured steps) — genuinely proceed with none, instead of fabricating
+    # a single fake "step" that just restates "do the request". The UI only
+    # shows a plan checklist when plan_steps is non-empty, so real, live
+    # per-turn status (agent_message events, below) is what represents
+    # progress here instead of a hardcoded placeholder bullet.
     session["pending_plan"] = []
-    await emit({"type": "plan_created", "steps": plan_steps, "mode": "build"})
+    if plan_steps:
+        await emit({"type": "plan_created", "steps": plan_steps, "mode": "build"})
 
     activities: List[dict] = []
     diffs: List[dict] = []
