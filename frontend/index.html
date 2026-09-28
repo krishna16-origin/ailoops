@@ -634,6 +634,8 @@
 
 
         .thinking-block { margin-top:2px; }
+        .thinking-header { display:flex; align-items:center; gap:7px; min-height:30px; }
+        .thinking-header .assistant-avatar { flex:0 0 26px; margin-top:0; }
         .thinking-toggle { background:none; border:none; padding:0; font-size:13px; font-family:inherit; color:var(--text-secondary); cursor:pointer; }
         .thinking-toggle:hover { color:var(--text-primary); text-decoration:underline; }
         .thinking-toggle.shimmer {
@@ -3837,7 +3839,9 @@
                 statusDiv.className = 'thinking-block';
                 statusDiv.style.display = 'none'; // hidden until we actually get a thought
                 statusDiv.innerHTML = `
-                    <button type="button" class="thinking-toggle">Thinking</button>
+                    <div class="thinking-header">
+                        <button type="button" class="thinking-toggle">Thinking</button>
+                    </div>
                     <div class="thinking-content expanded"></div>
                 `;
                 statusDiv.querySelector('.thinking-toggle').addEventListener('click', () => {
@@ -3845,6 +3849,11 @@
                 });
 
                 body.appendChild(statusDiv);
+                if (currentMode === 'chat') {
+                    // The chat orb belongs to this fixed header, directly beside
+                    // "Thinking". It must not be a sibling of the growing answer.
+                    statusDiv.querySelector('.thinking-header').prepend(avatar);
+                }
 
                 // File-download cards: available in both modes. Code mode fills these
                 // from in-memory generated text (client-side Blob download); Chat mode
@@ -4003,7 +4012,7 @@
 
                 body.appendChild(footer);
 
-                bubble.appendChild(avatar);
+                if (currentMode === 'code') bubble.appendChild(avatar);
                 bubble.appendChild(body);
             } else {
                 // Long pasted prompts/messages are collapsed to a handful of lines
