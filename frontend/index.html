@@ -388,7 +388,7 @@
         .assistant .message-bubble { background-color:transparent; border-radius:8px; color:var(--text-primary); display:flex; gap:12px; padding-left:0; align-items:flex-start; }
         /* Chat thinking circle — the official Libraries.dev orb sits inside the
            existing round assistant avatar, replacing the old Nexus spark. */
-        .assistant-avatar { flex-shrink:0; width:26px; height:26px; padding:2px; border-radius:50%; border:1px solid var(--border-color); color:var(--text-secondary); margin-top:2px; position:relative; overflow:hidden; display:flex; align-items:center; justify-content:center; }
+        .assistant-avatar { flex:0 0 26px; width:26px; height:26px; padding:2px; box-sizing:border-box; align-self:flex-start; border-radius:50%; border:1px solid var(--border-color); color:var(--text-secondary); margin-top:2px; position:relative; overflow:hidden; display:flex; align-items:center; justify-content:center; }
         .assistant-avatar canvas { display:block; width:20px; height:20px; }
         .assistant-body { flex:1; min-width:0; display:flex; flex-direction:column; gap:10px; }
 
@@ -492,7 +492,9 @@
         /* Nothing to act on yet while the answer is still "Thinking" (.message-prose
            has no rendered content) — hide the row until the first token lands,
            rather than showing actions that would just operate on an empty string. */
-        .assistant-body:has(.message-prose:empty) .message-footer { display:none; }
+        .assistant-body:has(.message-prose:empty) .message-footer,
+        .assistant-body.is-streaming .message-footer { display:none; }
+        .message-footer[hidden] { display:none !important; }
 
         /* ============== CODE MODE: workflow trace (steps) ============== */
         .response-workflow { margin-top:10px; padding-top:2px; }
@@ -1023,7 +1025,7 @@
             .opening-subtitle { font-size:13px; }
             .message-bubble { max-width:92%; padding:12px 14px; font-size:14.5px; }
             .assistant .message-bubble { gap:8px; }
-            .assistant-avatar { width:24px; height:24px; }
+            .assistant-avatar { flex-basis:24px; width:24px; height:24px; }
 
             /* Input: safe-area, smaller padding, prevent iOS zoom */
             .input-container { padding:10px 12px max(10px, env(safe-area-inset-bottom)); padding-bottom:max(10px, env(safe-area-inset-bottom)); }
@@ -4270,6 +4272,8 @@
             }
 
             const assistantBubble = appendMessage('assistant', '');
+            const responseBody = assistantBubble.querySelector('.assistant-body');
+            if (responseBody) responseBody.classList.add('is-streaming');
             const textContainer = assistantBubble.querySelector('.message-text');
             const sourcesBtnEl = assistantBubble.querySelector('.sources-btn');
             const thinkingBlock = assistantBubble.querySelector('.thinking-block');
@@ -5353,7 +5357,7 @@
             // Avatar lives inside the message's .assistant-avatar circle. Code mode
             // replaces the spark inside that existing circle (see appendMessage);
             // there is no second indicator appended to the message body.
-            // Chat mode keeps the classic spark indicator in the text flow.
+            // Chat mode keeps the orb in the fixed circular avatar slot.
             let indicatorEl = null;
             setProse(textContainer, '');
             if (mode === 'code') {
@@ -5714,6 +5718,9 @@
                 const cursor = textContainer.querySelector('.thinking-indicator');
                 if (cursor) cursor.remove();
                 finishThinking(); // no-op if already finalized; settles a stopped/errored turn's toggle too
+                if (responseBody) responseBody.classList.remove('is-streaming');
+                const responseFooter = assistantBubble.querySelector('.message-footer');
+                if (responseFooter) responseFooter.hidden = !assistantFullText.trim();
                 modes[mode].html = chatContent.innerHTML;
                 if (mode === 'code') liveMonitorEndTurn();
             }
