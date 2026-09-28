@@ -3203,7 +3203,7 @@ async def chat_estimate(request: ChatEstimateRequest):
     }
 
 
-GROQ_CHAT_MODEL = "llama-3.1-8b-instant"
+GROQ_CHAT_MODEL = "openai/gpt-oss-20b"
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_TTS_MODEL = "canopylabs/orpheus-v1-english"
 GROQ_TTS_URL = "https://api.groq.com/openai/v1/audio/speech"
