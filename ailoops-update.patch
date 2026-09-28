@@ -1,0 +1,299 @@
+diff --git a/app.py b/app.py
+index 94b718e..56371f0 100644
+--- a/app.py
++++ b/app.py
+@@ -1278,6 +1278,105 @@ async def generate_response_once(request: "ChatRequest", session: dict, progress
+ 
+ 
+ 
++
++# ---------------------------------------------------------------------------
++# Auth helpers (email/password + Google/GitHub OAuth, HttpOnly JWT cookie)
++# ---------------------------------------------------------------------------
++FRONTEND_ORIGIN = (os.getenv("FRONTEND_ORIGIN") or "").strip().rstrip("/")
++PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
++AUTH_COOKIE = "maximus_session"
++AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "auth.db")
++AUTH_SECRET = os.getenv("AUTH_SECRET") or os.getenv("SECRET_KEY") or secrets.token_urlsafe(48)
++
++
++def _auth_db():
++    db = sqlite3.connect(AUTH_DB_PATH)
++    db.row_factory = sqlite3.Row
++    db.execute(
++        "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT, "
++        "avatar TEXT, provider TEXT, password_hash TEXT, created_at TEXT)"
++    )
++    return db
++
++
++def _b64u(data: bytes) -> str:
++    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
++
++
++def _b64u_decode(text: str) -> bytes:
++    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
++
++
++def _jwt_encode(payload: dict) -> str:
++    head = _b64u(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
++    body = _b64u(json.dumps(payload).encode())
++    sig = _b64u(hmac.new(AUTH_SECRET.encode(), f"{head}.{body}".encode(), hashlib.sha256).digest())
++    return f"{head}.{body}.{sig}"
++
++
++def _jwt_decode(token: str) -> Optional[dict]:
++    try:
++        head, body, sig = token.split(".")
++        expected = _b64u(hmac.new(AUTH_SECRET.encode(), f"{head}.{body}".encode(), hashlib.sha256).digest())
++        if not hmac.compare_digest(sig, expected):
++            return None
++        payload = json.loads(_b64u_decode(body))
++        if int(payload.get("exp", 0)) < int(time.time()):
++            return None
++        return payload
++    except Exception:
++        return None
++
++
++def _password_hash(password: str) -> str:
++    salt = secrets.token_bytes(16)
++    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
++    return f"pbkdf2${_b64u(salt)}${_b64u(digest)}"
++
++
++def _password_ok(password: str, stored: str) -> bool:
++    try:
++        _, salt, digest = stored.split("$")
++        check = hashlib.pbkdf2_hmac("sha256", password.encode(), _b64u_decode(salt), 200_000)
++        return hmac.compare_digest(_b64u(check), digest)
++    except Exception:
++        return False
++
++
++def _user_payload(row) -> dict:
++    return {"id": row["id"], "email": row["email"], "name": row["name"], "avatar": row["avatar"] or "", "provider": row["provider"]}
++
++
++def _current_user(request: Request) -> Optional[dict]:
++    payload = _jwt_decode(request.cookies.get(AUTH_COOKIE, ""))
++    if not payload:
++        return None
++    return {k: payload.get(k) for k in ("id", "email", "name", "avatar", "provider")}
++
++
++def _cookie_kwargs() -> dict:
++    # Frontend and API can live on different sites, so the cookie must be SameSite=None; Secure.
++    return {"httponly": True, "secure": True, "samesite": "none" if FRONTEND_ORIGIN else "lax", "path": "/", "max_age": 60 * 60 * 24 * 14}
++
++
++def _auth_response(user: dict, status_code: int = 200):
++    response = JSONResponse({"authenticated": True, "user": user}, status_code=status_code)
++    token = _jwt_encode({**user, "iat": int(time.time()), "exp": int(time.time()) + 60 * 60 * 24 * 14})
++    response.set_cookie(AUTH_COOKIE, token, **_cookie_kwargs())
++    return response
++
++
++def _redirect_uri(provider: str) -> str:
++    base = PUBLIC_BASE_URL or "http://localhost:8000"
++    return f"{base}/auth/{provider}/callback"
++
++
++def _back_to_app(ok: bool) -> RedirectResponse:
++    # Land back on the app. Failures are deliberately silent: the frontend just carries on.
++    target = (FRONTEND_ORIGIN or "") + "/"
++    return RedirectResponse(target if ok else target + "?auth=skipped")
++
++
+ app = FastAPI(title="AI Assistant")
+ 
+ app.add_middleware(
+@@ -3139,9 +3238,9 @@ async def auth_forgot_password(request: Request):
+ 
+ @app.get("/auth/{provider}")
+ async def oauth_start(provider: str):
+-    if provider not in {"google", "github"}: raise HTTPException(status_code=404)
++    if provider not in {"google", "github"}: return _back_to_app(False)
+     client_id = os.getenv(f"{provider.upper()}_CLIENT_ID")
+-    if not client_id: raise HTTPException(status_code=503, detail=f"{provider.title()} login is not configured.")
++    if not client_id or not os.getenv(f"{provider.upper()}_CLIENT_SECRET"): return _back_to_app(False)
+     state = secrets.token_urlsafe(24)
+     params = {"client_id": client_id, "redirect_uri": _redirect_uri(provider), "state": state}
+     if provider == "google": params.update({"response_type": "code", "scope": "openid email profile", "access_type": "online", "prompt": "select_account"}); url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+@@ -3159,13 +3258,25 @@ async def _oauth_user(provider: str, code: str):
+         return {"email": email.lower(), "name": data.get("name") or data.get("login"), "avatar": data.get("avatar_url", "")}
+ 
+ @app.get("/auth/{provider}/callback")
+-async def oauth_callback(provider: str, request: Request, code: str = "", state: str = ""):
+-    if provider not in {"google", "github"} or not code or not state or not hmac.compare_digest(state, request.cookies.get("maximus_oauth_state", "")): raise HTTPException(status_code=400, detail="Invalid OAuth sign-in request.")
+-    profile = await _oauth_user(provider, code); db = _auth_db(); row = db.execute("SELECT * FROM users WHERE email=?", (profile["email"],)).fetchone()
+-    if row: user = _user_payload(row); db.execute("UPDATE users SET name=?, avatar=?, provider=? WHERE id=?", (profile["name"], profile["avatar"], provider, row["id"]))
+-    else:
+-        user = {"id": secrets.token_urlsafe(18), **profile, "provider": provider}; db.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)", (user["id"], user["email"], user["name"], user["avatar"], provider, "", datetime.now(timezone.utc).isoformat()))
+-    db.commit(); db.close(); response = RedirectResponse("/"); response.set_cookie(AUTH_COOKIE, _jwt_encode({**user, "iat": int(time.time()), "exp": int(time.time()) + 60 * 60 * 24 * 14}), httponly=True, secure=True, samesite="lax", max_age=60*60*24*14, path="/"); response.delete_cookie("maximus_oauth_state", path="/"); return response
++async def oauth_callback(provider: str, request: Request, code: str = "", state: str = "", error: str = ""):
++    try:
++        if provider not in {"google", "github"} or error or not code or not state or not hmac.compare_digest(state, request.cookies.get("maximus_oauth_state", "")):
++            return _back_to_app(False)
++        profile = await _oauth_user(provider, code)
++        db = _auth_db(); row = db.execute("SELECT * FROM users WHERE email=?", (profile["email"],)).fetchone()
++        if row:
++            user = _user_payload(row); db.execute("UPDATE users SET name=?, avatar=?, provider=? WHERE id=?", (profile["name"], profile["avatar"], provider, row["id"]))
++        else:
++            user = {"id": secrets.token_urlsafe(18), **profile, "provider": provider}
++            db.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)", (user["id"], user["email"], user["name"], user["avatar"], provider, "", datetime.now(timezone.utc).isoformat()))
++        db.commit(); db.close()
++        response = _back_to_app(True)
++        response.set_cookie(AUTH_COOKIE, _jwt_encode({**user, "iat": int(time.time()), "exp": int(time.time()) + 60 * 60 * 24 * 14}), **_cookie_kwargs())
++        response.delete_cookie("maximus_oauth_state", path="/")
++        return response
++    except Exception as exc:
++        print(f"[auth] OAuth sign-in ignored ({provider}): {exc}")
++        return _back_to_app(False)
+ 
+ @app.get("/generated-files/{session_id}/{file_id}/{filename}")
+ async def download_generated_file(session_id: str, file_id: str, filename: str):
+diff --git a/frontend/index.html b/frontend/index.html
+index 51fcccb..409eb14 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -1324,8 +1324,18 @@
+         .auth-video-slot iframe, .auth-video-slot video { position:absolute; inset:0; display:block; width:100%; height:100%; border:0; object-fit:cover; background:#101015; }
+         .auth-video-placeholder { display:flex; height:100%; align-items:center; justify-content:center; padding:28px; color:rgba(242,236,248,.44); text-align:center; font-size:12px; line-height:1.5; }
+         .auth-video-placeholder small { color:rgba(242,236,248,.3); }
+-        .auth-audio-toggle { position:absolute; z-index:2; right:14px; bottom:14px; display:flex; align-items:center; gap:8px; padding:9px 12px; border:1px solid rgba(255,255,255,.14); border-radius:999px; color:#eee8f4; background:rgba(20,18,25,.86); backdrop-filter:blur(12px); cursor:pointer; font-size:12px; }
+-        .auth-audio-toggle input { accent-color:var(--accent); }
++        .auth-sound-btn { position:absolute; z-index:3; right:14px; bottom:14px; width:44px; height:44px; display:grid; place-items:center; padding:0; border:1px solid rgba(255,255,255,.22); border-radius:50%; color:#f1ebf5; background:rgba(20,18,25,.68); -webkit-backdrop-filter:blur(12px); backdrop-filter:blur(12px); cursor:pointer; transition:transform .2s, background .2s, border-color .2s; }
++        .auth-sound-btn:hover { transform:scale(1.07); background:rgba(20,18,25,.86); border-color:rgba(196,113,237,.7); }
++        .auth-sound-btn:focus-visible { outline:2px solid #c991df; outline-offset:2px; }
++        .auth-sound-btn svg { width:22px; height:22px; }
++        .auth-sound-btn .ico-on { display:none; }
++        .auth-sound-btn.is-on .ico-on { display:block; }
++        .auth-sound-btn.is-on .ico-off { display:none; }
++        .auth-sound-btn.is-on { border-color:rgba(196,113,237,.8); box-shadow:0 0 0 4px rgba(196,113,237,.18); }
++        .auth-sound-btn:not(.is-on):not(.is-tried) { animation:soundHint 2.2s ease-in-out 1s infinite; }
++        @keyframes soundHint { 0%,100% { box-shadow:0 0 0 0 rgba(196,113,237,.0); } 50% { box-shadow:0 0 0 7px rgba(196,113,237,.22); } }
++        .auth-sound-note { position:absolute; z-index:3; right:14px; bottom:66px; max-width:200px; padding:8px 11px; border-radius:10px; color:#f1ebf5; background:rgba(20,18,25,.9); border:1px solid rgba(255,255,255,.14); font-size:11px; line-height:1.4; opacity:0; transform:translateY(4px); pointer-events:none; transition:opacity .25s, transform .25s; }
++        .auth-sound-note.show { opacity:1; transform:none; }
+         .auth-form-panel { display:flex; align-items:center; justify-content:center; padding:28px clamp(24px, 4vw, 44px); overflow-y:auto; background:#1b1920; color:#f1ebf5; }
+         .auth-form { width:min(340px, 100%); }
+         .auth-brand { display:flex; align-items:center; gap:9px; margin-bottom:22px; color:#f1ebf5; font-size:17px; font-weight:600; letter-spacing:-.04em; }
+@@ -1430,6 +1440,11 @@
+                            disablepictureinpicture
+                            preload="auto">
+                        </video>
++                    <button type="button" class="auth-sound-btn" id="authSoundBtn" aria-pressed="false" aria-label="Turn sound on" title="Turn sound on">
++                        <svg class="ico-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="m22 9-6 6"/><path d="m16 9 6 6"/></svg>
++                        <svg class="ico-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9 9 0 0 1 0 13"/></svg>
++                    </button>
++                    <div class="auth-sound-note" id="authSoundNote" role="status"></div>
+                 </div>
+             </div>
+             <div class="auth-form-panel">
+@@ -2403,7 +2418,7 @@
+ 
+         let authSignupMode = false;
+         function setAuthStatus(message, error = true) { const el = document.getElementById('authStatus'); if (el) { el.textContent = message || ''; el.style.color = error ? '#b23b55' : '#3b7d62'; } }
+-        function showAuthScreen(show) { const el = document.getElementById('authScreen'); if (!show) { if (el) el.classList.remove('is-visible'); return; } (window.__splashReady || Promise.resolve()).then(() => { if (authDismissed || authKnownSignedIn) return; if (el) el.classList.add('is-visible'); requestAnimationFrame(() => startAuthVideoPlayback()); }); }
++        function showAuthScreen(show) { const el = document.getElementById('authScreen'); if (!show) { if (el) el.classList.remove('is-visible'); try { stopAuthSound(); } catch (_) {} return; } (window.__splashReady || Promise.resolve()).then(() => { if (authDismissed || authKnownSignedIn) return; if (el) el.classList.add('is-visible'); requestAnimationFrame(() => startAuthVideoPlayback()); }); }
+         function toggleAuthMode() { authSignupMode = !authSignupMode; document.getElementById('authTitle').textContent = authSignupMode ? 'Create account' : 'Sign in'; document.getElementById('authSubtitle').textContent = authSignupMode ? 'Create your private workspace in seconds.' : 'Continue to your private workspace.'; document.getElementById('authNameField').hidden = !authSignupMode; document.getElementById('authName').hidden = !authSignupMode; document.getElementById('authName').required = authSignupMode; document.getElementById('authPassword').autocomplete = authSignupMode ? 'new-password' : 'current-password'; document.getElementById('authSubmit').textContent = authSignupMode ? 'Create account' : 'Sign in'; document.getElementById('authSwitch').textContent = authSignupMode ? 'I have an account' : 'Create account'; setAuthStatus(''); }
+         function startOAuth(provider) { window.location.href = `${API_BASE}/auth/${provider}`; }
+         async function forgotPassword() { const email = document.getElementById('authEmail').value.trim(); if (!email) { setAuthStatus('Enter your email first.'); return; } setAuthStatus('If an account exists, reset instructions will be sent securely.', false); try { await fetch(`${API_BASE}/auth/forgot-password`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email}), credentials:'include'}); } catch (_) {} }
+@@ -2411,6 +2426,16 @@
+         document.getElementById('authSkip')?.addEventListener('click', () => { authDismissed = true; showAuthScreen(false); if (window.innerWidth > 768) document.getElementById('userInput')?.focus(); });
+         let authDismissed = false, authKnownSignedIn = false;
+         async function bootAuth() {
++            // Returning from a failed/cancelled OAuth attempt: ignore it silently and carry on to the app.
++            try {
++                const qs = new URLSearchParams(window.location.search);
++                if (qs.has('auth') || qs.has('error') || qs.has('code')) {
++                    qs.delete('auth'); qs.delete('error'); qs.delete('code'); qs.delete('state');
++                    const rest = qs.toString();
++                    history.replaceState(null, '', window.location.pathname + (rest ? '?' + rest : '') + window.location.hash);
++                    authDismissed = true; showAuthScreen(false);
++                }
++            } catch (_) {}
+             // Splash -> login page (always, unless the user is already signed in) -> Skip/Sign in -> chat
+             (window.__splashReady || Promise.resolve()).then(() => { if (!authKnownSignedIn && !authDismissed) showAuthScreen(true); });
+             try {
+@@ -2419,10 +2444,6 @@
+                 if (result.authenticated) { authKnownSignedIn = true; showAuthScreen(false); }
+             } catch (_) {}
+         }
+-        function setAuthVideoAudio(enabled) {
+-            document.querySelectorAll('#authVideoSlot video').forEach(video => { video.muted = !enabled; if (video.paused && video.src) video.play().catch(() => {}); });
+-            document.querySelectorAll('#authVideoSlot iframe').forEach(frame => { frame.contentWindow?.postMessage(JSON.stringify({event:'command', func: enabled ? 'unMute' : 'mute', args: []}), 'https://www.youtube.com'); });
+-        }
+         // Login video loader: tries every plausible location/format until one loads (handles
+         // frontend served from a different host/path than the API, and browsers without H.264/VP9).
+         (function () {
+@@ -2447,8 +2468,68 @@
+             window.__retryAuthVideo = () => { if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); } };
+             tryNext();
+         })();
++        // ---- Login video sound ----------------------------------------------------------
++        // Sound is OFF by default (browsers block unmuted autoplay). The round button at the bottom
++        // of the video turns it on/off. Audio comes from the video's own audio track if it has one,
++        // otherwise from an optional separate file next to it: maxi.mp3 / maxi.m4a / maxi.ogg.
++        let authSoundOn = false, authAudioEl = null, authAudioReady = false;
++        function authVideoHasTrack(v) {
++            return (v.mozHasAudio === true) || (typeof v.webkitAudioDecodedByteCount === 'number' && v.webkitAudioDecodedByteCount > 0) || (v.audioTracks && v.audioTracks.length > 0);
++        }
++        function showAuthSoundNote(text) {
++            const n = document.getElementById('authSoundNote'); if (!n) return;
++            n.textContent = text; n.classList.add('show');
++            clearTimeout(showAuthSoundNote.t); showAuthSoundNote.t = setTimeout(() => n.classList.remove('show'), 3200);
++        }
++        function paintAuthSoundBtn() {
++            const b = document.getElementById('authSoundBtn'); if (!b) return;
++            b.classList.toggle('is-on', authSoundOn);
++            b.setAttribute('aria-pressed', String(authSoundOn));
++            const label = authSoundOn ? 'Turn sound off' : 'Turn sound on';
++            b.setAttribute('aria-label', label); b.title = label;
++        }
++        function applyAuthSound() {
++            const v = document.getElementById('authVideo'); if (!v) return;
++            v.muted = !authSoundOn || authAudioReady; // if a separate file is used, the video stays silent
++            if (authAudioEl) {
++                if (authSoundOn && authAudioReady) { try { authAudioEl.currentTime = v.currentTime % (authAudioEl.duration || 1e9); } catch (_) {} authAudioEl.muted = false; const p = authAudioEl.play(); if (p && p.catch) p.catch(() => {}); }
++                else authAudioEl.pause();
++            }
++            paintAuthSoundBtn();
++        }
++        function toggleAuthSound() {
++            const v = document.getElementById('authVideo');
++            document.getElementById('authSoundBtn')?.classList.add('is-tried');
++            authSoundOn = !authSoundOn;
++            applyAuthSound();
++            if (authSoundOn && v) {
++                if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
++                // Nothing audible to play? Say so instead of silently doing nothing.
++                setTimeout(() => {
++                    if (!authSoundOn) return;
++                    const audible = authAudioReady || authVideoHasTrack(v);
++                    if (!audible && !(authVideoHasTrack(v))) showAuthSoundNote('This video has no sound track yet.');
++                }, 700);
++            }
++        }
++        function stopAuthSound() { authSoundOn = false; applyAuthSound(); }
++        (function initAuthAudioFile() {
++            const names = ['maxi.mp3', 'maxi.m4a', 'maxi.ogg', 'maxi-audio.mp4', 'sound.mp4'];
++            const bases = ['/frontend/', './', './frontend/', (typeof API_BASE !== 'undefined' ? API_BASE : '') + '/frontend/'];
++            const urls = []; bases.forEach(b => names.forEach(n => urls.push(b + n)));
++            let i = 0;
++            function next() {
++                if (i >= urls.length) return; // no separate audio file: rely on the video's own track
++                const a = new Audio(); a.preload = 'auto'; a.loop = true;
++                a.addEventListener('canplaythrough', () => { if (authAudioReady) return; authAudioEl = a; authAudioReady = true; applyAuthSound(); }, { once: true });
++                a.addEventListener('error', next, { once: true });
++                a.src = urls[i++]; a.load();
++            }
++            next();
++        })();
++        document.getElementById('authSoundBtn')?.addEventListener('click', toggleAuthSound);
+         function startAuthVideoPlayback() {
+-            document.querySelectorAll('#authVideoSlot video').forEach(video => { video.autoplay = true; video.loop = true; video.muted = true; video.playsInline = true; video.play().catch(() => {}); });
++            document.querySelectorAll('#authVideoSlot video').forEach(video => { video.autoplay = true; video.loop = true; video.muted = !authSoundOn || authAudioReady; video.playsInline = true; const p = video.play(); if (p && p.catch) p.catch(() => { video.muted = true; authSoundOn = false; paintAuthSoundBtn(); const q = video.play(); if (q && q.catch) q.catch(() => {}); }); });
+         }
+                 const authVideo = document.getElementById('authVideo');
+         authVideo?.addEventListener('canplay', () => { authVideo.hidden = false; const placeholder = document.getElementById('authVideoPlaceholder'); if (placeholder) placeholder.hidden = true; startAuthVideoPlayback(); });
