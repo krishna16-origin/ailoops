@@ -4643,7 +4643,10 @@
                     // only, matching the final-render call sites below.
                     if (mode === 'chat') wrapTables(textContainer);
                     if (mode === 'chat') renderChatFileCards(assistantFullText);
-                    if (indicatorEl) textContainer.appendChild(indicatorEl);
+                    // NOTE: do NOT re-append indicatorEl here. In Chat mode it is the
+                    // .assistant-avatar orb that lives in .thinking-header beside the
+                    // "Thinking" label; moving it into textContainer made it trail the
+                    // streaming answer. It must stay anchored in the header.
                     scrollToBottom();
                 });
             }
