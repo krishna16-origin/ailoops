@@ -6,6 +6,12 @@ import difflib
 import asyncio
 import traceback
 import warnings
+import sqlite3
+import secrets
+import hashlib
+import hmac
+import time
+from urllib.parse import urlencode
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -20,9 +26,10 @@ warnings.filterwarnings(
 )
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse, Response
+from fastapi.responses import StreamingResponse, FileResponse, Response, RedirectResponse, JSONResponse
 import httpx
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -45,6 +52,8 @@ if not os.getenv("TAVILY_API_KEY"):
     print("WARNING: TAVILY_API_KEY not found in environment. Web search will be disabled.")
 if not os.getenv("GROQ_API_KEY"):
     print("WARNING: GROQ_API_KEY not found in environment. Voice mode audio will be disabled.")
+if not os.getenv("JWT_SECRET"):
+    print("WARNING: JWT_SECRET not found. Authentication will remain unavailable until configured.")
 if not sandbox_manager.sandbox_configured():
     print("WARNING: E2B_API_KEY not found in environment. The live sandbox will be disabled.")
 
@@ -1273,8 +1282,8 @@ app = FastAPI(title="AI Assistant")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=[FRONTEND_ORIGIN] if FRONTEND_ORIGIN else ["*"],
+    allow_credentials=bool(FRONTEND_ORIGIN),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -3088,6 +3097,75 @@ async def list_generated_files(session_id: str):
     session = get_session(session_id)
     return {"session_id": session_id, "files": file_generator.list_generated_files(session)}
 
+
+@app.get("/auth/me")
+async def auth_me(request: Request):
+    user = _current_user(request)
+    return {"authenticated": bool(user), "user": user}
+
+@app.post("/auth/signup")
+async def auth_signup(request: Request):
+    data = await request.json()
+    email = str(data.get("email", "")).strip().lower()
+    password = str(data.get("password", ""))
+    name = str(data.get("name", "")).strip() or email.split("@", 1)[0]
+    if len(email) < 5 or "@" not in email or len(password) < 8:
+        raise HTTPException(status_code=400, detail="Use a valid email and a password of at least 8 characters.")
+    user = {"id": secrets.token_urlsafe(18), "email": email, "name": name, "avatar": "", "provider": "email"}
+    try:
+        db = _auth_db(); db.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)", (user["id"], email, name, "", "email", _password_hash(password), datetime.now(timezone.utc).isoformat())); db.commit(); db.close()
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="An account with this email already exists.")
+    return _auth_response(user, 201)
+
+@app.post("/auth/login")
+async def auth_login(request: Request):
+    data = await request.json(); email = str(data.get("email", "")).strip().lower(); password = str(data.get("password", ""))
+    db = _auth_db(); row = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone(); db.close()
+    if not row or not row["password_hash"] or not _password_ok(password, row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Incorrect email or password.")
+    return _auth_response(_user_payload(row))
+
+@app.post("/auth/logout")
+async def auth_logout():
+    response = JSONResponse({"ok": True}); response.delete_cookie(AUTH_COOKIE, path="/"); return response
+
+@app.post("/auth/forgot-password")
+async def auth_forgot_password(request: Request):
+    # Keep responses identical for existing and unknown emails to prevent account enumeration.
+    await request.json()
+    return {"ok": True, "message": "If an account exists, reset instructions will be sent securely."}
+
+
+@app.get("/auth/{provider}")
+async def oauth_start(provider: str):
+    if provider not in {"google", "github"}: raise HTTPException(status_code=404)
+    client_id = os.getenv(f"{provider.upper()}_CLIENT_ID")
+    if not client_id: raise HTTPException(status_code=503, detail=f"{provider.title()} login is not configured.")
+    state = secrets.token_urlsafe(24)
+    params = {"client_id": client_id, "redirect_uri": _redirect_uri(provider), "state": state}
+    if provider == "google": params.update({"response_type": "code", "scope": "openid email profile", "access_type": "online", "prompt": "select_account"}); url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    else: params.update({"scope": "read:user user:email"}); url = "https://github.com/login/oauth/authorize?" + urlencode(params)
+    response = RedirectResponse(url); response.set_cookie("maximus_oauth_state", state, httponly=True, secure=True, samesite="lax", max_age=600, path="/"); return response
+
+async def _oauth_user(provider: str, code: str):
+    async with httpx.AsyncClient(timeout=20) as client:
+        if provider == "google":
+            token = await client.post("https://oauth2.googleapis.com/token", data={"code": code, "client_id": os.getenv("GOOGLE_CLIENT_ID"), "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"), "redirect_uri": _redirect_uri(provider), "grant_type": "authorization_code"}); token.raise_for_status(); access = token.json()["access_token"]; info = await client.get("https://openidconnect.googleapis.com/v1/userinfo", headers={"Authorization": f"Bearer {access}"}); info.raise_for_status(); data = info.json(); return {"email": data["email"].lower(), "name": data.get("name") or data["email"].split("@",1)[0], "avatar": data.get("picture", "")}
+        token = await client.post("https://github.com/login/oauth/access_token", data={"client_id": os.getenv("GITHUB_CLIENT_ID"), "client_secret": os.getenv("GITHUB_CLIENT_SECRET"), "code": code, "redirect_uri": _redirect_uri(provider)}, headers={"Accept":"application/json"}); token.raise_for_status(); access = token.json()["access_token"]; info = await client.get("https://api.github.com/user", headers={"Authorization": f"Bearer {access}", "Accept":"application/vnd.github+json"}); info.raise_for_status(); data = info.json(); email = data.get("email")
+        if not email:
+            emails = await client.get("https://api.github.com/user/emails", headers={"Authorization": f"Bearer {access}", "Accept":"application/vnd.github+json"}); emails.raise_for_status(); email = next((x["email"] for x in emails.json() if x.get("primary") and x.get("verified")), None)
+        if not email: raise HTTPException(status_code=400, detail="Your provider did not return a verified email address.")
+        return {"email": email.lower(), "name": data.get("name") or data.get("login"), "avatar": data.get("avatar_url", "")}
+
+@app.get("/auth/{provider}/callback")
+async def oauth_callback(provider: str, request: Request, code: str = "", state: str = ""):
+    if provider not in {"google", "github"} or not code or not state or not hmac.compare_digest(state, request.cookies.get("maximus_oauth_state", "")): raise HTTPException(status_code=400, detail="Invalid OAuth sign-in request.")
+    profile = await _oauth_user(provider, code); db = _auth_db(); row = db.execute("SELECT * FROM users WHERE email=?", (profile["email"],)).fetchone()
+    if row: user = _user_payload(row); db.execute("UPDATE users SET name=?, avatar=?, provider=? WHERE id=?", (profile["name"], profile["avatar"], provider, row["id"]))
+    else:
+        user = {"id": secrets.token_urlsafe(18), **profile, "provider": provider}; db.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)", (user["id"], user["email"], user["name"], user["avatar"], provider, "", datetime.now(timezone.utc).isoformat()))
+    db.commit(); db.close(); response = RedirectResponse("/"); response.set_cookie(AUTH_COOKIE, _jwt_encode({**user, "iat": int(time.time()), "exp": int(time.time()) + 60 * 60 * 24 * 14}), httponly=True, secure=True, samesite="lax", max_age=60*60*24*14, path="/"); response.delete_cookie("maximus_oauth_state", path="/"); return response
 
 @app.get("/generated-files/{session_id}/{file_id}/{filename}")
 async def download_generated_file(session_id: str, file_id: str, filename: str):

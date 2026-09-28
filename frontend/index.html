@@ -1312,6 +1312,46 @@
            shadow as the app's other popup panels (.picker-more-panel). */
         .ui-tooltip { position:fixed; left:0; top:0; z-index:2147483647; max-width:260px; padding:6px 10px; background:#262626; color:var(--text-primary); border:1px solid var(--border-color); border-radius:8px; box-shadow:0 6px 20px rgba(0,0,0,0.4); font-family:inherit; font-size:12px; font-weight:500; line-height:1.4; pointer-events:none; opacity:0; visibility:hidden; transform:translateY(2px); transition:opacity 0.14s ease, transform 0.14s ease, visibility 0.14s; }
         .ui-tooltip.show { opacity:1; visibility:visible; transform:translateY(0); }
+
+        /* ============== AUTHENTICATION SCREEN ============== */
+        .auth-screen { position:fixed; inset:0; z-index:10000; display:none; align-items:center; justify-content:center; padding:28px; background:radial-gradient(circle at 18% 15%, rgba(196,113,237,.12), transparent 34%), var(--bg-main); overflow:auto; }
+        .auth-screen.is-visible { display:flex; }
+        .auth-shell { width:min(1120px, 100%); min-height:min(700px, calc(100vh - 56px)); display:grid; grid-template-columns:minmax(300px, .94fr) minmax(380px, 1.06fr); overflow:hidden; border:1px solid rgba(255,255,255,.13); border-radius:30px; background:#191919; box-shadow:0 30px 100px rgba(0,0,0,.55), 0 0 80px rgba(196,113,237,.08); }
+        .auth-video-panel { position:relative; display:flex; flex-direction:column; min-height:100%; padding:32px; background:#231d1e; overflow:hidden; }
+        .auth-video-panel::before { content:""; position:absolute; inset:0; background:radial-gradient(circle at 40% 38%, rgba(196,113,237,.2), transparent 35%), linear-gradient(145deg, rgba(255,255,255,.04), transparent 45%); pointer-events:none; }
+        .auth-video-kicker { position:relative; z-index:1; color:rgba(255,255,255,.62); font-size:12px; letter-spacing:.02em; }
+        .auth-video-title { position:relative; z-index:1; margin-top:auto; margin-bottom:18px; max-width:330px; color:#fff; font-size:clamp(30px, 4vw, 50px); line-height:.98; letter-spacing:-.055em; }
+        .auth-video-slot { position:relative; z-index:1; width:min(100%, 320px); aspect-ratio:9/16; align-self:center; border:1px solid rgba(255,255,255,.15); border-radius:22px; background:#111; box-shadow:0 18px 45px rgba(0,0,0,.4); overflow:hidden; }
+        .auth-video-slot iframe, .auth-video-slot video { display:block; width:100%; height:100%; border:0; object-fit:cover; }
+        .auth-video-placeholder { display:flex; height:100%; align-items:center; justify-content:center; padding:28px; color:rgba(255,255,255,.45); text-align:center; font-size:13px; line-height:1.5; }
+        .auth-audio-toggle { position:absolute; z-index:2; right:14px; bottom:14px; display:flex; align-items:center; gap:8px; padding:9px 12px; border:1px solid rgba(255,255,255,.16); border-radius:999px; color:#fff; background:rgba(17,17,17,.72); backdrop-filter:blur(12px); cursor:pointer; font-size:12px; }
+        .auth-audio-toggle input { accent-color:var(--accent); }
+        .auth-video-foot { position:relative; z-index:1; margin-top:22px; color:rgba(255,255,255,.42); font-size:11px; }
+        .auth-form-panel { display:flex; align-items:center; justify-content:center; padding:54px clamp(30px, 7vw, 88px); background:#f7f7f6; color:#1c1c1c; }
+        .auth-form { width:min(390px, 100%); }
+        .auth-brand { display:flex; align-items:center; gap:9px; margin-bottom:58px; color:#1d1d1d; font-size:18px; font-weight:600; letter-spacing:-.04em; }
+        .auth-brand-mark { width:24px; height:24px; border-radius:8px; background:linear-gradient(135deg,#c471ed,#4facfe 55%,#f64f59); box-shadow:0 5px 16px rgba(196,113,237,.35); }
+        .auth-form h1 { margin-bottom:9px; font-size:clamp(30px, 4vw, 42px); font-weight:500; letter-spacing:-.06em; }
+        .auth-subtitle { margin-bottom:26px; color:#777; font-size:13px; line-height:1.5; }
+        .auth-provider-row { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:18px; }
+        .auth-provider, .auth-submit { min-height:44px; border:1px solid #dedede; border-radius:12px; background:#fff; color:#222; cursor:pointer; font:inherit; font-size:13px; transition:transform .2s var(--transition-bezier), box-shadow .2s, border-color .2s; }
+        .auth-provider { display:flex; align-items:center; justify-content:center; gap:8px; }
+        .auth-provider:hover, .auth-submit:hover { transform:translateY(-1px); border-color:#bbb; box-shadow:0 8px 18px rgba(0,0,0,.08); }
+        .auth-provider svg { width:17px; height:17px; }
+        .auth-divider { display:flex; align-items:center; gap:12px; margin:20px 0; color:#999; font-size:11px; }
+        .auth-divider::before, .auth-divider::after { content:""; height:1px; flex:1; background:#e5e5e5; }
+        .auth-field { display:block; margin-bottom:12px; }
+        .auth-field span { display:block; margin:0 0 7px 2px; color:#777; font-size:11px; }
+        .auth-field input { width:100%; height:45px; padding:0 14px; border:1px solid #dedede; border-radius:12px; outline:0; background:#fff; color:#1d1d1d; font:inherit; font-size:13px; transition:border-color .2s, box-shadow .2s; }
+        .auth-field input:focus { border-color:#a56bc6; box-shadow:0 0 0 3px rgba(165,107,198,.14); }
+        .auth-password-row { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+        .auth-forgot, .auth-switch { border:0; background:none; color:#8a53ad; cursor:pointer; font:inherit; font-size:11px; }
+        .auth-submit { width:100%; margin-top:8px; border:0; color:#fff; background:linear-gradient(100deg,#c471ed,#f64f59); }
+        .auth-status { min-height:18px; margin-top:12px; color:#b23b55; font-size:12px; line-height:1.4; }
+        .auth-security { display:flex; gap:8px; margin-top:26px; padding-top:17px; border-top:1px solid #e7e7e7; color:#898989; font-size:10px; line-height:1.5; }
+        .auth-security svg { flex:0 0 15px; margin-top:1px; }
+        .auth-footer { display:flex; justify-content:space-between; margin-top:32px; color:#999; font-size:10px; }
+        @media (max-width:760px) { .auth-screen { align-items:stretch; padding:12px; } .auth-shell { min-height:calc(100vh - 24px); grid-template-columns:1fr; border-radius:22px; } .auth-video-panel { min-height:300px; padding:24px; } .auth-video-title { margin-top:42px; margin-bottom:0; font-size:34px; } .auth-video-slot { position:absolute; right:24px; bottom:24px; width:120px; border-radius:14px; } .auth-video-foot { display:none; } .auth-form-panel { padding:36px 24px; } .auth-brand { margin-bottom:34px; } .auth-form h1 { font-size:32px; } }
     </style>
 </head>
 <body>
@@ -1360,6 +1400,42 @@
         </div>
     </div>
 
+    <section class="auth-screen" id="authScreen" aria-label="Sign in to Maximus">
+        <div class="auth-shell">
+            <div class="auth-video-panel">
+                <div class="auth-video-kicker">A calmer way to think, create, and move forward.</div>
+                <h2 class="auth-video-title">Your ideas,<br>in motion.</h2>
+                <div class="auth-video-slot" id="authVideoSlot">
+                    <div class="auth-video-placeholder" id="authVideoPlaceholder">Your YouTube Short goes here<br><small>9:16 portrait slot · 320 × 569</small></div>
+                    <!-- Add your video by replacing the placeholder with either:
+                         <video id="authVideo" src="/your-video.mp4" autoplay muted loop playsinline></video>
+                         or a YouTube iframe using autoplay=1, mute=1, loop=1, playlist=VIDEO_ID, playsinline=1, enablejsapi=1. -->
+                    <label class="auth-audio-toggle"><input id="authAudioToggle" type="checkbox" checked> Audio</label>
+                </div>
+                <div class="auth-video-foot">A short introduction to Maximus · Add your video when ready</div>
+            </div>
+            <div class="auth-form-panel">
+                <form class="auth-form" id="authForm">
+                    <div class="auth-brand"><span class="auth-brand-mark"></span><span>Maximus</span></div>
+                    <h1 id="authTitle">Sign in</h1>
+                    <p class="auth-subtitle" id="authSubtitle">Continue to your private workspace.</p>
+                    <div class="auth-provider-row">
+                        <button type="button" class="auth-provider" onclick="startOAuth('google')"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#4285F4" d="M21.35 12.2c0-.7-.06-1.38-.2-2.02H12v3.83h5.24a4.48 4.48 0 0 1-1.94 2.94v2.45h3.14c1.84-1.69 2.91-4.18 2.91-7.2z"/><path fill="#34A853" d="M12 21.6c2.63 0 4.84-.87 6.45-2.36l-3.14-2.45c-.87.58-1.98.92-3.31.92-2.55 0-4.71-1.72-5.49-4.03H3.26v2.53A9.74 9.74 0 0 0 12 21.6z"/><path fill="#FBBC05" d="M6.51 13.68A5.85 5.85 0 0 1 6.2 12c0-.58.1-1.15.31-1.68V7.79H3.26A9.75 9.75 0 0 0 2.25 12c0 1.57.38 3.05 1.01 4.21l3.25-2.53z"/><path fill="#EA4335" d="M12 6.29c1.43 0 2.71.49 3.72 1.46l2.79-2.79C16.84 3.29 14.63 2.4 12 2.4a9.74 9.74 0 0 0-8.74 5.39l3.25 2.53C7.29 8.01 9.45 6.29 12 6.29z"/></svg>Google</button>
+                        <button type="button" class="auth-provider" onclick="startOAuth('github')"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.04c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.2.08 1.84 1.23 1.84 1.23 1.07 1.83 2.8 1.3 3.48.99.11-.77.42-1.3.76-1.6-2.67-.3-5.47-1.34-5.47-5.95 0-1.31.47-2.38 1.23-3.22-.12-.3-.53-1.52.12-3.18 0 0 1-.32 3.3 1.23a11.48 11.48 0 0 1 6 0c2.3-1.55 3.3-1.23 3.3-1.23.65 1.66.24 2.88.12 3.18.76.84 1.23 1.91 1.23 3.22 0 4.62-2.81 5.65-5.49 5.95.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.57A12 12 0 0 0 12 .5z"/></svg>GitHub</button>
+                    </div>
+                    <div class="auth-divider">or use email</div>
+                    <label class="auth-field"><span>Name</span><input id="authName" autocomplete="name" placeholder="Your name" hidden></label>
+                    <label class="auth-field"><span>Email</span><input id="authEmail" type="email" autocomplete="email" placeholder="you@example.com" required></label>
+                    <label class="auth-field"><span>Password</span><input id="authPassword" type="password" autocomplete="current-password" placeholder="At least 8 characters" minlength="8" required></label>
+                    <div class="auth-password-row"><button type="button" class="auth-forgot" onclick="forgotPassword()">Forgot password?</button><button type="button" class="auth-switch" id="authSwitch" onclick="toggleAuthMode()">Create account</button></div>
+                    <button class="auth-submit" id="authSubmit" type="submit">Sign in</button>
+                    <div class="auth-status" id="authStatus" role="status"></div>
+                    <div class="auth-security"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg><span>Protected by an encrypted, HttpOnly session cookie. Passwords are salted and hashed on the server; provider secrets never reach this page.</span></div>
+                    <div class="auth-footer"><span>Private workspace</span><span>Secure sign-in</span></div>
+                </form>
+            </div>
+        </div>
+    </section>
     <div class="sidebar" id="sidebar">
         <div class="sidebar-header">
             <span class="sidebar-brand">Max</span>
@@ -2305,6 +2381,26 @@
         }
 
         const API_BASE = 'https://ailoops.onrender.com';
+
+        let authSignupMode = false;
+        function setAuthStatus(message, error = true) { const el = document.getElementById('authStatus'); if (el) { el.textContent = message || ''; el.style.color = error ? '#b23b55' : '#3b7d62'; } }
+        function showAuthScreen(show) { const el = document.getElementById('authScreen'); if (el) el.classList.toggle('is-visible', show); }
+        function toggleAuthMode() { authSignupMode = !authSignupMode; document.getElementById('authTitle').textContent = authSignupMode ? 'Create account' : 'Sign in'; document.getElementById('authSubtitle').textContent = authSignupMode ? 'Create your private workspace in seconds.' : 'Continue to your private workspace.'; document.getElementById('authName').hidden = !authSignupMode; document.getElementById('authName').required = authSignupMode; document.getElementById('authPassword').autocomplete = authSignupMode ? 'new-password' : 'current-password'; document.getElementById('authSubmit').textContent = authSignupMode ? 'Create account' : 'Sign in'; document.getElementById('authSwitch').textContent = authSignupMode ? 'I have an account' : 'Create account'; setAuthStatus(''); }
+        function startOAuth(provider) { window.location.href = `${API_BASE}/auth/${provider}`; }
+        async function forgotPassword() { const email = document.getElementById('authEmail').value.trim(); if (!email) { setAuthStatus('Enter your email first.'); return; } setAuthStatus('If an account exists, reset instructions will be sent securely.', false); try { await fetch(`${API_BASE}/auth/forgot-password`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email}), credentials:'include'}); } catch (_) {} }
+        document.getElementById('authForm').addEventListener('submit', async (event) => { event.preventDefault(); const data = { email: document.getElementById('authEmail').value.trim(), password: document.getElementById('authPassword').value }; if (authSignupMode) data.name = document.getElementById('authName').value.trim(); setAuthStatus(''); const button = document.getElementById('authSubmit'); button.disabled = true; try { const response = await fetch(`${API_BASE}/auth/${authSignupMode ? 'signup' : 'login'}`, {method:'POST', headers:{'Content-Type':'application/json'}, credentials:'include', body:JSON.stringify(data)}); const result = await response.json(); if (!response.ok) throw new Error(result.detail || 'Unable to sign in.'); showAuthScreen(false); window.location.reload(); } catch (error) { setAuthStatus(error.message); } finally { button.disabled = false; } });
+        async function bootAuth() { try { const response = await fetch(`${API_BASE}/auth/me`, {credentials:'include'}); const result = await response.json(); showAuthScreen(!result.authenticated); } catch (_) { showAuthScreen(true); } }
+        function setAuthVideoAudio(enabled) {
+            document.querySelectorAll('#authVideoSlot video').forEach(video => { video.muted = !enabled; if (video.paused && video.src) video.play().catch(() => {}); });
+            document.querySelectorAll('#authVideoSlot iframe').forEach(frame => { frame.contentWindow?.postMessage(JSON.stringify({event:'command', func: enabled ? 'unMute' : 'mute', args: []}), 'https://www.youtube.com'); });
+        }
+        function startAuthVideoPlayback() {
+            document.querySelectorAll('#authVideoSlot video').forEach(video => { video.autoplay = true; video.loop = true; video.muted = true; video.playsInline = true; video.play().catch(() => {}); });
+        }
+        document.getElementById('authAudioToggle')?.addEventListener('change', (event) => setAuthVideoAudio(event.target.checked));
+        document.getElementById('authVideoSlot')?.addEventListener('loadedmetadata', startAuthVideoPlayback);
+        startAuthVideoPlayback();
+        bootAuth();
 
         function generateUUID() {
             return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
