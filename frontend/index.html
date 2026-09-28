@@ -72,11 +72,10 @@
                 brightness: 1.65,
                 saturation: 1.6
             };
-            // Keep exactly one VoiceBeam animation loop alive. Running both the
-            // desktop and mobile beams at once was the source of the stutter.
-            const isMobile = window.matchMedia('(max-width: 768px)').matches;
-            const target = isMobile ? mobileMount : mount;
-            const props = isMobile ? mobileBeamProps : beamProps;
+            // Keep exactly one VoiceBeam animation loop alive and place it in
+            // the full conversation screen on both mobile and laptop.
+            const target = mobileMount || mount;
+            const props = mobileMount ? mobileBeamProps : beamProps;
             createRoot(target).render(React.createElement(
                 VoiceBeam,
                 props,
@@ -822,6 +821,22 @@
         .input-box > textarea, .input-box > .attachment-chips, .input-box > .composer-toolbar { position:relative; z-index:1; }
         .voice-mode-btn.voice-glow-mounted::before, .voice-mode-btn.voice-glow-mounted::after, .voice-mode-btn.voice-glow-mounted .voice-mode-pulse { display:none; }
         .mobile-voice-overlay { display:none; }
+        @media (min-width:769px) {
+            .mobile-voice-overlay { position:fixed; inset:0; z-index:80; display:flex; flex-direction:column; justify-content:space-between; padding:44px 56px 30px; background:#171717; }
+            .mobile-voice-overlay[hidden] { display:none; }
+            .mobile-voice-glow-mount { position:absolute; left:-4%; right:-4%; bottom:0; height:430px; z-index:0; pointer-events:none; overflow:visible; }
+            .mobile-voice-glow-mount > div { width:100%; height:100%; }
+            .mobile-voice-copy { position:relative; z-index:1; flex:1; display:flex; flex-direction:column; justify-content:center; align-items:center; width:100%; max-width:1000px; margin:0 auto; text-align:center; padding:20px 20px 150px; }
+            .mobile-voice-transcript { max-width:900px; color:var(--text-primary); font-size:clamp(30px, 3.2vw, 52px); line-height:1.3; font-weight:400; word-break:break-word; text-wrap:balance; }
+            .mobile-voice-controls { position:relative; z-index:2; display:flex; align-items:center; justify-content:center; gap:14px; min-height:62px; width:100%; }
+            .mobile-voice-agent, .mobile-voice-stop, .mobile-voice-close { height:54px; border-radius:999px; border:1px solid rgba(255,255,255,.11); background:rgba(255,255,255,.08); color:var(--text-primary); display:flex; align-items:center; justify-content:center; }
+            .mobile-voice-agent { position:absolute; left:0; padding:0 18px; color:var(--text-secondary); font-size:15px; }
+            .mobile-voice-stop, .mobile-voice-close { width:54px; cursor:pointer; }
+            .mobile-voice-stop { color:#f0c7ff; background:rgba(180,144,202,.18); }
+            .mobile-voice-stop svg { width:24px; height:24px; }
+            .mobile-voice-close { color:var(--text-secondary); }
+            .mobile-voice-close svg { width:22px; height:22px; }
+        }
         @media (max-width:768px) {
             .mobile-voice-overlay { position:fixed; inset:0; z-index:80; display:flex; flex-direction:column; justify-content:space-between; padding:calc(30px + env(safe-area-inset-top)) 20px calc(18px + env(safe-area-inset-bottom)); background:#171717; }
             .mobile-voice-overlay[hidden] { display:none; }
@@ -4278,6 +4293,7 @@
                 try { voiceRecognition.stop(); } catch (error) { /* already stopped */ }
             }
             mobileVoiceTranscriptEl.textContent = text;
+            appendMessage('user', text, []);
             try {
                 const response = await fetch(`${API_BASE}/voice-chat`, {
                     method: 'POST',
@@ -4286,6 +4302,7 @@
                 });
                 const data = await response.json();
                 if (!response.ok) throw new Error(data.detail || 'Voice response failed');
+                appendMessage('assistant', data.response || '', []);
                 mobileVoiceTranscriptEl.textContent = data.response || '';
                 await playVoiceAudioChunks(data.audio || []);
             } catch (error) {
@@ -4305,7 +4322,7 @@
         }
 
         function openMobileVoiceMode() {
-            if (!isMobileVoiceMode() || !mobileVoiceOverlay) return;
+            if (!mobileVoiceOverlay) return;
             const modelLabel = document.getElementById('modelPickerLabel');
             if (mobileVoiceAgent) mobileVoiceAgent.textContent = 'Orpheus English';
             mobileVoiceTranscript = '';
