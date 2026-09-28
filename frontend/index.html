@@ -39,6 +39,57 @@
     <link rel="preconnect" href="https://cdn.jsdelivr.net">
     <link rel="preconnect" href="https://cdnjs.cloudflare.com">
     <link rel="preconnect" href="https://js.puter.com">
+    <script type="module">
+        // Libraries.dev's actual VoiceBeam component, loaded from CDN because this
+        // frontend is a single vanilla HTML file rather than a React build.
+        import React from "https://esm.sh/react@18.3.1?bundle";
+        import { createRoot } from "https://esm.sh/react-dom@18.3.1/client?bundle";
+        import { VoiceBeam } from "https://esm.sh/voice-glow@0.2.1?bundle&deps=react@18.3.1";
+
+        function mountVoiceBeam() {
+            const mount = document.getElementById('voiceGlowMount');
+            const mobileMount = document.getElementById('mobileVoiceGlowMount');
+            const button = document.getElementById('voiceModeBtn');
+            if (!mount || !mobileMount || !button) return;
+            const beamProps = {
+                type: 'default',
+                scale: 1,
+                level: () => Number(window.voiceModeLevel || 0),
+                colorVariant: 'colorful',
+                theme: 'dark',
+                bands: true,
+                flow: 42,
+                idle: 0,
+                attack: 0.22,
+                release: 1.4,
+                active: true
+            };
+            const mobileBeamProps = {
+                ...beamProps,
+                scale: 1.55,
+                reach: 2.2,
+                spread: 1.35,
+                brightness: 1.65,
+                saturation: 1.6
+            };
+            // Keep exactly one VoiceBeam animation loop alive. Running both the
+            // desktop and mobile beams at once was the source of the stutter.
+            const isMobile = window.matchMedia('(max-width: 768px)').matches;
+            const target = isMobile ? mobileMount : mount;
+            const props = isMobile ? mobileBeamProps : beamProps;
+            createRoot(target).render(React.createElement(
+                VoiceBeam,
+                props,
+                React.createElement('div', { className: 'voice-glow-beam-host' })
+            ));
+            button.classList.add('voice-glow-mounted');
+        }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', mountVoiceBeam, { once: true });
+        } else {
+            mountVoiceBeam();
+        }
+    </script>
 
     <!-- A real <link> (rather than a CSS @import inside the <style> block
          below) so the browser discovers and starts fetching this stylesheet
@@ -749,6 +800,44 @@
            the only extra affordance, so it doesn't look like a different
            control, just the same one offering a different action right now. */
         .send-btn.stop-mode:hover:not(:disabled) { background:#ef4444; color:#fff; }
+        /* Voice mode: same 34px × 34px footprint as Send, styled after
+           Libraries.dev voice-glow's centered, bottom-edge beam. */
+        .voice-mode-btn { position:relative; z-index:0; overflow:visible; background:transparent; color:var(--text-secondary); border:1px solid rgba(255,255,255,0.12); border-radius:50%; width:34px; height:34px; display:flex; align-items:center; justify-content:center; cursor:pointer; transition:color 0.2s ease, border-color 0.2s ease, transform 0.2s var(--transition-bezier); flex-shrink:0; }
+        .voice-mode-btn::before, .voice-mode-btn::after { content:""; position:absolute; left:5px; right:5px; bottom:-2px; height:calc(4px + (var(--voice-level, 0) * 22px)); border-radius:50% 50% 45% 45%; pointer-events:none; opacity:0; transform:scaleX(calc(0.7 + (var(--voice-level, 0) * 0.3))); transition:height 0.12s ease, opacity 0.25s ease, transform 0.12s ease; }
+        .voice-mode-btn::before { background:linear-gradient(90deg, #5ee7df, #b490ca 48%, #f7797d); filter:blur(5px); z-index:-2; }
+        .voice-mode-btn::after { background:linear-gradient(90deg, transparent, rgba(255,255,255,0.9) 50%, transparent); filter:blur(1px); z-index:-1; }
+        .voice-mode-btn:hover { color:var(--text-primary); border-color:rgba(255,255,255,0.28); transform:scale(1.06); }
+        .voice-mode-btn:active { transform:scale(0.94); }
+        .voice-mode-btn.is-listening { color:#fff; border-color:rgba(180,144,202,0.7); }
+        .voice-mode-btn.is-listening::before, .voice-mode-btn.is-listening::after { opacity:calc(0.35 + (var(--voice-level, 0) * 0.65)); }
+        .voice-mode-btn svg { width:17px; height:17px; position:relative; z-index:1; }
+        .voice-mode-btn .voice-mode-pulse { position:absolute; inset:-4px; border:1px solid rgba(180,144,202,0.45); border-radius:50%; opacity:0; pointer-events:none; }
+        .voice-mode-btn.is-listening .voice-mode-pulse { opacity:1; animation:voiceModePulse 1.8s ease-out infinite; }
+        @keyframes voiceModePulse { 0% { transform:scale(0.9); opacity:0.65; } 100% { transform:scale(1.45); opacity:0; } }
+        @media (prefers-reduced-motion:reduce) { .voice-mode-btn.is-listening .voice-mode-pulse { animation:none; opacity:0.5; } }
+        .composer-actions { display:flex; align-items:center; gap:6px; flex-shrink:0; }
+        .voice-glow-mount { position:absolute; inset:0; z-index:0; border-radius:inherit; pointer-events:none; overflow:visible; }
+        .voice-glow-mount > div { width:100%; height:100%; border-radius:inherit; }
+        .voice-glow-beam-host { display:block; width:100%; height:100%; border-radius:inherit; }
+        .input-box > textarea, .input-box > .attachment-chips, .input-box > .composer-toolbar { position:relative; z-index:1; }
+        .voice-mode-btn.voice-glow-mounted::before, .voice-mode-btn.voice-glow-mounted::after, .voice-mode-btn.voice-glow-mounted .voice-mode-pulse { display:none; }
+        .mobile-voice-overlay { display:none; }
+        @media (max-width:768px) {
+            .mobile-voice-overlay { position:fixed; inset:0; z-index:80; display:flex; flex-direction:column; justify-content:space-between; padding:calc(30px + env(safe-area-inset-top)) 20px calc(18px + env(safe-area-inset-bottom)); background:#171717; }
+            .mobile-voice-overlay[hidden] { display:none; }
+            .mobile-voice-glow-mount { position:absolute; left:-2%; right:-2%; bottom:0; height:380px; z-index:0; pointer-events:none; overflow:visible; }
+            .mobile-voice-glow-mount > div { width:100%; height:100%; }
+            .mobile-voice-copy { position:relative; z-index:1; flex:1; display:flex; flex-direction:column; justify-content:center; align-items:center; width:100%; max-width:640px; margin:0 auto; text-align:center; padding:20px 10px 120px; }
+            .mobile-voice-transcript { max-width:620px; color:var(--text-primary); font-size:clamp(24px, 5.2vw, 38px); line-height:1.35; font-weight:400; word-break:break-word; text-wrap:balance; }
+            .mobile-voice-controls { position:relative; z-index:2; display:flex; align-items:center; justify-content:center; gap:12px; min-height:58px; width:100%; }
+            .mobile-voice-agent, .mobile-voice-stop, .mobile-voice-close { height:50px; border-radius:999px; border:1px solid rgba(255,255,255,.11); background:rgba(255,255,255,.08); color:var(--text-primary); display:flex; align-items:center; justify-content:center; }
+            .mobile-voice-agent { position:absolute; left:0; padding:0 16px; color:var(--text-secondary); font-size:14px; }
+            .mobile-voice-stop, .mobile-voice-close { width:50px; cursor:pointer; }
+            .mobile-voice-stop { color:#f0c7ff; background:rgba(180,144,202,.18); }
+            .mobile-voice-stop svg { width:22px; height:22px; }
+            .mobile-voice-close { color:var(--text-secondary); }
+            .mobile-voice-close svg { width:20px; height:20px; }
+        }
 
         /* ============== MODEL / EFFORT PICKER (input-attached, ChatGPT/Claude-style) ============== */
         .composer-toolbar { display:flex; align-items:center; justify-content:space-between; margin-top:6px; padding-top:2px; }
@@ -1462,6 +1551,7 @@
 
         <div class="input-container">
             <div class="input-box">
+                <span class="voice-glow-mount" id="voiceGlowMount" aria-hidden="true"></span>
                 <!-- Deep Think live countdown — a single persistent Dynamic
                      Island-style pill floating a small gap above the input
                      box (not per-message; see startDeepThinkCountdown()).
@@ -1574,16 +1664,42 @@
                         </div>
                     </div>
                     </div>
-                    <button class="send-btn" id="sendBtn" onclick="sendMessage()">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                            <line x1="12" y1="19" x2="12" y2="5"></line>
-                            <polyline points="5 12 12 5 19 12"></polyline>
-                        </svg>
-                    </button>
+                    <div class="composer-actions">
+                        <button type="button" class="voice-mode-btn" id="voiceModeBtn" onclick="toggleVoiceMode(event)" title="Voice mode" aria-label="Start voice mode" aria-pressed="false">
+                            <span class="voice-mode-pulse" aria-hidden="true"></span>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <rect x="9" y="3" width="6" height="11" rx="3"></rect>
+                                <path d="M5.5 11a6.5 6.5 0 0 0 13 0"></path>
+                                <path d="M12 17.5V21"></path>
+                                <path d="M8.5 21h7"></path>
+                            </svg>
+                        </button>
+                        <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                <line x1="12" y1="19" x2="12" y2="5"></line>
+                                <polyline points="5 12 12 5 19 12"></polyline>
+                            </svg>
+                        </button>
+                    </div>
                 </div>
             </div>
         </div>
 
+        <section class="mobile-voice-overlay" id="mobileVoiceOverlay" hidden aria-label="Voice mode">
+            <span class="mobile-voice-glow-mount" id="mobileVoiceGlowMount" aria-hidden="true"></span>
+            <div class="mobile-voice-copy">
+                <p class="mobile-voice-transcript" id="mobileVoiceTranscript"></p>
+            </div>
+            <div class="mobile-voice-controls">
+                <span class="mobile-voice-agent" id="mobileVoiceAgent">Agent (auto)</span>
+                <button type="button" class="mobile-voice-stop" onclick="toggleVoiceMode(event)" aria-label="Stop voice mode">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"></path><path d="M5.5 11a6.5 6.5 0 0 0 13 0"></path><path d="M12 17.5V21"></path><path d="M8.5 21h7"></path></svg>
+                </button>
+                <button type="button" class="mobile-voice-close" onclick="stopVoiceMode()" aria-label="Close voice mode">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"></path></svg>
+                </button>
+            </div>
+        </section>
         <!-- Model / Temperature / Reasoning source-of-truth fields. These are the
              exact same elements sendMessage() has always read by id — only their
              location changed (out of the sidebar, into the composer) and they're
@@ -2212,6 +2328,7 @@
         openingSubtitle.textContent = MODE_COPY.chat.subtitle;
         const userInput = document.getElementById('userInput');
         const sendBtn = document.getElementById('sendBtn');
+        const voiceModeBtn = document.getElementById('voiceModeBtn');
         const modeToggle = document.getElementById('modeToggle');
         // Position the pill under "Chat" (the initially-active button) once the
         // toggle has real layout — updateModePill() itself is defined further
@@ -4121,6 +4238,184 @@
         // and toggles .stop-mode for the (red, square-icon) styling.
         const SEND_ICON_HTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>';
         const STOP_ICON_HTML = '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2.5"></rect></svg>';
+        // Mirrors voice-glow's level-driven behavior for this vanilla frontend.
+        let voiceStream = null;
+        let voiceAudioContext = null;
+        let voiceAnalyser = null;
+        let voiceLevelFrame = null;
+        let voiceLevelData = null;
+        let voiceSmoothedLevel = 0;
+        let voiceRecognition = null;
+        let voiceRecognitionPaused = false;
+        let voiceTurnTimer = null;
+        let mobileVoiceTranscript = '';
+        let voiceAudio = null;
+        const mobileVoiceOverlay = document.getElementById('mobileVoiceOverlay');
+        const mobileVoiceTranscriptEl = document.getElementById('mobileVoiceTranscript');
+        const mobileVoiceAgent = document.getElementById('mobileVoiceAgent');
+        function isMobileVoiceMode() { return window.matchMedia && window.matchMedia('(max-width: 768px)').matches; }
+        function playVoiceAudioChunks(chunks) {
+            return new Promise((resolve) => {
+                let index = 0;
+                const playNext = () => {
+                    if (!chunks || index >= chunks.length) { resolve(); return; }
+                    voiceAudio = new Audio(`data:audio/wav;base64,${chunks[index++]}`);
+                    voiceAudio.onended = playNext;
+                    voiceAudio.onerror = playNext;
+                    voiceAudio.play().catch(playNext);
+                };
+                playNext();
+            });
+        }
+        async function submitVoiceTurn() {
+            const text = mobileVoiceTranscript.trim();
+            if (!text || !voiceStream) return;
+            mobileVoiceTranscript = '';
+            if (voiceTurnTimer) { clearTimeout(voiceTurnTimer); voiceTurnTimer = null; }
+            voiceRecognitionPaused = true;
+            if (voiceRecognition) {
+                voiceRecognition.onend = null;
+                try { voiceRecognition.stop(); } catch (error) { /* already stopped */ }
+            }
+            mobileVoiceTranscriptEl.textContent = text;
+            try {
+                const response = await fetch(`${API_BASE}/voice-chat`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: text, session_id: modes.chat.sessionId, voice: 'hannah' })
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || 'Voice response failed');
+                mobileVoiceTranscriptEl.textContent = data.response || '';
+                await playVoiceAudioChunks(data.audio || []);
+            } catch (error) {
+                mobileVoiceTranscriptEl.textContent = 'Voice response unavailable.';
+                console.warn('Voice chat failed:', error);
+            } finally {
+                voiceRecognitionPaused = false;
+                if (voiceStream && mobileVoiceOverlay && !mobileVoiceOverlay.hidden && voiceRecognition) {
+                    voiceRecognition.onend = () => {
+                        if (voiceStream && !voiceRecognitionPaused && !mobileVoiceOverlay.hidden) {
+                            try { voiceRecognition.start(); } catch (restartError) { /* already listening */ }
+                        }
+                    };
+                    try { voiceRecognition.start(); } catch (error) { /* already listening */ }
+                }
+            }
+        }
+
+        function openMobileVoiceMode() {
+            if (!isMobileVoiceMode() || !mobileVoiceOverlay) return;
+            const modelLabel = document.getElementById('modelPickerLabel');
+            if (mobileVoiceAgent) mobileVoiceAgent.textContent = 'Orpheus English';
+            mobileVoiceTranscript = '';
+            mobileVoiceTranscriptEl.textContent = '';
+            mobileVoiceOverlay.hidden = false;
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRecognition) return;
+            voiceRecognition = new SpeechRecognition();
+            voiceRecognition.continuous = true;
+            voiceRecognition.interimResults = true;
+            voiceRecognition.lang = document.documentElement.lang || 'en-US';
+            voiceRecognition.onresult = (event) => {
+                let interim = '';
+                for (let i = event.resultIndex; i < event.results.length; i++) {
+                    const phrase = event.results[i][0].transcript;
+                    if (event.results[i].isFinal) mobileVoiceTranscript += phrase + ' ';
+                    else interim += phrase;
+                }
+                mobileVoiceTranscriptEl.textContent = (mobileVoiceTranscript + interim).trim();
+                if (mobileVoiceTranscript.trim()) {
+                    if (voiceTurnTimer) clearTimeout(voiceTurnTimer);
+                    voiceTurnTimer = setTimeout(submitVoiceTurn, 850);
+                }
+            };
+            voiceRecognition.onerror = () => {};
+            voiceRecognition.onend = () => {
+                if (voiceStream && !voiceRecognitionPaused && mobileVoiceOverlay && !mobileVoiceOverlay.hidden) {
+                    try { voiceRecognition.start(); } catch (error) { /* already restarting */ }
+                }
+            };
+            try { voiceRecognition.start(); } catch (error) { /* browser may already be listening */ }
+        }
+        function closeMobileVoiceMode() {
+            if (voiceTurnTimer) { clearTimeout(voiceTurnTimer); voiceTurnTimer = null; }
+            if (voiceAudio) { voiceAudio.pause(); voiceAudio = null; }
+            voiceRecognitionPaused = true;
+            if (voiceRecognition) {
+                voiceRecognition.onend = null;
+                try { voiceRecognition.stop(); } catch (error) { /* already stopped */ }
+            }
+            voiceRecognition = null;
+            if (mobileVoiceOverlay) mobileVoiceOverlay.hidden = true;
+        }
+        function setVoiceLevel(level) {
+            const normalized = Math.max(0, Math.min(1, level));
+            // Keep the hot path off the DOM; VoiceBeam samples this shared value
+            // directly on its own animation frame for high-refresh displays.
+            window.voiceModeLevel = normalized;
+            if (!voiceModeBtn.classList.contains('voice-glow-mounted')) {
+                voiceModeBtn.style.setProperty('--voice-level', normalized.toFixed(3));
+            }
+        }
+        function stopVoiceMode() {
+            closeMobileVoiceMode();
+            if (voiceLevelFrame) cancelAnimationFrame(voiceLevelFrame);
+            voiceLevelFrame = null;
+            if (voiceStream) voiceStream.getTracks().forEach(track => track.stop());
+            voiceStream = null;
+            if (voiceAudioContext && voiceAudioContext.state !== 'closed') voiceAudioContext.close();
+            voiceAudioContext = null;
+            voiceAnalyser = null;
+            voiceLevelData = null;
+            voiceSmoothedLevel = 0;
+            setVoiceLevel(0);
+            voiceModeBtn.classList.remove('is-listening');
+            voiceModeBtn.setAttribute('aria-pressed', 'false');
+            voiceModeBtn.setAttribute('aria-label', 'Start voice mode');
+            voiceModeBtn.title = 'Voice mode';
+        }
+        function sampleVoiceLevel() {
+            if (!voiceAnalyser || !voiceLevelData) return;
+            voiceAnalyser.getByteTimeDomainData(voiceLevelData);
+            let sum = 0;
+            for (let i = 0; i < voiceLevelData.length; i++) {
+                const sample = (voiceLevelData[i] - 128) / 128;
+                sum += sample * sample;
+            }
+            // Boost conversational microphone levels so the beam visibly rises
+            // even when browser input gain is conservative.
+            const targetLevel = Math.min(1, Math.sqrt(sum / voiceLevelData.length) * 14);
+            voiceSmoothedLevel += (targetLevel - voiceSmoothedLevel) * 0.18;
+            setVoiceLevel(voiceSmoothedLevel);
+            voiceLevelFrame = requestAnimationFrame(sampleVoiceLevel);
+        }
+        async function toggleVoiceMode(event) {
+            if (event) event.preventDefault();
+            if (voiceStream) { stopVoiceMode(); return; }
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                voiceModeBtn.title = 'Microphone is not supported in this browser';
+                return;
+            }
+            try {
+                voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                voiceAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+                voiceAnalyser = voiceAudioContext.createAnalyser();
+                voiceAnalyser.fftSize = 256;
+                voiceLevelData = new Uint8Array(voiceAnalyser.fftSize);
+                voiceAudioContext.createMediaStreamSource(voiceStream).connect(voiceAnalyser);
+                voiceModeBtn.classList.add('is-listening');
+                voiceModeBtn.setAttribute('aria-pressed', 'true');
+                voiceModeBtn.setAttribute('aria-label', 'Stop voice mode');
+                voiceModeBtn.title = 'Stop voice mode';
+                openMobileVoiceMode();
+                sampleVoiceLevel();
+            } catch (error) {
+                stopVoiceMode();
+                voiceModeBtn.title = 'Microphone permission is required for voice mode';
+                console.warn('Voice mode could not access the microphone:', error);
+            }
+        }
 
         function setSendButtonGenerating(isGenerating) {
             sendBtn.innerHTML = isGenerating ? STOP_ICON_HTML : SEND_ICON_HTML;

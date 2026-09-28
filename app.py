@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import re
 import difflib
 import asyncio
@@ -22,6 +23,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse, Response
+import httpx
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
@@ -41,6 +43,8 @@ if not os.getenv("NVIDIA_API_KEY"):
     print("WARNING: NVIDIA_API_KEY not found in environment. The API calls will fail.")
 if not os.getenv("TAVILY_API_KEY"):
     print("WARNING: TAVILY_API_KEY not found in environment. Web search will be disabled.")
+if not os.getenv("GROQ_API_KEY"):
+    print("WARNING: GROQ_API_KEY not found in environment. Voice mode audio will be disabled.")
 if not sandbox_manager.sandbox_configured():
     print("WARNING: E2B_API_KEY not found in environment. The live sandbox will be disabled.")
 
@@ -1307,6 +1311,11 @@ class ChatRequest(BaseModel):
     # in this session — upload once, ask about it across multiple turns.
     attachment_ids: Optional[List[str]] = None
 
+
+class VoiceChatRequest(BaseModel):
+    message: str
+    session_id: str
+    voice: str = "hannah"
 
 class ChatEstimateRequest(BaseModel):
     """Chat mode only. Cheap, no-LLM-call estimate of how long a turn with
@@ -3191,6 +3200,91 @@ async def chat_estimate(request: ChatEstimateRequest):
         "estimated_seconds": estimate_response_seconds(model_name, budget),
         "thinking_level": config["label"],
         "max_tokens": budget,
+    }
+
+
+GROQ_TTS_MODEL = "canopylabs/orpheus-v1-english"
+GROQ_TTS_URL = "https://api.groq.com/openai/v1/audio/speech"
+GROQ_TTS_MAX_CHARS = 190
+
+
+def _split_voice_text(text: str, limit: int = GROQ_TTS_MAX_CHARS) -> List[str]:
+    """Split assistant text into Orpheus-safe chunks without cutting words."""
+    clean = re.sub(r"```[\s\S]*?```", "", text or "")
+    clean = re.sub(r"[*_`#>]", "", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    if not clean:
+        return []
+    chunks, current = [], ""
+    for sentence in re.split(r"(?<=[.!?])\s+", clean):
+        words = sentence.split()
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if current and len(candidate) > limit:
+                chunks.append(current)
+                current = word
+            else:
+                current = candidate
+        if current and len(current) >= limit - 12:
+            chunks.append(current)
+            current = ""
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def _groq_orpheus_audio(text: str, voice: str) -> List[str]:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="Voice mode is not configured: GROQ_API_KEY is missing.")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    audio_chunks = []
+    async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
+        for chunk in _split_voice_text(text):
+            response = await client.post(GROQ_TTS_URL, headers=headers, json={
+                "model": GROQ_TTS_MODEL,
+                "input": chunk,
+                "voice": voice if voice in {"autumn", "diana", "hannah", "austin", "daniel", "troy"} else "hannah",
+                "response_format": "wav",
+            })
+            if response.is_error:
+                detail = response.text[:500]
+                raise HTTPException(status_code=502, detail=f"Groq voice generation failed: {detail}")
+            audio_chunks.append(base64.b64encode(response.content).decode("ascii"))
+    return audio_chunks
+
+
+@app.post("/voice-chat")
+async def voice_chat(request: VoiceChatRequest):
+    """Generate a normal chat reply, then synthesize it with Groq Orpheus English."""
+    if not os.getenv("GROQ_API_KEY"):
+        raise HTTPException(status_code=503, detail="Voice mode is not configured: GROQ_API_KEY is missing.")
+    session = get_session(request.session_id)
+    session["messages"] = trim_memory(session["messages"])
+    session["messages"].append(HumanMessage(content=request.message))
+    chat_request = ChatRequest(
+        message=request.message,
+        session_id=request.session_id,
+        model_type="fast",
+        stream=False,
+        temperature=0.4,
+        thinking_level="low",
+        deep_think=False,
+    )
+    try:
+        response = await generate_response_once(chat_request, session, [])
+    except Exception as exc:
+        print(f"[{request.session_id}] Voice response generation failed: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail="The voice assistant could not generate a response.") from exc
+    session["messages"].append(AIMessage(content=response))
+    audio = await _groq_orpheus_audio(response, request.voice)
+    return {
+        "response": response,
+        "audio": audio,
+        "audio_mime": "audio/wav",
+        "voice_model": GROQ_TTS_MODEL,
+        "session_id": request.session_id,
     }
 
 
