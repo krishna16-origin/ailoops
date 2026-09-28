@@ -829,14 +829,14 @@
             .mobile-voice-overlay[hidden] { display:none; }
             .mobile-voice-glow-mount { position:absolute; left:-4%; right:-4%; bottom:0; height:430px; z-index:0; pointer-events:none; overflow:visible; }
             .mobile-voice-glow-mount > div { width:100%; height:100%; }
-            .mobile-voice-copy { position:relative; z-index:1; flex:1; display:flex; flex-direction:column; justify-content:center; align-items:center; width:100%; max-width:1000px; margin:0 auto; text-align:center; padding:20px 20px 150px; }
-            .voice-conversation { width:min(900px, 100%); height:100%; overflow-y:auto; overscroll-behavior:contain; display:flex; flex-direction:column; gap:18px; padding:30px 8px 24px; scrollbar-width:thin; scrollbar-color:rgba(255,255,255,.22) transparent; }
+            .mobile-voice-copy { position:relative; z-index:1; flex:1 1 auto; min-height:0; display:flex; flex-direction:column; justify-content:center; align-items:center; width:100%; max-width:1000px; margin:0 auto; text-align:center; padding:20px 20px 150px; }
+            .voice-conversation { display:none; width:min(900px, 100%); height:100%; min-height:0; overflow-y:auto; overscroll-behavior:contain; display:flex; flex-direction:column; gap:18px; padding:30px 8px 24px; scrollbar-width:thin; scrollbar-color:rgba(255,255,255,.22) transparent; }
             .voice-conversation-message { max-width:72%; padding:10px 14px; color:var(--text-primary); font-size:15px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; }
             .voice-conversation-message.user { align-self:flex-end; background:var(--bg-input); border:1px solid var(--border-color); border-radius:18px 18px 5px 18px; }
             .voice-conversation-message.assistant { align-self:flex-start; padding-left:2px; padding-right:20px; }
             .voice-conversation-message.is-streaming::after { content:""; display:inline-block; width:6px; height:15px; margin-left:3px; vertical-align:-2px; border-radius:2px; background:var(--text-secondary); animation:voiceTypingCaret .8s ease-in-out infinite; }
             @keyframes voiceTypingCaret { 0%,100% { opacity:.2; } 50% { opacity:1; } }
-            .mobile-voice-controls { position:relative; z-index:2; display:flex; align-items:center; justify-content:center; gap:14px; min-height:62px; width:100%; }
+            .mobile-voice-controls { position:relative; z-index:2; flex:0 0 auto; display:flex; align-items:center; justify-content:center; gap:14px; min-height:62px; width:100%; }
             .mobile-voice-agent, .mobile-voice-stop, .mobile-voice-close { height:54px; border-radius:999px; border:1px solid rgba(255,255,255,.11); background:rgba(255,255,255,.08); color:var(--text-primary); display:flex; align-items:center; justify-content:center; }
             .mobile-voice-agent { position:absolute; left:0; padding:0 18px; color:var(--text-secondary); font-size:15px; }
             .mobile-voice-stop, .mobile-voice-close { width:54px; cursor:pointer; }
@@ -844,7 +844,7 @@
             .mobile-voice-stop svg { width:24px; height:24px; }
             .mobile-voice-close { color:var(--text-secondary); }
             .mobile-voice-close svg { width:22px; height:22px; }
-                  .desktop-voice-composer { position:relative; z-index:2; display:flex; flex-direction:column; align-items:stretch; width:100%; max-width:820px; min-height:0; margin:0 auto 22px; padding:11px 15px; border:1px solid var(--border-color); border-radius:22px; background-color:var(--bg-input); box-shadow:0 4px 20px rgba(0,0,0,.15); overflow:visible; transition:border-color .25s ease, box-shadow .25s ease; }
+                  .desktop-voice-composer { position:relative; z-index:2; flex:0 0 auto; display:flex; flex-direction:column; align-items:stretch; width:100%; max-width:820px; min-height:0; margin:0 auto 22px; padding:11px 15px; border:1px solid var(--border-color); border-radius:22px; background-color:var(--bg-input); box-shadow:0 4px 20px rgba(0,0,0,.15); overflow:visible; transition:border-color .25s ease, box-shadow .25s ease; }
             .desktop-voice-glow-mount { position:absolute; inset:0; z-index:0; border-radius:inherit; pointer-events:none; overflow:visible; }
             .desktop-voice-glow-mount > div { width:100%; height:100%; border-radius:inherit; }
             .desktop-voice-composer:focus-within { border-color:rgba(255,255,255,.3); box-shadow:0 4px 24px rgba(0,0,0,.22); }
@@ -862,7 +862,7 @@
             .mobile-voice-glow-mount { position:absolute; left:-2%; right:-2%; bottom:0; height:380px; z-index:0; pointer-events:none; overflow:visible; }
             .mobile-voice-glow-mount > div { width:100%; height:100%; }
             .mobile-voice-copy { position:relative; z-index:1; flex:1; display:flex; flex-direction:column; justify-content:center; align-items:center; width:100%; max-width:640px; margin:0 auto; text-align:center; padding:20px 10px 120px; }
-            .voice-conversation { width:100%; height:100%; overflow-y:auto; overscroll-behavior:contain; display:flex; flex-direction:column; gap:14px; padding:18px 2px 24px; scrollbar-width:thin; scrollbar-color:rgba(255,255,255,.22) transparent; }
+            .voice-conversation { display:none; width:100%; height:100%; overflow-y:auto; overscroll-behavior:contain; display:flex; flex-direction:column; gap:14px; padding:18px 2px 24px; scrollbar-width:thin; scrollbar-color:rgba(255,255,255,.22) transparent; }
             .voice-conversation-message { max-width:82%; padding:8px 12px; color:var(--text-primary); font-size:14px; line-height:1.48; white-space:pre-wrap; overflow-wrap:anywhere; }
             .voice-conversation-message.user { align-self:flex-end; background:var(--bg-input); border:1px solid var(--border-color); border-radius:16px 16px 4px 16px; }
             .voice-conversation-message.assistant { align-self:flex-start; padding-left:1px; padding-right:12px; }
@@ -4298,6 +4298,9 @@
         let voiceTurnTimer = null;
         let mobileVoiceTranscript = '';
         let voiceAudio = null;
+        let voiceReplyLevel = 0;
+        let voiceReplyGlowFrame = null;
+        let voiceReplyGlowActive = false;
         const mobileVoiceOverlay = document.getElementById('mobileVoiceOverlay');
         const mobileVoiceConversation = document.getElementById('mobileVoiceConversation');
         const mobileVoiceAgent = document.getElementById('mobileVoiceAgent');
@@ -4322,11 +4325,30 @@
             element.classList.remove('is-streaming');
         }
         function isMobileVoiceMode() { return window.matchMedia && window.matchMedia('(max-width: 768px)').matches; }
+        function animateVoiceReplyGlow(timestamp) {
+            if (!voiceReplyGlowActive) return;
+            const pulse = 0.22 + (Math.sin(timestamp / 105) * 0.13) + (Math.sin(timestamp / 43) * 0.06);
+            voiceReplyLevel += (Math.max(0.08, Math.min(0.72, pulse)) - voiceReplyLevel) * 0.18;
+            voiceReplyGlowFrame = requestAnimationFrame(animateVoiceReplyGlow);
+        }
+        function startVoiceReplyGlow() {
+            if (voiceReplyGlowActive) return;
+            voiceReplyGlowActive = true;
+            voiceReplyGlowFrame = requestAnimationFrame(animateVoiceReplyGlow);
+        }
+        function stopVoiceReplyGlow() {
+            voiceReplyGlowActive = false;
+            if (voiceReplyGlowFrame) cancelAnimationFrame(voiceReplyGlowFrame);
+            voiceReplyGlowFrame = null;
+            voiceReplyLevel = 0;
+        }
+
         function playVoiceAudioChunks(chunks) {
             return new Promise((resolve) => {
                 let index = 0;
+                if (chunks && chunks.length) startVoiceReplyGlow();
                 const playNext = () => {
-                    if (!chunks || index >= chunks.length) { resolve(); return; }
+                    if (!chunks || index >= chunks.length) { stopVoiceReplyGlow(); resolve(); return; }
                     voiceAudio = new Audio(`data:audio/wav;base64,${chunks[index++]}`);
                     voiceAudio.onended = playNext;
                     voiceAudio.onerror = playNext;
@@ -4425,6 +4447,7 @@
             try { voiceRecognition.start(); } catch (error) { /* browser may already be listening */ }
         }
         function closeMobileVoiceMode() {
+            stopVoiceReplyGlow();
             if (voiceTurnTimer) { clearTimeout(voiceTurnTimer); voiceTurnTimer = null; }
             if (voiceAudio) { voiceAudio.pause(); voiceAudio = null; }
             voiceRecognitionPaused = true;
@@ -4471,7 +4494,8 @@
             }
             // Boost conversational microphone levels so the beam visibly rises
             // even when browser input gain is conservative.
-            const targetLevel = Math.min(1, Math.sqrt(sum / voiceLevelData.length) * 14);
+            const microphoneLevel = Math.min(1, Math.sqrt(sum / voiceLevelData.length) * 14);
+            const targetLevel = Math.max(microphoneLevel, voiceReplyLevel);
             voiceSmoothedLevel += (targetLevel - voiceSmoothedLevel) * 0.18;
             setVoiceLevel(voiceSmoothedLevel);
             voiceLevelFrame = requestAnimationFrame(sampleVoiceLevel);
