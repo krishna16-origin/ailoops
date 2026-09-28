@@ -1406,10 +1406,15 @@
                 <div class="auth-video-kicker">A calmer way to think, create, and move forward.</div>
                 <h2 class="auth-video-title">Your ideas,<br>in motion.</h2>
                 <div class="auth-video-slot" id="authVideoSlot">
-                    <div class="auth-video-placeholder" id="authVideoPlaceholder">Your YouTube Short goes here<br><small>9:16 portrait slot · 320 × 569</small></div>
-                    <!-- Add your video by replacing the placeholder with either:
-                         <video id="authVideo" src="/your-video.mp4" autoplay muted loop playsinline></video>
-                         or a YouTube iframe using autoplay=1, mute=1, loop=1, playlist=VIDEO_ID, playsinline=1, enablejsapi=1. -->
+                    <video
+                           id="authVideo"
+                           src="/frontend/your-video.mp4"
+                           autoplay
+                           muted
+                           loop
+                           playsinline
+                           preload="auto">
+                       </video>
                     <label class="auth-audio-toggle"><input id="authAudioToggle" type="checkbox" checked> Audio</label>
                 </div>
                 <div class="auth-video-foot">A short introduction to Maximus · Add your video when ready</div>
