@@ -1314,43 +1314,45 @@
         .ui-tooltip.show { opacity:1; visibility:visible; transform:translateY(0); }
 
         /* ============== AUTHENTICATION SCREEN ============== */
-        .auth-screen { position:fixed; inset:0; z-index:10000; display:none; align-items:center; justify-content:center; padding:28px; background:radial-gradient(circle at 18% 15%, rgba(196,113,237,.12), transparent 34%), var(--bg-main); overflow:auto; }
+        .auth-screen { position:fixed; inset:0; z-index:10000; display:none; align-items:center; justify-content:center; padding:20px; background:radial-gradient(circle at 18% 15%, rgba(196,113,237,.12), transparent 34%), var(--bg-main); overflow:auto; }
         .auth-screen.is-visible { display:flex; }
-        .auth-shell { width:min(1120px, 100%); min-height:min(700px, calc(100vh - 56px)); display:grid; grid-template-columns:minmax(300px, .94fr) minmax(380px, 1.06fr); overflow:hidden; border:1px solid rgba(255,255,255,.13); border-radius:30px; background:#191919; box-shadow:0 30px 100px rgba(0,0,0,.55), 0 0 80px rgba(196,113,237,.08); }
-        .auth-video-panel { position:relative; display:flex; align-items:center; justify-content:center; min-height:100%; padding:28px; background:#17151a; overflow:hidden; }
-        .auth-video-panel::before { content:""; position:absolute; inset:0; background:radial-gradient(circle at 50% 50%, rgba(196,113,237,.12), transparent 54%); pointer-events:none; }
-        .auth-video-slot { position:relative; z-index:1; width:min(100%, 380px); height:min(620px, calc(100vh - 112px)); min-height:420px; border:1px solid rgba(255,255,255,.12); border-radius:24px; background:#101015; box-shadow:0 18px 55px rgba(0,0,0,.42), 0 0 30px rgba(196,113,237,.08); overflow:hidden; }
-        .auth-video-slot iframe, .auth-video-slot video { display:block; width:100%; height:100%; border:0; object-fit:contain; background:#101015; }
+        .auth-screen > .auth-shell { margin:auto; }
+        .auth-shell { width:min(860px, 100%); height:auto; max-height:calc(100dvh - 40px); display:grid; grid-template-columns:minmax(240px, .85fr) minmax(320px, 1.15fr); overflow:hidden; border:1px solid rgba(255,255,255,.13); border-radius:24px; background:#191919; box-shadow:0 30px 100px rgba(0,0,0,.55), 0 0 80px rgba(196,113,237,.08); }
+        .auth-video-panel { position:relative; display:block; min-height:0; padding:0; background:#101015; overflow:hidden; }
+        
+        .auth-video-slot { position:absolute; inset:0; width:100%; height:100%; max-height:none; aspect-ratio:auto; border:0; border-radius:0; background:#101015; box-shadow:none; overflow:hidden; }
+        .auth-video-slot iframe, .auth-video-slot video { position:absolute; inset:0; display:block; width:100%; height:100%; border:0; object-fit:cover; background:#101015; }
         .auth-video-placeholder { display:flex; height:100%; align-items:center; justify-content:center; padding:28px; color:rgba(242,236,248,.44); text-align:center; font-size:12px; line-height:1.5; }
         .auth-video-placeholder small { color:rgba(242,236,248,.3); }
         .auth-audio-toggle { position:absolute; z-index:2; right:14px; bottom:14px; display:flex; align-items:center; gap:8px; padding:9px 12px; border:1px solid rgba(255,255,255,.14); border-radius:999px; color:#eee8f4; background:rgba(20,18,25,.86); backdrop-filter:blur(12px); cursor:pointer; font-size:12px; }
         .auth-audio-toggle input { accent-color:var(--accent); }
-        .auth-form-panel { display:flex; align-items:center; justify-content:center; padding:54px clamp(30px, 7vw, 88px); background:#1b1920; color:#f1ebf5; }
-        .auth-form { width:min(390px, 100%); }
-        .auth-brand { display:flex; align-items:center; gap:9px; margin-bottom:58px; color:#f1ebf5; font-size:18px; font-weight:600; letter-spacing:-.04em; }
+        .auth-form-panel { display:flex; align-items:center; justify-content:center; padding:28px clamp(24px, 4vw, 44px); overflow-y:auto; background:#1b1920; color:#f1ebf5; }
+        .auth-form { width:min(340px, 100%); }
+        .auth-brand { display:flex; align-items:center; gap:9px; margin-bottom:22px; color:#f1ebf5; font-size:17px; font-weight:600; letter-spacing:-.04em; }
         .auth-brand-mark { width:24px; height:24px; border-radius:8px; background:linear-gradient(135deg,#c471ed,#4facfe 55%,#f64f59); box-shadow:0 5px 16px rgba(196,113,237,.35); }
-        .auth-form h1 { margin-bottom:9px; color:#f1ebf5; font-size:clamp(30px, 4vw, 42px); font-weight:500; letter-spacing:-.06em; }
-        .auth-subtitle { margin-bottom:26px; color:rgba(241,235,245,.56); font-size:13px; line-height:1.5; }
+        .auth-form h1 { margin-bottom:6px; color:#f1ebf5; font-size:clamp(24px, 3vw, 30px); font-weight:500; letter-spacing:-.06em; }
+        .auth-subtitle { margin-bottom:16px; color:rgba(241,235,245,.56); font-size:13px; line-height:1.5; }
         .auth-provider-row { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:18px; }
-        .auth-provider, .auth-submit { min-height:44px; border:1px solid rgba(255,255,255,.13); border-radius:12px; background:#24212a; color:#f1ebf5; cursor:pointer; font:inherit; font-size:13px; transition:transform .2s var(--transition-bezier), box-shadow .2s, border-color .2s; }
+        .auth-provider, .auth-submit { min-height:40px; border:1px solid rgba(255,255,255,.13); border-radius:12px; background:#24212a; color:#f1ebf5; cursor:pointer; font:inherit; font-size:13px; transition:transform .2s var(--transition-bezier), box-shadow .2s, border-color .2s; }
         .auth-provider { display:flex; align-items:center; justify-content:center; gap:8px; }
         .auth-provider:hover, .auth-submit:hover { transform:translateY(-1px); border-color:rgba(196,113,237,.62); box-shadow:0 8px 18px rgba(0,0,0,.22); }
         .auth-provider svg { width:17px; height:17px; }
-        .auth-divider { display:flex; align-items:center; gap:12px; margin:20px 0; color:rgba(241,235,245,.4); font-size:11px; }
+        .auth-divider { display:flex; align-items:center; gap:12px; margin:14px 0; color:rgba(241,235,245,.4); font-size:11px; }
         .auth-divider::before, .auth-divider::after { content:""; height:1px; flex:1; background:rgba(255,255,255,.1); }
-        .auth-field { display:block; margin-bottom:12px; }
+        .auth-field { display:block; margin-bottom:9px; }
+        .auth-field[hidden] { display:none; }
         .auth-field span { display:block; margin:0 0 7px 2px; color:rgba(241,235,245,.55); font-size:11px; }
-        .auth-field input { width:100%; height:45px; padding:0 14px; border:1px solid rgba(255,255,255,.13); border-radius:12px; outline:0; background:#24212a; color:#f1ebf5; font:inherit; font-size:13px; transition:border-color .2s, box-shadow .2s; }
+        .auth-field input { width:100%; height:40px; padding:0 14px; border:1px solid rgba(255,255,255,.13); border-radius:12px; outline:0; background:#24212a; color:#f1ebf5; font:inherit; font-size:13px; transition:border-color .2s, box-shadow .2s; }
         .auth-field input::placeholder { color:rgba(241,235,245,.34); }
         .auth-field input:focus { border-color:#a56bc6; box-shadow:0 0 0 3px rgba(165,107,198,.16); }
         .auth-password-row { display:flex; align-items:center; justify-content:space-between; gap:10px; }
         .auth-forgot, .auth-switch { border:0; background:none; color:#c991df; cursor:pointer; font:inherit; font-size:11px; }
         .auth-submit { width:100%; margin-top:8px; border:0; color:#fff; background:linear-gradient(100deg,#9b62bd,#c94c64); }
         .auth-status { min-height:18px; margin-top:12px; color:#ec849c; font-size:12px; line-height:1.4; }
-        .auth-security { display:flex; gap:8px; margin-top:26px; padding-top:17px; border-top:1px solid rgba(255,255,255,.1); color:rgba(241,235,245,.42); font-size:10px; line-height:1.5; }
+        .auth-security { display:flex; gap:8px; margin-top:16px; padding-top:12px; border-top:1px solid rgba(255,255,255,.1); color:rgba(241,235,245,.42); font-size:10px; line-height:1.5; }
         .auth-security svg { flex:0 0 15px; margin-top:1px; }
-        .auth-footer { display:flex; justify-content:space-between; margin-top:32px; color:rgba(241,235,245,.38); font-size:10px; }
-        @media (max-width:760px) { .auth-screen { align-items:stretch; padding:12px; } .auth-shell { min-height:calc(100vh - 24px); grid-template-columns:1fr; border-radius:22px; } .auth-video-panel { min-height:56vh; padding:18px; } .auth-video-slot { width:min(78vw, 300px); height:min(56vh, 520px); min-height:280px; border-radius:18px; } .auth-form-panel { padding:36px 24px; } .auth-brand { margin-bottom:34px; } .auth-form h1 { font-size:32px; } }
+        .auth-footer { display:flex; justify-content:space-between; margin-top:14px; color:rgba(241,235,245,.38); font-size:10px; }
+        @media (max-width:760px) { .auth-screen { padding:12px; } .auth-shell { width:min(400px, 100%); max-height:none; grid-template-columns:1fr; border-radius:20px; } .auth-video-panel { height:min(30dvh, 240px); padding:0; } .auth-video-slot { border-radius:0; } .auth-form-panel { padding:14px 22px 18px; } .auth-brand { display:none; } .auth-security, .auth-footer { display:none; } .auth-subtitle { margin-bottom:12px; } }
     </style>
 </head>
 <body>
@@ -1405,14 +1407,15 @@
                 <div class="auth-video-slot" id="authVideoSlot">
                     <video
                            id="authVideo"
-                           src="/frontend/maxi.mp4"
                            autoplay
                            muted
                            loop
                            playsinline
+                           webkit-playsinline
+                           disablepictureinpicture
                            preload="auto">
+                           <source src="/frontend/maxi.mp4" type="video/mp4">
                        </video>
-                    <label class="auth-audio-toggle"><input id="authAudioToggle" type="checkbox" checked> Audio</label>
                 </div>
             </div>
             <div class="auth-form-panel">
@@ -1425,7 +1428,7 @@
                         <button type="button" class="auth-provider" onclick="startOAuth('github')"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5a12 12 0 0 0-3.79 23.39c.6.11.82-.26.82-.58v-2.04c-3.34.73-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.09-.75.08-.73.08-.73 1.2.08 1.84 1.23 1.84 1.23 1.07 1.83 2.8 1.3 3.48.99.11-.77.42-1.3.76-1.6-2.67-.3-5.47-1.34-5.47-5.95 0-1.31.47-2.38 1.23-3.22-.12-.3-.53-1.52.12-3.18 0 0 1-.32 3.3 1.23a11.48 11.48 0 0 1 6 0c2.3-1.55 3.3-1.23 3.3-1.23.65 1.66.24 2.88.12 3.18.76.84 1.23 1.91 1.23 3.22 0 4.62-2.81 5.65-5.49 5.95.43.37.81 1.1.81 2.22v3.29c0 .32.22.69.83.57A12 12 0 0 0 12 .5z"/></svg>GitHub</button>
                     </div>
                     <div class="auth-divider">or use email</div>
-                    <label class="auth-field"><span>Name</span><input id="authName" autocomplete="name" placeholder="Your name" hidden></label>
+                    <label class="auth-field" id="authNameField" hidden><span>Name</span><input id="authName" autocomplete="name" placeholder="Your name" hidden></label>
                     <label class="auth-field"><span>Email</span><input id="authEmail" type="email" autocomplete="email" placeholder="you@example.com" required></label>
                     <label class="auth-field"><span>Password</span><input id="authPassword" type="password" autocomplete="current-password" placeholder="At least 8 characters" minlength="8" required></label>
                     <div class="auth-password-row"><button type="button" class="auth-forgot" onclick="forgotPassword()">Forgot password?</button><button type="button" class="auth-switch" id="authSwitch" onclick="toggleAuthMode()">Create account</button></div>
@@ -2385,8 +2388,8 @@
 
         let authSignupMode = false;
         function setAuthStatus(message, error = true) { const el = document.getElementById('authStatus'); if (el) { el.textContent = message || ''; el.style.color = error ? '#b23b55' : '#3b7d62'; } }
-        function showAuthScreen(show) { const el = document.getElementById('authScreen'); if (el) el.classList.toggle('is-visible', show); }
-        function toggleAuthMode() { authSignupMode = !authSignupMode; document.getElementById('authTitle').textContent = authSignupMode ? 'Create account' : 'Sign in'; document.getElementById('authSubtitle').textContent = authSignupMode ? 'Create your private workspace in seconds.' : 'Continue to your private workspace.'; document.getElementById('authName').hidden = !authSignupMode; document.getElementById('authName').required = authSignupMode; document.getElementById('authPassword').autocomplete = authSignupMode ? 'new-password' : 'current-password'; document.getElementById('authSubmit').textContent = authSignupMode ? 'Create account' : 'Sign in'; document.getElementById('authSwitch').textContent = authSignupMode ? 'I have an account' : 'Create account'; setAuthStatus(''); }
+        function showAuthScreen(show) { const el = document.getElementById('authScreen'); if (el) el.classList.toggle('is-visible', show); if (show) requestAnimationFrame(() => startAuthVideoPlayback()); }
+        function toggleAuthMode() { authSignupMode = !authSignupMode; document.getElementById('authTitle').textContent = authSignupMode ? 'Create account' : 'Sign in'; document.getElementById('authSubtitle').textContent = authSignupMode ? 'Create your private workspace in seconds.' : 'Continue to your private workspace.'; document.getElementById('authNameField').hidden = !authSignupMode; document.getElementById('authName').hidden = !authSignupMode; document.getElementById('authName').required = authSignupMode; document.getElementById('authPassword').autocomplete = authSignupMode ? 'new-password' : 'current-password'; document.getElementById('authSubmit').textContent = authSignupMode ? 'Create account' : 'Sign in'; document.getElementById('authSwitch').textContent = authSignupMode ? 'I have an account' : 'Create account'; setAuthStatus(''); }
         function startOAuth(provider) { window.location.href = `${API_BASE}/auth/${provider}`; }
         async function forgotPassword() { const email = document.getElementById('authEmail').value.trim(); if (!email) { setAuthStatus('Enter your email first.'); return; } setAuthStatus('If an account exists, reset instructions will be sent securely.', false); try { await fetch(`${API_BASE}/auth/forgot-password`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email}), credentials:'include'}); } catch (_) {} }
         document.getElementById('authForm').addEventListener('submit', async (event) => { event.preventDefault(); const data = { email: document.getElementById('authEmail').value.trim(), password: document.getElementById('authPassword').value }; if (authSignupMode) data.name = document.getElementById('authName').value.trim(); setAuthStatus(''); const button = document.getElementById('authSubmit'); button.disabled = true; try { const response = await fetch(`${API_BASE}/auth/${authSignupMode ? 'signup' : 'login'}`, {method:'POST', headers:{'Content-Type':'application/json'}, credentials:'include', body:JSON.stringify(data)}); const result = await response.json(); if (!response.ok) throw new Error(result.detail || 'Unable to sign in.'); showAuthScreen(false); window.location.reload(); } catch (error) { setAuthStatus(error.message); } finally { button.disabled = false; } });
@@ -2398,10 +2401,12 @@
         function startAuthVideoPlayback() {
             document.querySelectorAll('#authVideoSlot video').forEach(video => { video.autoplay = true; video.loop = true; video.muted = true; video.playsInline = true; video.play().catch(() => {}); });
         }
-        document.getElementById('authAudioToggle')?.addEventListener('change', (event) => setAuthVideoAudio(event.target.checked));
-        const authVideo = document.getElementById('authVideo');
+                const authVideo = document.getElementById('authVideo');
         authVideo?.addEventListener('canplay', () => { authVideo.hidden = false; const placeholder = document.getElementById('authVideoPlaceholder'); if (placeholder) placeholder.hidden = true; startAuthVideoPlayback(); });
-        document.getElementById('authVideoSlot')?.addEventListener('loadedmetadata', startAuthVideoPlayback);
+        authVideo?.addEventListener('loadedmetadata', startAuthVideoPlayback);
+        authVideo?.addEventListener('error', () => console.error('Login video failed to load', authVideo.error));
+        ['pointerdown','keydown','touchstart'].forEach(ev => document.addEventListener(ev, () => { if (authVideo && authVideo.paused) startAuthVideoPlayback(); }, {once:false, passive:true}));
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) startAuthVideoPlayback(); });
         startAuthVideoPlayback();
         bootAuth();
 
