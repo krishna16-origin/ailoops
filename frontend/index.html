@@ -204,8 +204,8 @@
         .new-chat-btn:hover { background-color:var(--bg-hover); }
         .new-chat-btn:active { transform:scale(0.98); }
         .history-list { flex:1; overflow-y:auto; overscroll-behavior:contain; -webkit-overflow-scrolling:touch; display:flex; flex-direction:column; gap:5px; }
-        .history-item { padding:12px; border-radius:8px; cursor:pointer; font-size:14px; overflow:hidden; text-overflow:ellipsis; color:var(--text-secondary); transition:background 0.2s, color 0.2s; }
-        .history-item:hover { background-color:var(--bg-hover); color:var(--text-primary); }
+        .history-item { display:block; width:100%; padding:12px; border:0; border-radius:8px; background:transparent; text-align:left; cursor:pointer; font:inherit; font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text-secondary); transition:background 0.2s, color 0.2s; }
+        .history-item:hover, .history-item.active { background-color:var(--bg-hover); color:var(--text-primary); }
         .sidebar-settings { margin-top:auto; padding-top:16px; border-top:1px solid var(--border-color); display:flex; flex-direction:column; gap:12px; }
         .mcp-entry { width:100%; display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; border:0; border-radius:8px; background:transparent; color:var(--text-primary); cursor:pointer; text-align:left; transition:background .2s,color .2s; }
         .mcp-entry:hover { background:var(--bg-hover); }
@@ -2439,6 +2439,47 @@
             code: { sessionId: generateUUID(), html: '', hasMessages: false },
             image: { sessionId: generateUUID(), html: '', hasMessages: false }
         };
+        const LOCAL_HISTORY_KEY = 'maximus.local.chat.history.v1';
+        let localHistorySaveTimer = null;
+        function readLocalHistory() { try { const value = JSON.parse(localStorage.getItem(LOCAL_HISTORY_KEY) || '[]'); return Array.isArray(value) ? value : []; } catch (_) { return []; } }
+        function writeLocalHistory(history) { try { localStorage.setItem(LOCAL_HISTORY_KEY, JSON.stringify(history.slice(0, 100))); } catch (_) { /* browser quota/private mode */ } }
+        function localHistoryTitle(html, fallback = 'New Chat') {
+            const holder = document.createElement('div'); holder.innerHTML = html || '';
+            const user = holder.querySelector('.message-row.user .message-bubble');
+            const text = (user ? user.innerText : '').replace(/\s+/g, ' ').trim();
+            return text ? text.slice(0, 72) + (text.length > 72 ? '…' : '') : fallback;
+        }
+        function persistCurrentLocalHistory() {
+            const state = modes[currentMode];
+            if (!state || !state.hasMessages) return;
+            state.html = chatContent.innerHTML;
+            const history = readLocalHistory();
+            const now = Date.now();
+            const existing = history.find(item => item.id === state.sessionId);
+            const record = { id: state.sessionId, mode: currentMode, title: localHistoryTitle(state.html, currentMode === 'code' ? 'New Code Session' : 'New Chat'), html: state.html, updatedAt: now, createdAt: existing?.createdAt || now };
+            const next = [record, ...history.filter(item => item.id !== record.id)];
+            writeLocalHistory(next);
+            renderLocalHistory();
+        }
+        function queueLocalHistorySave() { clearTimeout(localHistorySaveTimer); localHistorySaveTimer = setTimeout(persistCurrentLocalHistory, 250); }
+        function renderLocalHistory() {
+            const list = document.getElementById('historyList'); if (!list) return;
+            list.innerHTML = '';
+            readLocalHistory().sort((a,b) => (b.updatedAt || 0) - (a.updatedAt || 0)).forEach(record => {
+                const item = document.createElement('button'); item.type = 'button'; item.className = 'history-item'; item.textContent = record.title || 'New Chat'; item.title = record.title || 'New Chat';
+                item.classList.toggle('active', record.id === modes[currentMode].sessionId);
+                item.addEventListener('click', () => openLocalHistory(record.id)); list.appendChild(item);
+            });
+        }
+        function openLocalHistory(id) {
+            if (isWaitingForResponse) return;
+            persistCurrentLocalHistory();
+            const record = readLocalHistory().find(item => item.id === id); if (!record) return;
+            modes[record.mode] = { sessionId: record.id, html: record.html || '', hasMessages: true };
+            if (record.mode !== currentMode) { switchMode(record.mode); }
+            else { chatContent.innerHTML = record.html || ''; refreshOpeningSceneVisibility(); updateCodeHeroVisibility(); scrollToBottom(true); renderLocalHistory(); }
+        }
+        function clearLocalHistoryForSession(id) { writeLocalHistory(readLocalHistory().filter(item => item.id !== id)); renderLocalHistory(); }
         let currentMode = 'chat';
         // Deep Think — Chat mode only (composer "+" menu). Persists across
         // turns like the model/thinking-level pickers until switched off;
@@ -3891,10 +3932,12 @@
                 chatContent.classList.add('mode-fade-in');
                 scrollToBottom(true);
                 setTimeout(() => chatContent.classList.remove('mode-fade-in'), 260);
+                renderLocalHistory();
             }, 150);
         }
 
         function startNewChat() {
+            persistCurrentLocalHistory();
             modes[currentMode].sessionId = generateUUID();
             modes[currentMode].html = '';
             modes[currentMode].hasMessages = false;
@@ -3908,11 +3951,7 @@
             autoResize(userInput);
             userInput.focus();
 
-            const historyList = document.getElementById('historyList');
-            const item = document.createElement('div');
-            item.className = 'history-item';
-            item.textContent = currentMode === 'code' ? 'New Code Session' : (currentMode === 'image' ? 'New Image Session' : 'New Chat');
-            historyList.prepend(item);
+            renderLocalHistory();
         }
 
         function escapeHtml(str) {
@@ -4374,6 +4413,7 @@
                 container.insertBefore(prose, container.firstChild);
             }
             prose.innerHTML = DOMPurify.sanitize(html);
+            queueLocalHistorySave();
             return prose;
         }
 
@@ -6421,6 +6461,7 @@
             updateCodeHeroVisibility();
             initResponsiveSidebar();
             loadMcpServers();
+            renderLocalHistory();
         };
     </script>
 </body>
