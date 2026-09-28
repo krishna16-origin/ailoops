@@ -1429,7 +1429,6 @@
                            webkit-playsinline
                            disablepictureinpicture
                            preload="auto">
-                           <source src="/frontend/maxi.mp4" type="video/mp4">
                        </video>
                 </div>
             </div>
@@ -2424,6 +2423,30 @@
             document.querySelectorAll('#authVideoSlot video').forEach(video => { video.muted = !enabled; if (video.paused && video.src) video.play().catch(() => {}); });
             document.querySelectorAll('#authVideoSlot iframe').forEach(frame => { frame.contentWindow?.postMessage(JSON.stringify({event:'command', func: enabled ? 'unMute' : 'mute', args: []}), 'https://www.youtube.com'); });
         }
+        // Login video loader: tries every plausible location/format until one loads (handles
+        // frontend served from a different host/path than the API, and browsers without H.264/VP9).
+        (function () {
+            const v = document.getElementById('authVideo');
+            if (!v) return;
+            const names = [];
+            if (v.canPlayType('video/mp4; codecs="avc1.42E01E"')) names.push('maxi.mp4');
+            if (v.canPlayType('video/webm; codecs="vp9"')) names.push('maxi.webm');
+            if (!names.length) names.push('maxi.mp4', 'maxi.webm');
+            const bases = ['/frontend/', './', './frontend/', (typeof API_BASE !== 'undefined' ? API_BASE : '') + '/frontend/'];
+            const urls = [];
+            bases.forEach(b => names.forEach(n => urls.push(b + n)));
+            let idx = 0;
+            function tryNext() {
+                if (idx >= urls.length) { console.error('Login video: no source could be loaded', urls); return; }
+                const url = urls[idx++];
+                v.onerror = () => { console.warn('Login video failed, trying next:', url); tryNext(); };
+                v.src = url;
+                v.load();
+                const p = v.play(); if (p && p.catch) p.catch(() => {});
+            }
+            window.__retryAuthVideo = () => { if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); } };
+            tryNext();
+        })();
         function startAuthVideoPlayback() {
             document.querySelectorAll('#authVideoSlot video').forEach(video => { video.autoplay = true; video.loop = true; video.muted = true; video.playsInline = true; video.play().catch(() => {}); });
         }
