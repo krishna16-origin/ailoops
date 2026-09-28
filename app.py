@@ -3203,6 +3203,8 @@ async def chat_estimate(request: ChatEstimateRequest):
     }
 
 
+GROQ_CHAT_MODEL = "llama-3.1-8b-instant"
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_TTS_MODEL = "canopylabs/orpheus-v1-english"
 GROQ_TTS_URL = "https://api.groq.com/openai/v1/audio/speech"
 GROQ_TTS_MAX_CHARS = 190
@@ -3231,6 +3233,34 @@ def _split_voice_text(text: str, limit: int = GROQ_TTS_MAX_CHARS) -> List[str]:
     if current:
         chunks.append(current)
     return chunks
+
+
+async def _groq_voice_reply(session: dict) -> str:
+    """Use Groq's low-latency chat model for voice turns, not the long chat pipeline."""
+    api_key = os.getenv("GROQ_API_KEY")
+    messages = [{
+        "role": "system",
+        "content": "You are a helpful conversational voice assistant. Answer naturally, clearly, and concisely. Avoid markdown, long lists, and visual-only formatting because your answer will be spoken aloud.",
+    }]
+    for message in session.get("messages", [])[-12:]:
+        content = message.content if isinstance(message.content, str) else str(message.content)
+        if not content.strip():
+            continue
+        role = "assistant" if isinstance(message, AIMessage) else "user" if isinstance(message, HumanMessage) else "system"
+        messages.append({"role": role, "content": content})
+    async with httpx.AsyncClient(timeout=httpx.Timeout(35.0, connect=10.0)) as client:
+        response = await client.post(
+            GROQ_CHAT_URL,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": GROQ_CHAT_MODEL, "messages": messages, "temperature": 0.5, "max_tokens": 500},
+        )
+    if response.is_error:
+        raise HTTPException(status_code=502, detail=f"Groq voice chat failed: {response.text[:500]}")
+    data = response.json()
+    reply = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
+    if not reply:
+        raise HTTPException(status_code=502, detail="Groq returned an empty voice response.")
+    return reply
 
 
 async def _groq_orpheus_audio(text: str, voice: str) -> List[str]:
@@ -3262,17 +3292,10 @@ async def voice_chat(request: VoiceChatRequest):
     session = get_session(request.session_id)
     session["messages"] = trim_memory(session["messages"])
     session["messages"].append(HumanMessage(content=request.message))
-    chat_request = ChatRequest(
-        message=request.message,
-        session_id=request.session_id,
-        model_type="fast",
-        stream=False,
-        temperature=0.4,
-        thinking_level="low",
-        deep_think=False,
-    )
     try:
-        response = await generate_response_once(chat_request, session, [])
+        response = await _groq_voice_reply(session)
+    except HTTPException:
+        raise
     except Exception as exc:
         print(f"[{request.session_id}] Voice response generation failed: {exc}")
         traceback.print_exc()
