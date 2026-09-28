@@ -147,7 +147,7 @@
         @supports (height:100dvh) { body { height:100dvh; min-height:100dvh; } }
 
         /* ============== SPLASH SCREEN ============== */
-        .splash-screen { position:fixed; inset:0; background-color:var(--bg-main); z-index:9999; display:flex; flex-direction:column; align-items:center; justify-content:center; transition:opacity 0.7s var(--transition-bezier), visibility 0.7s; }
+        .splash-screen { position:fixed; inset:0; background-color:var(--bg-main); z-index:10001; display:flex; flex-direction:column; align-items:center; justify-content:center; transition:opacity 0.7s var(--transition-bezier), visibility 0.7s; }
         .splash-screen.hidden { opacity:0; visibility:hidden; }
 
         /* Soft ambient color wash breathing behind the mark */
@@ -1351,6 +1351,8 @@
         .auth-status { min-height:18px; margin-top:12px; color:#ec849c; font-size:12px; line-height:1.4; }
         .auth-security { display:flex; gap:8px; margin-top:16px; padding-top:12px; border-top:1px solid rgba(255,255,255,.1); color:rgba(241,235,245,.42); font-size:10px; line-height:1.5; }
         .auth-security svg { flex:0 0 15px; margin-top:1px; }
+        .auth-skip { display:block; width:100%; margin-top:12px; padding:8px; border:0; background:none; color:rgba(241,235,245,.55); cursor:pointer; font:inherit; font-size:12px; text-align:center; transition:color .2s; }
+        .auth-skip:hover { color:#f1ebf5; text-decoration:underline; }
         .auth-footer { display:flex; justify-content:space-between; margin-top:14px; color:rgba(241,235,245,.38); font-size:10px; }
         @media (max-width:760px) { .auth-screen { padding:12px; } .auth-shell { width:min(400px, 100%); max-height:none; grid-template-columns:1fr; border-radius:20px; } .auth-video-panel { height:min(30dvh, 240px); padding:0; } .auth-video-slot { border-radius:0; } .auth-form-panel { padding:14px 22px 18px; } .auth-brand { display:none; } .auth-security, .auth-footer { display:none; } .auth-subtitle { margin-bottom:12px; } }
     </style>
@@ -1401,7 +1403,20 @@
         </div>
     </div>
 
-    <section class="auth-screen" id="authScreen" aria-label="Sign in to Maximus">
+    <script>
+        // Splash plays its full animation, then fades out. Runs on its own timer so a slow
+        // window.onload or a fast /auth/me response can never cut it short.
+        window.__splashReady = new Promise(function (resolve) {
+            setTimeout(function () {
+                var splash = document.getElementById('splashScreen');
+                if (!splash) return resolve();
+                splash.classList.add('hidden');
+                setTimeout(function () { splash.style.display = 'none'; resolve(); }, 750);
+            }, 2300);
+        });
+    </script>
+
+    <section class="auth-screen is-visible" id="authScreen" aria-label="Sign in to Maximus">
         <div class="auth-shell">
             <div class="auth-video-panel">
                 <div class="auth-video-slot" id="authVideoSlot">
@@ -1436,6 +1451,7 @@
                     <div class="auth-status" id="authStatus" role="status"></div>
                     <div class="auth-security"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg><span>Protected by an encrypted, HttpOnly session cookie. Passwords are salted and hashed on the server; provider secrets never reach this page.</span></div>
                     <div class="auth-footer"><span>Private workspace</span><span>Secure sign-in</span></div>
+                    <button type="button" class="auth-skip" id="authSkip">Skip for now</button>
                 </form>
             </div>
         </div>
@@ -2388,12 +2404,22 @@
 
         let authSignupMode = false;
         function setAuthStatus(message, error = true) { const el = document.getElementById('authStatus'); if (el) { el.textContent = message || ''; el.style.color = error ? '#b23b55' : '#3b7d62'; } }
-        function showAuthScreen(show) { const el = document.getElementById('authScreen'); if (el) el.classList.toggle('is-visible', show); if (show) requestAnimationFrame(() => startAuthVideoPlayback()); }
+        function showAuthScreen(show) { const el = document.getElementById('authScreen'); if (!show) { if (el) el.classList.remove('is-visible'); return; } (window.__splashReady || Promise.resolve()).then(() => { if (authDismissed || authKnownSignedIn) return; if (el) el.classList.add('is-visible'); requestAnimationFrame(() => startAuthVideoPlayback()); }); }
         function toggleAuthMode() { authSignupMode = !authSignupMode; document.getElementById('authTitle').textContent = authSignupMode ? 'Create account' : 'Sign in'; document.getElementById('authSubtitle').textContent = authSignupMode ? 'Create your private workspace in seconds.' : 'Continue to your private workspace.'; document.getElementById('authNameField').hidden = !authSignupMode; document.getElementById('authName').hidden = !authSignupMode; document.getElementById('authName').required = authSignupMode; document.getElementById('authPassword').autocomplete = authSignupMode ? 'new-password' : 'current-password'; document.getElementById('authSubmit').textContent = authSignupMode ? 'Create account' : 'Sign in'; document.getElementById('authSwitch').textContent = authSignupMode ? 'I have an account' : 'Create account'; setAuthStatus(''); }
         function startOAuth(provider) { window.location.href = `${API_BASE}/auth/${provider}`; }
         async function forgotPassword() { const email = document.getElementById('authEmail').value.trim(); if (!email) { setAuthStatus('Enter your email first.'); return; } setAuthStatus('If an account exists, reset instructions will be sent securely.', false); try { await fetch(`${API_BASE}/auth/forgot-password`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email}), credentials:'include'}); } catch (_) {} }
         document.getElementById('authForm').addEventListener('submit', async (event) => { event.preventDefault(); const data = { email: document.getElementById('authEmail').value.trim(), password: document.getElementById('authPassword').value }; if (authSignupMode) data.name = document.getElementById('authName').value.trim(); setAuthStatus(''); const button = document.getElementById('authSubmit'); button.disabled = true; try { const response = await fetch(`${API_BASE}/auth/${authSignupMode ? 'signup' : 'login'}`, {method:'POST', headers:{'Content-Type':'application/json'}, credentials:'include', body:JSON.stringify(data)}); const result = await response.json(); if (!response.ok) throw new Error(result.detail || 'Unable to sign in.'); showAuthScreen(false); window.location.reload(); } catch (error) { setAuthStatus(error.message); } finally { button.disabled = false; } });
-        async function bootAuth() { try { const response = await fetch(`${API_BASE}/auth/me`, {credentials:'include'}); const result = await response.json(); showAuthScreen(!result.authenticated); } catch (_) { showAuthScreen(true); } }
+        document.getElementById('authSkip')?.addEventListener('click', () => { authDismissed = true; showAuthScreen(false); if (window.innerWidth > 768) document.getElementById('userInput')?.focus(); });
+        let authDismissed = false, authKnownSignedIn = false;
+        async function bootAuth() {
+            // Splash -> login page (always, unless the user is already signed in) -> Skip/Sign in -> chat
+            (window.__splashReady || Promise.resolve()).then(() => { if (!authKnownSignedIn && !authDismissed) showAuthScreen(true); });
+            try {
+                const response = await fetch(`${API_BASE}/auth/me`, {credentials:'include'});
+                const result = await response.json();
+                if (result.authenticated) { authKnownSignedIn = true; showAuthScreen(false); }
+            } catch (_) {}
+        }
         function setAuthVideoAudio(enabled) {
             document.querySelectorAll('#authVideoSlot video').forEach(video => { video.muted = !enabled; if (video.paused && video.src) video.play().catch(() => {}); });
             document.querySelectorAll('#authVideoSlot iframe').forEach(frame => { frame.contentWindow?.postMessage(JSON.stringify({event:'command', func: enabled ? 'unMute' : 'mute', args: []}), 'https://www.youtube.com'); });
@@ -6455,14 +6481,9 @@
             }
         });
         window.onload = () => {
-            setTimeout(() => {
-                const splash = document.getElementById('splashScreen');
-                if (splash) {
-                    splash.classList.add('hidden');
-                    setTimeout(() => splash.style.display = 'none', 700);
-                }
-                if (window.innerWidth > 768) document.getElementById('userInput').focus();
-            }, 2100);
+            (window.__splashReady || Promise.resolve()).then(() => {
+                if (window.innerWidth > 768 && !document.getElementById('authScreen')?.classList.contains('is-visible')) document.getElementById('userInput')?.focus();
+            });
             updateModelPickerLabel();
             updateWorkflowPicker();
             updateWatchLiveVisibility();
