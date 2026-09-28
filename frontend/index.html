@@ -1317,41 +1317,40 @@
         .auth-screen { position:fixed; inset:0; z-index:10000; display:none; align-items:center; justify-content:center; padding:28px; background:radial-gradient(circle at 18% 15%, rgba(196,113,237,.12), transparent 34%), var(--bg-main); overflow:auto; }
         .auth-screen.is-visible { display:flex; }
         .auth-shell { width:min(1120px, 100%); min-height:min(700px, calc(100vh - 56px)); display:grid; grid-template-columns:minmax(300px, .94fr) minmax(380px, 1.06fr); overflow:hidden; border:1px solid rgba(255,255,255,.13); border-radius:30px; background:#191919; box-shadow:0 30px 100px rgba(0,0,0,.55), 0 0 80px rgba(196,113,237,.08); }
-        .auth-video-panel { position:relative; display:flex; flex-direction:column; min-height:100%; padding:32px; background:#231d1e; overflow:hidden; }
-        .auth-video-panel::before { content:""; position:absolute; inset:0; background:radial-gradient(circle at 40% 38%, rgba(196,113,237,.2), transparent 35%), linear-gradient(145deg, rgba(255,255,255,.04), transparent 45%); pointer-events:none; }
-        .auth-video-kicker { position:relative; z-index:1; color:rgba(255,255,255,.62); font-size:12px; letter-spacing:.02em; }
-        .auth-video-title { position:relative; z-index:1; margin-top:auto; margin-bottom:18px; max-width:330px; color:#fff; font-size:clamp(30px, 4vw, 50px); line-height:.98; letter-spacing:-.055em; }
-        .auth-video-slot { position:relative; z-index:1; width:min(100%, 320px); aspect-ratio:9/16; align-self:center; border:1px solid rgba(255,255,255,.15); border-radius:22px; background:#111; box-shadow:0 18px 45px rgba(0,0,0,.4); overflow:hidden; }
-        .auth-video-slot iframe, .auth-video-slot video { display:block; width:100%; height:100%; border:0; object-fit:cover; }
-        .auth-video-placeholder { display:flex; height:100%; align-items:center; justify-content:center; padding:28px; color:rgba(255,255,255,.45); text-align:center; font-size:13px; line-height:1.5; }
-        .auth-audio-toggle { position:absolute; z-index:2; right:14px; bottom:14px; display:flex; align-items:center; gap:8px; padding:9px 12px; border:1px solid rgba(255,255,255,.16); border-radius:999px; color:#fff; background:rgba(17,17,17,.72); backdrop-filter:blur(12px); cursor:pointer; font-size:12px; }
+        .auth-video-panel { position:relative; display:flex; align-items:center; justify-content:center; min-height:100%; padding:28px; background:#17151a; overflow:hidden; }
+        .auth-video-panel::before { content:""; position:absolute; inset:0; background:radial-gradient(circle at 50% 50%, rgba(196,113,237,.12), transparent 54%); pointer-events:none; }
+        .auth-video-slot { position:relative; z-index:1; width:min(100%, 380px); height:min(620px, calc(100vh - 112px)); min-height:420px; border:1px solid rgba(255,255,255,.12); border-radius:24px; background:#101015; box-shadow:0 18px 55px rgba(0,0,0,.42), 0 0 30px rgba(196,113,237,.08); overflow:hidden; }
+        .auth-video-slot iframe, .auth-video-slot video { display:block; width:100%; height:100%; border:0; object-fit:contain; background:#101015; }
+        .auth-video-placeholder { display:flex; height:100%; align-items:center; justify-content:center; padding:28px; color:rgba(242,236,248,.44); text-align:center; font-size:12px; line-height:1.5; }
+        .auth-video-placeholder small { color:rgba(242,236,248,.3); }
+        .auth-audio-toggle { position:absolute; z-index:2; right:14px; bottom:14px; display:flex; align-items:center; gap:8px; padding:9px 12px; border:1px solid rgba(255,255,255,.14); border-radius:999px; color:#eee8f4; background:rgba(20,18,25,.86); backdrop-filter:blur(12px); cursor:pointer; font-size:12px; }
         .auth-audio-toggle input { accent-color:var(--accent); }
-        .auth-video-foot { position:relative; z-index:1; margin-top:22px; color:rgba(255,255,255,.42); font-size:11px; }
-        .auth-form-panel { display:flex; align-items:center; justify-content:center; padding:54px clamp(30px, 7vw, 88px); background:#f7f7f6; color:#1c1c1c; }
+        .auth-form-panel { display:flex; align-items:center; justify-content:center; padding:54px clamp(30px, 7vw, 88px); background:#1b1920; color:#f1ebf5; }
         .auth-form { width:min(390px, 100%); }
-        .auth-brand { display:flex; align-items:center; gap:9px; margin-bottom:58px; color:#1d1d1d; font-size:18px; font-weight:600; letter-spacing:-.04em; }
+        .auth-brand { display:flex; align-items:center; gap:9px; margin-bottom:58px; color:#f1ebf5; font-size:18px; font-weight:600; letter-spacing:-.04em; }
         .auth-brand-mark { width:24px; height:24px; border-radius:8px; background:linear-gradient(135deg,#c471ed,#4facfe 55%,#f64f59); box-shadow:0 5px 16px rgba(196,113,237,.35); }
-        .auth-form h1 { margin-bottom:9px; font-size:clamp(30px, 4vw, 42px); font-weight:500; letter-spacing:-.06em; }
-        .auth-subtitle { margin-bottom:26px; color:#777; font-size:13px; line-height:1.5; }
+        .auth-form h1 { margin-bottom:9px; color:#f1ebf5; font-size:clamp(30px, 4vw, 42px); font-weight:500; letter-spacing:-.06em; }
+        .auth-subtitle { margin-bottom:26px; color:rgba(241,235,245,.56); font-size:13px; line-height:1.5; }
         .auth-provider-row { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:18px; }
-        .auth-provider, .auth-submit { min-height:44px; border:1px solid #dedede; border-radius:12px; background:#fff; color:#222; cursor:pointer; font:inherit; font-size:13px; transition:transform .2s var(--transition-bezier), box-shadow .2s, border-color .2s; }
+        .auth-provider, .auth-submit { min-height:44px; border:1px solid rgba(255,255,255,.13); border-radius:12px; background:#24212a; color:#f1ebf5; cursor:pointer; font:inherit; font-size:13px; transition:transform .2s var(--transition-bezier), box-shadow .2s, border-color .2s; }
         .auth-provider { display:flex; align-items:center; justify-content:center; gap:8px; }
-        .auth-provider:hover, .auth-submit:hover { transform:translateY(-1px); border-color:#bbb; box-shadow:0 8px 18px rgba(0,0,0,.08); }
+        .auth-provider:hover, .auth-submit:hover { transform:translateY(-1px); border-color:rgba(196,113,237,.62); box-shadow:0 8px 18px rgba(0,0,0,.22); }
         .auth-provider svg { width:17px; height:17px; }
-        .auth-divider { display:flex; align-items:center; gap:12px; margin:20px 0; color:#999; font-size:11px; }
-        .auth-divider::before, .auth-divider::after { content:""; height:1px; flex:1; background:#e5e5e5; }
+        .auth-divider { display:flex; align-items:center; gap:12px; margin:20px 0; color:rgba(241,235,245,.4); font-size:11px; }
+        .auth-divider::before, .auth-divider::after { content:""; height:1px; flex:1; background:rgba(255,255,255,.1); }
         .auth-field { display:block; margin-bottom:12px; }
-        .auth-field span { display:block; margin:0 0 7px 2px; color:#777; font-size:11px; }
-        .auth-field input { width:100%; height:45px; padding:0 14px; border:1px solid #dedede; border-radius:12px; outline:0; background:#fff; color:#1d1d1d; font:inherit; font-size:13px; transition:border-color .2s, box-shadow .2s; }
-        .auth-field input:focus { border-color:#a56bc6; box-shadow:0 0 0 3px rgba(165,107,198,.14); }
+        .auth-field span { display:block; margin:0 0 7px 2px; color:rgba(241,235,245,.55); font-size:11px; }
+        .auth-field input { width:100%; height:45px; padding:0 14px; border:1px solid rgba(255,255,255,.13); border-radius:12px; outline:0; background:#24212a; color:#f1ebf5; font:inherit; font-size:13px; transition:border-color .2s, box-shadow .2s; }
+        .auth-field input::placeholder { color:rgba(241,235,245,.34); }
+        .auth-field input:focus { border-color:#a56bc6; box-shadow:0 0 0 3px rgba(165,107,198,.16); }
         .auth-password-row { display:flex; align-items:center; justify-content:space-between; gap:10px; }
-        .auth-forgot, .auth-switch { border:0; background:none; color:#8a53ad; cursor:pointer; font:inherit; font-size:11px; }
-        .auth-submit { width:100%; margin-top:8px; border:0; color:#fff; background:linear-gradient(100deg,#c471ed,#f64f59); }
-        .auth-status { min-height:18px; margin-top:12px; color:#b23b55; font-size:12px; line-height:1.4; }
-        .auth-security { display:flex; gap:8px; margin-top:26px; padding-top:17px; border-top:1px solid #e7e7e7; color:#898989; font-size:10px; line-height:1.5; }
+        .auth-forgot, .auth-switch { border:0; background:none; color:#c991df; cursor:pointer; font:inherit; font-size:11px; }
+        .auth-submit { width:100%; margin-top:8px; border:0; color:#fff; background:linear-gradient(100deg,#9b62bd,#c94c64); }
+        .auth-status { min-height:18px; margin-top:12px; color:#ec849c; font-size:12px; line-height:1.4; }
+        .auth-security { display:flex; gap:8px; margin-top:26px; padding-top:17px; border-top:1px solid rgba(255,255,255,.1); color:rgba(241,235,245,.42); font-size:10px; line-height:1.5; }
         .auth-security svg { flex:0 0 15px; margin-top:1px; }
-        .auth-footer { display:flex; justify-content:space-between; margin-top:32px; color:#999; font-size:10px; }
-        @media (max-width:760px) { .auth-screen { align-items:stretch; padding:12px; } .auth-shell { min-height:calc(100vh - 24px); grid-template-columns:1fr; border-radius:22px; } .auth-video-panel { min-height:300px; padding:24px; } .auth-video-title { margin-top:42px; margin-bottom:0; font-size:34px; } .auth-video-slot { position:absolute; right:24px; bottom:24px; width:120px; border-radius:14px; } .auth-video-foot { display:none; } .auth-form-panel { padding:36px 24px; } .auth-brand { margin-bottom:34px; } .auth-form h1 { font-size:32px; } }
+        .auth-footer { display:flex; justify-content:space-between; margin-top:32px; color:rgba(241,235,245,.38); font-size:10px; }
+        @media (max-width:760px) { .auth-screen { align-items:stretch; padding:12px; } .auth-shell { min-height:calc(100vh - 24px); grid-template-columns:1fr; border-radius:22px; } .auth-video-panel { min-height:56vh; padding:18px; } .auth-video-slot { width:min(78vw, 300px); height:min(56vh, 520px); min-height:280px; border-radius:18px; } .auth-form-panel { padding:36px 24px; } .auth-brand { margin-bottom:34px; } .auth-form h1 { font-size:32px; } }
     </style>
 </head>
 <body>
@@ -1403,8 +1402,6 @@
     <section class="auth-screen" id="authScreen" aria-label="Sign in to Maximus">
         <div class="auth-shell">
             <div class="auth-video-panel">
-                <div class="auth-video-kicker">A calmer way to think, create, and move forward.</div>
-                <h2 class="auth-video-title">Your ideas,<br>in motion.</h2>
                 <div class="auth-video-slot" id="authVideoSlot">
                     <video
                            id="authVideo"
@@ -1417,7 +1414,6 @@
                        </video>
                     <label class="auth-audio-toggle"><input id="authAudioToggle" type="checkbox" checked> Audio</label>
                 </div>
-                <div class="auth-video-foot">A short introduction to Maximus · Add your video when ready</div>
             </div>
             <div class="auth-form-panel">
                 <form class="auth-form" id="authForm">
@@ -2403,6 +2399,8 @@
             document.querySelectorAll('#authVideoSlot video').forEach(video => { video.autoplay = true; video.loop = true; video.muted = true; video.playsInline = true; video.play().catch(() => {}); });
         }
         document.getElementById('authAudioToggle')?.addEventListener('change', (event) => setAuthVideoAudio(event.target.checked));
+        const authVideo = document.getElementById('authVideo');
+        authVideo?.addEventListener('canplay', () => { authVideo.hidden = false; const placeholder = document.getElementById('authVideoPlaceholder'); if (placeholder) placeholder.hidden = true; startAuthVideoPlayback(); });
         document.getElementById('authVideoSlot')?.addEventListener('loadedmetadata', startAuthVideoPlayback);
         startAuthVideoPlayback();
         bootAuth();
