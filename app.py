@@ -46,6 +46,11 @@ import file_generator
 
 load_dotenv()
 
+# Optional production frontend origin. When unset, the API remains usable from
+# the same deployed service and falls back to the permissive no-credentials CORS
+# mode configured below.
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "").strip().rstrip("/")
+
 if not os.getenv("NVIDIA_API_KEY"):
     print("WARNING: NVIDIA_API_KEY not found in environment. The API calls will fail.")
 if not os.getenv("TAVILY_API_KEY"):
@@ -1275,6 +1280,96 @@ async def generate_response_once(request: "ChatRequest", session: dict, progress
     state = await chat_context_node(state, progress)
     state = await chat_compose_node(request, state, progress)
     return await chat_finalize_node(state, progress)
+
+
+# ---------------------------------------------------------------------------
+# Auth helpers (email/password + Google/GitHub OAuth, HttpOnly JWT cookie)
+# ---------------------------------------------------------------------------
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
+AUTH_COOKIE = "maximus_session"
+AUTH_DB_PATH = os.getenv("AUTH_DB_PATH", "auth.db")
+AUTH_SECRET = os.getenv("AUTH_SECRET") or os.getenv("SECRET_KEY") or secrets.token_urlsafe(48)
+
+
+def _auth_db():
+    db = sqlite3.connect(AUTH_DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT UNIQUE NOT NULL, name TEXT, "
+        "avatar TEXT, provider TEXT, password_hash TEXT, created_at TEXT)"
+    )
+    return db
+
+
+def _b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _b64u_decode(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def _jwt_encode(payload: dict) -> str:
+    head = _b64u(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    body = _b64u(json.dumps(payload).encode())
+    sig = _b64u(hmac.new(AUTH_SECRET.encode(), f"{head}.{body}".encode(), hashlib.sha256).digest())
+    return f"{head}.{body}.{sig}"
+
+
+def _jwt_decode(token: str) -> Optional[dict]:
+    try:
+        head, body, sig = token.split(".")
+        expected = _b64u(hmac.new(AUTH_SECRET.encode(), f"{head}.{body}".encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(sig, expected):
+            return None
+        payload = json.loads(_b64u_decode(body))
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _password_hash(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
+    return f"pbkdf2${_b64u(salt)}${_b64u(digest)}"
+
+
+def _password_ok(password: str, stored: str) -> bool:
+    try:
+        _, salt, digest = stored.split("$")
+        check = hashlib.pbkdf2_hmac("sha256", password.encode(), _b64u_decode(salt), 200_000)
+        return hmac.compare_digest(_b64u(check), digest)
+    except Exception:
+        return False
+
+
+def _user_payload(row) -> dict:
+    return {"id": row["id"], "email": row["email"], "name": row["name"], "avatar": row["avatar"] or "", "provider": row["provider"]}
+
+
+def _current_user(request: Request) -> Optional[dict]:
+    payload = _jwt_decode(request.cookies.get(AUTH_COOKIE, ""))
+    if not payload:
+        return None
+    return {k: payload.get(k) for k in ("id", "email", "name", "avatar", "provider")}
+
+
+def _cookie_kwargs() -> dict:
+    return {"httponly": True, "secure": True, "samesite": "none" if FRONTEND_ORIGIN else "lax", "path": "/", "max_age": 60 * 60 * 24 * 14}
+
+
+def _auth_response(user: dict, status_code: int = 200):
+    response = JSONResponse({"authenticated": True, "user": user}, status_code=status_code)
+    token = _jwt_encode({**user, "iat": int(time.time()), "exp": int(time.time()) + 60 * 60 * 24 * 14})
+    response.set_cookie(AUTH_COOKIE, token, **_cookie_kwargs())
+    return response
+
+
+def _redirect_uri(provider: str) -> str:
+    base = PUBLIC_BASE_URL or "http://localhost:8000"
+    return f"{base}/auth/{provider}/callback"
 
 
 
