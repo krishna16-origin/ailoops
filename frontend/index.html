@@ -204,8 +204,19 @@
         .new-chat-btn:hover { background-color:var(--bg-hover); }
         .new-chat-btn:active { transform:scale(0.98); }
         .history-list { flex:1; overflow-y:auto; overscroll-behavior:contain; -webkit-overflow-scrolling:touch; display:flex; flex-direction:column; gap:5px; }
-        .history-item { display:block; width:100%; padding:12px; border:0; border-radius:8px; background:transparent; text-align:left; cursor:pointer; font:inherit; font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text-secondary); transition:background 0.2s, color 0.2s; }
-        .history-item:hover, .history-item.active { background-color:var(--bg-hover); color:var(--text-primary); }
+        .history-item-wrap { position:relative; display:flex; width:100%; min-width:0; border-radius:8px; }
+        .history-item { display:block; flex:1; min-width:0; padding:11px 38px 11px 12px; border:0; border-radius:8px; background:transparent; text-align:left; cursor:pointer; font:inherit; font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--text-secondary); transition:background 0.2s, color 0.2s; }
+        .history-item-wrap:hover, .history-item-wrap.active { background-color:var(--bg-hover); }
+        .history-item-wrap:hover .history-item, .history-item-wrap.active .history-item { color:var(--text-primary); }
+        .history-item-pin { display:inline-flex; margin-right:6px; color:var(--text-secondary); font-size:11px; vertical-align:1px; }
+        .history-item-more { position:absolute; right:3px; top:50%; transform:translateY(-50%); width:30px; height:30px; display:flex; align-items:center; justify-content:center; border:0; border-radius:6px; background:transparent; color:var(--text-secondary); cursor:pointer; opacity:0; font-size:20px; line-height:1; letter-spacing:1px; transition:opacity .15s, background .15s, color .15s; }
+        .history-item-wrap:hover .history-item-more, .history-item-wrap.active .history-item-more, .history-item-more:focus-visible { opacity:1; }
+        .history-item-more:hover { background:rgba(255,255,255,.1); color:var(--text-primary); }
+        .history-item-menu { position:absolute; z-index:20; right:5px; top:calc(100% - 2px); width:138px; padding:4px; border:1px solid var(--border-color); border-radius:9px; background:var(--bg-sidebar); box-shadow:0 10px 28px rgba(0,0,0,.38); }
+        .history-item-menu[hidden] { display:none; }
+        .history-item-menu button { display:flex; width:100%; padding:8px 9px; border:0; border-radius:6px; background:transparent; color:var(--text-primary); text-align:left; font:inherit; font-size:13px; cursor:pointer; }
+        .history-item-menu button:hover { background:var(--bg-hover); }
+        .history-item-menu button.delete-history-action { color:#f0a5a5; }
         .sidebar-settings { margin-top:auto; padding-top:16px; border-top:1px solid var(--border-color); display:flex; flex-direction:column; gap:12px; }
         .mcp-entry { width:100%; display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 12px; border:0; border-radius:8px; background:transparent; color:var(--text-primary); cursor:pointer; text-align:left; transition:background .2s,color .2s; }
         .mcp-entry:hover { background:var(--bg-hover); }
@@ -2552,11 +2563,19 @@
         let localHistorySaveTimer = null;
         function readLocalHistory() { try { const value = JSON.parse(localStorage.getItem(LOCAL_HISTORY_KEY) || '[]'); return Array.isArray(value) ? value : []; } catch (_) { return []; } }
         function writeLocalHistory(history) { try { localStorage.setItem(LOCAL_HISTORY_KEY, JSON.stringify(history.slice(0, 100))); } catch (_) { /* browser quota/private mode */ } }
-        function localHistoryTitle(html, fallback = 'New Chat') {
+        function localHistorySummaryTitle(html, fallback = 'New Chat') {
+            // ChatGPT-style local summary: use only the first exchange, so later
+            // turns do not constantly rename an existing conversation. The first
+            // user request is the clearest title; for a greeting, use the first
+            // assistant reply as the useful summary instead.
             const holder = document.createElement('div'); holder.innerHTML = html || '';
-            const user = holder.querySelector('.message-row.user .message-bubble');
-            const text = (user ? user.innerText : '').replace(/\s+/g, ' ').trim();
-            return text ? text.slice(0, 72) + (text.length > 72 ? '…' : '') : fallback;
+            const firstUser = holder.querySelector('.message-row.user .message-bubble');
+            const firstAssistant = holder.querySelector('.message-row.assistant .message-bubble');
+            const userText = (firstUser ? firstUser.innerText : '').replace(/\s+/g, ' ').trim();
+            const assistantText = (firstAssistant ? firstAssistant.innerText : '').replace(/\s+/g, ' ').trim();
+            const isGreeting = /^(hi|hello|hey|good morning|good afternoon|good evening)[!.?, ]*$/i.test(userText);
+            const summary = isGreeting && assistantText ? assistantText : userText || assistantText;
+            return summary ? summary.slice(0, 72) + (summary.length > 72 ? '…' : '') : fallback;
         }
         function persistCurrentLocalHistory() {
             const state = modes[currentMode];
@@ -2565,19 +2584,72 @@
             const history = readLocalHistory();
             const now = Date.now();
             const existing = history.find(item => item.id === state.sessionId);
-            const record = { id: state.sessionId, mode: currentMode, title: localHistoryTitle(state.html, currentMode === 'code' ? 'New Code Session' : 'New Chat'), html: state.html, updatedAt: now, createdAt: existing?.createdAt || now };
+            const autoTitle = localHistorySummaryTitle(state.html, currentMode === 'code' ? 'New Code Session' : 'New Chat');
+            const record = { id: state.sessionId, mode: currentMode, title: existing?.customTitle ? existing.title : autoTitle, customTitle: Boolean(existing?.customTitle), pinned: Boolean(existing?.pinned), html: state.html, updatedAt: now, createdAt: existing?.createdAt || now };
             const next = [record, ...history.filter(item => item.id !== record.id)];
             writeLocalHistory(next);
             renderLocalHistory();
         }
         function queueLocalHistorySave() { clearTimeout(localHistorySaveTimer); localHistorySaveTimer = setTimeout(persistCurrentLocalHistory, 250); }
+        function closeHistoryMenus(except = null) {
+            document.querySelectorAll('.history-item-menu').forEach(menu => { if (menu !== except) menu.hidden = true; });
+        }
+        function updateLocalHistoryRecord(id, patch) {
+            const history = readLocalHistory();
+            const record = history.find(item => item.id === id);
+            if (!record) return;
+            Object.assign(record, patch, { updatedAt: Date.now() });
+            writeLocalHistory(history);
+            renderLocalHistory();
+        }
+        function toggleLocalHistoryPin(id) {
+            const record = readLocalHistory().find(item => item.id === id);
+            if (record) updateLocalHistoryRecord(id, { pinned: !record.pinned });
+        }
+        function renameLocalHistory(id) {
+            const record = readLocalHistory().find(item => item.id === id);
+            if (!record) return;
+            const nextTitle = window.prompt('Rename chat', record.title || 'New Chat');
+            if (nextTitle == null) return;
+            const title = nextTitle.replace(/\s+/g, ' ').trim().slice(0, 120);
+            if (!title) return;
+            updateLocalHistoryRecord(id, { title, customTitle: true });
+        }
+        function deleteLocalHistory(id) {
+            const record = readLocalHistory().find(item => item.id === id);
+            if (!record || !window.confirm(`Delete “${record.title || 'New Chat'}”?`)) return;
+            writeLocalHistory(readLocalHistory().filter(item => item.id !== id));
+            if (record.id === modes[currentMode].sessionId) {
+                modes[currentMode] = { sessionId: generateUUID(), html: '', hasMessages: false };
+                chatContent.innerHTML = '';
+                refreshOpeningSceneVisibility();
+                updateCodeHeroVisibility();
+            }
+            renderLocalHistory();
+        }
         function renderLocalHistory() {
             const list = document.getElementById('historyList'); if (!list) return;
             list.innerHTML = '';
-            readLocalHistory().sort((a,b) => (b.updatedAt || 0) - (a.updatedAt || 0)).forEach(record => {
-                const item = document.createElement('button'); item.type = 'button'; item.className = 'history-item'; item.textContent = record.title || 'New Chat'; item.title = record.title || 'New Chat';
-                item.classList.toggle('active', record.id === modes[currentMode].sessionId);
-                item.addEventListener('click', () => openLocalHistory(record.id)); list.appendChild(item);
+            readLocalHistory().sort((a,b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || (b.updatedAt || 0) - (a.updatedAt || 0)).forEach(record => {
+                const wrap = document.createElement('div');
+                wrap.className = 'history-item-wrap' + (record.id === modes[currentMode].sessionId ? ' active' : '');
+                const item = document.createElement('button');
+                item.type = 'button'; item.className = 'history-item'; item.title = record.title || 'New Chat';
+                item.innerHTML = `${record.pinned ? '<span class="history-item-pin" aria-label="Pinned">●</span>' : ''}<span>${escapeHtml(record.title || 'New Chat')}</span>`;
+                item.addEventListener('click', () => { closeHistoryMenus(); openLocalHistory(record.id); });
+                const more = document.createElement('button');
+                more.type = 'button'; more.className = 'history-item-more'; more.textContent = '⋯'; more.title = 'Chat options'; more.setAttribute('aria-label', `Options for ${record.title || 'New Chat'}`);
+                const menu = document.createElement('div');
+                menu.className = 'history-item-menu'; menu.hidden = true;
+                const pin = document.createElement('button'); pin.type = 'button'; pin.textContent = record.pinned ? 'Unpin' : 'Pin';
+                const rename = document.createElement('button'); rename.type = 'button'; rename.textContent = 'Rename';
+                const del = document.createElement('button'); del.type = 'button'; del.textContent = 'Delete'; del.className = 'delete-history-action';
+                pin.addEventListener('click', (event) => { event.stopPropagation(); menu.hidden = true; toggleLocalHistoryPin(record.id); });
+                rename.addEventListener('click', (event) => { event.stopPropagation(); menu.hidden = true; renameLocalHistory(record.id); });
+                del.addEventListener('click', (event) => { event.stopPropagation(); menu.hidden = true; deleteLocalHistory(record.id); });
+                menu.append(pin, rename, del);
+                more.addEventListener('click', (event) => { event.stopPropagation(); const wasHidden = menu.hidden; closeHistoryMenus(menu); menu.hidden = !wasHidden; });
+                wrap.append(item, more, menu); list.appendChild(wrap);
             });
         }
         function openLocalHistory(id) {
@@ -2588,7 +2660,7 @@
             if (record.mode !== currentMode) { switchMode(record.mode); }
             else { chatContent.innerHTML = record.html || ''; refreshOpeningSceneVisibility(); updateCodeHeroVisibility(); scrollToBottom(true); renderLocalHistory(); }
         }
-        function clearLocalHistoryForSession(id) { writeLocalHistory(readLocalHistory().filter(item => item.id !== id)); renderLocalHistory(); }
+        function clearLocalHistoryForSession(id) { deleteLocalHistory(id); }
         let currentMode = 'chat';
         // Deep Think — Chat mode only (composer "+" menu). Persists across
         // turns like the model/thinking-level pickers until switched off;

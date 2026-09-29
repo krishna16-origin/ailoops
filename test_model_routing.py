@@ -78,6 +78,19 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertIn("audio = await _groq_orpheus_audio(response, request.voice)", voice_source)
         self.assertNotIn("raise HTTPException(status_code=502", voice_source)
 
+    def test_chat_history_supports_titles_and_three_dot_actions(self):
+        frontend = pathlib.Path(__file__).with_name("frontend") / "index.html"
+        html = frontend.read_text(encoding="utf-8")
+        for marker in (
+            "history-item-more",
+            "toggleLocalHistoryPin",
+            "renameLocalHistory",
+            "deleteLocalHistory",
+            "customTitle",
+            "record.pinned",
+        ):
+            self.assertIn(marker, html)
+
     def test_glm_rejects_low_effort_maps_to_none(self):
         self.assertEqual(
             app._map_reasoning_effort("low", "z-ai/glm-5.3"),
