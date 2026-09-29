@@ -1434,7 +1434,6 @@
                 </div>
                 <button type="button" class="auth-audio-toggle" id="authAudioToggle" onclick="toggleAuthVideoAudio()" aria-label="Unmute video" aria-pressed="false" title="Unmute video">
                     <svg class="auth-volume-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>
-                    <svg class="auth-volume-muted-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" hidden><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="23" y1="9" x2="17" y2="15"></line><line x1="17" y1="9" x2="23" y2="15"></line></svg>
                 </button>
             </div>
             <div class="auth-form-panel">
@@ -2408,7 +2407,8 @@
 
         let authSignupMode = false;
         function setAuthStatus(message, error = true) { const el = document.getElementById('authStatus'); if (el) { el.textContent = message || ''; el.style.color = error ? '#b23b55' : '#3b7d62'; } }
-        function showAuthScreen(show) { const el = document.getElementById('authScreen'); if (!show) { if (el) el.classList.remove('is-visible'); return; } (window.__splashReady || Promise.resolve()).then(() => { if (authDismissed || authKnownSignedIn) return; if (el) el.classList.add('is-visible'); requestAnimationFrame(() => startAuthVideoPlayback()); }); }
+        function stopAuthVideoPlayback() { document.querySelectorAll('#authVideoSlot video').forEach(video => { video.pause(); video.currentTime = 0; }); }
+        function showAuthScreen(show) { const el = document.getElementById('authScreen'); if (!show) { stopAuthVideoPlayback(); if (el) el.classList.remove('is-visible'); return; } (window.__splashReady || Promise.resolve()).then(() => { if (authDismissed || authKnownSignedIn) return; if (el) el.classList.add('is-visible'); requestAnimationFrame(() => startAuthVideoPlayback()); }); }
         function toggleAuthMode() { authSignupMode = !authSignupMode; document.getElementById('authTitle').textContent = authSignupMode ? 'Create account' : 'Sign in'; document.getElementById('authSubtitle').textContent = authSignupMode ? 'Create your private workspace in seconds.' : 'Continue to your private workspace.'; document.getElementById('authNameField').hidden = !authSignupMode; document.getElementById('authName').hidden = !authSignupMode; document.getElementById('authName').required = authSignupMode; document.getElementById('authPassword').autocomplete = authSignupMode ? 'new-password' : 'current-password'; document.getElementById('authSubmit').textContent = authSignupMode ? 'Create account' : 'Sign in'; document.getElementById('authSwitch').textContent = authSignupMode ? 'I have an account' : 'Create account'; setAuthStatus(''); }
         function startOAuth(provider) { window.location.href = `${API_BASE}/auth/${provider}`; }
         async function forgotPassword() { const email = document.getElementById('authEmail').value.trim(); if (!email) { setAuthStatus('Enter your email first.'); return; } setAuthStatus('If an account exists, reset instructions will be sent securely.', false); try { await fetch(`${API_BASE}/auth/forgot-password`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({email}), credentials:'include'}); } catch (_) {} }
@@ -2440,8 +2440,10 @@
                 toggle.setAttribute('aria-pressed', enabled ? 'true' : 'false');
                 toggle.setAttribute('aria-label', enabled ? 'Mute video' : 'Unmute video');
                 toggle.title = enabled ? 'Mute video' : 'Unmute video';
-                toggle.querySelector('.auth-volume-icon')?.toggleAttribute('hidden', enabled);
-                toggle.querySelector('.auth-volume-muted-icon')?.toggleAttribute('hidden', !enabled);
+                const icon = toggle.querySelector('.auth-volume-icon');
+                if (icon) icon.innerHTML = enabled
+                    ? '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="23" y1="9" x2="17" y2="15"></line><line x1="17" y1="9" x2="23" y2="15"></line>'
+                    : '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>';
             }
             document.querySelectorAll('#authVideoSlot video').forEach(video => {
                 video.dataset.audioEnabled = enabled ? 'true' : 'false';
