@@ -1,0 +1,127 @@
+diff --git a/app.py b/app.py
+index e2fad46..d485266 100644
+--- a/app.py
++++ b/app.py
+@@ -3425,6 +3425,80 @@ def _split_voice_text(text: str, limit: int = GROQ_TTS_MAX_CHARS) -> List[str]:
+     return chunks
+ 
+ 
++VOICE_SYSTEM_PROMPT = (
++    "You are the voice of an AI assistant, speaking out loud like ChatGPT's voice mode. "
++    "You are given the user's question and a draft answer that was produced with tools (web search, files, etc.). "
++    "Turn it into what you would SAY in conversation.\n"
++    "Rules:\n"
++    "- Be concise, smart and short: usually 1-3 sentences, never more than about 60 words unless the user explicitly asks for detail.\n"
++    "- Lead with the answer itself. No preamble like 'Sure' or 'Great question', no recap of the question.\n"
++    "- Sound natural and warm, with contractions, like a sharp friend talking. Plain spoken words only.\n"
++    "- NEVER mention sources, links, URLs, citations, websites, articles, 'according to', 'I searched', 'I found', tools, or the search process.\n"
++    "- No markdown, bullets, numbered lists, tables, emojis, code, or symbols. Say numbers, dates and units the way a person would say them.\n"
++    "- If the draft has many items, mention only the top one to three and offer to say more.\n"
++    "- If the draft is a file or code you can't read aloud, just say briefly what was made and that it's on screen.\n"
++    "- Keep the same language the user spoke in.\n"
++    "Output only the words to be spoken."
++)
++
++
++def _strip_sources_for_voice(text: str) -> str:
++    """Remove the Sources / image block and any links so nothing source-like is spoken."""
++    clean = re.split(r"\n+\s*---\s*\n+\s*\*\*Sources\*\*", text or "", maxsplit=1)[0]
++    clean = re.split(r"\n+---\s*\n", clean, maxsplit=1)[0] if "**Sources**" in (text or "") else clean
++    clean = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", clean)
++    clean = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", clean)
++    clean = re.sub(r"https?://\S+", "", clean)
++    return clean.strip()
++
++
++def _clean_spoken_text(text: str) -> str:
++    clean = re.sub(r"```[\s\S]*?```", "", text or "")
++    clean = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", clean)
++    clean = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", clean)
++    clean = re.sub(r"https?://\S+", "", clean)
++    clean = re.sub(r"^\s*(?:[-*\u2022]|\d+[.)])\s+", "", clean, flags=re.M)
++    clean = re.sub(r"[*_`#>|~]", "", clean)
++    clean = re.sub(r"\s+", " ", clean).strip()
++    return clean
++
++
++async def _voice_spoken_reply(user_message: str, draft: str) -> str:
++    """Rewrite the tool-backed draft into a short, natural, source-free spoken reply."""
++    draft = _strip_sources_for_voice(draft)
++    fallback = _clean_spoken_text(draft)
++    if len(fallback) > 400:
++        fallback = " ".join(re.split(r"(?<=[.!?])\s+", fallback)[:3])
++    api_key = os.getenv("GROQ_API_KEY")
++    if not api_key or not draft:
++        return fallback
++    try:
++        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=8.0)) as client:
++            response = await client.post(
++                GROQ_CHAT_URL,
++                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
++                json={
++                    "model": GROQ_CHAT_MODEL,
++                    "messages": [
++                        {"role": "system", "content": VOICE_SYSTEM_PROMPT},
++                        {"role": "user", "content": f"User asked: {user_message}\n\nDraft answer (from tools):\n{draft[:6000]}"},
++                    ],
++                    "temperature": 0.5,
++                    "max_tokens": 220,
++                    "reasoning_effort": "low",
++                },
++            )
++        if response.is_error:
++            return fallback
++        data = response.json()
++        spoken = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
++        spoken = _clean_spoken_text(spoken)
++        return spoken or fallback
++    except Exception as exc:
++        print(f"Voice rewrite failed, using cleaned draft: {exc}")
++        return fallback
++
++
+ async def _groq_voice_reply(session: dict) -> str:
+     """Use Groq's low-latency chat model for voice turns, not the long chat pipeline."""
+     api_key = os.getenv("GROQ_API_KEY")
+@@ -3493,11 +3567,17 @@ async def voice_chat(request: VoiceChatRequest):
+         attachment_ids=request.attachment_ids,
+     )
+     try:
+-        response = await generate_response_once(chat_request, session)
++        # Tools (web search, files, MCP) still run inside the pipeline, but the
++        # raw result is only a private draft. Nothing from it is spoken directly.
++        draft = await generate_response_once(chat_request, session)
+     except Exception as exc:
+         print(f"[{request.session_id}] Voice Chat pipeline failed: {exc}")
+         traceback.print_exc()
+         raise HTTPException(status_code=502, detail=f"Chat pipeline failed: {str(exc)[:240]}") from exc
++    # Short, natural, source-free reply: this is what is shown AND spoken.
++    response = await _voice_spoken_reply(request.message, draft)
++    if not response:
++        response = "Sorry, I couldn't get that. Could you say it again?"
+     session["messages"].append(AIMessage(content=response))
+     audio = []
+     audio_error = ""
+@@ -3508,7 +3588,7 @@ async def voice_chat(request: VoiceChatRequest):
+             audio_error = f"Speech synthesis unavailable: {str(exc)[:240]}"
+             print(f"[{request.session_id}] Voice synthesis failed: {exc}")
+     else:
+-        audio_error = "Speech synthesis is not configured; the browser will read the answer instead."
++        audio_error = "Orpheus voice is not configured: GROQ_API_KEY is missing."
+     return {
+         "response": response,
+         "audio": audio,
+diff --git a/frontend/index.html b/frontend/index.html
+index 4cb9e12..b348cbf 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -4685,7 +4685,8 @@
+                     try { await playVoiceAudioChunks(data.audio); spoken = true; }
+                     catch (audioError) { console.warn('Voice audio playback failed; using browser speech:', audioError); }
+                 }
+-                if (!spoken) speakVoiceTextFallback(data.response || '');
++                // Orpheus is the only voice. No robotic browser-speech fallback.
++                if (!spoken) console.warn('Orpheus audio unavailable:', data.audio_error || 'no audio returned');
+             } catch (error) {
+                 appendVoiceConversationMessage('assistant', `Voice mode error: ${error.message || 'Chat pipeline failed.'}`);
+                 console.warn('Voice chat failed:', error);
