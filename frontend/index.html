@@ -1431,6 +1431,10 @@
                            preload="auto">
                        </video>
                 </div>
+                <label class="auth-audio-toggle" for="authAudioToggle">
+                    <input id="authAudioToggle" type="checkbox" onchange="setAuthVideoAudio(this.checked)">
+                    <span>Sound</span>
+                </label>
             </div>
             <div class="auth-form-panel">
                 <form class="auth-form" id="authForm">
@@ -2420,7 +2424,13 @@
             } catch (_) {}
         }
         function setAuthVideoAudio(enabled) {
-            document.querySelectorAll('#authVideoSlot video').forEach(video => { video.muted = !enabled; if (video.paused && video.src) video.play().catch(() => {}); });
+            const toggle = document.getElementById('authAudioToggle');
+            if (toggle) toggle.checked = enabled;
+            document.querySelectorAll('#authVideoSlot video').forEach(video => {
+                video.dataset.audioEnabled = enabled ? 'true' : 'false';
+                video.muted = !enabled;
+                if (video.paused && video.src) video.play().catch(() => {});
+            });
             document.querySelectorAll('#authVideoSlot iframe').forEach(frame => { frame.contentWindow?.postMessage(JSON.stringify({event:'command', func: enabled ? 'unMute' : 'mute', args: []}), 'https://www.youtube.com'); });
         }
         // Login video loader: tries every plausible location/format until one loads (handles
@@ -2448,7 +2458,13 @@
             tryNext();
         })();
         function startAuthVideoPlayback() {
-            document.querySelectorAll('#authVideoSlot video').forEach(video => { video.autoplay = true; video.loop = true; video.muted = true; video.playsInline = true; video.play().catch(() => {}); });
+            document.querySelectorAll('#authVideoSlot video').forEach(video => {
+                video.autoplay = true;
+                video.loop = true;
+                video.muted = video.dataset.audioEnabled !== 'true';
+                video.playsInline = true;
+                video.play().catch(() => {});
+            });
         }
                 const authVideo = document.getElementById('authVideo');
         authVideo?.addEventListener('canplay', () => { authVideo.hidden = false; const placeholder = document.getElementById('authVideoPlaceholder'); if (placeholder) placeholder.hidden = true; startAuthVideoPlayback(); });
