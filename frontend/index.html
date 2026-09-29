@@ -4636,6 +4636,15 @@
                 if (token === voicePlaybackToken) stopVoiceReplyGlow();
             }
         }
+        function speakVoiceTextFallback(text) {
+            if (!('speechSynthesis' in window) || !text) return;
+            window.speechSynthesis.cancel();
+            const spoken = text.replace(/```[\s\S]*?```/g, ' ').replace(/[*_#>`~-]/g, ' ').replace(/\[([^\]]+)\]\([^\)]+\)/g, '$1').replace(/\s+/g, ' ').trim();
+            if (!spoken) return;
+            const utterance = new SpeechSynthesisUtterance(spoken);
+            utterance.rate = 1;
+            window.speechSynthesis.speak(utterance);
+        }
         function sendTypedVoiceMessage(event) {
             if (event) event.preventDefault();
             const input = document.getElementById('desktopVoiceInput');
@@ -4661,16 +4670,30 @@
                 const response = await fetch(`${API_BASE}/voice-chat`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message: text, session_id: modes.chat.sessionId, voice: 'hannah' })
+                    body: JSON.stringify({
+                        message: text,
+                        session_id: modes.chat.sessionId,
+                        voice: 'hannah',
+                        model_type: document.getElementById('modelType')?.value || 'fast',
+                        temperature: 0.3,
+                        thinking_level: document.getElementById('tempSetting')?.value || 'medium',
+                        deep_think: typeof deepThinkEnabled !== 'undefined' ? Boolean(deepThinkEnabled) : false,
+                        mcp_servers: typeof selectedMcpServers === 'function' ? selectedMcpServers() : []
+                    })
                 });
                 const data = await response.json();
-                if (!response.ok) throw new Error(data.detail || 'Voice response failed');
+                if (!response.ok) throw new Error(data.detail || `Chat pipeline failed (${response.status})`);
                 appendMessage('assistant', data.response || '', []);
                 const assistantMessage = appendVoiceConversationMessage('assistant');
                 await streamVoiceConversationMessage(assistantMessage, data.response || '');
-                await playVoiceAudioChunks(data.audio || []);
+                let spoken = false;
+                if (data.audio?.length) {
+                    try { await playVoiceAudioChunks(data.audio); spoken = true; }
+                    catch (audioError) { console.warn('Voice audio playback failed; using browser speech:', audioError); }
+                }
+                if (!spoken) speakVoiceTextFallback(data.response || '');
             } catch (error) {
-                appendVoiceConversationMessage('assistant', 'Voice response unavailable.');
+                appendVoiceConversationMessage('assistant', `Voice mode error: ${error.message || 'Chat pipeline failed.'}`);
                 console.warn('Voice chat failed:', error);
             } finally {
                 voiceRecognitionPaused = false;

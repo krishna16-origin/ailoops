@@ -1420,6 +1420,12 @@ class VoiceChatRequest(BaseModel):
     message: str
     session_id: str
     voice: str = "hannah"
+    model_type: str = "fast"
+    temperature: float = 0.3
+    thinking_level: str = "medium"
+    deep_think: bool = False
+    mcp_servers: Optional[List[str]] = None
+    attachment_ids: Optional[List[str]] = None
 
 class ChatEstimateRequest(BaseModel):
     """Chat mode only. Cheap, no-LLM-call estimate of how long a turn with
@@ -3474,27 +3480,43 @@ async def _groq_orpheus_audio(text: str, voice: str) -> List[str]:
 
 @app.post("/voice-chat")
 async def voice_chat(request: VoiceChatRequest):
-    """Generate a normal chat reply, then synthesize it with Groq Orpheus English."""
-    if not os.getenv("GROQ_API_KEY"):
-        raise HTTPException(status_code=503, detail="Voice mode is not configured: GROQ_API_KEY is missing.")
+    """Run the full Chat mode pipeline, then optionally speak its answer."""
     session = get_session(request.session_id)
     session["messages"] = trim_memory(session["messages"])
     session["messages"].append(HumanMessage(content=request.message))
+    chat_request = ChatRequest(
+        message=request.message,
+        session_id=request.session_id,
+        model_type=request.model_type,
+        temperature=request.temperature,
+        thinking_level=request.thinking_level,
+        deep_think=request.deep_think,
+        mcp_servers=request.mcp_servers,
+        attachment_ids=request.attachment_ids,
+    )
     try:
-        response = await _groq_voice_reply(session)
-    except HTTPException:
-        raise
+        response = await generate_response_once(chat_request, session)
     except Exception as exc:
-        print(f"[{request.session_id}] Voice response generation failed: {exc}")
+        print(f"[{request.session_id}] Voice Chat pipeline failed: {exc}")
         traceback.print_exc()
-        raise HTTPException(status_code=502, detail="The voice assistant could not generate a response.") from exc
+        raise HTTPException(status_code=502, detail=f"Chat pipeline failed: {str(exc)[:240]}") from exc
     session["messages"].append(AIMessage(content=response))
-    audio = await _groq_orpheus_audio(response, request.voice)
+    audio = []
+    audio_error = ""
+    if os.getenv("GROQ_API_KEY"):
+        try:
+            audio = await _groq_orpheus_audio(response, request.voice)
+        except Exception as exc:
+            audio_error = f"Speech synthesis unavailable: {str(exc)[:240]}"
+            print(f"[{request.session_id}] Voice synthesis failed: {exc}")
+    else:
+        audio_error = "Speech synthesis is not configured; the browser will read the answer instead."
     return {
         "response": response,
         "audio": audio,
         "audio_mime": "audio/wav",
         "voice_model": GROQ_TTS_MODEL,
+        "audio_error": audio_error,
         "session_id": request.session_id,
     }
 
