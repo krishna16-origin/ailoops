@@ -4634,15 +4634,6 @@
                 if (token === voicePlaybackToken) stopVoiceReplyGlow();
             }
         }
-        function speakVoiceTextFallback(text) {
-            if (!('speechSynthesis' in window) || !text) return;
-            window.speechSynthesis.cancel();
-            const spoken = text.replace(/```[\s\S]*?```/g, ' ').replace(/[*_#>`~-]/g, ' ').replace(/\[([^\]]+)\]\([^\)]+\)/g, '$1').replace(/\s+/g, ' ').trim();
-            if (!spoken) return;
-            const utterance = new SpeechSynthesisUtterance(spoken);
-            utterance.rate = 1;
-            window.speechSynthesis.speak(utterance);
-        }
         function sendTypedVoiceMessage(event) {
             if (event) event.preventDefault();
             const input = document.getElementById('desktopVoiceInput');
@@ -4680,12 +4671,13 @@
                 appendMessage('assistant', data.response || '', []);
                 const assistantMessage = appendVoiceConversationMessage('assistant');
                 await streamVoiceConversationMessage(assistantMessage, data.response || '');
-                let spoken = false;
                 if (data.audio?.length) {
-                    try { await playVoiceAudioChunks(data.audio); spoken = true; }
-                    catch (audioError) { console.warn('Voice audio playback failed; using browser speech:', audioError); }
+                    try { await playVoiceAudioChunks(data.audio); }
+                    catch (audioError) { console.warn('Orpheus audio playback failed:', audioError); }
                 }
-                if (!spoken) speakVoiceTextFallback(data.response || '');
+                if (!data.audio?.length) {
+                    console.warn('Voice response was not synthesized by Orpheus:', data.audio_error || 'no audio returned');
+                }
             } catch (error) {
                 appendVoiceConversationMessage('assistant', `Voice mode error: ${error.message || 'Chat pipeline failed.'}`);
                 console.warn('Voice chat failed:', error);

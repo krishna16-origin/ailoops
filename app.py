@@ -1182,11 +1182,17 @@ async def chat_context_node(state: dict, progress=None) -> dict:
     search_text = ""
     links = []
     images = []
-    if needs_web_search(latest):
+    # Voice mode is deliberately MCP-only.  Do not let it implicitly invoke
+    # the legacy web-search heuristic or the uploaded-file RAG pipeline; those
+    # are separate Chat-mode tools and make voice behavior unpredictable.
+    voice_mode = bool(state.get("voice_mode"))
+    if not voice_mode and needs_web_search(latest):
         query = resolve_search_query(history, latest)
         await publish_progress(progress, "chat_context_node", "chat_context_node", f"Detected a current-information request and searched for: {query}")
         (search_text, links), images = await asyncio.gather(web_search(query), web_image_search(query))
         await publish_progress(progress, "chat_context_result", "chat_context_result", f"Collected {len(links)} source result(s) for the response context.")
+    elif voice_mode:
+        await publish_progress(progress, "chat_context_node", "chat_context_node", "Voice mode is using MCP integrations only.")
     else:
         await publish_progress(progress, "chat_context_node", "chat_context_node", "No web lookup was required; continuing with the conversation context.")
     mcp_context = await mcp_gateway.context_for_message(
@@ -1198,7 +1204,7 @@ async def chat_context_node(state: dict, progress=None) -> dict:
 
     rag_text = ""
     session = state.get("session") or {}
-    if rag_engine.has_files(session):
+    if not voice_mode and rag_engine.has_files(session):
         await _await_rag_indexing(session, state.get("attachment_ids"), progress)
         rag_text, rag_chunks = await rag_engine.build_context(session, latest, attachment_ids=state.get("attachment_ids"))
         attached_now = state.get("attachment_ids") or []
@@ -1277,6 +1283,7 @@ async def generate_response_once(request: "ChatRequest", session: dict, progress
     state["session_id"] = request.session_id
     state["mcp_servers"] = request.mcp_servers
     state["attachment_ids"] = request.attachment_ids
+    state["voice_mode"] = bool(getattr(request, "voice_mode", False))
     state = await chat_context_node(state, progress)
     state = await chat_compose_node(request, state, progress)
     return await chat_finalize_node(state, progress)
@@ -1410,6 +1417,9 @@ class ChatRequest(BaseModel):
     # DEEP_THINK_MAX_TOKENS).
     deep_think: bool = False
     mcp_servers: Optional[List[str]] = None
+    # Internal flag used only by /voice-chat. Voice turns may use MCP context,
+    # but must never activate Chat's web-search or RAG tools.
+    voice_mode: bool = False
     # Optional: restrict RAG retrieval to specific uploaded file ids for this
     # turn. When omitted/empty, retrieval searches every file uploaded so far
     # in this session — upload once, ask about it across multiple turns.
@@ -3476,7 +3486,7 @@ async def _groq_orpheus_audio(text: str, voice: str) -> List[str]:
 
 @app.post("/voice-chat")
 async def voice_chat(request: VoiceChatRequest):
-    """Run the full Chat mode pipeline, then optionally speak its answer."""
+    """Answer with MCP-only context and speak every result with Orpheus."""
     session = get_session(request.session_id)
     session["messages"] = trim_memory(session["messages"])
     session["messages"].append(HumanMessage(content=request.message))
@@ -3491,24 +3501,30 @@ async def voice_chat(request: VoiceChatRequest):
         deep_think=False,
         mcp_servers=request.mcp_servers,
         attachment_ids=request.attachment_ids,
+        voice_mode=True,
     )
+    response = "I’m sorry, I couldn’t complete that request. Please try again."
+    pipeline_error = ""
     try:
         response = await generate_response_once(chat_request, session)
     except Exception as exc:
         print(f"[{request.session_id}] Voice Chat pipeline failed: {exc}")
         traceback.print_exc()
-        raise HTTPException(status_code=502, detail=f"Chat pipeline failed: {str(exc)[:240]}") from exc
+        pipeline_error = f"Chat pipeline failed: {str(exc)[:240]}"
+        # Return the spoken error as a normal voice response so the client can
+        # still play it through the one permitted speech provider, Orpheus.
+        response = "I’m sorry, I couldn’t complete that request. Please try again."
     session["messages"].append(AIMessage(content=response))
     audio = []
-    audio_error = ""
-    if os.getenv("GROQ_API_KEY"):
-        try:
-            audio = await _groq_orpheus_audio(response, request.voice)
-        except Exception as exc:
-            audio_error = f"Speech synthesis unavailable: {str(exc)[:240]}"
-            print(f"[{request.session_id}] Voice synthesis failed: {exc}")
-    else:
-        audio_error = "Speech synthesis is not configured; the browser will read the answer instead."
+    audio_error = pipeline_error
+    try:
+        # This is intentionally the only speech path. Never substitute browser
+        # SpeechSynthesis or another provider, including for error messages.
+        audio = await _groq_orpheus_audio(response, request.voice)
+    except Exception as exc:
+        synthesis_error = f"Orpheus speech synthesis failed: {str(exc)[:240]}"
+        audio_error = "; ".join(x for x in (audio_error, synthesis_error) if x)
+        print(f"[{request.session_id}] Orpheus voice synthesis failed: {exc}")
     return {
         "response": response,
         "audio": audio,
