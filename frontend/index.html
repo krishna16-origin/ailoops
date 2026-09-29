@@ -4719,7 +4719,7 @@
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             if (!SpeechRecognition) return;
             voiceRecognition = new SpeechRecognition();
-            voiceRecognition.continuous = true;
+            voiceRecognition.continuous = false;
             voiceRecognition.interimResults = true;
             voiceRecognition.lang = document.documentElement.lang || 'en-US';
             voiceRecognition.onresult = (event) => {
@@ -4734,13 +4734,21 @@
                     voiceTurnTimer = setTimeout(submitVoiceTurn, 850);
                 }
             };
-            voiceRecognition.onerror = () => {};
-            voiceRecognition.onend = () => {
-                if (voiceStream && !voiceRecognitionPaused && mobileVoiceOverlay && !mobileVoiceOverlay.hidden) {
-                    try { voiceRecognition.start(); } catch (error) { /* already restarting */ }
+            voiceRecognition.onerror = (event) => {
+                if (event.error && !['no-speech', 'aborted'].includes(event.error)) {
+                    appendVoiceConversationMessage('assistant', `Microphone error: ${event.error}. Tap the voice button again and allow microphone access.`);
                 }
             };
-            try { voiceRecognition.start(); } catch (error) { /* browser may already be listening */ }
+            voiceRecognition.onend = () => {
+                if (voiceStream && !voiceRecognitionPaused && mobileVoiceOverlay && !mobileVoiceOverlay.hidden) {
+                    window.setTimeout(() => {
+                        if (voiceStream && !voiceRecognitionPaused && mobileVoiceOverlay && !mobileVoiceOverlay.hidden) {
+                            try { voiceRecognition.start(); } catch (error) { /* already listening */ }
+                        }
+                    }, 120);
+                }
+            };
+            try { voiceRecognition.start(); } catch (error) { appendVoiceConversationMessage('assistant', 'Tap the voice button again to start listening.'); }
         }
         function closeMobileVoiceMode() {
             stopVoiceReplyGlow();
@@ -4804,7 +4812,16 @@
                 return;
             }
             try {
-                voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+                // On phones, SpeechRecognition already owns the microphone. Opening
+                // a second getUserMedia microphone can prevent it from delivering
+                // final results, so use the speech API directly and keep an empty
+                // stream marker for the shared voice-mode state.
+                if (isMobileVoiceMode() && SpeechRecognitionCtor) {
+                    voiceStream = { getTracks: () => [] };
+                } else {
+                    voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                }
                 const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
                 if (!AudioContextCtor) throw new Error('Web Audio is not supported in this browser.');
                 voiceAudioContext = new AudioContextCtor();
@@ -4812,7 +4829,7 @@
                 voiceAnalyser = voiceAudioContext.createAnalyser();
                 voiceAnalyser.fftSize = 256;
                 voiceLevelData = new Uint8Array(voiceAnalyser.fftSize);
-                voiceAudioContext.createMediaStreamSource(voiceStream).connect(voiceAnalyser);
+                if (voiceStream.getTracks().length) voiceAudioContext.createMediaStreamSource(voiceStream).connect(voiceAnalyser);
                 voiceModeBtn.classList.add('is-listening');
                 voiceModeBtn.setAttribute('aria-pressed', 'true');
                 voiceModeBtn.setAttribute('aria-label', 'Stop voice mode');
