@@ -3137,11 +3137,21 @@ async def auth_forgot_password(request: Request):
     return {"ok": True, "message": "If an account exists, reset instructions will be sent securely."}
 
 
+def _oauth_failure_redirect(reason: str = "oauth_unavailable") -> RedirectResponse:
+    """Return OAuth cancellations/configuration gaps as a normal browser redirect.
+
+    OAuth is optional when users choose "Skip for now". Returning 4xx/5xx responses
+    for an unconfigured provider makes harmless abandoned sign-in attempts appear as
+    failed requests in Render, even though the app itself is healthy.
+    """
+    return RedirectResponse(f"/?auth_error={reason}", status_code=303)
+
+
 @app.get("/auth/{provider}")
 async def oauth_start(provider: str):
-    if provider not in {"google", "github"}: raise HTTPException(status_code=404)
+    if provider not in {"google", "github"}: return _oauth_failure_redirect("oauth_unavailable")
     client_id = os.getenv(f"{provider.upper()}_CLIENT_ID")
-    if not client_id: raise HTTPException(status_code=503, detail=f"{provider.title()} login is not configured.")
+    if not client_id: return _oauth_failure_redirect("oauth_unavailable")
     state = secrets.token_urlsafe(24)
     params = {"client_id": client_id, "redirect_uri": _redirect_uri(provider), "state": state}
     if provider == "google": params.update({"response_type": "code", "scope": "openid email profile", "access_type": "online", "prompt": "select_account"}); url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
@@ -3160,8 +3170,13 @@ async def _oauth_user(provider: str, code: str):
 
 @app.get("/auth/{provider}/callback")
 async def oauth_callback(provider: str, request: Request, code: str = "", state: str = ""):
-    if provider not in {"google", "github"} or not code or not state or not hmac.compare_digest(state, request.cookies.get("maximus_oauth_state", "")): raise HTTPException(status_code=400, detail="Invalid OAuth sign-in request.")
-    profile = await _oauth_user(provider, code); db = _auth_db(); row = db.execute("SELECT * FROM users WHERE email=?", (profile["email"],)).fetchone()
+    if provider not in {"google", "github"} or not code or not state or not hmac.compare_digest(state, request.cookies.get("maximus_oauth_state", "")):
+        return _oauth_failure_redirect("oauth_cancelled")
+    try:
+        profile = await _oauth_user(provider, code)
+    except Exception:
+        return _oauth_failure_redirect("oauth_failed")
+    db = _auth_db(); row = db.execute("SELECT * FROM users WHERE email=?", (profile["email"],)).fetchone()
     if row: user = _user_payload(row); db.execute("UPDATE users SET name=?, avatar=?, provider=? WHERE id=?", (profile["name"], profile["avatar"], provider, row["id"]))
     else:
         user = {"id": secrets.token_urlsafe(18), **profile, "provider": provider}; db.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)", (user["id"], user["email"], user["name"], user["avatar"], provider, "", datetime.now(timezone.utc).isoformat()))

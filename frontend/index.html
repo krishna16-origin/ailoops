@@ -2417,6 +2417,16 @@
         let authDismissed = false, authKnownSignedIn = false;
         async function bootAuth() {
             // Splash -> login page (always, unless the user is already signed in) -> Skip/Sign in -> chat
+            const authError = new URLSearchParams(window.location.search).get('auth_error');
+            if (authError) {
+                const messages = {
+                    oauth_unavailable: 'Social sign-in is not configured. Use email sign-in or Skip for now.',
+                    oauth_cancelled: 'Social sign-in was cancelled. Use email sign-in or Skip for now.',
+                    oauth_failed: 'Social sign-in could not be completed. Use email sign-in or Skip for now.'
+                };
+                setAuthStatus(messages[authError] || messages.oauth_failed);
+                window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
+            }
             (window.__splashReady || Promise.resolve()).then(() => { if (!authKnownSignedIn && !authDismissed) showAuthScreen(true); });
             try {
                 const response = await fetch(`${API_BASE}/auth/me`, {credentials:'include'});
