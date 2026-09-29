@@ -875,6 +875,8 @@
             .mobile-voice-stop svg { width:22px; height:22px; }
             .mobile-voice-close { color:var(--text-secondary); }
             .mobile-voice-close svg { width:20px; height:20px; }
+            .desktop-voice-composer { display:flex; width:100%; margin:0 auto 12px; padding:9px 12px; }
+            .desktop-voice-composer textarea { min-height:38px; font-size:15px; }
         }
 
         /* ============== MODEL / EFFORT PICKER (input-attached, ChatGPT/Claude-style) ============== */
@@ -4543,6 +4545,8 @@
         let voiceTurnTimer = null;
         let mobileVoiceTranscript = '';
         let voiceAudio = null;
+        let voiceAudioSource = null;
+        let voicePlaybackToken = 0;
         let voiceReplyLevel = 0;
         let voiceReplyGlowFrame = null;
         let voiceReplyGlowActive = false;
@@ -4588,19 +4592,49 @@
             voiceReplyLevel = 0;
         }
 
-        function playVoiceAudioChunks(chunks) {
-            return new Promise((resolve) => {
-                let index = 0;
-                if (chunks && chunks.length) startVoiceReplyGlow();
-                const playNext = () => {
-                    if (!chunks || index >= chunks.length) { stopVoiceReplyGlow(); resolve(); return; }
-                    voiceAudio = new Audio(`data:audio/wav;base64,${chunks[index++]}`);
-                    voiceAudio.onended = playNext;
-                    voiceAudio.onerror = playNext;
-                    voiceAudio.play().catch(playNext);
-                };
-                playNext();
-            });
+        function stopVoiceAudioPlayback() {
+            voicePlaybackToken += 1;
+            if (voiceAudioSource) {
+                try { voiceAudioSource.stop(); } catch (error) { /* already ended */ }
+                voiceAudioSource.disconnect();
+                voiceAudioSource = null;
+            }
+            if (voiceAudio) { voiceAudio.pause(); voiceAudio.src = ''; voiceAudio = null; }
+            stopVoiceReplyGlow();
+        }
+        function decodeVoiceChunk(base64) {
+            const bytes = atob(base64);
+            const buffer = new ArrayBuffer(bytes.length);
+            const view = new Uint8Array(buffer);
+            for (let i = 0; i < bytes.length; i++) view[i] = bytes.charCodeAt(i);
+            return buffer;
+        }
+        async function playVoiceAudioChunks(chunks) {
+            if (!chunks || !chunks.length) return;
+            stopVoiceAudioPlayback();
+            const token = voicePlaybackToken;
+            startVoiceReplyGlow();
+            try {
+                if (voiceAudioContext && voiceAudioContext.state !== 'closed') {
+                    await voiceAudioContext.resume();
+                    for (const chunk of chunks) {
+                        if (token !== voicePlaybackToken) return;
+                        const audioBuffer = await new Promise((resolve, reject) => voiceAudioContext.decodeAudioData(decodeVoiceChunk(chunk), resolve, reject));
+                        if (token !== voicePlaybackToken) return;
+                        await new Promise((resolve, reject) => {
+                            voiceAudioSource = voiceAudioContext.createBufferSource();
+                            voiceAudioSource.buffer = audioBuffer;
+                            voiceAudioSource.connect(voiceAudioContext.destination);
+                            voiceAudioSource.onended = () => { voiceAudioSource = null; resolve(); };
+                            try { voiceAudioSource.start(0); } catch (error) { reject(error); }
+                        });
+                    }
+                    return;
+                }
+                throw new Error('Audio output is unavailable.');
+            } finally {
+                if (token === voicePlaybackToken) stopVoiceReplyGlow();
+            }
         }
         function sendTypedVoiceMessage(event) {
             if (event) event.preventDefault();
@@ -4694,7 +4728,7 @@
         function closeMobileVoiceMode() {
             stopVoiceReplyGlow();
             if (voiceTurnTimer) { clearTimeout(voiceTurnTimer); voiceTurnTimer = null; }
-            if (voiceAudio) { voiceAudio.pause(); voiceAudio = null; }
+            stopVoiceAudioPlayback();
             voiceRecognitionPaused = true;
             if (voiceRecognition) {
                 voiceRecognition.onend = null;
@@ -4754,7 +4788,10 @@
             }
             try {
                 voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                voiceAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+                const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+                if (!AudioContextCtor) throw new Error('Web Audio is not supported in this browser.');
+                voiceAudioContext = new AudioContextCtor();
+                await voiceAudioContext.resume();
                 voiceAnalyser = voiceAudioContext.createAnalyser();
                 voiceAnalyser.fftSize = 256;
                 voiceLevelData = new Uint8Array(voiceAnalyser.fftSize);
