@@ -1420,10 +1420,6 @@ class VoiceChatRequest(BaseModel):
     message: str
     session_id: str
     voice: str = "hannah"
-    model_type: str = "fast"
-    temperature: float = 0.3
-    thinking_level: str = "medium"
-    deep_think: bool = False
     mcp_servers: Optional[List[str]] = None
     attachment_ids: Optional[List[str]] = None
 
@@ -3487,10 +3483,12 @@ async def voice_chat(request: VoiceChatRequest):
     chat_request = ChatRequest(
         message=request.message,
         session_id=request.session_id,
-        model_type=request.model_type,
-        temperature=request.temperature,
-        thinking_level=request.thinking_level,
-        deep_think=request.deep_think,
+        # Voice mode has its own fixed fast defaults; it does not inherit the
+        # Chat mode's selected model, thinking level, or Deep Think setting.
+        model_type="fast",
+        temperature=0.3,
+        thinking_level="medium",
+        deep_think=False,
         mcp_servers=request.mcp_servers,
         attachment_ids=request.attachment_ids,
     )

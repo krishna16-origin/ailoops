@@ -4674,10 +4674,6 @@
                         message: text,
                         session_id: modes.chat.sessionId,
                         voice: 'hannah',
-                        model_type: document.getElementById('modelType')?.value || 'fast',
-                        temperature: 0.3,
-                        thinking_level: document.getElementById('tempSetting')?.value || 'medium',
-                        deep_think: typeof deepThinkEnabled !== 'undefined' ? Boolean(deepThinkEnabled) : false,
                         mcp_servers: typeof selectedMcpServers === 'function' ? selectedMcpServers() : []
                     })
                 });
