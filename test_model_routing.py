@@ -81,6 +81,13 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertEqual(app.FISH_REFERENCE_ID, expected)
         self.assertEqual(voice_ws.FISH_REFERENCE_ID, expected)
 
+    def test_reopening_voice_mode_resets_paused_session_state(self):
+        source = pathlib.Path(__file__).with_name("frontend") / "index.html"
+        html = source.read_text(encoding="utf-8")
+        reopen = html[html.index("function openMobileVoiceMode") : html.index("function setVoiceLevel")]
+        self.assertIn("voiceRecognitionPaused = false", reopen)
+        self.assertIn("voiceSocketTurnActive = false", reopen)
+
     def test_voice_chat_streams_groq_text_through_fish_audio(self):
         source = pathlib.Path(__file__).with_name("app.py").read_text(encoding="utf-8")
         voice_source = source[source.index("async def voice_chat"):]

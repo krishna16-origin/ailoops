@@ -5186,6 +5186,15 @@
             if (!mobileVoiceOverlay) return;
             const modelLabel = document.getElementById('modelPickerLabel');
             if (mobileVoiceAgent) mobileVoiceAgent.textContent = 'Fish Audio';
+            // stopVoiceMode() intentionally pauses recognition; clear that
+            // session state before creating a fresh recognizer on reopen.
+            voiceRecognitionPaused = false;
+            voiceSocketTurnActive = false;
+            voiceCurrentReply = '';
+            voiceActiveServerTurn = 0;
+            voiceIgnoredServerTurn = 0;
+            voiceSocketError = null;
+            voiceStreamDone = true;
             ensureVoicePlayCtx();
             mobileVoiceTranscript = '';
             if (mobileVoiceConversation) mobileVoiceConversation.innerHTML = '';
