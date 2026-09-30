@@ -128,7 +128,18 @@ class BrowserManager:
             profile = _session_dir(session_id) if persistent else None
             headless = os.getenv("PLAYWRIGHT_HEADLESS", "1").lower() not in {"0", "false", "no"}
             executable = os.getenv("PLAYWRIGHT_EXECUTABLE_PATH")
-            launch_args: dict[str, Any] = {"headless": headless}
+            # Render runs the service in a restricted container without a usable
+            # Chromium sandbox or large /dev/shm. These flags are safe for the
+            # isolated browser worker and prevent the browser process from
+            # exiting immediately after it is found and launched.
+            chromium_args = [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ]
+            extra_args = os.getenv("PLAYWRIGHT_ARGS", "").split()
+            launch_args: dict[str, Any] = {"headless": headless, "args": chromium_args + extra_args}
             if executable:
                 launch_args["executable_path"] = executable
             elif os.getenv("PLAYWRIGHT_BROWSER_CHANNEL"):
