@@ -3406,7 +3406,8 @@ VOICE_LLM_MODEL = os.getenv("VOICE_LLM_MODEL", "openai/gpt-oss-20b")
 FISH_TTS_URL = "https://api.fish.audio/v1/tts"
 FISH_MODEL = os.getenv("FISH_MODEL", "s2.1-pro-free")
 FISH_LATENCY = os.getenv("FISH_LATENCY", "balanced")  # "normal" | "balanced"
-FISH_REFERENCE_ID = os.getenv("FISH_REFERENCE_ID", "").strip()
+DEFAULT_FISH_REFERENCE_ID = "933563129e564b19a115bedd57b7406a"  # Sarah — Fish Official, female/conversational
+FISH_REFERENCE_ID = os.getenv("FISH_REFERENCE_ID", DEFAULT_FISH_REFERENCE_ID).strip() or DEFAULT_FISH_REFERENCE_ID
 
 VOICE_SYSTEM_PROMPT = (
     "You are a friendly real-time voice assistant. Reply the way a person talks: "

@@ -2,6 +2,7 @@ import pathlib
 import unittest
 
 import app
+import voice_ws
 
 
 class ModelRoutingTests(unittest.TestCase):
@@ -74,6 +75,11 @@ class ModelRoutingTests(unittest.TestCase):
 
     def test_voice_uses_groq_gpt_oss_20b_by_default(self):
         self.assertEqual(app.VOICE_LLM_MODEL, "openai/gpt-oss-20b")
+
+    def test_voice_uses_one_fixed_sarah_reference_across_transports(self):
+        expected = "933563129e564b19a115bedd57b7406a"
+        self.assertEqual(app.FISH_REFERENCE_ID, expected)
+        self.assertEqual(voice_ws.FISH_REFERENCE_ID, expected)
 
     def test_voice_chat_streams_groq_text_through_fish_audio(self):
         source = pathlib.Path(__file__).with_name("app.py").read_text(encoding="utf-8")
