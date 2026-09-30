@@ -8,16 +8,16 @@ new page so browser work never replaces an ailoops web-app page.
 from __future__ import annotations
 
 import asyncio
-import base64
 import os
 import re
-import shutil
+import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from playwright.async_api import BrowserContext, Page, async_playwright
+from playwright.async_api import BrowserContext, Error as PlaywrightError, Page, async_playwright
 
 MAX_TEXT = 24_000
 MAX_ITEMS = 200
@@ -73,6 +73,49 @@ class BrowserManager:
         self._contexts: dict[str, BrowserContext] = {}
         self._traces: set[str] = set()
         self._lock = asyncio.Lock()
+        self._browser_install_lock = asyncio.Lock()
+        self._browser_install_attempted = False
+
+    async def _install_browser_if_needed(self) -> None:
+        """Download Chromium into Playwright's cache when a Render build omitted it."""
+        if self._browser_install_attempted:
+            return
+        async with self._browser_install_lock:
+            if self._browser_install_attempted:
+                return
+            self._browser_install_attempted = True
+            if os.getenv("PLAYWRIGHT_AUTO_INSTALL", "1").lower() in {"0", "false", "no"}:
+                raise RuntimeError(
+                    "Playwright Chromium is not installed. Run `python -m playwright install chromium` "
+                    "during the Render build or set PLAYWRIGHT_AUTO_INSTALL=1."
+                )
+            try:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    [sys.executable, "-m", "playwright", "install", "chromium"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+            except Exception as exc:
+                detail = getattr(exc, "stderr", "") or str(exc)
+                raise RuntimeError(f"Playwright could not install Chromium: {detail[-800:]}") from exc
+
+    async def _launch_context(self, profile: str | None, launch_args: dict[str, Any]) -> BrowserContext:
+        try:
+            if profile:
+                return await self._playwright.chromium.launch_persistent_context(profile, **launch_args)
+            browser = await self._playwright.chromium.launch(**launch_args)
+            return await browser.new_context(accept_downloads=True)
+        except PlaywrightError as exc:
+            if "Executable doesn't exist" not in str(exc) and "executable doesn't exist" not in str(exc):
+                raise
+            await self._install_browser_if_needed()
+            if profile:
+                return await self._playwright.chromium.launch_persistent_context(profile, **launch_args)
+            browser = await self._playwright.chromium.launch(**launch_args)
+            return await browser.new_context(accept_downloads=True)
 
     async def _context(self, session_id: str) -> BrowserContext:
         async with self._lock:
@@ -90,11 +133,7 @@ class BrowserManager:
                 launch_args["executable_path"] = executable
             elif os.getenv("PLAYWRIGHT_BROWSER_CHANNEL"):
                 launch_args["channel"] = os.getenv("PLAYWRIGHT_BROWSER_CHANNEL")
-            if profile:
-                context = await self._playwright.chromium.launch_persistent_context(str(profile), **launch_args)
-            else:
-                browser = await self._playwright.chromium.launch(**launch_args)
-                context = await browser.new_context(accept_downloads=True)
+            context = await self._launch_context(str(profile) if profile else None, launch_args)
             self._contexts[session_id] = context
             return context
 
