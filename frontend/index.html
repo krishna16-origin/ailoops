@@ -4621,6 +4621,15 @@
         let voiceRecognition = null;
         let voiceRecognitionPaused = false;
         let voiceTurnTimer = null;
+        let voiceAudioSource = null;
+        let voiceCaptureProcessor = null;
+        let voiceCaptureMute = null;
+        let voicePcmSpeaking = false;
+        let voicePcmLastSpeechAt = 0;
+        let voicePendingTypedText = '';
+        const VOICE_PCM_RATE = 16000;
+        const VOICE_VAD_THRESHOLD = 0.012;
+        const VOICE_SILENCE_MS = 720;
         let mobileVoiceTranscript = '';
         let voiceAudio = null;
         let voicePlaybackToken = 0;
@@ -4930,6 +4939,12 @@
                 voiceCurrentReply += `${event.text || ''} `;
                 return;
             }
+            if (event.type === 'transcript') {
+                const text = String(event.text || '').trim();
+                if (text && text !== voicePendingTypedText) appendMessage('user', text, []);
+                voicePendingTypedText = '';
+                return;
+            }
             if (event.type === 'state' && event.turn) {
                 if (event.state === 'thinking' || event.state === 'transcribing') {
                     voiceActiveServerTurn = Number(event.turn) || voiceActiveServerTurn;
@@ -5042,6 +5057,14 @@
                         voiceSocketTurnActive = false;
                         voiceStreamDone = true;
                         maybeFinishVoicePlayback(voicePlaybackToken, resumeVoiceListening);
+                    } else if (mobileVoiceOverlay && !mobileVoiceOverlay.hidden && !voiceRecognitionPaused) {
+                        // Recover a dropped idle socket without requiring the
+                        // user to close and reopen voice mode.
+                        window.setTimeout(() => {
+                            if (mobileVoiceOverlay && !mobileVoiceOverlay.hidden && !voiceRecognitionPaused && !voiceSocket) {
+                                connectVoiceSocket().catch(() => {});
+                            }
+                        }, 400);
                     }
                 };
             });
@@ -5181,10 +5204,95 @@
         }
         function resumeVoiceListening() {
             voiceRecognitionPaused = false;
+            if (voiceAudioSource) {
+                if (!voiceSocket || !voiceSocketReady || voiceSocket.readyState !== WebSocket.OPEN) {
+                    connectVoiceSocket().catch(() => {});
+                }
+                return;
+            }
             if (voiceStream && mobileVoiceOverlay && !mobileVoiceOverlay.hidden && voiceRecognition) {
                 voiceRecognition.onend = handleVoiceRecognitionEnd;
                 try { voiceRecognition.start(); } catch (error) { /* already listening */ }
             }
+        }
+        function resampleVoicePcm(input, inputRate) {
+            const ratio = inputRate / VOICE_PCM_RATE;
+            const outputLength = Math.max(1, Math.floor(input.length / ratio));
+            const output = new Int16Array(outputLength);
+            for (let i = 0; i < outputLength; i++) {
+                const sample = input[Math.min(input.length - 1, Math.floor(i * ratio))] || 0;
+                const clipped = Math.max(-1, Math.min(1, sample));
+                output[i] = clipped < 0 ? clipped * 32768 : clipped * 32767;
+            }
+            return output.buffer;
+        }
+        function sendVoicePcmControl(type) {
+            if (voiceSocket && voiceSocketReady && voiceSocket.readyState === WebSocket.OPEN) {
+                try { voiceSocket.send(JSON.stringify({ type })); return true; } catch (_) {}
+            }
+            return false;
+        }
+        function stopVoicePcmCapture(abort = false) {
+            if (voicePcmSpeaking) {
+                sendVoicePcmControl(abort ? 'speech_abort' : 'speech_end');
+                voicePcmSpeaking = false;
+            }
+            if (voiceCaptureProcessor) {
+                voiceCaptureProcessor.onaudioprocess = null;
+                try { voiceCaptureProcessor.disconnect(); } catch (_) {}
+            }
+            if (voiceAudioSource) {
+                try { voiceAudioSource.disconnect(); } catch (_) {}
+            }
+            if (voiceCaptureMute) {
+                try { voiceCaptureMute.disconnect(); } catch (_) {}
+            }
+            voiceCaptureProcessor = null;
+            voiceAudioSource = null;
+            voiceCaptureMute = null;
+            voicePcmLastSpeechAt = 0;
+        }
+        function startVoicePcmCapture() {
+            if (!voiceAudioContext || !voiceStream || !voiceStream.getTracks().length || voiceCaptureProcessor) return;
+            const ctx = voiceAudioContext;
+            voiceAudioSource = ctx.createMediaStreamSource(voiceStream);
+            voiceCaptureProcessor = ctx.createScriptProcessor(4096, 1, 1);
+            voiceCaptureMute = ctx.createGain();
+            voiceCaptureMute.gain.value = 0;
+            voiceAudioSource.connect(voiceAnalyser);
+            voiceAudioSource.connect(voiceCaptureProcessor);
+            voiceCaptureProcessor.connect(voiceCaptureMute);
+            voiceCaptureMute.connect(ctx.destination);
+            voiceCaptureProcessor.onaudioprocess = (event) => {
+                if (!voiceAudioSource || voiceRecognitionPaused || voiceSocketTurnActive || !mobileVoiceOverlay || mobileVoiceOverlay.hidden) return;
+                const input = event.inputBuffer.getChannelData(0);
+                let sum = 0;
+                for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+                const rms = Math.sqrt(sum / input.length);
+                voiceInputPulse = Math.max(voiceInputPulse, Math.min(0.9, rms * 12));
+                const now = performance.now();
+                const activeSocket = voiceSocket && voiceSocketReady && voiceSocket.readyState === WebSocket.OPEN;
+                if (rms >= VOICE_VAD_THRESHOLD) {
+                    if (!voicePcmSpeaking) {
+                        if (!activeSocket) return;
+                        sendVoicePcmControl('speech_start');
+                        voicePcmSpeaking = true;
+                    }
+                    voicePcmLastSpeechAt = now;
+                    if (activeSocket) {
+                        try { voiceSocket.send(resampleVoicePcm(input, ctx.sampleRate)); } catch (_) {}
+                    }
+                } else if (voicePcmSpeaking && now - voicePcmLastSpeechAt >= VOICE_SILENCE_MS) {
+                    sendVoicePcmControl('speech_end');
+                    voicePcmSpeaking = false;
+                    // Do not capture the assistant's reply or accidentally
+                    // turn speaker output into the next user utterance.
+                    voiceRecognitionPaused = true;
+                } else if (voicePcmSpeaking && activeSocket) {
+                    // Preserve short pauses inside a phrase for the server's endpointing hold.
+                    try { voiceSocket.send(resampleVoicePcm(input, ctx.sampleRate)); } catch (_) {}
+                }
+            };
         }
         function sendTypedVoiceMessage(event) {
             if (event) event.preventDefault();
@@ -5193,6 +5301,7 @@
             if (!text || !voiceStream) return;
             input.value = '';
             mobileVoiceTranscript = text;
+            voicePendingTypedText = text;
             submitVoiceTurn();
         }
         async function submitVoiceTurn() {
@@ -5315,6 +5424,7 @@
             voiceIgnoredServerTurn = 0;
             voiceSocketError = null;
             voiceStreamDone = true;
+            voicePendingTypedText = '';
             ensureVoicePlayCtx();
             mobileVoiceTranscript = '';
             if (mobileVoiceConversation) mobileVoiceConversation.innerHTML = '';
@@ -5331,7 +5441,9 @@
                 });
             }
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-            if (!SpeechRecognition) return;
+            // Native PCM capture is the primary path. Browser SpeechRecognition
+            // remains only as a fallback when microphone streaming is unavailable.
+            if (!SpeechRecognition || voiceAudioSource) return;
             voiceRecognition = new SpeechRecognition();
             // Keep recognition alive across natural pauses; a short debounce
             // below decides when a complete conversational turn is ready.
@@ -5372,6 +5484,7 @@
             stopVoiceReplyGlow();
             if (voiceTurnTimer) { clearTimeout(voiceTurnTimer); voiceTurnTimer = null; }
             stopVoiceAudioPlayback();
+            stopVoicePcmCapture(true);
             voiceRecognitionPaused = true;
             if (voiceRecognition) {
                 voiceRecognition.onend = null;
@@ -5460,7 +5573,7 @@
                     voiceAnalyser = voiceAudioContext.createAnalyser();
                     voiceAnalyser.fftSize = 256;
                     voiceLevelData = new Uint8Array(voiceAnalyser.fftSize);
-                    if (voiceStream.getTracks().length) voiceAudioContext.createMediaStreamSource(voiceStream).connect(voiceAnalyser);
+                    if (voiceStream.getTracks().length) startVoicePcmCapture();
                 }
                 voiceModeBtn.classList.add('is-listening');
                 voiceModeBtn.setAttribute('aria-pressed', 'true');

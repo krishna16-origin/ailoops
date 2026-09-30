@@ -3499,9 +3499,11 @@ async def _fish_tts(text: str, reference_id: str = "") -> Optional[str]:
         return None
 
 
+VOICE_HISTORY_MESSAGES = int(os.getenv("VOICE_HISTORY_MESSAGES", "20"))
+VOICE_MAX_TOKENS = int(os.getenv("VOICE_MAX_TOKENS", "500"))
 def _voice_history(session: dict) -> List[Dict[str, str]]:
-    messages = [{"role": "system", "content": VOICE_SYSTEM_PROMPT}]
-    for message in session.get("messages", [])[-6:]:
+    messages = [{"role": "system", "content": f"{VOICE_SYSTEM_PROMPT} Current date and time: {get_current_datetime_str()}. If asked for the time, answer with this current UTC time and say it is UTC."}]
+    for message in session.get("messages", [])[-VOICE_HISTORY_MESSAGES:]:
         content = message.content if isinstance(message.content, str) else str(message.content)
         if not content.strip():
             continue
@@ -3521,7 +3523,7 @@ async def _groq_voice_stream(session: dict):
         "model": VOICE_LLM_MODEL,
         "messages": _voice_history(session),
         "temperature": 0.6,
-        "max_tokens": 220,
+        "max_tokens": VOICE_MAX_TOKENS,
         "stream": True,
     }
     if "gpt-oss" in VOICE_LLM_MODEL:

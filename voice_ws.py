@@ -60,6 +60,7 @@ DEFAULT_FISH_REFERENCE_ID = "933563129e564b19a115bedd57b7406a"  # Sarah — Fish
 FISH_REFERENCE_ID = os.getenv("FISH_REFERENCE_ID", DEFAULT_FISH_REFERENCE_ID).strip() or DEFAULT_FISH_REFERENCE_ID
 VOICE_LLM_FIRST_TOKEN_TIMEOUT = float(os.getenv("VOICE_LLM_FIRST_TOKEN_TIMEOUT", "15"))
 VOICE_LLM_CHUNK_TIMEOUT = float(os.getenv("VOICE_LLM_CHUNK_TIMEOUT", "20"))
+VOICE_HISTORY_MESSAGES = int(os.getenv("VOICE_HISTORY_MESSAGES", "20"))
 PCM_RATE = int(os.getenv("VOICE_PCM_RATE", "24000"))
 HOLD_MS = int(os.getenv("VOICE_HOLD_MS", "150"))          # minimal grace period for unfinished speech
 TTS_CONCURRENCY = int(os.getenv("VOICE_TTS_CONCURRENCY", "3"))
@@ -472,7 +473,7 @@ class VoiceConnection:
             await self.send_json(type="state", state="thinking", turn=turn.id)
 
             session = self.deps.get_session(self.session_id)
-            session["messages"] = self.deps.trim_memory(session["messages"])
+            session["messages"] = self.deps.trim_memory(session["messages"], limit=VOICE_HISTORY_MESSAGES)
             turn.user_msg = self.deps.human_message(text)
             session["messages"].append(turn.user_msg)
 

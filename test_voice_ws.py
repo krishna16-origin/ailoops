@@ -38,7 +38,7 @@ class VoiceHelpersTests(unittest.TestCase):
         ws = FakeWebSocket()
         deps = voice_ws.VoiceDeps(
             get_session=lambda _: {"messages": []},
-            trim_memory=lambda messages: messages,
+            trim_memory=lambda messages, **kwargs: messages,
             llm_stream=empty_stream,
             human_message=lambda text: text,
             ai_message=lambda text: text,
@@ -55,7 +55,7 @@ class VoiceHelpersTests(unittest.TestCase):
         ws = FakeWebSocket()
         deps = voice_ws.VoiceDeps(
             get_session=lambda _: {"messages": []},
-            trim_memory=lambda messages: messages,
+            trim_memory=lambda messages, **kwargs: messages,
             llm_stream=empty_stream,
             human_message=lambda text: text,
             ai_message=lambda text: text,
