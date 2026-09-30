@@ -17,7 +17,7 @@ Why this is faster than the old POST /voice-chat flow:
 Wire protocol
 -------------
 client -> server (JSON):
-    {"type":"config","session_id":..,"mcp_servers":[..],"voice":".."}
+    {"type":"config","session_id":..,"voice":".."}
     {"type":"speech_start"} / {"type":"speech_end"} / {"type":"speech_abort"}
     {"type":"interrupt"}                       # user barged in over the assistant
     {"type":"text","text":".."}                # typed message, skips STT
@@ -26,10 +26,10 @@ client -> server (binary): raw little-endian int16 mono 16 kHz PCM, only while s
 
 server -> client (JSON):
     ready{pcm_rate} state{state,turn} transcript{text,turn} assistant_text{text,turn}
-    tts_fallback{text,turn} turn_done{turn,response} cancelled{turn} metrics{..}
+    turn_done{turn,response} cancelled{turn} metrics{..}
     error{message} pong{t}
 server -> client (binary): [kind:u8][turn:u32 BE][payload]
-    kind 1 = int16 mono PCM at `pcm_rate`, kind 2 = a complete mp3 (fallback tier)
+    kind 1 = int16 mono PCM at `pcm_rate`, kind 2 = a complete Fish Audio mp3 (retry tier)
 """
 from __future__ import annotations
 
@@ -209,9 +209,9 @@ def _fish_request(text: str, voice: str, fmt: str) -> Tuple[Dict[str, str], Dict
     if not key:
         raise RuntimeError("FISH_API_KEY is missing")
     payload: Dict[str, Any] = {
-        # Small chunks reduce time-to-first-audio; the WebSocket forwards each
-        # PCM chunk immediately instead of waiting for a whole sentence.
-        "text": text, "format": fmt, "latency": FISH_LATENCY, "normalize": False, "chunk_length": 80,
+        # Fish accepts chunk_length 100-300 only (anything lower is a 422). 100 is the
+        # smallest allowed, i.e. the fastest time-to-first-audio.
+        "text": text, "format": fmt, "latency": FISH_LATENCY, "normalize": False, "chunk_length": 100,
     }
     if fmt == "pcm":
         payload["sample_rate"] = PCM_RATE
@@ -257,7 +257,6 @@ class VoiceDeps:
     get_session: Callable[[str], Dict[str, Any]]
     trim_memory: Callable[[list], list]
     llm_stream: Callable[[Dict[str, Any]], AsyncIterator[str]]
-    mcp_text: Callable[[str, str, List[str], Dict[str, Any]], Awaitable[str]]
     human_message: Callable[[str], Any]
     ai_message: Callable[[str], Any]
     stt: Callable[[bytes], Awaitable[str]] = groq_stt
@@ -278,6 +277,7 @@ class Turn:
     t0: float = field(default_factory=time.perf_counter)
     marks: Dict[str, float] = field(default_factory=dict)
     task: Optional[asyncio.Task] = None
+    tts_error: bool = False
 
 
 class VoiceConnection:
@@ -285,7 +285,6 @@ class VoiceConnection:
         self.ws, self.deps = ws, deps
         self.session_id = ""
         self.voice = ""
-        self.mcp: List[str] = []
         self.pcm = bytearray()          # audio of the utterance being collected (kept across a "hold")
         self.utt_mark = 0
         self.in_speech = False
@@ -356,7 +355,6 @@ class VoiceConnection:
         elif t == "config":
             self.session_id = str(m.get("session_id") or self.session_id)
             self.voice = str(m.get("voice") or "")
-            self.mcp = [str(x) for x in (m.get("mcp_servers") or [])]
         elif t == "speech_start":
             await self.on_speech_start()
         elif t == "speech_end":
@@ -475,7 +473,7 @@ class VoiceConnection:
             turn.user_msg = self.deps.human_message(text)
             session["messages"].append(turn.user_msg)
 
-            full = await self._speak_reply(turn, session, text)
+            full = await self._speak_reply(turn, session)
             await self._commit(turn)          # covers replies that produced no audio at all
             session["messages"].append(self.deps.ai_message(full.strip()))
             await self.send_json(type="turn_done", turn=turn.id, response=full.strip())
@@ -500,7 +498,7 @@ class VoiceConnection:
             m["turn_to_first_audio_ms"] = (turn.marks["first_audio"] - turn.t0) * 1000
         return m
 
-    async def _speak_reply(self, turn: Turn, session: Dict[str, Any], user_text: str) -> str:
+    async def _speak_reply(self, turn: Turn, session: Dict[str, Any]) -> str:
         order: asyncio.Queue = asyncio.Queue()   # (piece, chunk_queue) in speaking order, then None
         synth_tasks: List[asyncio.Task] = []
         state = {"full": ""}
@@ -513,24 +511,17 @@ class VoiceConnection:
         async def producer() -> None:
             turn.marks["llm_start"] = time.perf_counter()
             try:
-                if self.mcp:   # slow path: tools are involved, so speak the finished answer
-                    state["full"] = await self.deps.mcp_text(self.session_id, user_text, self.mcp, session)
-                    turn.marks["llm_first"] = time.perf_counter()
-                    pieces, rest = pop_speakable(state["full"] + " ", False)
-                    for p in pieces + ([rest.strip()] if rest.strip() else []):
+                buf, first = "", True
+                async for delta in self.deps.llm_stream(session):
+                    turn.marks.setdefault("llm_first", time.perf_counter())
+                    state["full"] += delta
+                    buf += delta
+                    pieces, buf = pop_speakable(buf, first)
+                    for p in pieces:
+                        first = False
                         start_piece(p)
-                else:
-                    buf, first = "", True
-                    async for delta in self.deps.llm_stream(session):
-                        turn.marks.setdefault("llm_first", time.perf_counter())
-                        state["full"] += delta
-                        buf += delta
-                        pieces, buf = pop_speakable(buf, first)
-                        for p in pieces:
-                            first = False
-                            start_piece(p)
-                    if buf.strip():
-                        start_piece(buf.strip())
+                if buf.strip():
+                    start_piece(buf.strip())
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -556,8 +547,9 @@ class VoiceConnection:
                         await self.send_audio(KIND_PCM, turn.id, payload)
                     elif kind == "mp3":
                         await self.send_audio(KIND_MP3, turn.id, payload)
-                    elif kind == "text":
-                        await self.send_json(type="tts_fallback", text=payload, turn=turn.id)
+                    elif kind == "error" and not turn.tts_error:
+                        turn.tts_error = True
+                        await self.send_json(type="error", message=payload)
                 turn.spoken.append(piece)
                 await self.send_json(type="assistant_text", text=piece, turn=turn.id)
 
@@ -573,8 +565,9 @@ class VoiceConnection:
         return state["full"]
 
     async def _synth(self, text: str, q: asyncio.Queue) -> None:
-        """Speak one piece. Tier 1: streamed PCM. Tier 2: whole mp3. Tier 3: tell the client to use the
-        browser's own speech synthesis. A failure half-way through a stream keeps the audio already sent."""
+        """Speak one piece with Fish Audio only. Tier 1: streamed PCM. Tier 2: whole mp3 retry. If both
+        fail the client gets an error (no browser voice). A failure half-way through a stream keeps the
+        audio already sent."""
         spoken = clean_for_speech(text)
         sent = 0
         try:
@@ -601,7 +594,7 @@ class VoiceConnection:
                 if mp3:
                     q.put_nowait(("mp3", mp3))
                 else:
-                    q.put_nowait(("text", spoken))
+                    q.put_nowait(("error", "Fish Audio couldn't generate speech. Check FISH_API_KEY / FISH_MODEL."))
         finally:
             q.put_nowait(("end", None))
 
