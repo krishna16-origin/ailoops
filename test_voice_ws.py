@@ -40,7 +40,6 @@ class VoiceHelpersTests(unittest.TestCase):
             get_session=lambda _: {"messages": []},
             trim_memory=lambda messages: messages,
             llm_stream=empty_stream,
-            mcp_text=lambda *args: None,
             human_message=lambda text: text,
             ai_message=lambda text: text,
         )
@@ -58,7 +57,6 @@ class VoiceHelpersTests(unittest.TestCase):
             get_session=lambda _: {"messages": []},
             trim_memory=lambda messages: messages,
             llm_stream=empty_stream,
-            mcp_text=lambda *args: None,
             human_message=lambda text: text,
             ai_message=lambda text: text,
         )
