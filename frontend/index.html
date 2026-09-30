@@ -1837,13 +1837,13 @@
         <section class="mobile-voice-overlay" id="mobileVoiceOverlay" hidden aria-label="Voice mode">
             <span class="mobile-voice-glow-mount" id="mobileVoiceGlowMount" aria-hidden="true"></span>
             <div class="mobile-voice-copy">
-                <div class="voice-conversation" id="mobileVoiceConversation" aria-live="polite" aria-label="Voice conversation"></div>
+                <div class="voice-conversation" id="mobileVoiceConversation" hidden style="display:none !important" aria-live="polite" aria-label="Voice conversation"></div>
             </div>
             <form class="desktop-voice-composer" id="desktopVoiceComposer" onsubmit="sendTypedVoiceMessage(event)">
                 <span class="desktop-voice-glow-mount" id="desktopVoiceGlowMount" aria-hidden="true"></span>
                 <textarea id="desktopVoiceInput" rows="1" placeholder="Ask anything…" aria-label="Type a voice-mode message"></textarea>
                 <div class="desktop-voice-toolbar">
-                    <span class="desktop-voice-model">Orpheus English</span>
+                    <span class="desktop-voice-model">Fish Audio</span>
                     <button type="submit" class="desktop-voice-send" aria-label="Send voice message">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
                     </button>
@@ -4622,26 +4622,8 @@
         const mobileVoiceOverlay = document.getElementById('mobileVoiceOverlay');
         const mobileVoiceConversation = document.getElementById('mobileVoiceConversation');
         const mobileVoiceAgent = document.getElementById('mobileVoiceAgent');
-        function appendVoiceConversationMessage(role, text = '') {
-            if (!mobileVoiceConversation) return null;
-            const message = document.createElement('div');
-            message.className = `voice-conversation-message ${role}`;
-            message.textContent = text;
-            mobileVoiceConversation.appendChild(message);
-            mobileVoiceConversation.scrollTop = mobileVoiceConversation.scrollHeight;
-            return message;
-        }
-        async function streamVoiceConversationMessage(element, text) {
-            if (!element) return;
-            element.classList.add('is-streaming');
-            element.textContent = '';
-            for (let i = 0; i < text.length; i += 3) {
-                element.textContent += text.slice(i, i + 3);
-                if (mobileVoiceConversation) mobileVoiceConversation.scrollTop = mobileVoiceConversation.scrollHeight;
-                await new Promise(resolve => setTimeout(resolve, 12));
-            }
-            element.classList.remove('is-streaming');
-        }
+        // Voice mode is audio-only: nothing is rendered in the overlay.
+        function appendVoiceConversationMessage(role, text = '') { if (text) console.debug('[voice]', role, text); return null; }
         function isMobileVoiceMode() { return window.matchMedia && window.matchMedia('(max-width: 768px)').matches; }
         function animateVoiceReplyGlow(timestamp) {
             if (!voiceReplyGlowActive) return;
@@ -4661,44 +4643,79 @@
             voiceReplyLevel = 0;
         }
 
+        // ---- Streaming playback (Fish Audio mp3 chunks, gapless via WebAudio) ----
+        let voicePlayCtx = null;
+        let voicePlayNextTime = 0;
+        let voicePlaySources = [];
+        let voicePendingDecodes = 0;
+        let voiceStreamDone = true;
+        let voiceTurnAbort = null;
+        let voiceDecodeChain = Promise.resolve();
+        function ensureVoicePlayCtx() {
+            if (!voicePlayCtx || voicePlayCtx.state === 'closed') {
+                const Ctx = window.AudioContext || window.webkitAudioContext;
+                voicePlayCtx = new Ctx({ latencyHint: 'interactive' });
+            }
+            if (voicePlayCtx.state === 'suspended') voicePlayCtx.resume().catch(() => {});
+            return voicePlayCtx;
+        }
+        function b64ToArrayBuffer(b64) {
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            return bytes.buffer;
+        }
         function stopVoiceAudioPlayback() {
             voicePlaybackToken += 1;
-            if (voiceAudio) { voiceAudio.pause(); voiceAudio.src = ''; voiceAudio = null; }
+            voicePlaySources.forEach(src => { try { src.onended = null; src.stop(); } catch (e) {} });
+            voicePlaySources = [];
+            voicePlayNextTime = 0;
+            voicePendingDecodes = 0;
+            voiceDecodeChain = Promise.resolve();
             stopVoiceReplyGlow();
         }
-        async function playVoiceAudioChunks(chunks) {
-            if (!chunks || !chunks.length) return;
-            stopVoiceAudioPlayback();
-            const token = voicePlaybackToken;
-            startVoiceReplyGlow();
-            try {
-                // Native WAV playback is more reliable than decodeAudioData for
-                // sequential WAV blobs, especially in Safari/iOS and mobile
-                // Chromium. Orpheus remains the only speech provider here.
-                for (const chunk of chunks) {
+        function maybeFinishVoicePlayback(token, onIdle) {
+            if (token !== voicePlaybackToken) return;
+            if (voiceStreamDone && voicePendingDecodes === 0 && voicePlaySources.length === 0) {
+                stopVoiceReplyGlow();
+                if (onIdle) onIdle();
+            }
+        }
+        // Queue one mp3 chunk; decoding is chained so chunks stay in order,
+        // and each buffer is scheduled right after the previous one (no gaps).
+        function enqueueVoiceChunk(b64, token, onIdle) {
+            const ctx = ensureVoicePlayCtx();
+            voicePendingDecodes += 1;
+            voiceDecodeChain = voiceDecodeChain.then(async () => {
+                if (token !== voicePlaybackToken) return;
+                try {
+                    const buffer = await ctx.decodeAudioData(b64ToArrayBuffer(b64));
                     if (token !== voicePlaybackToken) return;
-                    await new Promise((resolve, reject) => {
-                        const audio = new Audio(`data:audio/wav;base64,${chunk}`);
-                        voiceAudio = audio;
-                        let settled = false;
-                        const cleanup = () => {
-                            audio.onended = null;
-                            audio.onerror = null;
-                            if (voiceAudio === audio) voiceAudio = null;
-                        };
-                        const finish = (error) => {
-                            if (settled) return;
-                            settled = true;
-                            cleanup();
-                            if (error) reject(error); else resolve();
-                        };
-                        audio.onended = () => finish();
-                        audio.onerror = () => finish(new Error('The browser could not decode Orpheus audio.'));
-                        audio.play().catch(finish);
-                    });
+                    const src = ctx.createBufferSource();
+                    src.buffer = buffer;
+                    src.connect(ctx.destination);
+                    const startAt = Math.max(ctx.currentTime + 0.02, voicePlayNextTime);
+                    src.start(startAt);
+                    voicePlayNextTime = startAt + buffer.duration;
+                    voicePlaySources.push(src);
+                    startVoiceReplyGlow();
+                    src.onended = () => {
+                        voicePlaySources = voicePlaySources.filter(x => x !== src);
+                        maybeFinishVoicePlayback(token, onIdle);
+                    };
+                } catch (err) {
+                    console.warn('Fish Audio chunk could not be decoded:', err);
+                } finally {
+                    voicePendingDecodes = Math.max(0, voicePendingDecodes - 1);
+                    maybeFinishVoicePlayback(token, onIdle);
                 }
-            } finally {
-                if (token === voicePlaybackToken) stopVoiceReplyGlow();
+            });
+        }
+        function resumeVoiceListening() {
+            voiceRecognitionPaused = false;
+            if (voiceStream && mobileVoiceOverlay && !mobileVoiceOverlay.hidden && voiceRecognition) {
+                voiceRecognition.onend = handleVoiceRecognitionEnd;
+                try { voiceRecognition.start(); } catch (error) { /* already listening */ }
             }
         }
         function sendTypedVoiceMessage(event) {
@@ -4720,51 +4737,81 @@
                 voiceRecognition.onend = null;
                 try { voiceRecognition.stop(); } catch (error) { /* already stopped */ }
             }
-            appendVoiceConversationMessage('user', text);
+            if (voiceTurnAbort) voiceTurnAbort.abort();
+            stopVoiceAudioPlayback();
+            const token = voicePlaybackToken;
+            voiceStreamDone = false;
+            voiceTurnAbort = new AbortController();
+            ensureVoicePlayCtx();
             appendMessage('user', text, []);
+            let finalText = '';
+            let gotAudio = false;
             try {
                 const response = await fetch(`${API_BASE}/voice-chat`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
+                    signal: voiceTurnAbort.signal,
                     body: JSON.stringify({
                         message: text,
                         session_id: modes.chat.sessionId,
-                        voice: 'hannah',
                         mcp_servers: typeof selectedMcpServers === 'function' ? selectedMcpServers() : []
                     })
                 });
-                const data = await response.json();
-                if (!response.ok) throw new Error(data.detail || `Chat pipeline failed (${response.status})`);
-                appendMessage('assistant', data.response || '', []);
-                const assistantMessage = appendVoiceConversationMessage('assistant');
-                await streamVoiceConversationMessage(assistantMessage, data.response || '');
-                if (data.audio?.length) {
-                    try { await playVoiceAudioChunks(data.audio); }
-                    catch (audioError) { console.warn('Orpheus audio playback failed:', audioError); }
+                if (!response.ok) throw new Error(`Voice request failed (${response.status})`);
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buf = '';
+                const handleLine = (line) => {
+                    if (!line.trim()) return;
+                    let evt; try { evt = JSON.parse(line); } catch (e) { return; }
+                    if (evt.type === 'audio' && evt.data) {
+                        gotAudio = true;
+                        enqueueVoiceChunk(evt.data, token, resumeVoiceListening);
+                    } else if (evt.type === 'done') {
+                        finalText = evt.response || '';
+                    }
+                };
+                while (true) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    buf += decoder.decode(value, { stream: true });
+                    let nl;
+                    while ((nl = buf.indexOf('\n')) >= 0) {
+                        handleLine(buf.slice(0, nl));
+                        buf = buf.slice(nl + 1);
+                    }
                 }
-                if (!data.audio?.length) {
-                    console.warn('Voice response was not synthesized by Orpheus:', data.audio_error || 'no audio returned');
-                }
+                handleLine(buf);
+                if (finalText) appendMessage('assistant', finalText, []);
+                if (!gotAudio) console.warn('Voice reply had no audio. Check FISH_API_KEY on the server.');
             } catch (error) {
-                appendVoiceConversationMessage('assistant', `Voice mode error: ${error.message || 'Chat pipeline failed.'}`);
-                console.warn('Voice chat failed:', error);
+                if (error.name !== 'AbortError') console.warn('Voice chat failed:', error);
             } finally {
-                voiceRecognitionPaused = false;
-                if (voiceStream && mobileVoiceOverlay && !mobileVoiceOverlay.hidden && voiceRecognition) {
-                    voiceRecognition.onend = () => {
-                        if (voiceStream && !voiceRecognitionPaused && !mobileVoiceOverlay.hidden) {
-                            try { voiceRecognition.start(); } catch (restartError) { /* already listening */ }
-                        }
-                    };
-                    try { voiceRecognition.start(); } catch (error) { /* already listening */ }
+                voiceStreamDone = true;
+                // If nothing is playing (no audio / error), go back to listening now;
+                // otherwise listening resumes when the last chunk finishes playing.
+                if (token === voicePlaybackToken) {
+                    if (voicePendingDecodes === 0 && voicePlaySources.length === 0) resumeVoiceListening();
                 }
+            }
+        }
+        function handleVoiceRecognitionEnd() {
+            // Recognition ended (user paused). Send what we have right away.
+            if (mobileVoiceTranscript.trim() && !voiceRecognitionPaused) { submitVoiceTurn(); return; }
+            if (voiceStream && !voiceRecognitionPaused && mobileVoiceOverlay && !mobileVoiceOverlay.hidden) {
+                window.setTimeout(() => {
+                    if (voiceStream && !voiceRecognitionPaused && mobileVoiceOverlay && !mobileVoiceOverlay.hidden) {
+                        try { voiceRecognition.start(); } catch (error) { /* already listening */ }
+                    }
+                }, 60);
             }
         }
 
         function openMobileVoiceMode() {
             if (!mobileVoiceOverlay) return;
             const modelLabel = document.getElementById('modelPickerLabel');
-            if (mobileVoiceAgent) mobileVoiceAgent.textContent = 'Orpheus English';
+            if (mobileVoiceAgent) mobileVoiceAgent.textContent = 'Fish Audio';
+            ensureVoicePlayCtx();
             mobileVoiceTranscript = '';
             if (mobileVoiceConversation) mobileVoiceConversation.innerHTML = '';
             mobileVoiceOverlay.hidden = false;
@@ -4790,7 +4837,7 @@
                 }
                 if (mobileVoiceTranscript.trim()) {
                     if (voiceTurnTimer) clearTimeout(voiceTurnTimer);
-                    voiceTurnTimer = setTimeout(submitVoiceTurn, 850);
+                    voiceTurnTimer = setTimeout(submitVoiceTurn, 400);
                 }
             };
             voiceRecognition.onerror = (event) => {
@@ -4798,18 +4845,11 @@
                     appendVoiceConversationMessage('assistant', `Microphone error: ${event.error}. Tap the voice button again and allow microphone access.`);
                 }
             };
-            voiceRecognition.onend = () => {
-                if (voiceStream && !voiceRecognitionPaused && mobileVoiceOverlay && !mobileVoiceOverlay.hidden) {
-                    window.setTimeout(() => {
-                        if (voiceStream && !voiceRecognitionPaused && mobileVoiceOverlay && !mobileVoiceOverlay.hidden) {
-                            try { voiceRecognition.start(); } catch (error) { /* already listening */ }
-                        }
-                    }, 120);
-                }
-            };
+            voiceRecognition.onend = handleVoiceRecognitionEnd;
             try { voiceRecognition.start(); } catch (error) { appendVoiceConversationMessage('assistant', 'Tap the voice button again to start listening.'); }
         }
         function closeMobileVoiceMode() {
+            if (voiceTurnAbort) { voiceTurnAbort.abort(); voiceTurnAbort = null; }
             stopVoiceReplyGlow();
             if (voiceTurnTimer) { clearTimeout(voiceTurnTimer); voiceTurnTimer = null; }
             stopVoiceAudioPlayback();
