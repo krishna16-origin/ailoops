@@ -3402,20 +3402,32 @@ async def chat_estimate(request: ChatEstimateRequest):
 # whole answer has been generated and synthesized.
 # ---------------------------------------------------------------------------
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+# gpt-oss-20b is a reasoning model: it emits a hidden "reasoning" pass before
+# its first visible content token, which is dead air on a live voice call.
+# Groq's GPT-OSS models don't support turning reasoning off entirely — only
+# reasoning_effort low/medium/high — so "reasoning_effort": "low" below (kept
+# forced on for any gpt-oss* model) is the actual latency lever available
+# while staying on this model; it's the difference between ~5 reasoning
+# tokens (~300ms) and a much longer high-effort trace, not a full elimination
+# of the thinking phase.
 VOICE_LLM_MODEL = os.getenv("VOICE_LLM_MODEL", "openai/gpt-oss-20b")
 FISH_TTS_URL = "https://api.fish.audio/v1/tts"
 FISH_MODEL = os.getenv("FISH_MODEL", "s2.1-pro-free")
-FISH_LATENCY = os.getenv("FISH_LATENCY", "balanced")  # "normal" | "balanced"
+FISH_LATENCY = os.getenv("FISH_LATENCY", "low")  # "low" | "balanced" | "normal"
 DEFAULT_FISH_REFERENCE_ID = "933563129e564b19a115bedd57b7406a"  # Sarah — Fish Official, female/conversational
 FISH_REFERENCE_ID = os.getenv("FISH_REFERENCE_ID", DEFAULT_FISH_REFERENCE_ID).strip() or DEFAULT_FISH_REFERENCE_ID
 VOICE_LLM_FIRST_TOKEN_TIMEOUT = float(os.getenv("VOICE_LLM_FIRST_TOKEN_TIMEOUT", "15"))
 VOICE_LLM_CHUNK_TIMEOUT = float(os.getenv("VOICE_LLM_CHUNK_TIMEOUT", "20"))
 
 VOICE_SYSTEM_PROMPT = (
-    "You are a friendly real-time voice assistant. Reply the way a person talks: "
-    "short, natural, 1-3 sentences unless the user clearly asks for more. "
-    "Never use markdown, bullet points, emojis, code blocks or URLs. "
-    "Do not read out symbols. Start speaking the answer immediately."
+    "You are a real-time voice assistant. You are being spoken aloud, not read, so:\n"
+    "- Answer first. No preamble like 'Sure' or 'Great question', and don't repeat the question back.\n"
+    "- Keep it short: one to three sentences unless the user clearly asks for more detail.\n"
+    "- Talk like a sharp, friendly person — contractions, everyday words, short sentences.\n"
+    "- Never use markdown, bullet points, emojis, code blocks, or URLs. Don't read out symbols; "
+    "say numbers, dates and units the way a person would say them out loud.\n"
+    "- If you're unsure, say so briefly instead of hedging at length.\n"
+    "- Reply in the same language the user is speaking."
 )
 
 _voice_http: Optional[httpx.AsyncClient] = None
@@ -3479,7 +3491,7 @@ async def _fish_tts(text: str, reference_id: str = "") -> Optional[str]:
         "mp3_bitrate": 64,
         "latency": FISH_LATENCY,
         "normalize": False,
-        "chunk_length": 200,
+        "chunk_length": 100,  # Fish's minimum allowed value = fastest time-to-first-audio
     }
     ref = (reference_id or FISH_REFERENCE_ID).strip()
     if ref:
@@ -3499,7 +3511,7 @@ async def _fish_tts(text: str, reference_id: str = "") -> Optional[str]:
         return None
 
 
-VOICE_HISTORY_MESSAGES = int(os.getenv("VOICE_HISTORY_MESSAGES", "20"))
+VOICE_HISTORY_MESSAGES = int(os.getenv("VOICE_HISTORY_MESSAGES", "40"))
 VOICE_MAX_TOKENS = int(os.getenv("VOICE_MAX_TOKENS", "500"))
 def _voice_history(session: dict) -> List[Dict[str, str]]:
     messages = [{"role": "system", "content": f"{VOICE_SYSTEM_PROMPT} Current date and time: {get_current_datetime_str()}. If asked for the time, answer with this current UTC time and say it is UTC."}]
