@@ -4810,7 +4810,6 @@
             return {
                 type: 'config',
                 session_id: modes.chat.sessionId,
-                mcp_servers: typeof selectedMcpServers === 'function' ? selectedMcpServers() : [],
                 voice: ''
             };
         }
@@ -4831,10 +4830,6 @@
                 }
                 return;
             }
-            if (event.type === 'tts_fallback') {
-                speakVoiceFallback(event.text || '');
-                return;
-            }
             if (event.type === 'turn_done') {
                 const reply = String(event.response || voiceCurrentReply || '').trim();
                 if (reply) appendMessage('assistant', reply, []);
@@ -4845,6 +4840,7 @@
                 return;
             }
             if (event.type === 'cancelled') {
+                if (Number(event.turn) !== voiceActiveServerTurn) return;
                 voiceCurrentReply = '';
                 voiceSocketTurnActive = false;
                 voiceStreamDone = true;
@@ -4999,7 +4995,7 @@
             const src = ctx.createBufferSource();
             src.buffer = buffer;
             src.connect(ctx.destination);
-            const startAt = Math.max(ctx.currentTime + 0.015, voicePlayNextTime);
+            const startAt = voicePlayNextTime > ctx.currentTime ? voicePlayNextTime : ctx.currentTime + 0.06;
             src.start(startAt);
             voicePlayNextTime = startAt + buffer.duration;
             voicePlaySources.push(src);
@@ -5010,18 +5006,6 @@
             };
         }
 
-        let voiceFallbackSpeaking = false;
-        function speakVoiceFallback(text) {
-            if (!text || !window.speechSynthesis || !window.SpeechSynthesisUtterance) return;
-            voiceFallbackSpeaking = true;
-            window.speechSynthesis.cancel();
-            const utterance = new SpeechSynthesisUtterance(text);
-            utterance.onend = utterance.onerror = () => {
-                voiceFallbackSpeaking = false;
-                maybeFinishVoicePlayback(voicePlaybackToken, resumeVoiceListening);
-            };
-            window.speechSynthesis.speak(utterance);
-        }
         function b64ToArrayBuffer(b64) {
             const bin = atob(b64);
             const bytes = new Uint8Array(bin.length);
@@ -5035,13 +5019,11 @@
             voicePlayNextTime = 0;
             voicePendingDecodes = 0;
             voiceDecodeChain = Promise.resolve();
-            voiceFallbackSpeaking = false;
-            if (window.speechSynthesis) window.speechSynthesis.cancel();
             stopVoiceReplyGlow();
         }
         function maybeFinishVoicePlayback(token, onIdle) {
             if (token !== voicePlaybackToken) return;
-            if (voiceStreamDone && !voiceFallbackSpeaking && voicePendingDecodes === 0 && voicePlaySources.length === 0) {
+            if (voiceStreamDone && voicePendingDecodes === 0 && voicePlaySources.length === 0) {
                 stopVoiceReplyGlow();
                 if (onIdle) onIdle();
             }
@@ -5138,8 +5120,7 @@
                     signal: voiceTurnAbort.signal,
                     body: JSON.stringify({
                         message: text,
-                        session_id: modes.chat.sessionId,
-                        mcp_servers: typeof selectedMcpServers === 'function' ? selectedMcpServers() : []
+                        session_id: modes.chat.sessionId
                     })
                 });
                 if (!response.ok) throw new Error(`Voice request failed (${response.status})`);
