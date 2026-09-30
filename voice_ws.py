@@ -55,10 +55,10 @@ STT_MODEL = os.getenv("VOICE_STT_MODEL", "whisper-large-v3-turbo")
 STT_LANG = os.getenv("VOICE_STT_LANG", "en").strip()
 FISH_TTS_URL = "https://api.fish.audio/v1/tts"
 FISH_MODEL = os.getenv("FISH_MODEL", "s2.1-pro-free")
-FISH_LATENCY = os.getenv("FISH_LATENCY", "balanced")
+FISH_LATENCY = os.getenv("FISH_LATENCY", "low")
 FISH_REFERENCE_ID = os.getenv("FISH_REFERENCE_ID", "").strip()
 PCM_RATE = int(os.getenv("VOICE_PCM_RATE", "24000"))
-HOLD_MS = int(os.getenv("VOICE_HOLD_MS", "650"))          # wait this long if the sentence sounds unfinished
+HOLD_MS = int(os.getenv("VOICE_HOLD_MS", "350"))          # short grace period for unfinished speech
 TTS_CONCURRENCY = int(os.getenv("VOICE_TTS_CONCURRENCY", "3"))
 
 IN_RATE = 16000
@@ -86,11 +86,11 @@ def pcm_rms(pcm: bytes) -> float:
     return float(np.sqrt(np.mean(a * a)))
 
 
-_SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]]*\s+|\n+")
+_SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]]*(?:\s+|$)|\n+")
 _CLAUSE_END = re.compile(r"(?<=[,;:\u2014])\s+")
 _ABBREV = re.compile(r"\b(?:Mr|Mrs|Ms|Dr|Prof|St|vs|etc|e\.g|i\.e)\.$", re.I)
 _FIRST_CLAUSE_MIN_CHARS = 14
-_FIRST_FLUSH_WORDS = 7
+_FIRST_FLUSH_WORDS = 5
 
 
 def pop_speakable(buffer: str, first: bool) -> Tuple[List[str], str]:
@@ -113,7 +113,7 @@ def pop_speakable(buffer: str, first: bool) -> Tuple[List[str], str]:
             else:
                 words = buffer.split(" ")
                 # N complete words + a partial one still arriving
-                if len(words) > _FIRST_FLUSH_WORDS + 1:
+                if len(words) > _FIRST_FLUSH_WORDS:
                     head = " ".join(words[:_FIRST_FLUSH_WORDS])
                     cut = (len(head), len(head) + 1)
         if not cut:
@@ -334,8 +334,18 @@ class VoiceConnection:
             await self.cancel_turn("disconnect", notify=False)
 
     def on_audio(self, chunk: bytes) -> None:
-        if self.in_speech and len(self.pcm) < MAX_UTTERANCE_BYTES:
-            self.pcm.extend(chunk)
+        """Append bounded, sample-aligned PCM received while speaking."""
+        if not self.in_speech or not chunk:
+            return
+        remaining = MAX_UTTERANCE_BYTES - len(self.pcm)
+        if remaining <= 0:
+            return
+        # A client frame can be larger than the remaining budget. Keep the cap
+        # strict and avoid retaining a dangling byte for int16 decoding.
+        data = chunk[:remaining]
+        if len(data) % 2:
+            data = data[:-1]
+        self.pcm.extend(data)
 
     async def on_message(self, m: Dict[str, Any]) -> None:
         t = m.get("type")

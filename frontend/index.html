@@ -4732,7 +4732,11 @@
         }
 
         function handleVoiceSocketBinary(data) {
-            const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer);
+            const bytes = data instanceof ArrayBuffer
+                ? new Uint8Array(data)
+                : ArrayBuffer.isView(data)
+                    ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+                    : new Uint8Array(data);
             if (bytes.byteLength < 5) return;
             const kind = bytes[0];
             const turnId = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(1, false);
@@ -4985,7 +4989,7 @@
             try {
                 await Promise.race([
                     connectVoiceSocket(),
-                    new Promise((_, reject) => window.setTimeout(() => reject(new Error('voice socket timeout')), 1200))
+                    new Promise((_, reject) => window.setTimeout(() => reject(new Error('voice socket timeout')), 450))
                 ]);
                 sentToSocket = sendVoiceSocketText(text);
             } catch (_) { /* use the compatible POST transport below */ }
@@ -5089,10 +5093,10 @@
                     if (event.results[i].isFinal) mobileVoiceTranscript += phrase + ' ';
                     else interim += phrase;
                 }
-                if (mobileVoiceTranscript.trim()) {
-                    if (voiceTurnTimer) clearTimeout(voiceTurnTimer);
-                    voiceTurnTimer = setTimeout(submitVoiceTurn, 400);
-                }
+                // SpeechRecognition has already detected the end of the
+                // utterance. Debouncing here adds a fixed 400 ms to every turn
+                // and can race with onend; submit once the final result lands.
+                if (mobileVoiceTranscript.trim()) submitVoiceTurn();
             };
             voiceRecognition.onerror = (event) => {
                 if (event.error && !['no-speech', 'aborted'].includes(event.error)) {
