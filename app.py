@@ -1186,17 +1186,11 @@ async def chat_context_node(state: dict, progress=None) -> dict:
     search_text = ""
     links = []
     images = []
-    # Voice mode is deliberately MCP-only.  Do not let it implicitly invoke
-    # the legacy web-search heuristic or the uploaded-file RAG pipeline; those
-    # are separate Chat-mode tools and make voice behavior unpredictable.
-    voice_mode = bool(state.get("voice_mode"))
-    if not voice_mode and needs_web_search(latest):
+    if needs_web_search(latest):
         query = resolve_search_query(history, latest)
         await publish_progress(progress, "chat_context_node", "chat_context_node", f"Detected a current-information request and searched for: {query}")
         (search_text, links), images = await asyncio.gather(web_search(query), web_image_search(query))
         await publish_progress(progress, "chat_context_result", "chat_context_result", f"Collected {len(links)} source result(s) for the response context.")
-    elif voice_mode:
-        await publish_progress(progress, "chat_context_node", "chat_context_node", "Voice mode is using MCP integrations only.")
     else:
         await publish_progress(progress, "chat_context_node", "chat_context_node", "No web lookup was required; continuing with the conversation context.")
     mcp_context = await mcp_gateway.context_for_message(
@@ -1208,7 +1202,7 @@ async def chat_context_node(state: dict, progress=None) -> dict:
 
     rag_text = ""
     session = state.get("session") or {}
-    if not voice_mode and rag_engine.has_files(session):
+    if rag_engine.has_files(session):
         await _await_rag_indexing(session, state.get("attachment_ids"), progress)
         rag_text, rag_chunks = await rag_engine.build_context(session, latest, attachment_ids=state.get("attachment_ids"))
         attached_now = state.get("attachment_ids") or []
@@ -1287,7 +1281,6 @@ async def generate_response_once(request: "ChatRequest", session: dict, progress
     state["session_id"] = request.session_id
     state["mcp_servers"] = request.mcp_servers
     state["attachment_ids"] = request.attachment_ids
-    state["voice_mode"] = bool(getattr(request, "voice_mode", False))
     state = await chat_context_node(state, progress)
     state = await chat_compose_node(request, state, progress)
     return await chat_finalize_node(state, progress)
@@ -1421,9 +1414,6 @@ class ChatRequest(BaseModel):
     # DEEP_THINK_MAX_TOKENS).
     deep_think: bool = False
     mcp_servers: Optional[List[str]] = None
-    # Internal flag used only by /voice-chat. Voice turns may use MCP context,
-    # but must never activate Chat's web-search or RAG tools.
-    voice_mode: bool = False
     # Optional: restrict RAG retrieval to specific uploaded file ids for this
     # turn. When omitted/empty, retrieval searches every file uploaded so far
     # in this session — upload once, ask about it across multiple turns.
@@ -1434,8 +1424,6 @@ class VoiceChatRequest(BaseModel):
     message: str
     session_id: str
     voice: str = ""  # optional Fish Audio reference_id (voice model id)
-    mcp_servers: Optional[List[str]] = None
-    attachment_ids: Optional[List[str]] = None
 
 class ChatEstimateRequest(BaseModel):
     """Chat mode only. Cheap, no-LLM-call estimate of how long a turn with
@@ -3557,22 +3545,6 @@ async def _groq_voice_stream(session: dict):
                 yield delta
 
 
-async def _mcp_voice_text(request: "VoiceChatRequest", session: dict) -> str:
-    """Slow path, only used when MCP tools are selected."""
-    chat_request = ChatRequest(
-        message=request.message,
-        session_id=request.session_id,
-        model_type="fast",
-        temperature=0.3,
-        thinking_level="low",
-        deep_think=False,
-        mcp_servers=request.mcp_servers,
-        attachment_ids=request.attachment_ids,
-        voice_mode=True,
-    )
-    return await generate_response_once(chat_request, session)
-
-
 @app.post("/voice-chat")
 async def voice_chat(request: VoiceChatRequest):
     """Streaming voice turn. Emits NDJSON lines:
@@ -3583,7 +3555,6 @@ async def voice_chat(request: VoiceChatRequest):
     session = get_session(request.session_id)
     session["messages"] = trim_memory(session["messages"])
     session["messages"].append(HumanMessage(content=request.message))
-    use_mcp = bool(request.mcp_servers)
 
     async def event_stream():
         full_text = ""
@@ -3594,23 +3565,15 @@ async def voice_chat(request: VoiceChatRequest):
             nonlocal full_text
             buffer, first = "", True
             try:
-                if use_mcp:
-                    full_text = await _mcp_voice_text(request, session)
-                    buffer = full_text + " "
-                    pieces, buffer = _pop_speakable(buffer, False)
-                    pieces = pieces + ([buffer.strip()] if buffer.strip() else [])
+                async for delta in _groq_voice_stream(session):
+                    full_text += delta
+                    buffer += delta
+                    pieces, buffer = _pop_speakable(buffer, first)
                     for piece in pieces:
+                        first = False
                         await queue.put(asyncio.create_task(_fish_tts(piece, request.voice)))
-                else:
-                    async for delta in _groq_voice_stream(session):
-                        full_text += delta
-                        buffer += delta
-                        pieces, buffer = _pop_speakable(buffer, first)
-                        for piece in pieces:
-                            first = False
-                            await queue.put(asyncio.create_task(_fish_tts(piece, request.voice)))
-                    if buffer.strip():
-                        await queue.put(asyncio.create_task(_fish_tts(buffer.strip(), request.voice)))
+                if buffer.strip():
+                    await queue.put(asyncio.create_task(_fish_tts(buffer.strip(), request.voice)))
             except Exception as exc:
                 print(f"[{request.session_id}] Voice pipeline failed: {exc}")
                 if not full_text:
@@ -3650,20 +3613,10 @@ async def _voice_llm_stream(session: dict):
         yield delta
 
 
-async def _voice_mcp_text(session_id: str, user_text: str, mcp_servers: List[str], session: dict) -> str:
-    request = VoiceChatRequest(
-        message=user_text,
-        session_id=session_id,
-        mcp_servers=mcp_servers,
-    )
-    return await _mcp_voice_text(request, session)
-
-
 app.include_router(create_router(VoiceDeps(
     get_session=get_session,
     trim_memory=trim_memory,
     llm_stream=_voice_llm_stream,
-    mcp_text=_voice_mcp_text,
     human_message=lambda text: HumanMessage(content=text),
     ai_message=lambda text: AIMessage(content=text),
     allowed_origin=FRONTEND_ORIGIN,
