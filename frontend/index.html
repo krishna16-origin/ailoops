@@ -4994,16 +4994,22 @@
             socket.binaryType = 'arraybuffer';
             voiceSocket = socket;
             voiceSocketReady = false;
-            voiceSocketReadyPromise = new Promise((resolve, reject) => {
+            let pendingPromise;
+            pendingPromise = new Promise((resolve, reject) => {
                 let settled = false;
+                const isCurrentSocket = () => voiceSocket === socket;
                 const fail = (error) => {
                     if (!settled) { settled = true; reject(error); }
                 };
                 socket.onopen = () => {
+                    if (!isCurrentSocket()) return;
                     try { socket.send(JSON.stringify(voiceSocketConfig())); }
                     catch (error) { fail(error); }
                 };
                 socket.onmessage = (message) => {
+                    // A close/reopen can leave late events from the old socket.
+                    // Never let those events mutate the fresh voice session.
+                    if (!isCurrentSocket()) return;
                     if (typeof message.data === 'string') {
                         let event;
                         try { event = JSON.parse(message.data); } catch (_) { return; }
@@ -5018,16 +5024,18 @@
                     }
                 };
                 socket.onerror = () => {
+                    if (!isCurrentSocket()) return;
                     voiceSocketError = 'Voice connection failed';
                     fail(new Error(voiceSocketError));
                 };
                 socket.onclose = () => {
-                    if (voiceSocket === socket) {
-                        voiceSocket = null;
-                        voiceSocketReady = false;
+                    if (!isCurrentSocket()) {
+                        fail(new Error('Stale voice connection closed'));
+                        return;
                     }
+                    voiceSocket = null;
+                    voiceSocketReady = false;
                     fail(new Error(voiceSocketError || 'Voice connection closed'));
-                    voiceSocketReadyPromise = null;
                     // Do not leave recognition paused forever if a proxy or
                     // mobile network drops the persistent socket mid-turn.
                     if (voiceSocketTurnActive && mobileVoiceOverlay && !mobileVoiceOverlay.hidden && voiceRecognitionPaused) {
@@ -5036,8 +5044,14 @@
                         maybeFinishVoicePlayback(voicePlaybackToken, resumeVoiceListening);
                     }
                 };
-            }).finally(() => { voiceSocketReadyPromise = null; });
-            return voiceSocketReadyPromise;
+            });
+            voiceSocketReadyPromise = pendingPromise;
+            pendingPromise.finally(() => {
+                // An earlier socket's promise must not clear a newer socket's
+                // promise during a close-and-reopen cycle.
+                if (voiceSocketReadyPromise === pendingPromise) voiceSocketReadyPromise = null;
+            }).catch(() => {});
+            return pendingPromise;
         }
 
         function closeVoiceSocket() {
