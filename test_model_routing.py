@@ -62,21 +62,32 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertIn('data-workflow-mode="build"', html)
         self.assertIn("mode: document.getElementById('codeWorkflowMode').value", html)
 
-    def test_voice_mode_is_mcp_only_and_uses_orpheus_audio(self):
+    def test_voice_chat_uses_separate_fish_audio_request(self):
         frontend = pathlib.Path(__file__).with_name("frontend") / "index.html"
         html = frontend.read_text(encoding="utf-8")
-        self.assertTrue(app.ChatRequest(message="x", session_id="s", voice_mode=True).voice_mode)
-        self.assertEqual(app.GROQ_TTS_MODEL, "canopylabs/orpheus-v1-english")
+        self.assertFalse(hasattr(app.ChatRequest(message="x", session_id="s"), "voice_mode"))
+        voice_request = app.VoiceChatRequest(message="x", session_id="s")
+        self.assertEqual(voice_request.voice, "")
+        self.assertTrue(app.FISH_MODEL)
         self.assertNotIn("speakVoiceTextFallback", html)
         self.assertNotIn("using browser speech", html.lower())
 
-    def test_voice_chat_keeps_error_response_speakable(self):
+    def test_voice_chat_streams_groq_text_through_fish_audio(self):
         source = pathlib.Path(__file__).with_name("app.py").read_text(encoding="utf-8")
         voice_source = source[source.index("async def voice_chat"):]
         voice_source = voice_source[:voice_source.index("\n\n@app.post(\"/chat\")")]
-        self.assertIn("voice_mode=True", voice_source)
-        self.assertIn("audio = await _groq_orpheus_audio(response, request.voice)", voice_source)
-        self.assertNotIn("raise HTTPException(status_code=502", voice_source)
+        self.assertIn("async for delta in _groq_voice_stream(session)", voice_source)
+        self.assertIn("_fish_tts(piece, request.voice)", voice_source)
+        self.assertIn('media_type="application/x-ndjson"', voice_source)
+        self.assertNotIn("voice_mode=True", voice_source)
+        self.assertNotIn("_groq_orpheus_audio", voice_source)
+
+    def test_voice_router_wiring_has_no_legacy_mcp_text_dependency(self):
+        # Importing app constructs this dependency bundle at module load time;
+        # this assertion documents the startup contract that previously broke
+        # the Render deploy when app.py and voice_ws.py were out of sync.
+        self.assertNotIn("mcp_text", app.VoiceDeps.__dataclass_fields__)
+        self.assertIn("llm_stream", app.VoiceDeps.__dataclass_fields__)
 
     def test_chat_history_supports_titles_and_three_dot_actions(self):
         frontend = pathlib.Path(__file__).with_name("frontend") / "index.html"
