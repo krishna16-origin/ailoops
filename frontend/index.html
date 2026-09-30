@@ -842,7 +842,7 @@
             .mobile-voice-glow-mount > div { width:100%; height:100%; }
             .mobile-voice-copy { position:relative; z-index:1; flex:1 1 auto; min-height:0; display:flex; flex-direction:column; justify-content:center; align-items:center; width:100%; max-width:1000px; margin:0 auto; text-align:center; padding:20px 20px 150px; }
             .voice-orb-shell { position:relative; flex:0 0 auto; width:min(390px, 58vh); height:min(390px, 58vh); margin:auto; border-radius:50%; pointer-events:none; filter:drop-shadow(0 0 34px rgba(99,214,255,.10)); }
-            .voice-orb-shell::before { content:""; position:absolute; inset:13%; border-radius:50%; background:radial-gradient(circle, rgba(111,217,255,.08), rgba(180,144,202,.035) 42%, transparent 72%); filter:blur(18px); }
+            .voice-orb-shell::before { display:none; }
             .voice-orb-canvas { position:relative; display:block; width:100%; height:100%; }
             .voice-conversation { display:none; width:min(900px, 100%); height:100%; min-height:0; overflow-y:auto; overscroll-behavior:contain; display:flex; flex-direction:column; gap:18px; padding:30px 8px 24px; scrollbar-width:thin; scrollbar-color:rgba(255,255,255,.22) transparent; }
             .voice-conversation-message { max-width:72%; padding:10px 14px; color:var(--text-primary); font-size:15px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; }
@@ -4630,129 +4630,235 @@
         const mobileVoiceOverlay = document.getElementById('mobileVoiceOverlay');
         const mobileVoiceConversation = document.getElementById('mobileVoiceConversation');
         const mobileVoiceAgent = document.getElementById('mobileVoiceAgent');
-        const voiceOrbCanvas = document.getElementById('voiceOrbCanvas');
-        let voiceOrbCtx = null;
+        let voiceOrbCanvas = document.getElementById('voiceOrbCanvas');
         let voiceOrbFrame = null;
-        let voiceOrbParticles = null;
-        let voiceOrbWidth = 0;
-        let voiceOrbHeight = 0;
-        let voiceOrbLastTime = 0;
-        // Voice mode keeps the conversation surface visually quiet until the
-        // orb is opened; the orb itself is a small projected 3D point cloud so
-        // it stays crisp without a WebGL or external-library dependency.
-        function makeVoiceOrbParticles() {
-            const particles = [];
-            const count = 240;
-            const golden = Math.PI * (3 - Math.sqrt(5));
-            for (let i = 0; i < count; i++) {
-                const y = 1 - (i / (count - 1)) * 2;
-                const radius = Math.sqrt(Math.max(0, 1 - y * y));
-                const theta = golden * i;
-                particles.push({
-                    x: Math.cos(theta) * radius,
-                    y,
-                    z: Math.sin(theta) * radius,
-                    size: 0.45 + ((i * 17) % 11) / 18,
-                    phase: (i * 0.71) % (Math.PI * 2),
-                    band: i % 5
+        // Voice-mode particle orb: same shell and audio state, now rendered with
+        // the supplied Three.js point-cloud treatment on a transparent canvas.
+        let voiceOrbThree = null;
+        let voiceOrbScene = null;
+        let voiceOrbCamera = null;
+        let voiceOrbRenderer = null;
+        let voiceOrbGeometry = null;
+        let voiceOrbMaterial = null;
+        let voiceOrb = null;
+        let voiceOrbBasePositions = null;
+        let voiceOrbDirs = null;
+        let voiceOrbPositions = null;
+        let voiceOrbSmoothedTreble = 0;
+        let voiceOrbFreqData = null;
+        let voiceOrbTimeData = null;
+        let voiceOrbFallbackCtx = null;
+        let voiceOrbFallbackParticles = null;
+        const voiceOrbThreeReady = import('https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.module.js')
+            .then((module) => { voiceOrbThree = module; return module; })
+            .catch((error) => { console.warn('Voice orb renderer unavailable:', error); return null; });
+
+        function createVoiceOrb() {
+            if (!voiceOrbCanvas || voiceOrbRenderer || !voiceOrbThree) return;
+            const THREE = voiceOrbThree;
+            const COUNT = 12000;
+            const RADIUS = 1.35;
+            voiceOrbScene = new THREE.Scene();
+            voiceOrbCamera = new THREE.PerspectiveCamera(60, 1, 0.1, 100);
+            voiceOrbCamera.position.z = 4.2;
+            try {
+                voiceOrbRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            } catch (error) {
+                console.warn('Voice orb WebGL unavailable; using Canvas fallback:', error);
+                createVoiceOrbFallback();
+                return;
+            }
+            voiceOrbRenderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+            voiceOrbRenderer.setClearColor(0x000000, 0);
+            voiceOrbRenderer.domElement.style.background = 'transparent';
+            voiceOrbCanvas.replaceWith(voiceOrbRenderer.domElement);
+            voiceOrbRenderer.domElement.className = 'voice-orb-canvas';
+            voiceOrbRenderer.domElement.id = 'voiceOrbCanvas';
+            voiceOrbRenderer.domElement.setAttribute('aria-hidden', 'true');
+            voiceOrbCanvas = voiceOrbRenderer.domElement;
+
+            voiceOrbBasePositions = new Float32Array(COUNT * 3);
+            voiceOrbDirs = new Float32Array(COUNT * 3);
+            voiceOrbPositions = new Float32Array(COUNT * 3);
+            const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+            for (let i = 0; i < COUNT; i++) {
+                const y = 1 - (i / (COUNT - 1)) * 2;
+                const r = Math.sqrt(1 - y * y);
+                const theta = goldenAngle * i;
+                const x = Math.cos(theta) * r;
+                const z = Math.sin(theta) * r;
+                const jitter = 0.94 + Math.random() * 0.12;
+                const ix = i * 3;
+                const px = x * RADIUS * jitter;
+                const py = y * RADIUS * jitter;
+                const pz = z * RADIUS * jitter;
+                voiceOrbBasePositions[ix] = px;
+                voiceOrbBasePositions[ix + 1] = py;
+                voiceOrbBasePositions[ix + 2] = pz;
+                voiceOrbDirs[ix] = x;
+                voiceOrbDirs[ix + 1] = y;
+                voiceOrbDirs[ix + 2] = z;
+                voiceOrbPositions[ix] = px;
+                voiceOrbPositions[ix + 1] = py;
+                voiceOrbPositions[ix + 2] = pz;
+            }
+            voiceOrbGeometry = new THREE.BufferGeometry();
+            voiceOrbGeometry.setAttribute('position', new THREE.BufferAttribute(voiceOrbPositions, 3));
+            const size = 64;
+            const spriteCanvas = document.createElement('canvas');
+            spriteCanvas.width = spriteCanvas.height = size;
+            const spriteContext = spriteCanvas.getContext('2d');
+            const gradient = spriteContext.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+            gradient.addColorStop(0, 'rgba(255,255,255,1)');
+            gradient.addColorStop(0.4, 'rgba(255,255,255,0.4)');
+            gradient.addColorStop(1, 'rgba(255,255,255,0)');
+            spriteContext.fillStyle = gradient;
+            spriteContext.fillRect(0, 0, size, size);
+            voiceOrbMaterial = new THREE.PointsMaterial({
+                size: 0.045,
+                map: new THREE.CanvasTexture(spriteCanvas),
+                transparent: true,
+                depthWrite: false,
+                blending: THREE.AdditiveBlending,
+                color: new THREE.Color(0x66aaff)
+            });
+            voiceOrb = new THREE.Points(voiceOrbGeometry, voiceOrbMaterial);
+            voiceOrbScene.add(voiceOrb);
+            voiceOrbTimeData = new Uint8Array(256);
+            voiceOrbFreqData = new Uint8Array(128);
+            resizeVoiceOrb();
+        }
+
+        function createVoiceOrbFallback() {
+            if (!voiceOrbCanvas) return;
+            voiceOrbFallbackCtx = voiceOrbCanvas.getContext('2d');
+            if (!voiceOrbFallbackParticles) {
+                const count = 2400;
+                const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+                voiceOrbFallbackParticles = Array.from({ length: count }, (_, i) => {
+                    const y = 1 - (i / (count - 1)) * 2;
+                    const radius = Math.sqrt(Math.max(0, 1 - y * y));
+                    const theta = goldenAngle * i;
+                    return { x: Math.cos(theta) * radius, y, z: Math.sin(theta) * radius, phase: i * 0.37 };
                 });
             }
-            return particles;
         }
-        function resizeVoiceOrb() {
-            if (!voiceOrbCanvas) return;
-            const rect = voiceOrbCanvas.getBoundingClientRect();
-            const dpr = Math.min(2, window.devicePixelRatio || 1);
-            const width = Math.max(1, Math.round(rect.width * dpr));
-            const height = Math.max(1, Math.round(rect.height * dpr));
-            if (voiceOrbCanvas.width !== width || voiceOrbCanvas.height !== height) {
-                voiceOrbCanvas.width = width;
-                voiceOrbCanvas.height = height;
-                voiceOrbWidth = width;
-                voiceOrbHeight = height;
-                voiceOrbCtx = voiceOrbCanvas.getContext('2d');
-                if (voiceOrbCtx) voiceOrbCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-            }
-        }
-        function drawVoiceOrb(timestamp) {
-            if (!voiceOrbCtx || !voiceOrbCanvas || !voiceOrbParticles) return;
+
+        function drawVoiceOrbFallback(timestamp) {
+            if (!voiceOrbFallbackCtx || !voiceOrbCanvas) return;
             const rect = voiceOrbCanvas.getBoundingClientRect();
             const width = rect.width;
             const height = rect.height;
             if (!width || !height) return;
-            const dpr = Math.min(2, window.devicePixelRatio || 1);
-            if (voiceOrbWidth !== Math.round(width * dpr) || voiceOrbHeight !== Math.round(height * dpr)) resizeVoiceOrb();
-            const ctx = voiceOrbCtx;
             const level = Math.max(Number(window.voiceModeLevel || 0), voiceReplyLevel * 0.92);
-            voiceOrbLastTime = timestamp;
-            const rotation = timestamp * (0.00016 + level * 0.00032);
-            const tilt = Math.sin(timestamp * 0.00023) * 0.14;
+            const time = timestamp * 0.001;
+            const ctx = voiceOrbFallbackCtx;
             const centerX = width / 2;
             const centerY = height / 2;
-            const baseRadius = Math.min(width, height) * 0.37;
+            const radius = Math.min(width, height) * 0.39;
             ctx.clearRect(0, 0, width, height);
-            const projected = [];
-            const cosR = Math.cos(rotation);
-            const sinR = Math.sin(rotation);
-            const cosT = Math.cos(tilt);
-            const sinT = Math.sin(tilt);
-            for (const particle of voiceOrbParticles) {
-                // Audio waves travel around latitude bands and push the shell
-                // outward, making the orb visibly respond to speech rather
-                // than merely pulsing as a flat circle.
-                const wave = Math.sin(particle.phase + timestamp * 0.006 + particle.y * 8.5) * level;
-                const shell = 1 + wave * 0.105 + Math.sin(timestamp * 0.002 + particle.phase) * level * 0.035;
-                let x = particle.x * shell;
-                let y = particle.y * shell;
-                let z = particle.z * shell;
-                const rotatedX = x * cosR - z * sinR;
-                z = x * sinR + z * cosR;
-                x = rotatedX;
-                const tiltedY = y * cosT - z * sinT;
-                z = y * sinT + z * cosT;
-                y = tiltedY;
+            ctx.globalCompositeOperation = 'lighter';
+            for (const particle of voiceOrbFallbackParticles) {
+                const wave = Math.sin(time * 6 + particle.x * 3 + particle.y * 2 + particle.phase) * level;
+                const scale = 1 + wave * 0.55 + Math.sin(time * 1.4) * 0.04;
+                const rotation = time * 0.22 + level * time * 1.5;
+                const x = particle.x * scale * Math.cos(rotation) - particle.z * scale * Math.sin(rotation);
+                const z = particle.x * scale * Math.sin(rotation) + particle.z * scale * Math.cos(rotation);
+                const y = particle.y * scale;
                 const perspective = 1 / (1.82 - z * 0.48);
-                projected.push({
-                    x: centerX + x * baseRadius * perspective,
-                    y: centerY + y * baseRadius * perspective,
-                    z,
-                    size: particle.size * perspective * (1 + level * 0.7),
-                    alpha: Math.max(0.08, Math.min(0.95, 0.27 + (z + 1) * 0.27 + level * 0.38)),
-                    hue: 188 + particle.band * 19 + level * 22
-                });
-            }
-            projected.sort((a, b) => a.z - b.z);
-            for (const point of projected) {
+                const alpha = Math.max(0.12, Math.min(0.95, 0.3 + (z + 1) * 0.28 + level * 0.4));
+                ctx.fillStyle = `rgba(${70 + level * 185}, ${165 - level * 45}, 255, ${alpha})`;
                 ctx.beginPath();
-                ctx.fillStyle = `hsla(${point.hue}, 88%, ${62 + point.z * 10 + level * 12}%, ${point.alpha})`;
-                ctx.arc(point.x, point.y, point.size, 0, Math.PI * 2);
+                ctx.arc(centerX + x * radius * perspective, centerY + y * radius * perspective, 0.7 + level * 1.8, 0, Math.PI * 2);
                 ctx.fill();
             }
-            if (level > 0.02) {
-                const glow = ctx.createRadialGradient(centerX, centerY, baseRadius * 0.15, centerX, centerY, baseRadius * 1.2);
-                glow.addColorStop(0, `rgba(112, 220, 255, ${0.055 + level * 0.08})`);
-                glow.addColorStop(0.52, `rgba(180, 144, 202, ${0.025 + level * 0.04})`);
-                glow.addColorStop(1, 'rgba(0, 0, 0, 0)');
-                ctx.fillStyle = glow;
-                ctx.beginPath();
-                ctx.arc(centerX, centerY, baseRadius * 1.2, 0, Math.PI * 2);
-                ctx.fill();
+            ctx.globalCompositeOperation = 'source-over';
+            if (mobileVoiceOverlay && !mobileVoiceOverlay.hidden) voiceOrbFrame = requestAnimationFrame(drawVoiceOrbFallback);
+        }
+
+        function resizeVoiceOrb() {
+            if (!voiceOrbRenderer || !voiceOrbCanvas || !voiceOrbCamera) return;
+            const rect = voiceOrbCanvas.getBoundingClientRect();
+            const width = Math.max(1, rect.width);
+            const height = Math.max(1, rect.height);
+            voiceOrbCamera.aspect = width / height;
+            voiceOrbCamera.updateProjectionMatrix();
+            voiceOrbRenderer.setSize(width, height, false);
+        }
+
+        function computeVoiceOrbVolume() {
+            if (!voiceAnalyser || !voiceOrbTimeData) return 0;
+            voiceAnalyser.getByteTimeDomainData(voiceOrbTimeData);
+            let sum = 0;
+            for (let i = 0; i < voiceOrbTimeData.length; i++) {
+                const value = (voiceOrbTimeData[i] - 128) / 128;
+                sum += value * value;
             }
+            return Math.sqrt(sum / voiceOrbTimeData.length);
+        }
+
+        function computeVoiceOrbTreble() {
+            if (!voiceAnalyser || !voiceOrbFreqData) return 0;
+            voiceAnalyser.getByteFrequencyData(voiceOrbFreqData);
+            const start = Math.floor(voiceOrbFreqData.length * 0.5);
+            let sum = 0;
+            for (let i = start; i < voiceOrbFreqData.length; i++) sum += voiceOrbFreqData[i];
+            return sum / ((voiceOrbFreqData.length - start) * 255);
+        }
+
+        function drawVoiceOrb(timestamp) {
+            if (!voiceOrbRenderer) { drawVoiceOrbFallback(timestamp); return; }
+            if (!voiceOrb || !voiceOrbGeometry || !voiceOrbPositions) return;
+            const time = timestamp * 0.001;
+            const microphoneVolume = computeVoiceOrbVolume();
+            const level = Math.max(Number(window.voiceModeLevel || 0), voiceReplyLevel * 0.92);
+            const treble = computeVoiceOrbTreble();
+            voiceOrbSmoothedTreble += (treble - voiceOrbSmoothedTreble) * 0.1;
+            const breathe = 1 + Math.sin(time * 1.4) * 0.04;
+            const disturb = Math.max(level, Math.min(microphoneVolume * 3, 1.4)) * 0.9;
+            const baseColor = new voiceOrbThree.Color(0x4fa8ff);
+            const hotColor = new voiceOrbThree.Color(0xff77ff);
+            const displayColor = baseColor.lerp(hotColor, Math.min(level * 1.2, 1));
+            for (let i = 0; i < voiceOrbPositions.length / 3; i++) {
+                const ix = i * 3;
+                const bx = voiceOrbBasePositions[ix];
+                const by = voiceOrbBasePositions[ix + 1];
+                const bz = voiceOrbBasePositions[ix + 2];
+                const wave = Math.sin(time * 6 + bx * 3 + by * 2) * disturb
+                    + Math.sin(time * 11 + bz * 5) * disturb * 0.5;
+                const flutter = Math.sin(time * 13 + i * 0.37) * 0.02 * (1 + disturb * 8);
+                const scale = breathe + wave * (0.55 + voiceOrbSmoothedTreble) + flutter;
+                voiceOrbPositions[ix] = bx * scale + voiceOrbDirs[ix] * wave * 0.25;
+                voiceOrbPositions[ix + 1] = by * scale + voiceOrbDirs[ix + 1] * wave * 0.25;
+                voiceOrbPositions[ix + 2] = bz * scale + voiceOrbDirs[ix + 2] * wave * 0.25;
+            }
+            voiceOrbGeometry.attributes.position.needsUpdate = true;
+            voiceOrbMaterial.color.copy(displayColor);
+            voiceOrbMaterial.size = 0.04 + level * 0.05;
+            voiceOrb.rotation.y += 0.0022 + level * 0.015;
+            voiceOrb.rotation.x = Math.sin(time * 0.3) * 0.15;
+            voiceOrbRenderer.render(voiceOrbScene, voiceOrbCamera);
             if (mobileVoiceOverlay && !mobileVoiceOverlay.hidden) voiceOrbFrame = requestAnimationFrame(drawVoiceOrb);
         }
+
         function startVoiceOrb() {
-            if (!voiceOrbCanvas) return;
-            voiceOrbParticles = voiceOrbParticles || makeVoiceOrbParticles();
-            resizeVoiceOrb();
-            if (voiceOrbFrame) cancelAnimationFrame(voiceOrbFrame);
-            voiceOrbLastTime = performance.now();
-            voiceOrbFrame = requestAnimationFrame(drawVoiceOrb);
+            voiceOrbThreeReady.then(() => {
+                if (!mobileVoiceOverlay || mobileVoiceOverlay.hidden) return;
+                createVoiceOrb();
+                if (!voiceOrbRenderer && !voiceOrbFallbackCtx) return;
+                resizeVoiceOrb();
+                if (voiceOrbFrame) cancelAnimationFrame(voiceOrbFrame);
+                voiceOrbFrame = requestAnimationFrame(voiceOrbRenderer ? drawVoiceOrb : drawVoiceOrbFallback);
+            });
         }
+
         function stopVoiceOrb() {
             if (voiceOrbFrame) cancelAnimationFrame(voiceOrbFrame);
             voiceOrbFrame = null;
-            if (voiceOrbCtx && voiceOrbCanvas) voiceOrbCtx.clearRect(0, 0, voiceOrbCanvas.width, voiceOrbCanvas.height);
+            if (voiceOrbRenderer) voiceOrbRenderer.clear();
+            if (voiceOrbFallbackCtx && voiceOrbCanvas) voiceOrbFallbackCtx.clearRect(0, 0, voiceOrbCanvas.width, voiceOrbCanvas.height);
         }
+        window.addEventListener('resize', resizeVoiceOrb);
         function appendVoiceConversationMessage(role, text = '') { if (text) console.debug('[voice]', role, text); return null; }
         function isMobileVoiceMode() { return window.matchMedia && window.matchMedia('(max-width: 768px)').matches; }
         function animateVoiceReplyGlow(timestamp) {
