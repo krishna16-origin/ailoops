@@ -46,6 +46,8 @@ import file_generator
 
 load_dotenv()
 
+from voice_ws import VoiceDeps, create_router, warmup as warm_voice_upstream
+
 # Optional production frontend origin. When unset, the API remains usable from
 # the same deployed service and falls back to the permissive no-credentials CORS
 # mode configured below.
@@ -3412,7 +3414,7 @@ async def chat_estimate(request: ChatEstimateRequest):
 # whole answer has been generated and synthesized.
 # ---------------------------------------------------------------------------
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
-VOICE_LLM_MODEL = os.getenv("VOICE_LLM_MODEL", "openai/gpt-oss-20b")
+VOICE_LLM_MODEL = os.getenv("VOICE_LLM_MODEL", "llama-3.1-8b-instant")
 FISH_TTS_URL = "https://api.fish.audio/v1/tts"
 FISH_MODEL = os.getenv("FISH_MODEL", "s2.1-pro-free")
 FISH_LATENCY = os.getenv("FISH_LATENCY", "balanced")  # "normal" | "balanced"
@@ -3508,7 +3510,7 @@ async def _fish_tts(text: str, reference_id: str = "") -> Optional[str]:
 
 def _voice_history(session: dict) -> List[Dict[str, str]]:
     messages = [{"role": "system", "content": VOICE_SYSTEM_PROMPT}]
-    for message in session.get("messages", [])[-10:]:
+    for message in session.get("messages", [])[-6:]:
         content = message.content if isinstance(message.content, str) else str(message.content)
         if not content.strip():
             continue
@@ -3528,7 +3530,7 @@ async def _groq_voice_stream(session: dict):
         "model": VOICE_LLM_MODEL,
         "messages": _voice_history(session),
         "temperature": 0.6,
-        "max_tokens": 400,
+        "max_tokens": 220,
         "stream": True,
     }
     if "gpt-oss" in VOICE_LLM_MODEL:
@@ -3637,6 +3639,50 @@ async def voice_chat(request: VoiceChatRequest):
         media_type="application/x-ndjson",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
+
+
+# The WebSocket voice path is the primary transport.  It keeps one connection
+# alive across turns, streams PCM directly, and owns cancellation at the turn
+# boundary.  Keep the older /voice-chat endpoint above for clients that have
+# not adopted the socket protocol yet.
+async def _voice_llm_stream(session: dict):
+    async for delta in _groq_voice_stream(session):
+        yield delta
+
+
+async def _voice_mcp_text(session_id: str, user_text: str, mcp_servers: List[str], session: dict) -> str:
+    request = VoiceChatRequest(
+        message=user_text,
+        session_id=session_id,
+        mcp_servers=mcp_servers,
+    )
+    return await _mcp_voice_text(request, session)
+
+
+app.include_router(create_router(VoiceDeps(
+    get_session=get_session,
+    trim_memory=trim_memory,
+    llm_stream=_voice_llm_stream,
+    mcp_text=_voice_mcp_text,
+    human_message=lambda text: HumanMessage(content=text),
+    ai_message=lambda text: AIMessage(content=text),
+    allowed_origin=FRONTEND_ORIGIN,
+)))
+
+
+@app.on_event("startup")
+async def _warm_voice_upstreams() -> None:
+    # Warm in the background so deployment health checks are not delayed while
+    # still paying DNS/TLS setup before the first normal voice turn.
+    asyncio.create_task(warm_voice_upstream())
+    async def warm_legacy_pool() -> None:
+        client = _get_voice_http()
+        for url in ("https://api.groq.com/openai/v1/models", FISH_TTS_URL):
+            try:
+                await client.head(url, timeout=5.0)
+            except Exception:
+                pass
+    asyncio.create_task(warm_legacy_pool())
 
 
 @app.post("/chat")

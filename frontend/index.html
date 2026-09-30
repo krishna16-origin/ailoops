@@ -4651,13 +4651,242 @@
         let voiceStreamDone = true;
         let voiceTurnAbort = null;
         let voiceDecodeChain = Promise.resolve();
+        let voiceSocket = null;
+        let voiceSocketReady = false;
+        let voiceSocketReadyPromise = null;
+        let voiceCurrentReply = '';
+        let voicePcmRate = 24000;
+        let voiceSocketError = null;
+        let voiceActiveServerTurn = 0;
+        let voiceIgnoredServerTurn = 0;
+        let voiceSocketTurnActive = false;
         function ensureVoicePlayCtx() {
             if (!voicePlayCtx || voicePlayCtx.state === 'closed') {
                 const Ctx = window.AudioContext || window.webkitAudioContext;
+                if (!Ctx) throw new Error('Web Audio is not supported');
                 voicePlayCtx = new Ctx({ latencyHint: 'interactive' });
             }
             if (voicePlayCtx.state === 'suspended') voicePlayCtx.resume().catch(() => {});
             return voicePlayCtx;
+        }
+
+        function voiceSocketUrl() {
+            const url = new URL('/ws/voice', API_BASE || window.location.href);
+            url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+            return url.toString();
+        }
+
+        function voiceSocketConfig() {
+            return {
+                type: 'config',
+                session_id: modes.chat.sessionId,
+                mcp_servers: typeof selectedMcpServers === 'function' ? selectedMcpServers() : [],
+                voice: ''
+            };
+        }
+
+        function handleVoiceSocketJson(event) {
+            if (!event || typeof event !== 'object') return;
+            if (event.type === 'ready') {
+                voicePcmRate = Number(event.pcm_rate) || 24000;
+                return;
+            }
+            if (event.type === 'assistant_text') {
+                voiceCurrentReply += `${event.text || ''} `;
+                return;
+            }
+            if (event.type === 'state' && event.turn) {
+                if (event.state === 'thinking' || event.state === 'transcribing') {
+                    voiceActiveServerTurn = Number(event.turn) || voiceActiveServerTurn;
+                }
+                return;
+            }
+            if (event.type === 'tts_fallback') {
+                speakVoiceFallback(event.text || '');
+                return;
+            }
+            if (event.type === 'turn_done') {
+                const reply = String(event.response || voiceCurrentReply || '').trim();
+                if (reply) appendMessage('assistant', reply, []);
+                voiceCurrentReply = '';
+                voiceSocketTurnActive = false;
+                voiceStreamDone = true;
+                maybeFinishVoicePlayback(voicePlaybackToken, resumeVoiceListening);
+                return;
+            }
+            if (event.type === 'cancelled') {
+                voiceCurrentReply = '';
+                voiceSocketTurnActive = false;
+                voiceStreamDone = true;
+                stopVoiceAudioPlayback();
+                resumeVoiceListening();
+                return;
+            }
+            if (event.type === 'error') {
+                console.warn('Voice socket error:', event.message || event);
+                voiceSocketError = event.message || 'Voice request failed';
+                voiceSocketTurnActive = false;
+                voiceStreamDone = true;
+                maybeFinishVoicePlayback(voicePlaybackToken, resumeVoiceListening);
+            }
+        }
+
+        function handleVoiceSocketBinary(data) {
+            const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer);
+            if (bytes.byteLength < 5) return;
+            const kind = bytes[0];
+            const turnId = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(1, false);
+            if (turnId === voiceIgnoredServerTurn) return;
+            if (voiceActiveServerTurn && turnId !== voiceActiveServerTurn) return;
+            const payload = bytes.slice(5).buffer;
+            const token = voicePlaybackToken;
+            if (kind === 1) {
+                enqueueVoicePcm(payload, voicePcmRate, token, resumeVoiceListening);
+            } else if (kind === 2) {
+                enqueueVoiceEncoded(payload, token, resumeVoiceListening);
+            }
+        }
+
+        function connectVoiceSocket() {
+            if (voiceSocket && voiceSocket.readyState === WebSocket.OPEN && voiceSocketReady) {
+                return Promise.resolve(voiceSocket);
+            }
+            if (voiceSocketReadyPromise) return voiceSocketReadyPromise;
+            voiceSocketError = null;
+            const socket = new WebSocket(voiceSocketUrl());
+            socket.binaryType = 'arraybuffer';
+            voiceSocket = socket;
+            voiceSocketReady = false;
+            voiceSocketReadyPromise = new Promise((resolve, reject) => {
+                let settled = false;
+                const fail = (error) => {
+                    if (!settled) { settled = true; reject(error); }
+                };
+                socket.onopen = () => {
+                    try { socket.send(JSON.stringify(voiceSocketConfig())); }
+                    catch (error) { fail(error); }
+                };
+                socket.onmessage = (message) => {
+                    if (typeof message.data === 'string') {
+                        let event;
+                        try { event = JSON.parse(message.data); } catch (_) { return; }
+                        if (event.type === 'ready' && !settled) {
+                            voiceSocketReady = true;
+                            settled = true;
+                            resolve(socket);
+                        }
+                        handleVoiceSocketJson(event);
+                    } else {
+                        handleVoiceSocketBinary(message.data);
+                    }
+                };
+                socket.onerror = () => {
+                    voiceSocketError = 'Voice connection failed';
+                    fail(new Error(voiceSocketError));
+                };
+                socket.onclose = () => {
+                    if (voiceSocket === socket) {
+                        voiceSocket = null;
+                        voiceSocketReady = false;
+                    }
+                    fail(new Error(voiceSocketError || 'Voice connection closed'));
+                    voiceSocketReadyPromise = null;
+                    // Do not leave recognition paused forever if a proxy or
+                    // mobile network drops the persistent socket mid-turn.
+                    if (voiceSocketTurnActive && mobileVoiceOverlay && !mobileVoiceOverlay.hidden && voiceRecognitionPaused) {
+                        voiceSocketTurnActive = false;
+                        voiceStreamDone = true;
+                        maybeFinishVoicePlayback(voicePlaybackToken, resumeVoiceListening);
+                    }
+                };
+            }).finally(() => { voiceSocketReadyPromise = null; });
+            return voiceSocketReadyPromise;
+        }
+
+        function closeVoiceSocket() {
+            const socket = voiceSocket;
+            voiceSocket = null;
+            voiceSocketReady = false;
+            voiceSocketReadyPromise = null;
+            if (!socket) return;
+            try {
+                if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'interrupt' }));
+                socket.close(1000, 'voice mode closed');
+            } catch (_) { /* already closed */ }
+        }
+
+        function sendVoiceSocketText(text) {
+            if (!voiceSocket || !voiceSocketReady || voiceSocket.readyState !== WebSocket.OPEN) return false;
+            try {
+                voiceCurrentReply = '';
+                voiceSocketTurnActive = true;
+                voiceSocket.send(JSON.stringify({ type: 'text', text }));
+                return true;
+            } catch (error) {
+                voiceSocketTurnActive = false;
+                voiceSocketError = error.message || 'Voice send failed';
+                return false;
+            }
+        }
+
+        function enqueueVoiceEncoded(data, token, onIdle) {
+            const ctx = ensureVoicePlayCtx();
+            voicePendingDecodes += 1;
+            voiceDecodeChain = voiceDecodeChain.then(async () => {
+                if (token !== voicePlaybackToken) return;
+                try {
+                    const buffer = await ctx.decodeAudioData(data.slice(0));
+                    if (token !== voicePlaybackToken) return;
+                    scheduleVoiceBuffer(buffer, token, onIdle);
+                } catch (error) {
+                    console.warn('Voice audio could not be decoded:', error);
+                } finally {
+                    voicePendingDecodes = Math.max(0, voicePendingDecodes - 1);
+                    maybeFinishVoicePlayback(token, onIdle);
+                }
+            });
+        }
+
+        function enqueueVoicePcm(data, sampleRate, token, onIdle) {
+            if (token !== voicePlaybackToken) return;
+            const samples = new Int16Array(data);
+            if (!samples.length) return;
+            const ctx = ensureVoicePlayCtx();
+            const buffer = ctx.createBuffer(1, samples.length, sampleRate || 24000);
+            const channel = new Float32Array(samples.length);
+            for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32768;
+            buffer.copyToChannel(channel, 0);
+            scheduleVoiceBuffer(buffer, token, onIdle);
+        }
+
+        function scheduleVoiceBuffer(buffer, token, onIdle) {
+            if (token !== voicePlaybackToken) return;
+            const ctx = ensureVoicePlayCtx();
+            const src = ctx.createBufferSource();
+            src.buffer = buffer;
+            src.connect(ctx.destination);
+            const startAt = Math.max(ctx.currentTime + 0.015, voicePlayNextTime);
+            src.start(startAt);
+            voicePlayNextTime = startAt + buffer.duration;
+            voicePlaySources.push(src);
+            startVoiceReplyGlow();
+            src.onended = () => {
+                voicePlaySources = voicePlaySources.filter(item => item !== src);
+                maybeFinishVoicePlayback(token, onIdle);
+            };
+        }
+
+        let voiceFallbackSpeaking = false;
+        function speakVoiceFallback(text) {
+            if (!text || !window.speechSynthesis || !window.SpeechSynthesisUtterance) return;
+            voiceFallbackSpeaking = true;
+            window.speechSynthesis.cancel();
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.onend = utterance.onerror = () => {
+                voiceFallbackSpeaking = false;
+                maybeFinishVoicePlayback(voicePlaybackToken, resumeVoiceListening);
+            };
+            window.speechSynthesis.speak(utterance);
         }
         function b64ToArrayBuffer(b64) {
             const bin = atob(b64);
@@ -4672,11 +4901,13 @@
             voicePlayNextTime = 0;
             voicePendingDecodes = 0;
             voiceDecodeChain = Promise.resolve();
+            voiceFallbackSpeaking = false;
+            if (window.speechSynthesis) window.speechSynthesis.cancel();
             stopVoiceReplyGlow();
         }
         function maybeFinishVoicePlayback(token, onIdle) {
             if (token !== voicePlaybackToken) return;
-            if (voiceStreamDone && voicePendingDecodes === 0 && voicePlaySources.length === 0) {
+            if (voiceStreamDone && !voiceFallbackSpeaking && voicePendingDecodes === 0 && voicePlaySources.length === 0) {
                 stopVoiceReplyGlow();
                 if (onIdle) onIdle();
             }
@@ -4741,9 +4972,29 @@
             stopVoiceAudioPlayback();
             const token = voicePlaybackToken;
             voiceStreamDone = false;
-            voiceTurnAbort = new AbortController();
+            voiceCurrentReply = '';
+            voiceIgnoredServerTurn = voiceActiveServerTurn;
+            voiceActiveServerTurn = 0;
             ensureVoicePlayCtx();
             appendMessage('user', text, []);
+
+            // The socket is opened when voice mode starts, so this is normally
+            // an immediate send. A short timeout preserves the old HTTP path
+            // for deployments that have not restarted with WebSocket support.
+            let sentToSocket = false;
+            try {
+                await Promise.race([
+                    connectVoiceSocket(),
+                    new Promise((_, reject) => window.setTimeout(() => reject(new Error('voice socket timeout')), 1200))
+                ]);
+                sentToSocket = sendVoiceSocketText(text);
+            } catch (_) { /* use the compatible POST transport below */ }
+            if (sentToSocket) return;
+            await submitLegacyVoiceTurn(text, token);
+        }
+
+        async function submitLegacyVoiceTurn(text, token) {
+            voiceTurnAbort = new AbortController();
             let finalText = '';
             let gotAudio = false;
             try {
@@ -4816,12 +5067,15 @@
             if (mobileVoiceConversation) mobileVoiceConversation.innerHTML = '';
             mobileVoiceOverlay.hidden = false;
             const desktopVoiceInput = document.getElementById('desktopVoiceInput');
-            if (desktopVoiceInput) desktopVoiceInput.addEventListener('keydown', (event) => {
-                if (event.key === 'Enter' && !event.shiftKey) {
-                    event.preventDefault();
-                    sendTypedVoiceMessage(event);
-                }
-            });
+            if (desktopVoiceInput && desktopVoiceInput.dataset.voiceBound !== 'true') {
+                desktopVoiceInput.dataset.voiceBound = 'true';
+                desktopVoiceInput.addEventListener('keydown', (event) => {
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                        event.preventDefault();
+                        sendTypedVoiceMessage(event);
+                    }
+                });
+            }
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             if (!SpeechRecognition) return;
             voiceRecognition = new SpeechRecognition();
@@ -4850,6 +5104,9 @@
         }
         function closeMobileVoiceMode() {
             if (voiceTurnAbort) { voiceTurnAbort.abort(); voiceTurnAbort = null; }
+            if (voiceSocket && voiceSocket.readyState === WebSocket.OPEN) {
+                try { voiceSocket.send(JSON.stringify({ type: 'interrupt' })); } catch (_) { /* closing */ }
+            }
             stopVoiceReplyGlow();
             if (voiceTurnTimer) { clearTimeout(voiceTurnTimer); voiceTurnTimer = null; }
             stopVoiceAudioPlayback();
@@ -4872,6 +5129,7 @@
         }
         function stopVoiceMode() {
             closeMobileVoiceMode();
+            closeVoiceSocket();
             if (voiceLevelFrame) cancelAnimationFrame(voiceLevelFrame);
             voiceLevelFrame = null;
             if (voiceStream) voiceStream.getTracks().forEach(track => track.stop());
@@ -4918,11 +5176,10 @@
                 return;
             }
             try {
-                // On phones, SpeechRecognition already owns the microphone. Opening
-                // a second getUserMedia microphone can prevent it from delivering
-                // final results, so use the speech API directly and keep an empty
-                // stream marker for the shared voice-mode state.
-                if (isMobileVoiceMode() && SpeechRecognitionCtor) {
+                // SpeechRecognition owns the microphone in browsers that expose
+                // it. Opening a second getUserMedia stream can make recognition
+                // stall or return no final results, so keep only a state marker.
+                if (SpeechRecognitionCtor) {
                     voiceStream = { getTracks: () => [] };
                 } else if (canRecord) {
                     voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -4945,6 +5202,9 @@
                 voiceModeBtn.setAttribute('aria-label', 'Stop voice mode');
                 voiceModeBtn.title = 'Stop voice mode';
                 openMobileVoiceMode();
+                // Pay the WebSocket handshake while the user is looking at the
+                // voice surface, before they finish their first utterance.
+                connectVoiceSocket().catch(error => console.warn('Voice socket unavailable; using fallback:', error));
                 sampleVoiceLevel();
             } catch (error) {
                 stopVoiceMode();
