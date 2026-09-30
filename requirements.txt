@@ -10,6 +10,7 @@ python-dotenv
 openai
 e2b
 httpx>=0.27
+playwright>=1.40
 python-multipart
 pypdf
 python-docx

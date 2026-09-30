@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 import httpx
+import playwright_mcp
 
 MAX_RESULT_CHARS = 12000
 DEFAULT_TIMEOUT = 15.0
@@ -39,7 +40,7 @@ _SERVER_META = {
 
 _DEFAULT_TOOLS = {
     "filesystem": ["list_directory", "read_file"],
-    "fetch": ["fetch_url"], "playwright": ["browser_status"],
+    "fetch": ["fetch_url"], "playwright": list(playwright_mcp.TOOLS),
     "git": ["status", "diff", "log"], "sqlite": ["query"],
     "memory": ["remember", "recall", "forget"],
     "open-meteo": ["geocode", "forecast"], "nominatim": ["search_places"],
@@ -176,7 +177,7 @@ async def _call_builtin(server_id: str, tool: str, args: dict, session_id: str) 
             response.raise_for_status()
             return {"url": str(response.url), "status": response.status_code, "content": response.text[:MAX_RESULT_CHARS]}
     if server_id == "playwright":
-        return {"status": "disabled", "message": "Playwright is opt-in and requires an isolated browser runtime."}
+        return await playwright_mcp.call(tool, args, session_id)
     if server_id == "git":
         cmd = {"status": ["status", "--short"], "diff": ["diff", "--", "."], "log": ["log", "-8", "--oneline"]}.get(tool)
         if not cmd: raise ValueError("Git tool is read-only in this integration slice")
