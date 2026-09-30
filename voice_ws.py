@@ -58,7 +58,7 @@ FISH_MODEL = os.getenv("FISH_MODEL", "s2.1-pro-free")
 FISH_LATENCY = os.getenv("FISH_LATENCY", "low")
 FISH_REFERENCE_ID = os.getenv("FISH_REFERENCE_ID", "").strip()
 PCM_RATE = int(os.getenv("VOICE_PCM_RATE", "24000"))
-HOLD_MS = int(os.getenv("VOICE_HOLD_MS", "350"))          # short grace period for unfinished speech
+HOLD_MS = int(os.getenv("VOICE_HOLD_MS", "150"))          # minimal grace period for unfinished speech
 TTS_CONCURRENCY = int(os.getenv("VOICE_TTS_CONCURRENCY", "3"))
 
 IN_RATE = 16000
@@ -89,8 +89,8 @@ def pcm_rms(pcm: bytes) -> float:
 _SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]]*(?:\s+|$)|\n+")
 _CLAUSE_END = re.compile(r"(?<=[,;:\u2014])\s+")
 _ABBREV = re.compile(r"\b(?:Mr|Mrs|Ms|Dr|Prof|St|vs|etc|e\.g|i\.e)\.$", re.I)
-_FIRST_CLAUSE_MIN_CHARS = 14
-_FIRST_FLUSH_WORDS = 5
+_FIRST_CLAUSE_MIN_CHARS = 8
+_FIRST_FLUSH_WORDS = 3
 
 
 def pop_speakable(buffer: str, first: bool) -> Tuple[List[str], str]:
@@ -209,7 +209,9 @@ def _fish_request(text: str, voice: str, fmt: str) -> Tuple[Dict[str, str], Dict
     if not key:
         raise RuntimeError("FISH_API_KEY is missing")
     payload: Dict[str, Any] = {
-        "text": text, "format": fmt, "latency": FISH_LATENCY, "normalize": False, "chunk_length": 200,
+        # Small chunks reduce time-to-first-audio; the WebSocket forwards each
+        # PCM chunk immediately instead of waiting for a whole sentence.
+        "text": text, "format": fmt, "latency": FISH_LATENCY, "normalize": False, "chunk_length": 80,
     }
     if fmt == "pcm":
         payload["sample_rate"] = PCM_RATE
@@ -230,7 +232,7 @@ async def fish_tts_pcm(text: str, voice: str = "") -> AsyncIterator[bytes]:
             detail = (await r.aread()).decode("utf-8", "ignore")[:200]
             raise RuntimeError(f"Fish TTS stream failed ({r.status_code}): {detail}")
         carry = b""
-        async for chunk in r.aiter_bytes(4800):  # ~100 ms @ 24 kHz
+        async for chunk in r.aiter_bytes(1920):  # ~40 ms @ 24 kHz
             data = carry + chunk
             carry = data[-1:] if len(data) % 2 else b""
             if carry:

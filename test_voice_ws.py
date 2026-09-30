@@ -22,12 +22,12 @@ async def empty_stream(_session):
 
 
 class VoiceHelpersTests(unittest.TestCase):
-    def test_first_piece_flushes_after_five_words(self):
+    def test_first_piece_flushes_after_three_words(self):
         pieces, rest = voice_ws.pop_speakable(
             "Tell me about the weather today and", first=True
         )
-        self.assertEqual(pieces, ["Tell me about the weather"])
-        self.assertEqual(rest, "today and")
+        self.assertEqual(pieces, ["Tell me about"])
+        self.assertEqual(rest, "the weather today and")
 
     def test_sentence_chunker_does_not_split_abbreviation(self):
         pieces, rest = voice_ws.pop_speakable("Dr. Smith is here. Next step.", first=True)
