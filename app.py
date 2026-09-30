@@ -3402,7 +3402,7 @@ async def chat_estimate(request: ChatEstimateRequest):
 # whole answer has been generated and synthesized.
 # ---------------------------------------------------------------------------
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
-VOICE_LLM_MODEL = os.getenv("VOICE_LLM_MODEL", "llama-3.1-8b-instant")
+VOICE_LLM_MODEL = os.getenv("VOICE_LLM_MODEL", "openai/gpt-oss-20b")
 FISH_TTS_URL = "https://api.fish.audio/v1/tts"
 FISH_MODEL = os.getenv("FISH_MODEL", "s2.1-pro-free")
 FISH_LATENCY = os.getenv("FISH_LATENCY", "balanced")  # "normal" | "balanced"

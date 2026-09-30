@@ -72,6 +72,9 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertNotIn("speakVoiceTextFallback", html)
         self.assertNotIn("using browser speech", html.lower())
 
+    def test_voice_uses_groq_gpt_oss_20b_by_default(self):
+        self.assertEqual(app.VOICE_LLM_MODEL, "openai/gpt-oss-20b")
+
     def test_voice_chat_streams_groq_text_through_fish_audio(self):
         source = pathlib.Path(__file__).with_name("app.py").read_text(encoding="utf-8")
         voice_source = source[source.index("async def voice_chat"):]
