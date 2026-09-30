@@ -814,7 +814,7 @@
         .send-btn.stop-mode:hover:not(:disabled) { background:#ef4444; color:#fff; }
         /* Voice mode: same 34px × 34px footprint as Send, styled after
            Libraries.dev voice-glow's centered, bottom-edge beam. */
-        .voice-mode-btn { position:relative; z-index:0; overflow:visible; background:transparent; color:var(--text-secondary); border:1px solid rgba(255,255,255,0.12); border-radius:50%; width:34px; height:34px; display:flex; align-items:center; justify-content:center; cursor:pointer; transition:color 0.2s ease, border-color 0.2s ease, transform 0.2s var(--transition-bezier); flex-shrink:0; }
+        .voice-mode-btn { position:relative; z-index:0; overflow:visible; background:transparent; color:var(--text-secondary); border:1px solid transparent; border-radius:50%; width:34px; height:34px; display:flex; align-items:center; justify-content:center; cursor:pointer; transition:color 0.2s ease, border-color 0.2s ease, transform 0.2s var(--transition-bezier); flex-shrink:0; }
         .voice-mode-btn::before, .voice-mode-btn::after { content:""; position:absolute; left:5px; right:5px; bottom:-2px; height:calc(4px + (var(--voice-level, 0) * 22px)); border-radius:50% 50% 45% 45%; pointer-events:none; opacity:0; transform:scaleX(calc(0.7 + (var(--voice-level, 0) * 0.3))); transition:height 0.12s ease, opacity 0.25s ease, transform 0.12s ease; }
         .voice-mode-btn::before { background:linear-gradient(90deg, #5ee7df, #b490ca 48%, #f7797d); filter:blur(5px); z-index:-2; }
         .voice-mode-btn::after { background:linear-gradient(90deg, transparent, rgba(255,255,255,0.9) 50%, transparent); filter:blur(1px); z-index:-1; }
@@ -823,6 +823,7 @@
         .voice-mode-btn.is-listening { color:#fff; border-color:rgba(180,144,202,0.7); }
         .voice-mode-btn.is-listening::before, .voice-mode-btn.is-listening::after { opacity:calc(0.35 + (var(--voice-level, 0) * 0.65)); }
         .voice-mode-btn svg { width:17px; height:17px; position:relative; z-index:1; }
+        .voice-mode-btn .voice-mode-icon { width:100%; height:100%; }
         .voice-mode-btn .voice-mode-pulse { position:absolute; inset:-4px; border:1px solid rgba(180,144,202,0.45); border-radius:50%; opacity:0; pointer-events:none; }
         .voice-mode-btn.is-listening .voice-mode-pulse { opacity:1; animation:voiceModePulse 1.8s ease-out infinite; }
         @keyframes voiceModePulse { 0% { transform:scale(0.9); opacity:0.65; } 100% { transform:scale(1.45); opacity:0; } }
@@ -1820,11 +1821,14 @@
                     <div class="composer-actions">
                         <button type="button" class="voice-mode-btn" id="voiceModeBtn" onclick="toggleVoiceMode(event)" title="Voice mode" aria-label="Start voice mode" aria-pressed="false">
                             <span class="voice-mode-pulse" aria-hidden="true"></span>
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                                <rect x="9" y="3" width="6" height="11" rx="3"></rect>
-                                <path d="M5.5 11a6.5 6.5 0 0 0 13 0"></path>
-                                <path d="M12 17.5V21"></path>
-                                <path d="M8.5 21h7"></path>
+                            <svg class="voice-mode-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                <circle cx="12" cy="12" r="12" fill="#fff"></circle>
+                                <g stroke="#111" stroke-width="1.3" stroke-linecap="round">
+                                    <line x1="8.2" y1="10.1" x2="8.2" y2="13.9"></line>
+                                    <line x1="10.7" y1="7.25" x2="10.7" y2="16.75"></line>
+                                    <line x1="13.3" y1="9.15" x2="13.3" y2="14.85"></line>
+                                    <line x1="16.1" y1="10.1" x2="16.1" y2="13.9"></line>
+                                </g>
                             </svg>
                         </button>
                         <button class="send-btn" id="sendBtn" onclick="sendMessage()">
