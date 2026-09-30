@@ -841,6 +841,9 @@
             .mobile-voice-glow-mount { position:absolute; left:-4%; right:-4%; bottom:0; height:430px; z-index:0; pointer-events:none; overflow:visible; }
             .mobile-voice-glow-mount > div { width:100%; height:100%; }
             .mobile-voice-copy { position:relative; z-index:1; flex:1 1 auto; min-height:0; display:flex; flex-direction:column; justify-content:center; align-items:center; width:100%; max-width:1000px; margin:0 auto; text-align:center; padding:20px 20px 150px; }
+            .voice-orb-shell { position:relative; flex:0 0 auto; width:min(390px, 58vh); height:min(390px, 58vh); margin:auto; border-radius:50%; pointer-events:none; filter:drop-shadow(0 0 34px rgba(99,214,255,.10)); }
+            .voice-orb-shell::before { content:""; position:absolute; inset:13%; border-radius:50%; background:radial-gradient(circle, rgba(111,217,255,.08), rgba(180,144,202,.035) 42%, transparent 72%); filter:blur(18px); }
+            .voice-orb-canvas { position:relative; display:block; width:100%; height:100%; }
             .voice-conversation { display:none; width:min(900px, 100%); height:100%; min-height:0; overflow-y:auto; overscroll-behavior:contain; display:flex; flex-direction:column; gap:18px; padding:30px 8px 24px; scrollbar-width:thin; scrollbar-color:rgba(255,255,255,.22) transparent; }
             .voice-conversation-message { max-width:72%; padding:10px 14px; color:var(--text-primary); font-size:15px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; }
             .voice-conversation-message.user { align-self:flex-end; background:var(--bg-input); border:1px solid var(--border-color); border-radius:18px 18px 5px 18px; }
@@ -873,6 +876,7 @@
             .mobile-voice-glow-mount { position:absolute; left:-2%; right:-2%; bottom:0; height:380px; z-index:0; pointer-events:none; overflow:visible; }
             .mobile-voice-glow-mount > div { width:100%; height:100%; }
             .mobile-voice-copy { position:relative; z-index:1; flex:1; display:flex; flex-direction:column; justify-content:center; align-items:center; width:100%; max-width:640px; margin:0 auto; text-align:center; padding:20px 10px 120px; }
+            .voice-orb-shell { width:min(300px, 50vh); height:min(300px, 50vh); margin:0 auto 18px; filter:drop-shadow(0 0 28px rgba(99,214,255,.12)); }
             .voice-conversation { display:none; width:100%; height:100%; overflow-y:auto; overscroll-behavior:contain; display:flex; flex-direction:column; gap:14px; padding:18px 2px 24px; scrollbar-width:thin; scrollbar-color:rgba(255,255,255,.22) transparent; }
             .voice-conversation-message { max-width:82%; padding:8px 12px; color:var(--text-primary); font-size:14px; line-height:1.48; white-space:pre-wrap; overflow-wrap:anywhere; }
             .voice-conversation-message.user { align-self:flex-end; background:var(--bg-input); border:1px solid var(--border-color); border-radius:16px 16px 4px 16px; }
@@ -1837,6 +1841,9 @@
         <section class="mobile-voice-overlay" id="mobileVoiceOverlay" hidden aria-label="Voice mode">
             <span class="mobile-voice-glow-mount" id="mobileVoiceGlowMount" aria-hidden="true"></span>
             <div class="mobile-voice-copy">
+                <div class="voice-orb-shell" id="voiceOrbShell" aria-hidden="true">
+                    <canvas class="voice-orb-canvas" id="voiceOrbCanvas"></canvas>
+                </div>
                 <div class="voice-conversation" id="mobileVoiceConversation" hidden style="display:none !important" aria-live="polite" aria-label="Voice conversation"></div>
             </div>
             <form class="desktop-voice-composer" id="desktopVoiceComposer" onsubmit="sendTypedVoiceMessage(event)">
@@ -4610,6 +4617,7 @@
         let voiceLevelFrame = null;
         let voiceLevelData = null;
         let voiceSmoothedLevel = 0;
+        let voiceInputPulse = 0;
         let voiceRecognition = null;
         let voiceRecognitionPaused = false;
         let voiceTurnTimer = null;
@@ -4622,7 +4630,129 @@
         const mobileVoiceOverlay = document.getElementById('mobileVoiceOverlay');
         const mobileVoiceConversation = document.getElementById('mobileVoiceConversation');
         const mobileVoiceAgent = document.getElementById('mobileVoiceAgent');
-        // Voice mode is audio-only: nothing is rendered in the overlay.
+        const voiceOrbCanvas = document.getElementById('voiceOrbCanvas');
+        let voiceOrbCtx = null;
+        let voiceOrbFrame = null;
+        let voiceOrbParticles = null;
+        let voiceOrbWidth = 0;
+        let voiceOrbHeight = 0;
+        let voiceOrbLastTime = 0;
+        // Voice mode keeps the conversation surface visually quiet until the
+        // orb is opened; the orb itself is a small projected 3D point cloud so
+        // it stays crisp without a WebGL or external-library dependency.
+        function makeVoiceOrbParticles() {
+            const particles = [];
+            const count = 240;
+            const golden = Math.PI * (3 - Math.sqrt(5));
+            for (let i = 0; i < count; i++) {
+                const y = 1 - (i / (count - 1)) * 2;
+                const radius = Math.sqrt(Math.max(0, 1 - y * y));
+                const theta = golden * i;
+                particles.push({
+                    x: Math.cos(theta) * radius,
+                    y,
+                    z: Math.sin(theta) * radius,
+                    size: 0.45 + ((i * 17) % 11) / 18,
+                    phase: (i * 0.71) % (Math.PI * 2),
+                    band: i % 5
+                });
+            }
+            return particles;
+        }
+        function resizeVoiceOrb() {
+            if (!voiceOrbCanvas) return;
+            const rect = voiceOrbCanvas.getBoundingClientRect();
+            const dpr = Math.min(2, window.devicePixelRatio || 1);
+            const width = Math.max(1, Math.round(rect.width * dpr));
+            const height = Math.max(1, Math.round(rect.height * dpr));
+            if (voiceOrbCanvas.width !== width || voiceOrbCanvas.height !== height) {
+                voiceOrbCanvas.width = width;
+                voiceOrbCanvas.height = height;
+                voiceOrbWidth = width;
+                voiceOrbHeight = height;
+                voiceOrbCtx = voiceOrbCanvas.getContext('2d');
+                if (voiceOrbCtx) voiceOrbCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            }
+        }
+        function drawVoiceOrb(timestamp) {
+            if (!voiceOrbCtx || !voiceOrbCanvas || !voiceOrbParticles) return;
+            const rect = voiceOrbCanvas.getBoundingClientRect();
+            const width = rect.width;
+            const height = rect.height;
+            if (!width || !height) return;
+            const dpr = Math.min(2, window.devicePixelRatio || 1);
+            if (voiceOrbWidth !== Math.round(width * dpr) || voiceOrbHeight !== Math.round(height * dpr)) resizeVoiceOrb();
+            const ctx = voiceOrbCtx;
+            const level = Math.max(Number(window.voiceModeLevel || 0), voiceReplyLevel * 0.92);
+            voiceOrbLastTime = timestamp;
+            const rotation = timestamp * (0.00016 + level * 0.00032);
+            const tilt = Math.sin(timestamp * 0.00023) * 0.14;
+            const centerX = width / 2;
+            const centerY = height / 2;
+            const baseRadius = Math.min(width, height) * 0.37;
+            ctx.clearRect(0, 0, width, height);
+            const projected = [];
+            const cosR = Math.cos(rotation);
+            const sinR = Math.sin(rotation);
+            const cosT = Math.cos(tilt);
+            const sinT = Math.sin(tilt);
+            for (const particle of voiceOrbParticles) {
+                // Audio waves travel around latitude bands and push the shell
+                // outward, making the orb visibly respond to speech rather
+                // than merely pulsing as a flat circle.
+                const wave = Math.sin(particle.phase + timestamp * 0.006 + particle.y * 8.5) * level;
+                const shell = 1 + wave * 0.105 + Math.sin(timestamp * 0.002 + particle.phase) * level * 0.035;
+                let x = particle.x * shell;
+                let y = particle.y * shell;
+                let z = particle.z * shell;
+                const rotatedX = x * cosR - z * sinR;
+                z = x * sinR + z * cosR;
+                x = rotatedX;
+                const tiltedY = y * cosT - z * sinT;
+                z = y * sinT + z * cosT;
+                y = tiltedY;
+                const perspective = 1 / (1.82 - z * 0.48);
+                projected.push({
+                    x: centerX + x * baseRadius * perspective,
+                    y: centerY + y * baseRadius * perspective,
+                    z,
+                    size: particle.size * perspective * (1 + level * 0.7),
+                    alpha: Math.max(0.08, Math.min(0.95, 0.27 + (z + 1) * 0.27 + level * 0.38)),
+                    hue: 188 + particle.band * 19 + level * 22
+                });
+            }
+            projected.sort((a, b) => a.z - b.z);
+            for (const point of projected) {
+                ctx.beginPath();
+                ctx.fillStyle = `hsla(${point.hue}, 88%, ${62 + point.z * 10 + level * 12}%, ${point.alpha})`;
+                ctx.arc(point.x, point.y, point.size, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            if (level > 0.02) {
+                const glow = ctx.createRadialGradient(centerX, centerY, baseRadius * 0.15, centerX, centerY, baseRadius * 1.2);
+                glow.addColorStop(0, `rgba(112, 220, 255, ${0.055 + level * 0.08})`);
+                glow.addColorStop(0.52, `rgba(180, 144, 202, ${0.025 + level * 0.04})`);
+                glow.addColorStop(1, 'rgba(0, 0, 0, 0)');
+                ctx.fillStyle = glow;
+                ctx.beginPath();
+                ctx.arc(centerX, centerY, baseRadius * 1.2, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            if (mobileVoiceOverlay && !mobileVoiceOverlay.hidden) voiceOrbFrame = requestAnimationFrame(drawVoiceOrb);
+        }
+        function startVoiceOrb() {
+            if (!voiceOrbCanvas) return;
+            voiceOrbParticles = voiceOrbParticles || makeVoiceOrbParticles();
+            resizeVoiceOrb();
+            if (voiceOrbFrame) cancelAnimationFrame(voiceOrbFrame);
+            voiceOrbLastTime = performance.now();
+            voiceOrbFrame = requestAnimationFrame(drawVoiceOrb);
+        }
+        function stopVoiceOrb() {
+            if (voiceOrbFrame) cancelAnimationFrame(voiceOrbFrame);
+            voiceOrbFrame = null;
+            if (voiceOrbCtx && voiceOrbCanvas) voiceOrbCtx.clearRect(0, 0, voiceOrbCanvas.width, voiceOrbCanvas.height);
+        }
         function appendVoiceConversationMessage(role, text = '') { if (text) console.debug('[voice]', role, text); return null; }
         function isMobileVoiceMode() { return window.matchMedia && window.matchMedia('(max-width: 768px)').matches; }
         function animateVoiceReplyGlow(timestamp) {
@@ -5070,6 +5200,7 @@
             mobileVoiceTranscript = '';
             if (mobileVoiceConversation) mobileVoiceConversation.innerHTML = '';
             mobileVoiceOverlay.hidden = false;
+            startVoiceOrb();
             const desktopVoiceInput = document.getElementById('desktopVoiceInput');
             if (desktopVoiceInput && desktopVoiceInput.dataset.voiceBound !== 'true') {
                 desktopVoiceInput.dataset.voiceBound = 'true';
@@ -5096,6 +5227,7 @@
                 // SpeechRecognition has already detected the end of the
                 // utterance. Debouncing here adds a fixed 400 ms to every turn
                 // and can race with onend; submit once the final result lands.
+                voiceInputPulse = Math.max(voiceInputPulse, 0.38 + Math.min(0.45, interim.length / 30));
                 if (mobileVoiceTranscript.trim()) submitVoiceTurn();
             };
             voiceRecognition.onerror = (event) => {
@@ -5120,6 +5252,7 @@
                 try { voiceRecognition.stop(); } catch (error) { /* already stopped */ }
             }
             voiceRecognition = null;
+            stopVoiceOrb();
             if (mobileVoiceOverlay) mobileVoiceOverlay.hidden = true;
         }
         function setVoiceLevel(level) {
@@ -5143,6 +5276,7 @@
             voiceAnalyser = null;
             voiceLevelData = null;
             voiceSmoothedLevel = 0;
+            voiceInputPulse = 0;
             setVoiceLevel(0);
             voiceModeBtn.classList.remove('is-listening');
             voiceModeBtn.setAttribute('aria-pressed', 'false');
@@ -5160,7 +5294,8 @@
             // Boost conversational microphone levels so the beam visibly rises
             // even when browser input gain is conservative.
             const microphoneLevel = Math.min(1, Math.sqrt(sum / voiceLevelData.length) * 14);
-            const targetLevel = Math.max(microphoneLevel, voiceReplyLevel);
+            voiceInputPulse *= 0.94;
+            const targetLevel = Math.max(microphoneLevel, voiceReplyLevel, voiceInputPulse);
             voiceSmoothedLevel += (targetLevel - voiceSmoothedLevel) * 0.18;
             setVoiceLevel(voiceSmoothedLevel);
             voiceLevelFrame = requestAnimationFrame(sampleVoiceLevel);
