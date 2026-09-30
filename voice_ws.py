@@ -58,6 +58,8 @@ FISH_MODEL = os.getenv("FISH_MODEL", "s2.1-pro-free")
 FISH_LATENCY = os.getenv("FISH_LATENCY", "low")
 DEFAULT_FISH_REFERENCE_ID = "933563129e564b19a115bedd57b7406a"  # Sarah — Fish Official, female/conversational
 FISH_REFERENCE_ID = os.getenv("FISH_REFERENCE_ID", DEFAULT_FISH_REFERENCE_ID).strip() or DEFAULT_FISH_REFERENCE_ID
+VOICE_LLM_FIRST_TOKEN_TIMEOUT = float(os.getenv("VOICE_LLM_FIRST_TOKEN_TIMEOUT", "15"))
+VOICE_LLM_CHUNK_TIMEOUT = float(os.getenv("VOICE_LLM_CHUNK_TIMEOUT", "20"))
 PCM_RATE = int(os.getenv("VOICE_PCM_RATE", "24000"))
 HOLD_MS = int(os.getenv("VOICE_HOLD_MS", "150"))          # minimal grace period for unfinished speech
 TTS_CONCURRENCY = int(os.getenv("VOICE_TTS_CONCURRENCY", "3"))
@@ -513,7 +515,17 @@ class VoiceConnection:
             turn.marks["llm_start"] = time.perf_counter()
             try:
                 buf, first = "", True
-                async for delta in self.deps.llm_stream(session):
+                stream = self.deps.llm_stream(session)
+                got_token = False
+                while True:
+                    try:
+                        delta = await asyncio.wait_for(
+                            anext(stream),
+                            timeout=VOICE_LLM_CHUNK_TIMEOUT if got_token else VOICE_LLM_FIRST_TOKEN_TIMEOUT,
+                        )
+                    except StopAsyncIteration:
+                        break
+                    got_token = True
                     turn.marks.setdefault("llm_first", time.perf_counter())
                     state["full"] += delta
                     buf += delta
@@ -527,9 +539,12 @@ class VoiceConnection:
                 raise
             except Exception as exc:
                 print(f"[voice:{self.session_id}] LLM failed: {exc}")
+                await self.send_json(
+                    type="error",
+                    message="The voice model took too long to reply. Please try again.",
+                )
                 if not state["full"]:
-                    state["full"] = "Sorry, something went wrong. Please try again."
-                    start_piece(state["full"])
+                    state["full"] = ""
             finally:
                 order.put_nowait(None)
 

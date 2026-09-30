@@ -4851,6 +4851,7 @@
             if (event.type === 'error') {
                 console.warn('Voice socket error:', event.message || event);
                 voiceSocketError = event.message || 'Voice request failed';
+                appendVoiceConversationMessage('assistant', voiceSocketError);
                 voiceSocketTurnActive = false;
                 voiceStreamDone = true;
                 maybeFinishVoicePlayback(voicePlaybackToken, resumeVoiceListening);
@@ -5101,7 +5102,7 @@
             try {
                 await Promise.race([
                     connectVoiceSocket(),
-                    new Promise((_, reject) => window.setTimeout(() => reject(new Error('voice socket timeout')), 450))
+                    new Promise((_, reject) => window.setTimeout(() => reject(new Error('voice socket timeout')), 8000))
                 ]);
                 sentToSocket = sendVoiceSocketText(text);
             } catch (_) { /* use the compatible POST transport below */ }
@@ -5162,8 +5163,16 @@
             }
         }
         function handleVoiceRecognitionEnd() {
-            // Recognition ended (user paused). Send what we have right away.
-            if (mobileVoiceTranscript.trim() && !voiceRecognitionPaused) { submitVoiceTurn(); return; }
+            // Browsers may end recognition after a phrase even in continuous
+            // mode. Preserve the transcript, let the silence debounce submit it,
+            // and restart recognition for the next phrase.
+            if (mobileVoiceTranscript.trim() && !voiceRecognitionPaused) {
+                if (voiceTurnTimer) clearTimeout(voiceTurnTimer);
+                voiceTurnTimer = window.setTimeout(() => {
+                    voiceTurnTimer = null;
+                    if (mobileVoiceTranscript.trim() && !voiceRecognitionPaused) submitVoiceTurn();
+                }, 900);
+            }
             if (voiceStream && !voiceRecognitionPaused && mobileVoiceOverlay && !mobileVoiceOverlay.hidden) {
                 window.setTimeout(() => {
                     if (voiceStream && !voiceRecognitionPaused && mobileVoiceOverlay && !mobileVoiceOverlay.hidden) {
@@ -5195,7 +5204,9 @@
             const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
             if (!SpeechRecognition) return;
             voiceRecognition = new SpeechRecognition();
-            voiceRecognition.continuous = false;
+            // Keep recognition alive across natural pauses; a short debounce
+            // below decides when a complete conversational turn is ready.
+            voiceRecognition.continuous = true;
             voiceRecognition.interimResults = true;
             voiceRecognition.lang = document.documentElement.lang || 'en-US';
             voiceRecognition.onresult = (event) => {
@@ -5205,11 +5216,16 @@
                     if (event.results[i].isFinal) mobileVoiceTranscript += phrase + ' ';
                     else interim += phrase;
                 }
-                // SpeechRecognition has already detected the end of the
-                // utterance. Debouncing here adds a fixed 400 ms to every turn
-                // and can race with onend; submit once the final result lands.
+                // Accumulate final phrases and submit only after a real silence
+                // gap, so long speech is not split into premature turns.
                 voiceInputPulse = Math.max(voiceInputPulse, 0.38 + Math.min(0.45, interim.length / 30));
-                if (mobileVoiceTranscript.trim()) submitVoiceTurn();
+                if (mobileVoiceTranscript.trim()) {
+                    if (voiceTurnTimer) clearTimeout(voiceTurnTimer);
+                    voiceTurnTimer = window.setTimeout(() => {
+                        voiceTurnTimer = null;
+                        if (mobileVoiceTranscript.trim() && !voiceRecognitionPaused) submitVoiceTurn();
+                    }, 900);
+                }
             };
             voiceRecognition.onerror = (event) => {
                 if (event.error && !['no-speech', 'aborted'].includes(event.error)) {

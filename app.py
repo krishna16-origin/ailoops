@@ -3408,6 +3408,8 @@ FISH_MODEL = os.getenv("FISH_MODEL", "s2.1-pro-free")
 FISH_LATENCY = os.getenv("FISH_LATENCY", "balanced")  # "normal" | "balanced"
 DEFAULT_FISH_REFERENCE_ID = "933563129e564b19a115bedd57b7406a"  # Sarah — Fish Official, female/conversational
 FISH_REFERENCE_ID = os.getenv("FISH_REFERENCE_ID", DEFAULT_FISH_REFERENCE_ID).strip() or DEFAULT_FISH_REFERENCE_ID
+VOICE_LLM_FIRST_TOKEN_TIMEOUT = float(os.getenv("VOICE_LLM_FIRST_TOKEN_TIMEOUT", "15"))
+VOICE_LLM_CHUNK_TIMEOUT = float(os.getenv("VOICE_LLM_CHUNK_TIMEOUT", "20"))
 
 VOICE_SYSTEM_PROMPT = (
     "You are a friendly real-time voice assistant. Reply the way a person talks: "
@@ -3532,7 +3534,16 @@ async def _groq_voice_stream(session: dict):
         if response.is_error:
             detail = (await response.aread()).decode("utf-8", "ignore")[:300]
             raise RuntimeError(f"Groq voice chat failed: {detail}")
-        async for line in response.aiter_lines():
+        lines = response.aiter_lines()
+        got_token = False
+        while True:
+            try:
+                line = await asyncio.wait_for(
+                    anext(lines),
+                    timeout=VOICE_LLM_CHUNK_TIMEOUT if got_token else VOICE_LLM_FIRST_TOKEN_TIMEOUT,
+                )
+            except StopAsyncIteration:
+                break
             if not line.startswith("data:"):
                 continue
             data = line[5:].strip()
@@ -3543,6 +3554,7 @@ async def _groq_voice_stream(session: dict):
             except Exception:
                 continue
             if delta:
+                got_token = True
                 yield delta
 
 
