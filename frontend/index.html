@@ -4615,7 +4615,6 @@
         let voiceTurnTimer = null;
         let mobileVoiceTranscript = '';
         let voiceAudio = null;
-        let voiceAudioSource = null;
         let voicePlaybackToken = 0;
         let voiceReplyLevel = 0;
         let voiceReplyGlowFrame = null;
@@ -4664,20 +4663,8 @@
 
         function stopVoiceAudioPlayback() {
             voicePlaybackToken += 1;
-            if (voiceAudioSource) {
-                try { voiceAudioSource.stop(); } catch (error) { /* already ended */ }
-                voiceAudioSource.disconnect();
-                voiceAudioSource = null;
-            }
             if (voiceAudio) { voiceAudio.pause(); voiceAudio.src = ''; voiceAudio = null; }
             stopVoiceReplyGlow();
-        }
-        function decodeVoiceChunk(base64) {
-            const bytes = atob(base64);
-            const buffer = new ArrayBuffer(bytes.length);
-            const view = new Uint8Array(buffer);
-            for (let i = 0; i < bytes.length; i++) view[i] = bytes.charCodeAt(i);
-            return buffer;
         }
         async function playVoiceAudioChunks(chunks) {
             if (!chunks || !chunks.length) return;
@@ -4685,23 +4672,31 @@
             const token = voicePlaybackToken;
             startVoiceReplyGlow();
             try {
-                if (voiceAudioContext && voiceAudioContext.state !== 'closed') {
-                    await voiceAudioContext.resume();
-                    for (const chunk of chunks) {
-                        if (token !== voicePlaybackToken) return;
-                        const audioBuffer = await new Promise((resolve, reject) => voiceAudioContext.decodeAudioData(decodeVoiceChunk(chunk), resolve, reject));
-                        if (token !== voicePlaybackToken) return;
-                        await new Promise((resolve, reject) => {
-                            voiceAudioSource = voiceAudioContext.createBufferSource();
-                            voiceAudioSource.buffer = audioBuffer;
-                            voiceAudioSource.connect(voiceAudioContext.destination);
-                            voiceAudioSource.onended = () => { voiceAudioSource = null; resolve(); };
-                            try { voiceAudioSource.start(0); } catch (error) { reject(error); }
-                        });
-                    }
-                    return;
+                // Native WAV playback is more reliable than decodeAudioData for
+                // sequential WAV blobs, especially in Safari/iOS and mobile
+                // Chromium. Orpheus remains the only speech provider here.
+                for (const chunk of chunks) {
+                    if (token !== voicePlaybackToken) return;
+                    await new Promise((resolve, reject) => {
+                        const audio = new Audio(`data:audio/wav;base64,${chunk}`);
+                        voiceAudio = audio;
+                        let settled = false;
+                        const cleanup = () => {
+                            audio.onended = null;
+                            audio.onerror = null;
+                            if (voiceAudio === audio) voiceAudio = null;
+                        };
+                        const finish = (error) => {
+                            if (settled) return;
+                            settled = true;
+                            cleanup();
+                            if (error) reject(error); else resolve();
+                        };
+                        audio.onended = () => finish();
+                        audio.onerror = () => finish(new Error('The browser could not decode Orpheus audio.'));
+                        audio.play().catch(finish);
+                    });
                 }
-                throw new Error('Audio output is unavailable.');
             } finally {
                 if (token === voicePlaybackToken) stopVoiceReplyGlow();
             }
@@ -4871,29 +4866,40 @@
         async function toggleVoiceMode(event) {
             if (event) event.preventDefault();
             if (voiceStream) { stopVoiceMode(); return; }
-            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+            const canRecord = Boolean(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+            const canRecognize = Boolean(SpeechRecognitionCtor);
+            // Typed voice-mode messages still work without either microphone
+            // API on desktop, and speech recognition can own the microphone
+            // directly on mobile Safari/Chrome. Do not reject desktop voice
+            // mode merely because getUserMedia is unavailable in its context.
+            if (isMobileVoiceMode() && !canRecord && !canRecognize) {
                 voiceModeBtn.title = 'Microphone is not supported in this browser';
                 return;
             }
             try {
-                const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
                 // On phones, SpeechRecognition already owns the microphone. Opening
                 // a second getUserMedia microphone can prevent it from delivering
                 // final results, so use the speech API directly and keep an empty
                 // stream marker for the shared voice-mode state.
                 if (isMobileVoiceMode() && SpeechRecognitionCtor) {
                     voiceStream = { getTracks: () => [] };
-                } else {
+                } else if (canRecord) {
                     voiceStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                } else {
+                    // The typed composer remains usable on browsers with no
+                    // getUserMedia implementation.
+                    voiceStream = { getTracks: () => [] };
                 }
                 const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-                if (!AudioContextCtor) throw new Error('Web Audio is not supported in this browser.');
-                voiceAudioContext = new AudioContextCtor();
-                await voiceAudioContext.resume();
-                voiceAnalyser = voiceAudioContext.createAnalyser();
-                voiceAnalyser.fftSize = 256;
-                voiceLevelData = new Uint8Array(voiceAnalyser.fftSize);
-                if (voiceStream.getTracks().length) voiceAudioContext.createMediaStreamSource(voiceStream).connect(voiceAnalyser);
+                if (AudioContextCtor) {
+                    voiceAudioContext = new AudioContextCtor();
+                    await voiceAudioContext.resume();
+                    voiceAnalyser = voiceAudioContext.createAnalyser();
+                    voiceAnalyser.fftSize = 256;
+                    voiceLevelData = new Uint8Array(voiceAnalyser.fftSize);
+                    if (voiceStream.getTracks().length) voiceAudioContext.createMediaStreamSource(voiceStream).connect(voiceAnalyser);
+                }
                 voiceModeBtn.classList.add('is-listening');
                 voiceModeBtn.setAttribute('aria-pressed', 'true');
                 voiceModeBtn.setAttribute('aria-label', 'Stop voice mode');
