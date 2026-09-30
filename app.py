@@ -56,7 +56,9 @@ if not os.getenv("NVIDIA_API_KEY"):
 if not os.getenv("TAVILY_API_KEY"):
     print("WARNING: TAVILY_API_KEY not found in environment. Web search will be disabled.")
 if not os.getenv("GROQ_API_KEY"):
-    print("WARNING: GROQ_API_KEY not found in environment. Voice mode audio will be disabled.")
+    print("WARNING: GROQ_API_KEY not found in environment. Voice mode replies will be disabled.")
+if not os.getenv("FISH_API_KEY"):
+    print("WARNING: FISH_API_KEY not found in environment. Voice mode audio will be disabled.")
 if not os.getenv("JWT_SECRET"):
     print("WARNING: JWT_SECRET not found. Authentication will remain unavailable until configured.")
 if not sandbox_manager.sandbox_configured():
@@ -1429,7 +1431,7 @@ class ChatRequest(BaseModel):
 class VoiceChatRequest(BaseModel):
     message: str
     session_id: str
-    voice: str = "hannah"
+    voice: str = ""  # optional Fish Audio reference_id (voice model id)
     mcp_servers: Optional[List[str]] = None
     attachment_ids: Optional[List[str]] = None
 
@@ -3403,136 +3405,238 @@ async def chat_estimate(request: ChatEstimateRequest):
     }
 
 
-GROQ_CHAT_MODEL = "openai/gpt-oss-20b"
+# ---------------------------------------------------------------------------
+# Voice mode: Groq LLM (streaming) -> Fish Audio TTS (per sentence, in parallel)
+# Audio is streamed to the browser as NDJSON the moment each sentence is ready,
+# so the first words are spoken after ~1 sentence of latency, not after the
+# whole answer has been generated and synthesized.
+# ---------------------------------------------------------------------------
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_TTS_MODEL = "canopylabs/orpheus-v1-english"
-GROQ_TTS_URL = "https://api.groq.com/openai/v1/audio/speech"
-GROQ_TTS_MAX_CHARS = 190
+VOICE_LLM_MODEL = os.getenv("VOICE_LLM_MODEL", "llama-3.3-70b-versatile")
+FISH_TTS_URL = "https://api.fish.audio/v1/tts"
+FISH_MODEL = os.getenv("FISH_MODEL", "s1")
+FISH_LATENCY = os.getenv("FISH_LATENCY", "balanced")  # "normal" | "balanced"
+FISH_REFERENCE_ID = os.getenv("FISH_REFERENCE_ID", "").strip()
+
+VOICE_SYSTEM_PROMPT = (
+    "You are a friendly real-time voice assistant. Reply the way a person talks: "
+    "short, natural, 1-3 sentences unless the user clearly asks for more. "
+    "Never use markdown, bullet points, emojis, code blocks or URLs. "
+    "Do not read out symbols. Start speaking the answer immediately."
+)
+
+_voice_http: Optional[httpx.AsyncClient] = None
 
 
-def _split_voice_text(text: str, limit: int = GROQ_TTS_MAX_CHARS) -> List[str]:
-    """Split assistant text into Orpheus-safe chunks without cutting words."""
-    clean = re.sub(r"```[\s\S]*?```", "", text or "")
-    clean = re.sub(r"[*_`#>]", "", clean)
+def _get_voice_http() -> httpx.AsyncClient:
+    """One shared keep-alive client so TLS/HTTP2 handshakes are paid once."""
+    global _voice_http
+    if _voice_http is None or _voice_http.is_closed:
+        _voice_http = httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
+        )
+    return _voice_http
+
+
+def _clean_for_speech(text: str) -> str:
+    clean = re.sub(r"```[\s\S]*?```", " ", text or "")
+    clean = re.sub(r"https?://\S+", " ", clean)
+    clean = re.sub(r"[*_`#>~|]", "", clean)
+    clean = re.sub(r"^\s*[-•]\s+", "", clean, flags=re.M)
     clean = re.sub(r"\s+", " ", clean).strip()
-    if not clean:
-        return []
-    chunks, current = [], ""
-    for sentence in re.split(r"(?<=[.!?])\s+", clean):
-        words = sentence.split()
-        for word in words:
-            candidate = f"{current} {word}".strip()
-            if current and len(candidate) > limit:
-                chunks.append(current)
-                current = word
-            else:
-                current = candidate
-        if current and len(current) >= limit - 12:
-            chunks.append(current)
-            current = ""
-    if current:
-        chunks.append(current)
-    return chunks
+    return clean
 
 
-async def _groq_voice_reply(session: dict) -> str:
-    """Use Groq's low-latency chat model for voice turns, not the long chat pipeline."""
-    api_key = os.getenv("GROQ_API_KEY")
-    messages = [{
-        "role": "system",
-        "content": "You are a helpful conversational voice assistant. Answer naturally, clearly, and concisely. Avoid markdown, long lists, and visual-only formatting because your answer will be spoken aloud.",
-    }]
-    for message in session.get("messages", [])[-12:]:
+_SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]]*\s+|\n+")
+_CLAUSE_END = re.compile(r"(?<=[,;:])\s+")
+
+
+def _pop_speakable(buffer: str, first: bool) -> Tuple[List[str], str]:
+    """Pull complete sentences out of `buffer`. For the very first chunk we also
+    accept a clause boundary so speech starts as early as possible."""
+    out: List[str] = []
+    while True:
+        m = _SENTENCE_END.search(buffer)
+        cut = None
+        if m and len(buffer[:m.start()].strip()) >= 8:
+            cut = m
+        elif first and not out:
+            c = _CLAUSE_END.search(buffer)
+            if c and len(buffer[:c.start()].strip()) >= 24:
+                cut = c
+        if not cut:
+            break
+        piece = buffer[:cut.start()]
+        out.append(piece.strip())
+        buffer = buffer[cut.end():]
+        first = False
+    return out, buffer
+
+
+async def _fish_tts(text: str, reference_id: str = "") -> Optional[str]:
+    """Synthesize one chunk with Fish Audio. Returns base64 mp3 or None."""
+    api_key = os.getenv("FISH_API_KEY")
+    text = _clean_for_speech(text)
+    if not api_key or not text:
+        return None
+    payload: Dict[str, Any] = {
+        "text": text,
+        "format": "mp3",
+        "mp3_bitrate": 64,
+        "latency": FISH_LATENCY,
+        "normalize": False,
+        "chunk_length": 200,
+    }
+    ref = (reference_id or FISH_REFERENCE_ID).strip()
+    if ref:
+        payload["reference_id"] = ref
+    try:
+        response = await _get_voice_http().post(
+            FISH_TTS_URL,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "model": FISH_MODEL},
+            json=payload,
+        )
+        if response.is_error:
+            print(f"Fish Audio TTS failed ({response.status_code}): {response.text[:300]}")
+            return None
+        return base64.b64encode(response.content).decode("ascii")
+    except Exception as exc:
+        print(f"Fish Audio TTS error: {exc}")
+        return None
+
+
+def _voice_history(session: dict) -> List[Dict[str, str]]:
+    messages = [{"role": "system", "content": VOICE_SYSTEM_PROMPT}]
+    for message in session.get("messages", [])[-10:]:
         content = message.content if isinstance(message.content, str) else str(message.content)
         if not content.strip():
             continue
         role = "assistant" if isinstance(message, AIMessage) else "user" if isinstance(message, HumanMessage) else "system"
+        if role == "system":
+            continue
         messages.append({"role": role, "content": content})
-    async with httpx.AsyncClient(timeout=httpx.Timeout(35.0, connect=10.0)) as client:
-        response = await client.post(
-            GROQ_CHAT_URL,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": GROQ_CHAT_MODEL, "messages": messages, "temperature": 0.5, "max_tokens": 500},
-        )
-    if response.is_error:
-        raise HTTPException(status_code=502, detail=f"Groq voice chat failed: {response.text[:500]}")
-    data = response.json()
-    reply = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
-    if not reply:
-        raise HTTPException(status_code=502, detail="Groq returned an empty voice response.")
-    return reply
+    return messages
 
 
-async def _groq_orpheus_audio(text: str, voice: str) -> List[str]:
+async def _groq_voice_stream(session: dict):
+    """Yield text deltas from Groq as they are generated."""
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=503, detail="Voice mode is not configured: GROQ_API_KEY is missing.")
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    audio_chunks = []
-    async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
-        for chunk in _split_voice_text(text):
-            response = await client.post(GROQ_TTS_URL, headers=headers, json={
-                "model": GROQ_TTS_MODEL,
-                "input": chunk,
-                "voice": voice if voice in {"autumn", "diana", "hannah", "austin", "daniel", "troy"} else "hannah",
-                "response_format": "wav",
-            })
-            if response.is_error:
-                detail = response.text[:500]
-                raise HTTPException(status_code=502, detail=f"Groq voice generation failed: {detail}")
-            audio_chunks.append(base64.b64encode(response.content).decode("ascii"))
-    return audio_chunks
+        raise HTTPException(status_code=503, detail="GROQ_API_KEY is missing.")
+    body: Dict[str, Any] = {
+        "model": VOICE_LLM_MODEL,
+        "messages": _voice_history(session),
+        "temperature": 0.6,
+        "max_tokens": 400,
+        "stream": True,
+    }
+    if "gpt-oss" in VOICE_LLM_MODEL:
+        body["reasoning_effort"] = "low"
+    async with _get_voice_http().stream(
+        "POST", GROQ_CHAT_URL,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=body,
+    ) as response:
+        if response.is_error:
+            detail = (await response.aread()).decode("utf-8", "ignore")[:300]
+            raise RuntimeError(f"Groq voice chat failed: {detail}")
+        async for line in response.aiter_lines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                delta = (json.loads(data).get("choices") or [{}])[0].get("delta", {}).get("content")
+            except Exception:
+                continue
+            if delta:
+                yield delta
 
 
-@app.post("/voice-chat")
-async def voice_chat(request: VoiceChatRequest):
-    """Answer with MCP-only context and speak every result with Orpheus."""
-    session = get_session(request.session_id)
-    session["messages"] = trim_memory(session["messages"])
-    session["messages"].append(HumanMessage(content=request.message))
+async def _mcp_voice_text(request: "VoiceChatRequest", session: dict) -> str:
+    """Slow path, only used when MCP tools are selected."""
     chat_request = ChatRequest(
         message=request.message,
         session_id=request.session_id,
-        # Voice mode has its own fixed fast defaults; it does not inherit the
-        # Chat mode's selected model, thinking level, or Deep Think setting.
         model_type="fast",
         temperature=0.3,
-        thinking_level="medium",
+        thinking_level="low",
         deep_think=False,
         mcp_servers=request.mcp_servers,
         attachment_ids=request.attachment_ids,
         voice_mode=True,
     )
-    response = "I’m sorry, I couldn’t complete that request. Please try again."
-    pipeline_error = ""
-    try:
-        response = await generate_response_once(chat_request, session)
-    except Exception as exc:
-        print(f"[{request.session_id}] Voice Chat pipeline failed: {exc}")
-        traceback.print_exc()
-        pipeline_error = f"Chat pipeline failed: {str(exc)[:240]}"
-        # Return the spoken error as a normal voice response so the client can
-        # still play it through the one permitted speech provider, Orpheus.
-        response = "I’m sorry, I couldn’t complete that request. Please try again."
-    session["messages"].append(AIMessage(content=response))
-    audio = []
-    audio_error = pipeline_error
-    try:
-        # This is intentionally the only speech path. Never substitute browser
-        # SpeechSynthesis or another provider, including for error messages.
-        audio = await _groq_orpheus_audio(response, request.voice)
-    except Exception as exc:
-        synthesis_error = f"Orpheus speech synthesis failed: {str(exc)[:240]}"
-        audio_error = "; ".join(x for x in (audio_error, synthesis_error) if x)
-        print(f"[{request.session_id}] Orpheus voice synthesis failed: {exc}")
-    return {
-        "response": response,
-        "audio": audio,
-        "audio_mime": "audio/wav",
-        "voice_model": GROQ_TTS_MODEL,
-        "audio_error": audio_error,
-        "session_id": request.session_id,
-    }
+    return await generate_response_once(chat_request, session)
+
+
+@app.post("/voice-chat")
+async def voice_chat(request: VoiceChatRequest):
+    """Streaming voice turn. Emits NDJSON lines:
+    {"type":"audio","data":<b64 mp3>,"mime":"audio/mpeg"}  (one per sentence, in order)
+    {"type":"done","response":<full text>}
+    {"type":"error","message":...}
+    """
+    session = get_session(request.session_id)
+    session["messages"] = trim_memory(session["messages"])
+    session["messages"].append(HumanMessage(content=request.message))
+    use_mcp = bool(request.mcp_servers)
+
+    async def event_stream():
+        full_text = ""
+        queue: asyncio.Queue = asyncio.Queue()
+        FINISHED = object()
+
+        async def producer():
+            nonlocal full_text
+            buffer, first = "", True
+            try:
+                if use_mcp:
+                    full_text = await _mcp_voice_text(request, session)
+                    buffer = full_text + " "
+                    pieces, buffer = _pop_speakable(buffer, False)
+                    pieces = pieces + ([buffer.strip()] if buffer.strip() else [])
+                    for piece in pieces:
+                        await queue.put(asyncio.create_task(_fish_tts(piece, request.voice)))
+                else:
+                    async for delta in _groq_voice_stream(session):
+                        full_text += delta
+                        buffer += delta
+                        pieces, buffer = _pop_speakable(buffer, first)
+                        for piece in pieces:
+                            first = False
+                            await queue.put(asyncio.create_task(_fish_tts(piece, request.voice)))
+                    if buffer.strip():
+                        await queue.put(asyncio.create_task(_fish_tts(buffer.strip(), request.voice)))
+            except Exception as exc:
+                print(f"[{request.session_id}] Voice pipeline failed: {exc}")
+                if not full_text:
+                    full_text = "Sorry, something went wrong. Please try again."
+                    await queue.put(asyncio.create_task(_fish_tts(full_text, request.voice)))
+            finally:
+                await queue.put(FINISHED)
+
+        producer_task = asyncio.create_task(producer())
+        try:
+            while True:
+                item = await queue.get()
+                if item is FINISHED:
+                    break
+                audio = await item  # sentences are synthesized in parallel, played in order
+                if audio:
+                    yield json.dumps({"type": "audio", "data": audio, "mime": "audio/mpeg"}) + "\n"
+        finally:
+            if not producer_task.done():
+                producer_task.cancel()
+        session["messages"].append(AIMessage(content=full_text.strip()))
+        yield json.dumps({"type": "done", "response": full_text.strip()}) + "\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+    )
 
 
 @app.post("/chat")
