@@ -4627,9 +4627,28 @@
         let voicePcmSpeaking = false;
         let voicePcmLastSpeechAt = 0;
         let voicePendingTypedText = '';
+        // Watchdog for a turn sent over the socket: if the server never answers
+        // (lost packet, zombie TCP connection that hasn't fired onclose yet,
+        // upstream hang) this guarantees we still come back to "listening"
+        // instead of sitting paused forever. Guarded by voicePlaybackToken so a
+        // late firing after the turn actually finished (or a new one started)
+        // is a no-op.
+        let voiceTurnWatchdog = null;
+        const VOICE_TURN_WATCHDOG_MS = 28000;
+        // Keeps the persistent /ws/voice connection alive across silences so
+        // idle-connection timeouts (reverse proxies, Render's free-tier
+        // network layer, etc.) don't quietly kill it while the user is just
+        // thinking between turns.
+        let voicePingTimer = null;
+        const VOICE_PING_INTERVAL_MS = 20000;
         const VOICE_PCM_RATE = 16000;
         const VOICE_VAD_THRESHOLD = 0.012;
         const VOICE_SILENCE_MS = 720;
+        // How long to wait after the browser reports a final phrase before
+        // treating the utterance as finished and sending it. This is pure
+        // dead-air latency added to every single turn, so keep it as tight as
+        // possible while still tolerating a natural mid-sentence breath.
+        const VOICE_SILENCE_DEBOUNCE_MS = 550;
         let mobileVoiceTranscript = '';
         let voiceAudio = null;
         let voicePlaybackToken = 0;
@@ -4868,7 +4887,25 @@
             if (voiceOrbFallbackCtx && voiceOrbCanvas) voiceOrbFallbackCtx.clearRect(0, 0, voiceOrbCanvas.width, voiceOrbCanvas.height);
         }
         window.addEventListener('resize', resizeVoiceOrb);
-        function appendVoiceConversationMessage(role, text = '') { if (text) console.debug('[voice]', role, text); return null; }
+        let voiceStatusFlashTimer = null;
+        // #mobileVoiceConversation is force-hidden (display:none !important) by
+        // design, so appending text there is invisible to the user. Errors used
+        // to only reach console.debug, which is why a failed turn looked
+        // identical to voice mode "just not responding". Flash the message in
+        // the one label that IS visible instead, then restore it.
+        function appendVoiceConversationMessage(role, text = '') {
+            if (!text) return null;
+            console.debug('[voice]', role, text);
+            if (role === 'assistant' && mobileVoiceAgent && mobileVoiceOverlay && !mobileVoiceOverlay.hidden) {
+                if (voiceStatusFlashTimer) clearTimeout(voiceStatusFlashTimer);
+                mobileVoiceAgent.textContent = text;
+                voiceStatusFlashTimer = window.setTimeout(() => {
+                    voiceStatusFlashTimer = null;
+                    if (mobileVoiceAgent) mobileVoiceAgent.textContent = 'Fish Audio';
+                }, 4000);
+            }
+            return null;
+        }
         function isMobileVoiceMode() { return window.matchMedia && window.matchMedia('(max-width: 768px)').matches; }
         function animateVoiceReplyGlow(timestamp) {
             if (!voiceReplyGlowActive) return;
@@ -4929,6 +4966,43 @@
             };
         }
 
+        function clearVoiceTurnWatchdog() {
+            if (voiceTurnWatchdog) {
+                clearTimeout(voiceTurnWatchdog);
+                voiceTurnWatchdog = null;
+            }
+        }
+
+        // The single place that clears every piece of "a turn is in flight /
+        // the socket errored" bookkeeping. Previously this was reset in three
+        // different places (open, close, turn_done) each clearing a different
+        // partial subset of the same variables, so a flag set by one code path
+        // could survive a close/reopen and leave the mic permanently paused.
+        function resetVoiceTurnState() {
+            clearVoiceTurnWatchdog();
+            voiceSocketTurnActive = false;
+            voiceStreamDone = true;
+            voiceCurrentReply = '';
+            voiceActiveServerTurn = 0;
+            voiceIgnoredServerTurn = 0;
+            voiceSocketError = null;
+        }
+
+        function stopVoicePing() {
+            if (voicePingTimer) {
+                clearInterval(voicePingTimer);
+                voicePingTimer = null;
+            }
+        }
+
+        function startVoicePing() {
+            stopVoicePing();
+            voicePingTimer = window.setInterval(() => {
+                if (!voiceSocket || voiceSocket.readyState !== WebSocket.OPEN) { stopVoicePing(); return; }
+                try { voiceSocket.send(JSON.stringify({ type: 'ping', t: Date.now() })); } catch (_) { /* socket closing */ }
+            }, VOICE_PING_INTERVAL_MS);
+        }
+
         function handleVoiceSocketJson(event) {
             if (!event || typeof event !== 'object') return;
             if (event.type === 'ready') {
@@ -4952,6 +5026,7 @@
                 return;
             }
             if (event.type === 'turn_done') {
+                clearVoiceTurnWatchdog();
                 const reply = String(event.response || voiceCurrentReply || '').trim();
                 if (reply) appendMessage('assistant', reply, []);
                 voiceCurrentReply = '';
@@ -4962,6 +5037,7 @@
             }
             if (event.type === 'cancelled') {
                 if (Number(event.turn) !== voiceActiveServerTurn) return;
+                clearVoiceTurnWatchdog();
                 voiceCurrentReply = '';
                 voiceSocketTurnActive = false;
                 voiceStreamDone = true;
@@ -4971,6 +5047,7 @@
             }
             if (event.type === 'error') {
                 console.warn('Voice socket error:', event.message || event);
+                clearVoiceTurnWatchdog();
                 voiceSocketError = event.message || 'Voice request failed';
                 appendVoiceConversationMessage('assistant', voiceSocketError);
                 voiceSocketTurnActive = false;
@@ -5031,6 +5108,7 @@
                         if (event.type === 'ready' && !settled) {
                             voiceSocketReady = true;
                             settled = true;
+                            startVoicePing();
                             resolve(socket);
                         }
                         handleVoiceSocketJson(event);
@@ -5050,22 +5128,26 @@
                     }
                     voiceSocket = null;
                     voiceSocketReady = false;
+                    stopVoicePing();
                     fail(new Error(voiceSocketError || 'Voice connection closed'));
-                    // Do not leave recognition paused forever if a proxy or
-                    // mobile network drops the persistent socket mid-turn.
-                    if (voiceSocketTurnActive && mobileVoiceOverlay && !mobileVoiceOverlay.hidden && voiceRecognitionPaused) {
-                        voiceSocketTurnActive = false;
-                        voiceStreamDone = true;
-                        maybeFinishVoicePlayback(voicePlaybackToken, resumeVoiceListening);
-                    } else if (mobileVoiceOverlay && !mobileVoiceOverlay.hidden && !voiceRecognitionPaused) {
-                        // Recover a dropped idle socket without requiring the
-                        // user to close and reopen voice mode.
-                        window.setTimeout(() => {
-                            if (mobileVoiceOverlay && !mobileVoiceOverlay.hidden && !voiceRecognitionPaused && !voiceSocket) {
-                                connectVoiceSocket().catch(() => {});
-                            }
-                        }, 400);
+                    if (!mobileVoiceOverlay || mobileVoiceOverlay.hidden) return;
+                    // A turn was still in flight when the connection died (lost
+                    // packet, zombie TCP connection, idle-timeout from a proxy or
+                    // Render's free-tier network layer): unblock it unconditionally
+                    // instead of leaving the mic paused waiting for a turn_done
+                    // that is never coming.
+                    if (voiceSocketTurnActive) {
+                        resetVoiceTurnState();
+                        stopVoiceAudioPlayback();
                     }
+                    // Recover a dropped socket without requiring the user to
+                    // close and reopen voice mode themselves.
+                    window.setTimeout(() => {
+                        if (mobileVoiceOverlay && !mobileVoiceOverlay.hidden && !voiceSocket) {
+                            connectVoiceSocket().catch(() => {});
+                        }
+                    }, 400);
+                    resumeVoiceListening();
                 };
             });
             voiceSocketReadyPromise = pendingPromise;
@@ -5082,6 +5164,8 @@
             voiceSocket = null;
             voiceSocketReady = false;
             voiceSocketReadyPromise = null;
+            stopVoicePing();
+            resetVoiceTurnState();
             if (!socket) return;
             try {
                 if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'interrupt' }));
@@ -5202,6 +5286,26 @@
                 }
             });
         }
+        function startVoiceRecognitionSafely(retryDelayMs = 250) {
+            if (!voiceRecognition) return;
+            try {
+                voiceRecognition.start();
+            } catch (error) {
+                // Most commonly InvalidStateError: start() raced a stop() that
+                // hasn't finished settling yet. Retry once after a short delay
+                // instead of silently leaving the mic dead for the rest of the
+                // session.
+                window.setTimeout(() => {
+                    if (!voiceRecognition || voiceRecognitionPaused || !mobileVoiceOverlay || mobileVoiceOverlay.hidden) return;
+                    try {
+                        voiceRecognition.start();
+                    } catch (retryError) {
+                        console.warn('[voice] could not restart speech recognition:', retryError);
+                        appendVoiceConversationMessage('assistant', "Lost the mic — tap voice mode's stop button, then start it again.");
+                    }
+                }, retryDelayMs);
+            }
+        }
         function resumeVoiceListening() {
             voiceRecognitionPaused = false;
             if (voiceAudioSource) {
@@ -5212,7 +5316,7 @@
             }
             if (voiceStream && mobileVoiceOverlay && !mobileVoiceOverlay.hidden && voiceRecognition) {
                 voiceRecognition.onend = handleVoiceRecognitionEnd;
-                try { voiceRecognition.start(); } catch (error) { /* already listening */ }
+                startVoiceRecognitionSafely();
             }
         }
         function resampleVoicePcm(input, inputRate) {
@@ -5335,7 +5439,21 @@
                 ]);
                 sentToSocket = sendVoiceSocketText(text);
             } catch (_) { /* use the compatible POST transport below */ }
-            if (sentToSocket) return;
+            if (sentToSocket) {
+                clearVoiceTurnWatchdog();
+                voiceTurnWatchdog = window.setTimeout(() => {
+                    voiceTurnWatchdog = null;
+                    // A newer turn already replaced this one; nothing to recover.
+                    if (token !== voicePlaybackToken) return;
+                    console.warn('[voice] turn timed out waiting for a server reply; recovering.');
+                    appendVoiceConversationMessage('assistant', 'That took too long. Please try again.');
+                    voiceSocketTurnActive = false;
+                    voiceStreamDone = true;
+                    stopVoiceAudioPlayback();
+                    resumeVoiceListening();
+                }, VOICE_TURN_WATCHDOG_MS);
+                return;
+            }
             await submitLegacyVoiceTurn(text, token);
         }
 
@@ -5400,7 +5518,7 @@
                 voiceTurnTimer = window.setTimeout(() => {
                     voiceTurnTimer = null;
                     if (mobileVoiceTranscript.trim() && !voiceRecognitionPaused) submitVoiceTurn();
-                }, 900);
+                }, VOICE_SILENCE_DEBOUNCE_MS);
             }
             if (voiceStream && !voiceRecognitionPaused && mobileVoiceOverlay && !mobileVoiceOverlay.hidden) {
                 window.setTimeout(() => {
@@ -5418,12 +5536,7 @@
             // stopVoiceMode() intentionally pauses recognition; clear that
             // session state before creating a fresh recognizer on reopen.
             voiceRecognitionPaused = false;
-            voiceSocketTurnActive = false;
-            voiceCurrentReply = '';
-            voiceActiveServerTurn = 0;
-            voiceIgnoredServerTurn = 0;
-            voiceSocketError = null;
-            voiceStreamDone = true;
+            resetVoiceTurnState();
             voicePendingTypedText = '';
             ensureVoicePlayCtx();
             mobileVoiceTranscript = '';
@@ -5465,7 +5578,7 @@
                     voiceTurnTimer = window.setTimeout(() => {
                         voiceTurnTimer = null;
                         if (mobileVoiceTranscript.trim() && !voiceRecognitionPaused) submitVoiceTurn();
-                    }, 900);
+                    }, VOICE_SILENCE_DEBOUNCE_MS);
                 }
             };
             voiceRecognition.onerror = (event) => {
@@ -5477,6 +5590,7 @@
             try { voiceRecognition.start(); } catch (error) { appendVoiceConversationMessage('assistant', 'Tap the voice button again to start listening.'); }
         }
         function closeMobileVoiceMode() {
+            clearVoiceTurnWatchdog();
             if (voiceTurnAbort) { voiceTurnAbort.abort(); voiceTurnAbort = null; }
             if (voiceSocket && voiceSocket.readyState === WebSocket.OPEN) {
                 try { voiceSocket.send(JSON.stringify({ type: 'interrupt' })); } catch (_) { /* closing */ }
