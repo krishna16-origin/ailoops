@@ -297,6 +297,7 @@ class VoiceConnection:
         self.tts_sem = asyncio.Semaphore(TTS_CONCURRENCY)
         self._send_lock = asyncio.Lock()
         self.closed = False
+        self.ready_sent = False
 
     # ---- outbound
     async def send_json(self, **msg: Any) -> None:
@@ -319,7 +320,6 @@ class VoiceConnection:
 
     # ---- main loop
     async def run(self) -> None:
-        await self.send_json(type="ready", pcm_rate=PCM_RATE)
         asyncio.create_task(warmup())
         try:
             while True:
@@ -359,6 +359,12 @@ class VoiceConnection:
         elif t == "config":
             self.session_id = str(m.get("session_id") or self.session_id)
             self.voice = str(m.get("voice") or "")
+            # Resolve the client's connection promise only after its session
+            # identity has reached this connection. This removes the fresh
+            # socket race where text could arrive before config was processed.
+            if not self.ready_sent:
+                self.ready_sent = True
+                await self.send_json(type="ready", pcm_rate=PCM_RATE)
         elif t == "speech_start":
             await self.on_speech_start()
         elif t == "speech_end":
