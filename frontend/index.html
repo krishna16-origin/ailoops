@@ -5872,6 +5872,14 @@
         window.addEventListener('pagehide', () => {
             if (voiceStream || voiceSocket || voiceSocketReadyPromise) stopVoiceMode();
         });
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden && voiceStream && mobileVoiceOverlay && !mobileVoiceOverlay.hidden
+                && !voiceSocketTurnActive && voiceStreamDone) {
+                // Browsers can suspend AudioContext or speech recognition while
+                // backgrounded. Returning must not require a reopen.
+                resumeVoiceListening();
+            }
+        });
 
         function setSendButtonGenerating(isGenerating) {
             sendBtn.innerHTML = isGenerating ? STOP_ICON_HTML : SEND_ICON_HTML;

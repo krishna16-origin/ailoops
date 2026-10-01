@@ -101,6 +101,10 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertIn("font-size:14px; pointer-events:none;", html)
         activate = html[html.index("async function toggleVoiceMode") :]
         self.assertIn("closeVoiceSocket();", activate)
+        self.assertIn("openFreshVoiceSocket(sessionId)", activate)
+        self.assertIn("new WebSocket(voiceSocketUrl(sessionId))", html)
+        self.assertIn("url.searchParams.set('voice_open'", html)
+        self.assertIn("document.addEventListener('visibilitychange'", html)
         transcript = html[html.index("if (event.type === 'transcript')") : html.index("if (event.type === 'state'", html.index("if (event.type === 'transcript')"))]
         self.assertNotIn("appendMessage('user'", transcript)
 
