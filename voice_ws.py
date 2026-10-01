@@ -64,6 +64,10 @@ VOICE_HISTORY_MESSAGES = int(os.getenv("VOICE_HISTORY_MESSAGES", "40"))
 PCM_RATE = int(os.getenv("VOICE_PCM_RATE", "24000"))
 HOLD_MS = int(os.getenv("VOICE_HOLD_MS", "150"))          # minimal grace period for unfinished speech
 TTS_CONCURRENCY = int(os.getenv("VOICE_TTS_CONCURRENCY", "3"))
+# Text must not wait indefinitely for audio generation. Fish can occasionally
+# leave a streaming response open while the LLM answer is already complete.
+TTS_STREAM_TIMEOUT = float(os.getenv("VOICE_TTS_STREAM_TIMEOUT", "12"))
+TTS_FALLBACK_TIMEOUT = float(os.getenv("VOICE_TTS_FALLBACK_TIMEOUT", "8"))
 
 IN_RATE = 16000
 MIN_UTTERANCE_BYTES = int(IN_RATE * 2 * 0.25)              # ignore clicks / coughs < 250 ms
@@ -539,8 +543,14 @@ class VoiceConnection:
                     pieces, buf = pop_speakable(buf, first)
                     for p in pieces:
                         first = False
+                        # The visible answer is independent of TTS. Send it as
+                        # soon as the LLM has a speakable piece so a slow or
+                        # unavailable audio provider cannot make voice mode
+                        # look stuck.
+                        await self.send_json(type="assistant_text", text=p, turn=turn.id)
                         start_piece(p)
                 if buf.strip():
+                    await self.send_json(type="assistant_text", text=buf.strip(), turn=turn.id)
                     start_piece(buf.strip())
             except asyncio.CancelledError:
                 raise
@@ -574,7 +584,6 @@ class VoiceConnection:
                         turn.tts_error = True
                         await self.send_json(type="error", message=payload)
                 turn.spoken.append(piece)
-                await self.send_json(type="assistant_text", text=piece, turn=turn.id)
 
         prod = asyncio.create_task(producer())
         try:
@@ -598,19 +607,28 @@ class VoiceConnection:
                 return
             async with self.tts_sem:
                 try:
-                    async for chunk in self.deps.tts_pcm(spoken, self.voice):
-                        sent += len(chunk)
-                        q.put_nowait(("pcm", chunk))
+                    async with asyncio.timeout(TTS_STREAM_TIMEOUT):
+                        async for chunk in self.deps.tts_pcm(spoken, self.voice):
+                            sent += len(chunk)
+                            q.put_nowait(("pcm", chunk))
                 except asyncio.CancelledError:
                     raise
+                except TimeoutError:
+                    print(f"[voice:{self.session_id}] TTS stream timed out")
                 except Exception as exc:
                     print(f"[voice:{self.session_id}] TTS stream failed: {exc}")
                 if sent:
                     return
                 try:
-                    mp3 = await self.deps.tts_mp3(spoken, self.voice)
+                    mp3 = await asyncio.wait_for(
+                        self.deps.tts_mp3(spoken, self.voice),
+                        timeout=TTS_FALLBACK_TIMEOUT,
+                    )
                 except asyncio.CancelledError:
                     raise
+                except asyncio.TimeoutError:
+                    print(f"[voice:{self.session_id}] TTS fallback timed out")
+                    mp3 = None
                 except Exception as exc:
                     print(f"[voice:{self.session_id}] TTS mp3 fallback failed: {exc}")
                     mp3 = None

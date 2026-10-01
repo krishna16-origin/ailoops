@@ -4956,6 +4956,7 @@
         let voiceActiveServerTurn = 0;
         let voiceIgnoredServerTurn = 0;
         let voiceSocketTurnActive = false;
+        let voiceAssistantBubble = null;
         function ensureVoicePlayCtx() {
             if (!voicePlayCtx || voicePlayCtx.state === 'closed') {
                 const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -5004,6 +5005,7 @@
             voiceTurnSubmitLock = false;
             voiceStreamDone = true;
             voiceCurrentReply = '';
+            voiceAssistantBubble = null;
             voiceActiveServerTurn = 0;
             voiceIgnoredServerTurn = 0;
             voiceSocketError = null;
@@ -5047,6 +5049,7 @@
             }
             if (event.type === 'assistant_text') {
                 voiceCurrentReply += `${event.text || ''} `;
+                renderVoiceAssistantReply(false);
                 return;
             }
             if (event.type === 'transcript') {
@@ -5065,7 +5068,11 @@
             if (event.type === 'turn_done') {
                 clearVoiceTurnWatchdog();
                 const reply = String(event.response || voiceCurrentReply || '').trim();
-                if (reply) appendMessage('assistant', reply, []);
+                if (reply) {
+                    voiceCurrentReply = reply;
+                    renderVoiceAssistantReply(true);
+                }
+                voiceAssistantBubble = null;
                 voiceCurrentReply = '';
                 voiceSocketTurnActive = false;
                 voiceStreamDone = true;
@@ -5093,6 +5100,17 @@
             }
         }
 
+        function renderVoiceAssistantReply(final = false) {
+            const text = voiceCurrentReply.trim();
+            if (!text) return;
+            if (!voiceAssistantBubble) voiceAssistantBubble = appendMessage('assistant', '');
+            const textContainer = voiceAssistantBubble && voiceAssistantBubble.querySelector('.message-text');
+            if (!textContainer) return;
+            setProse(textContainer, marked.parse(normalizeMathDelimiters(text)));
+            const body = voiceAssistantBubble.querySelector('.assistant-body');
+            if (body) body.classList.toggle('is-streaming', !final);
+            scrollToBottom(false);
+        }
         function handleVoiceSocketBinary(data) {
             const bytes = data instanceof ArrayBuffer
                 ? new Uint8Array(data)
@@ -5492,6 +5510,7 @@
             const token = voicePlaybackToken;
             voiceStreamDone = false;
             voiceCurrentReply = '';
+            voiceAssistantBubble = null;
             voiceIgnoredServerTurn = voiceActiveServerTurn;
             voiceActiveServerTurn = 0;
             // Mobile browsers can leave a playback context suspended after
