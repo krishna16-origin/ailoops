@@ -4631,6 +4631,9 @@
         let voicePcmSpeaking = false;
         let voicePcmLastSpeechAt = 0;
         let voicePendingTypedText = '';
+        // SpeechRecognition can emit a final result and onend in the same turn,
+        // while desktop Enter can trigger both keydown and form submit paths.
+        let voiceTurnSubmitLock = false;
         // Watchdog for a turn sent over the socket: if the server never answers
         // (lost packet, zombie TCP connection that hasn't fired onclose yet,
         // upstream hang) this guarantees we still come back to "listening"
@@ -4993,6 +4996,7 @@
         function resetVoiceTurnState() {
             clearVoiceTurnWatchdog();
             voiceSocketTurnActive = false;
+            voiceTurnSubmitLock = false;
             voiceStreamDone = true;
             voiceCurrentReply = '';
             voiceAssistantBubble = null;
@@ -5482,7 +5486,8 @@
         }
         async function submitVoiceTurn() {
             const text = mobileVoiceTranscript.trim();
-            if (!text || !voiceStream) return;
+            if (!text || !voiceStream || voiceTurnSubmitLock || voiceSocketTurnActive) return;
+            voiceTurnSubmitLock = true;
             const sessionId = voiceModeSession;
             voiceAssistantBubble = null;
             mobileVoiceTranscript = '';
@@ -5517,11 +5522,18 @@
                     connectVoiceSocket(sessionId),
                     new Promise((_, reject) => window.setTimeout(() => reject(new Error('voice socket timeout')), 8000))
                 ]);
-                if (sessionId !== voiceModeSession || !voiceStream) return;
+                if (sessionId !== voiceModeSession || !voiceStream) {
+                    voiceTurnSubmitLock = false;
+                    return;
+                }
                 sentToSocket = sendVoiceSocketText(text);
             } catch (_) { /* use the compatible POST transport below */ }
-            if (sessionId !== voiceModeSession || !voiceStream) return;
+            if (sessionId !== voiceModeSession || !voiceStream) {
+                voiceTurnSubmitLock = false;
+                return;
+            }
             if (sentToSocket) {
+                voiceTurnSubmitLock = false;
                 clearVoiceTurnWatchdog();
                 voiceTurnWatchdog = window.setTimeout(() => {
                     voiceTurnWatchdog = null;
@@ -5530,13 +5542,18 @@
                     console.warn('[voice] turn timed out waiting for a server reply; recovering.');
                     appendVoiceConversationMessage('assistant', 'That took too long. Please try again.');
                     voiceSocketTurnActive = false;
+                    voiceTurnSubmitLock = false;
                     voiceStreamDone = true;
                     stopVoiceAudioPlayback();
                     resumeVoiceListening();
                 }, VOICE_TURN_WATCHDOG_MS);
                 return;
             }
-            await submitLegacyVoiceTurn(text, token);
+            try {
+                await submitLegacyVoiceTurn(text, token);
+            } finally {
+                voiceTurnSubmitLock = false;
+            }
         }
 
         async function submitLegacyVoiceTurn(text, token) {
