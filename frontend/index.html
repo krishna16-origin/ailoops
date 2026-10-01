@@ -4944,6 +4944,9 @@
         // check below prevents late callbacks from an old mode session mutating a
         // newly opened connection.
         let voiceSocketGeneration = 0;
+        // Identifies one click-to-close voice-mode lifetime. This is separate
+        // from socket generation because microphone startup is asynchronous.
+        let voiceModeSession = 0;
         let voiceCurrentReply = '';
         let voicePcmRate = 24000;
         let voiceSocketError = null;
@@ -5007,7 +5010,22 @@
             stopVoicePing();
             voicePingTimer = window.setInterval(() => {
                 if (!voiceSocket || voiceSocket.readyState !== WebSocket.OPEN) { stopVoicePing(); return; }
-                try { voiceSocket.send(JSON.stringify({ type: 'ping', t: Date.now() })); } catch (_) { /* socket closing */ }
+                try {
+                    voiceSocket.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+                } catch (_) {
+                    // A mobile radio/proxy can leave a socket reporting OPEN
+                    // while send() is already unusable. Replace it just like a
+                    // normal close so the next turn never waits on a zombie.
+                    const sessionId = voiceModeSession;
+                    closeVoiceSocket();
+                    if (sessionId === voiceModeSession && voiceStream && mobileVoiceOverlay && !mobileVoiceOverlay.hidden) {
+                        window.setTimeout(() => {
+                            if (sessionId === voiceModeSession && voiceStream && !voiceSocket) {
+                                connectVoiceSocket(sessionId).catch(() => {});
+                            }
+                        }, 100);
+                    }
+                }
             }, VOICE_PING_INTERVAL_MS);
         }
 
@@ -5085,7 +5103,10 @@
             }
         }
 
-        function connectVoiceSocket() {
+        function connectVoiceSocket(sessionId = voiceModeSession) {
+            if (sessionId !== voiceModeSession) {
+                return Promise.reject(new Error('Stale voice mode session'));
+            }
             if (voiceSocket && voiceSocket.readyState === WebSocket.OPEN && voiceSocketReady) {
                 return Promise.resolve(voiceSocket);
             }
@@ -5099,7 +5120,11 @@
             let pendingPromise;
             pendingPromise = new Promise((resolve, reject) => {
                 let settled = false;
-                const isCurrentSocket = () => voiceSocket === socket && voiceSocketGeneration === generation;
+                const isCurrentSocket = () => (
+                    sessionId === voiceModeSession
+                    && voiceSocket === socket
+                    && voiceSocketGeneration === generation
+                );
                 const fail = (error) => {
                     if (!settled) { settled = true; reject(error); }
                 };
@@ -5156,8 +5181,8 @@
                     // Recover a dropped socket without requiring the user to
                     // close and reopen voice mode themselves.
                     window.setTimeout(() => {
-                        if (mobileVoiceOverlay && !mobileVoiceOverlay.hidden && !voiceSocket) {
-                            connectVoiceSocket().catch(() => {});
+                        if (sessionId === voiceModeSession && mobileVoiceOverlay && !mobileVoiceOverlay.hidden && !voiceSocket) {
+                            connectVoiceSocket(sessionId).catch(() => {});
                         }
                     }, 400);
                     resumeVoiceListening();
@@ -5330,7 +5355,7 @@
             voiceRecognitionPaused = false;
             if (voiceAudioSource) {
                 if (!voiceSocket || !voiceSocketReady || voiceSocket.readyState !== WebSocket.OPEN) {
-                    connectVoiceSocket().catch(() => {});
+                    connectVoiceSocket(voiceModeSession).catch(() => {});
                 }
                 return;
             }
@@ -5431,6 +5456,7 @@
         async function submitVoiceTurn() {
             const text = mobileVoiceTranscript.trim();
             if (!text || !voiceStream) return;
+            const sessionId = voiceModeSession;
             mobileVoiceTranscript = '';
             if (voiceTurnTimer) { clearTimeout(voiceTurnTimer); voiceTurnTimer = null; }
             voiceRecognitionPaused = true;
@@ -5460,11 +5486,13 @@
             let sentToSocket = false;
             try {
                 await Promise.race([
-                    connectVoiceSocket(),
+                    connectVoiceSocket(sessionId),
                     new Promise((_, reject) => window.setTimeout(() => reject(new Error('voice socket timeout')), 8000))
                 ]);
+                if (sessionId !== voiceModeSession || !voiceStream) return;
                 sentToSocket = sendVoiceSocketText(text);
             } catch (_) { /* use the compatible POST transport below */ }
+            if (sessionId !== voiceModeSession || !voiceStream) return;
             if (sentToSocket) {
                 clearVoiceTurnWatchdog();
                 voiceTurnWatchdog = window.setTimeout(() => {
@@ -5644,6 +5672,9 @@
             }
         }
         function stopVoiceMode() {
+            // Invalidate pending microphone/socket startup before teardown so a
+            // stale activation cannot attach itself to the next one.
+            voiceModeSession += 1;
             closeMobileVoiceMode();
             closeVoiceSocket();
             if (voiceLevelFrame) cancelAnimationFrame(voiceLevelFrame);
@@ -5691,6 +5722,7 @@
             // Treat every activation as a new voice session. This also handles
             // a stale CONNECTING/OPEN socket left behind by a browser or proxy
             // after the previous overlay was closed.
+            const sessionId = ++voiceModeSession;
             closeVoiceSocket();
             const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
             const canRecord = Boolean(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
@@ -5716,6 +5748,11 @@
                     // getUserMedia implementation.
                     voiceStream = { getTracks: () => [] };
                 }
+                if (sessionId !== voiceModeSession) {
+                    if (voiceStream && voiceStream.getTracks) voiceStream.getTracks().forEach(track => track.stop());
+                    voiceStream = null;
+                    return;
+                }
                 const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
                 if (AudioContextCtor) {
                     voiceAudioContext = new AudioContextCtor();
@@ -5725,6 +5762,11 @@
                     voiceLevelData = new Uint8Array(voiceAnalyser.fftSize);
                     if (voiceStream.getTracks().length) startVoicePcmCapture();
                 }
+                if (sessionId !== voiceModeSession) {
+                    if (voiceStream && voiceStream.getTracks) voiceStream.getTracks().forEach(track => track.stop());
+                    voiceStream = null;
+                    return;
+                }
                 voiceModeBtn.classList.add('is-listening');
                 voiceModeBtn.setAttribute('aria-pressed', 'true');
                 voiceModeBtn.setAttribute('aria-label', 'Stop voice mode');
@@ -5732,14 +5774,22 @@
                 openMobileVoiceMode();
                 // Pay the WebSocket handshake while the user is looking at the
                 // voice surface, before they finish their first utterance.
-                connectVoiceSocket().catch(error => console.warn('Voice socket unavailable; using fallback:', error));
+                connectVoiceSocket(sessionId).catch(error => console.warn('Voice socket unavailable; using fallback:', error));
                 sampleVoiceLevel();
             } catch (error) {
+                if (sessionId !== voiceModeSession) return;
                 stopVoiceMode();
                 voiceModeBtn.title = 'Microphone permission is required for voice mode';
                 console.warn('Voice mode could not access the microphone:', error);
             }
         }
+
+        // A refresh can preserve the document in the browser page lifecycle
+        // long enough for a WebSocket to remain half-open. Explicitly tear down
+        // voice resources so the next document always starts clean.
+        window.addEventListener('pagehide', () => {
+            if (voiceStream || voiceSocket || voiceSocketReadyPromise) stopVoiceMode();
+        });
 
         function setSendButtonGenerating(isGenerating) {
             sendBtn.innerHTML = isGenerating ? STOP_ICON_HTML : SEND_ICON_HTML;
