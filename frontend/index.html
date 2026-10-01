@@ -5687,6 +5687,10 @@
         async function toggleVoiceMode(event) {
             if (event) event.preventDefault();
             if (voiceStream) { stopVoiceMode(); return; }
+            // Treat every activation as a new voice session. This also handles
+            // a stale CONNECTING/OPEN socket left behind by a browser or proxy
+            // after the previous overlay was closed.
+            closeVoiceSocket();
             const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
             const canRecord = Boolean(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
             const canRecognize = Boolean(SpeechRecognitionCtor);

@@ -89,6 +89,8 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertIn("resetVoiceTurnState()", reopen)
         self.assertIn(".mobile-voice-agent { position:absolute; left:0;", html)
         self.assertIn("font-size:14px; pointer-events:none;", html)
+        activate = html[html.index("async function toggleVoiceMode") :]
+        self.assertIn("closeVoiceSocket();", activate)
 
     def test_voice_chat_streams_groq_text_through_fish_audio(self):
         source = pathlib.Path(__file__).with_name("app.py").read_text(encoding="utf-8")
