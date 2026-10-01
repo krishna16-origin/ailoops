@@ -5444,7 +5444,13 @@
             voiceCurrentReply = '';
             voiceIgnoredServerTurn = voiceActiveServerTurn;
             voiceActiveServerTurn = 0;
-            ensureVoicePlayCtx();
+            // Mobile browsers can leave a playback context suspended after
+            // voice mode is closed and reopened. Resume it before the server
+            // starts sending the next reply.
+            const playCtx = ensureVoicePlayCtx();
+            if (playCtx.state === 'suspended') {
+                try { await playCtx.resume(); } catch (_) { /* next gesture can retry */ }
+            }
             appendMessage('user', text, []);
 
             // The socket is opened when voice mode starts, so this is normally
@@ -5645,6 +5651,12 @@
             voiceStream = null;
             if (voiceAudioContext && voiceAudioContext.state !== 'closed') voiceAudioContext.close();
             voiceAudioContext = null;
+            // Never reuse a playback context that may have been suspended by
+            // the browser while the voice overlay was closed.
+            if (voicePlayCtx && voicePlayCtx.state !== 'closed') {
+                voicePlayCtx.close().catch(() => {});
+            }
+            voicePlayCtx = null;
             voiceAnalyser = null;
             voiceLevelData = null;
             voiceSmoothedLevel = 0;
