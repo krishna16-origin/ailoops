@@ -533,13 +533,8 @@ class VoiceConnection:
                     pieces, buf = pop_speakable(buf, first)
                     for p in pieces:
                         first = False
-                        # Text must reach the client as soon as the LLM has a
-                        # speakable piece. Do not make the visible response
-                        # wait for Fish Audio, which may be slow or unavailable.
-                        await self.send_json(type="assistant_text", text=p, turn=turn.id)
                         start_piece(p)
                 if buf.strip():
-                    await self.send_json(type="assistant_text", text=buf.strip(), turn=turn.id)
                     start_piece(buf.strip())
             except asyncio.CancelledError:
                 raise
@@ -573,6 +568,7 @@ class VoiceConnection:
                         turn.tts_error = True
                         await self.send_json(type="error", message=payload)
                 turn.spoken.append(piece)
+                await self.send_json(type="assistant_text", text=piece, turn=turn.id)
 
         prod = asyncio.create_task(producer())
         try:
