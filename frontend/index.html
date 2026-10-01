@@ -5104,6 +5104,11 @@
             const text = voiceCurrentReply.trim();
             if (!text) return;
             if (!voiceAssistantBubble) voiceAssistantBubble = appendMessage('assistant', '');
+            // Voice mode audio is exclusively Fish Audio. The normal chat
+            // message footer has a browser speech-synthesis button; remove it
+            // from voice replies so no non-Fish audio can be triggered here.
+            const browserSpeakButton = voiceAssistantBubble && voiceAssistantBubble.querySelector('.speak-btn');
+            if (browserSpeakButton) browserSpeakButton.remove();
             const textContainer = voiceAssistantBubble && voiceAssistantBubble.querySelector('.message-text');
             if (!textContainer) return;
             setProse(textContainer, marked.parse(normalizeMathDelimiters(text)));

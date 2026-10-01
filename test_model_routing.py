@@ -73,6 +73,16 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertNotIn("speakVoiceTextFallback", html)
         self.assertNotIn("using browser speech", html.lower())
 
+    def test_voice_mode_is_fish_audio_only(self):
+        frontend = pathlib.Path(__file__).with_name("frontend") / "index.html"
+        html = frontend.read_text(encoding="utf-8")
+        voice_source = html[html.index("let voiceStream = null;"):html.index("function setSendButtonGenerating")]
+        self.assertIn("Fish Audio", voice_source)
+        self.assertIn("enqueueVoicePcm", voice_source)
+        self.assertNotIn("speechSynthesis", voice_source)
+        self.assertNotIn("SpeechSynthesisUtterance", voice_source)
+        self.assertIn("browserSpeakButton.remove()", voice_source)
+
     def test_voice_uses_groq_gpt_oss_20b_by_default(self):
         self.assertEqual(app.VOICE_LLM_MODEL, "openai/gpt-oss-20b")
 
