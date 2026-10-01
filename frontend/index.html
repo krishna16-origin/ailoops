@@ -4940,6 +4940,7 @@
         let voiceStreamDone = true;
         let voiceTurnAbort = null;
         let voiceDecodeChain = Promise.resolve();
+        let voiceResumeRecoveryTimer = null;
         let voiceSocket = null;
         let voiceSocketReady = false;
         let voiceSocketReadyPromise = null;
@@ -4993,6 +4994,26 @@
                 voiceTurnWatchdog = null;
             }
         }
+        function clearVoiceResumeRecovery() {
+            if (voiceResumeRecoveryTimer) {
+                clearTimeout(voiceResumeRecoveryTimer);
+                voiceResumeRecoveryTimer = null;
+            }
+        }
+        function armVoiceResumeRecovery(token) {
+            clearVoiceResumeRecovery();
+            // Android can miss AudioBufferSourceNode.onended after focus
+            // changes. Never leave the microphone paused indefinitely.
+            voiceResumeRecoveryTimer = window.setTimeout(() => {
+                voiceResumeRecoveryTimer = null;
+                if (token !== voicePlaybackToken || !voiceStream || !mobileVoiceOverlay || mobileVoiceOverlay.hidden) return;
+                console.warn('[voice] forcing listening recovery after playback timeout');
+                voiceSocketTurnActive = false;
+                voiceStreamDone = true;
+                stopVoiceAudioPlayback();
+                resumeVoiceListening();
+            }, 15000);
+        }
 
         // The single place that clears every piece of "a turn is in flight /
         // the socket errored" bookkeeping. Previously this was reset in three
@@ -5001,6 +5022,7 @@
         // could survive a close/reopen and leave the mic permanently paused.
         function resetVoiceTurnState() {
             clearVoiceTurnWatchdog();
+            clearVoiceResumeRecovery();
             voiceSocketTurnActive = false;
             voiceTurnSubmitLock = false;
             voiceStreamDone = true;
@@ -5397,6 +5419,7 @@
             }
         }
         function resumeVoiceListening() {
+            clearVoiceResumeRecovery();
             voiceRecognitionPaused = false;
             if (voiceAudioSource) {
                 if (!voiceSocket || !voiceSocketReady || voiceSocket.readyState !== WebSocket.OPEN) {
@@ -5549,6 +5572,7 @@
             if (sentToSocket) {
                 voiceTurnSubmitLock = false;
                 clearVoiceTurnWatchdog();
+                armVoiceResumeRecovery(token);
                 voiceTurnWatchdog = window.setTimeout(() => {
                     voiceTurnWatchdog = null;
                     // A newer turn already replaced this one; nothing to recover.
@@ -5566,6 +5590,7 @@
                 await submitLegacyVoiceTurn(text, token);
             } finally {
                 voiceTurnSubmitLock = false;
+                if (token === voicePlaybackToken && voiceStreamDone) resumeVoiceListening();
             }
         }
 
