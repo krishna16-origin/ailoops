@@ -86,7 +86,9 @@ class ModelRoutingTests(unittest.TestCase):
         html = source.read_text(encoding="utf-8")
         reopen = html[html.index("function openMobileVoiceMode") : html.index("function setVoiceLevel")]
         self.assertIn("voiceRecognitionPaused = false", reopen)
-        self.assertIn("voiceSocketTurnActive = false", reopen)
+        self.assertIn("resetVoiceTurnState()", reopen)
+        self.assertIn(".mobile-voice-agent { position:absolute; left:0;", html)
+        self.assertIn("font-size:14px; pointer-events:none;", html)
 
     def test_voice_chat_streams_groq_text_through_fish_audio(self):
         source = pathlib.Path(__file__).with_name("app.py").read_text(encoding="utf-8")
@@ -118,13 +120,17 @@ class ModelRoutingTests(unittest.TestCase):
         ):
             self.assertIn(marker, html)
 
-    def test_glm_rejects_low_effort_maps_to_none(self):
+    def test_glm_low_and_medium_use_direct_answer_effort(self):
         self.assertEqual(
             app._map_reasoning_effort("low", "z-ai/glm-5.3"),
             "none",
         )
         self.assertEqual(
             app._map_reasoning_effort("medium", "z-ai/glm-5.3"),
+            "none",
+        )
+        self.assertEqual(
+            app._map_reasoning_effort("high", "z-ai/glm-5.3"),
             "high",
         )
         self.assertEqual(
@@ -132,10 +138,18 @@ class ModelRoutingTests(unittest.TestCase):
             "max",
         )
 
-    def test_kimi_effort_keeps_low(self):
+    def test_kimi_low_and_medium_use_low_effort(self):
         self.assertEqual(
             app._map_reasoning_effort("low", "moonshotai/kimi-k3"),
             "low",
+        )
+        self.assertEqual(
+            app._map_reasoning_effort("medium", "moonshotai/kimi-k3"),
+            "low",
+        )
+        self.assertEqual(
+            app._map_reasoning_effort("high", "moonshotai/kimi-k3"),
+            "high",
         )
         self.assertEqual(
             app._map_reasoning_effort("max", "moonshotai/kimi-k3"),

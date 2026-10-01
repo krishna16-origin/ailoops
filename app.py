@@ -325,14 +325,20 @@ def _map_reasoning_effort(level: str, model_name: str = "", deep_think: bool = F
         return "max"
     lvl = normalize_thinking_level(level)
     if _is_glm_model(model_name):
-        if lvl == "low":
+        # Keep Low and Medium on GLM's direct-answer path. Medium used to map
+        # to high, which made it wait for a full reasoning pass even though the
+        # UI describes it as balanced. High/Extra/Max retain their existing
+        # deeper effort levels.
+        if lvl in ("low", "medium"):
             return "none"
-        if lvl in ("medium", "high"):
+        if lvl == "high":
             return "high"
         return "max"
-    if lvl == "low":
+    # Kimi supports a low native effort level. Use it for both UI levels that
+    # promise a quick response; high and above remain unchanged.
+    if lvl in ("low", "medium"):
         return "low"
-    if lvl in ("medium", "high"):
+    if lvl == "high":
         return "high"
     return "max"
 
