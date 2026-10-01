@@ -5218,6 +5218,15 @@
             } catch (_) { /* already closed */ }
         }
 
+        // Voice mode opens are intentionally not allowed to reuse the normal
+        // reconnect path. Every click that starts voice mode gets a new native
+        // WebSocket, even if the previous socket is still closing.
+        function openFreshVoiceSocket(sessionId) {
+            closeVoiceSocket();
+            voiceSocketReadyPromise = null;
+            return connectVoiceSocket(sessionId);
+        }
+
         function sendVoiceSocketText(text) {
             if (!voiceSocket || !voiceSocketReady || voiceSocket.readyState !== WebSocket.OPEN) return false;
             try {
@@ -5774,7 +5783,7 @@
                 openMobileVoiceMode();
                 // Pay the WebSocket handshake while the user is looking at the
                 // voice surface, before they finish their first utterance.
-                connectVoiceSocket(sessionId).catch(error => console.warn('Voice socket unavailable; using fallback:', error));
+                openFreshVoiceSocket(sessionId).catch(error => console.warn('Voice socket unavailable; using fallback:', error));
                 sampleVoiceLevel();
             } catch (error) {
                 if (sessionId !== voiceModeSession) return;
