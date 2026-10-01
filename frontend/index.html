@@ -4948,6 +4948,7 @@
         // from socket generation because microphone startup is asynchronous.
         let voiceModeSession = 0;
         let voiceCurrentReply = '';
+        let voiceAssistantBubble = null;
         let voicePcmRate = 24000;
         let voiceSocketError = null;
         let voiceActiveServerTurn = 0;
@@ -4994,6 +4995,7 @@
             voiceSocketTurnActive = false;
             voiceStreamDone = true;
             voiceCurrentReply = '';
+            voiceAssistantBubble = null;
             voiceActiveServerTurn = 0;
             voiceIgnoredServerTurn = 0;
             voiceSocketError = null;
@@ -5037,6 +5039,7 @@
             }
             if (event.type === 'assistant_text') {
                 voiceCurrentReply += `${event.text || ''} `;
+                renderVoiceAssistantReply(false);
                 return;
             }
             if (event.type === 'transcript') {
@@ -5055,7 +5058,10 @@
             if (event.type === 'turn_done') {
                 clearVoiceTurnWatchdog();
                 const reply = String(event.response || voiceCurrentReply || '').trim();
-                if (reply) appendMessage('assistant', reply, []);
+                if (reply) {
+                    voiceCurrentReply = reply;
+                    renderVoiceAssistantReply(true);
+                }
                 voiceCurrentReply = '';
                 voiceSocketTurnActive = false;
                 voiceStreamDone = true;
@@ -5081,6 +5087,18 @@
                 voiceStreamDone = true;
                 maybeFinishVoicePlayback(voicePlaybackToken, resumeVoiceListening);
             }
+        }
+
+        function renderVoiceAssistantReply(final = false) {
+            const text = voiceCurrentReply.trim();
+            if (!text) return;
+            if (!voiceAssistantBubble) voiceAssistantBubble = appendMessage('assistant', '');
+            const textContainer = voiceAssistantBubble && voiceAssistantBubble.querySelector('.message-text');
+            if (!textContainer) return;
+            setProse(textContainer, marked.parse(normalizeMathDelimiters(text)));
+            const body = voiceAssistantBubble.querySelector('.assistant-body');
+            if (body) body.classList.toggle('is-streaming', !final);
+            scrollToBottom(false);
         }
 
         function handleVoiceSocketBinary(data) {
@@ -5466,6 +5484,7 @@
             const text = mobileVoiceTranscript.trim();
             if (!text || !voiceStream) return;
             const sessionId = voiceModeSession;
+            voiceAssistantBubble = null;
             mobileVoiceTranscript = '';
             if (voiceTurnTimer) { clearTimeout(voiceTurnTimer); voiceTurnTimer = null; }
             voiceRecognitionPaused = true;
