@@ -4940,6 +4940,10 @@
         let voiceSocket = null;
         let voiceSocketReady = false;
         let voiceSocketReadyPromise = null;
+        // A WebSocket can deliver callbacks after close() returns. The generation
+        // check below prevents late callbacks from an old mode session mutating a
+        // newly opened connection.
+        let voiceSocketGeneration = 0;
         let voiceCurrentReply = '';
         let voicePcmRate = 24000;
         let voiceSocketError = null;
@@ -5087,13 +5091,14 @@
             if (voiceSocketReadyPromise) return voiceSocketReadyPromise;
             voiceSocketError = null;
             const socket = new WebSocket(voiceSocketUrl());
+            const generation = ++voiceSocketGeneration;
             socket.binaryType = 'arraybuffer';
             voiceSocket = socket;
             voiceSocketReady = false;
             let pendingPromise;
             pendingPromise = new Promise((resolve, reject) => {
                 let settled = false;
-                const isCurrentSocket = () => voiceSocket === socket;
+                const isCurrentSocket = () => voiceSocket === socket && voiceSocketGeneration === generation;
                 const fail = (error) => {
                     if (!settled) { settled = true; reject(error); }
                 };
@@ -5124,6 +5129,9 @@
                     if (!isCurrentSocket()) return;
                     voiceSocketError = 'Voice connection failed';
                     fail(new Error(voiceSocketError));
+                    // Some browsers do not follow error with a useful close
+                    // callback. Force the normal reconnect path to run.
+                    try { socket.close(); } catch (_) { /* already closed */ }
                 };
                 socket.onclose = () => {
                     if (!isCurrentSocket()) {
@@ -5165,6 +5173,9 @@
 
         function closeVoiceSocket() {
             const socket = voiceSocket;
+            // Invalidate callbacks before closing the native socket. This also
+            // prevents a pending ready promise from affecting a later reopen.
+            voiceSocketGeneration += 1;
             voiceSocket = null;
             voiceSocketReady = false;
             voiceSocketReadyPromise = null;
@@ -5172,6 +5183,10 @@
             resetVoiceTurnState();
             if (!socket) return;
             try {
+                socket.onopen = null;
+                socket.onmessage = null;
+                socket.onerror = null;
+                socket.onclose = null;
                 if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'interrupt' }));
                 socket.close(1000, 'voice mode closed');
             } catch (_) { /* already closed */ }
