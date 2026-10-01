@@ -5022,8 +5022,9 @@
                 return;
             }
             if (event.type === 'transcript') {
-                const text = String(event.text || '').trim();
-                if (text && text !== voicePendingTypedText) appendMessage('user', text, []);
+                // submitVoiceTurn() already renders the user message before
+                // sending it. The server transcript is acknowledgement/data
+                // for STT, not a second chat message to append.
                 voicePendingTypedText = '';
                 return;
             }

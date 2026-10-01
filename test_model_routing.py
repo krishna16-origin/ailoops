@@ -91,6 +91,8 @@ class ModelRoutingTests(unittest.TestCase):
         self.assertIn("font-size:14px; pointer-events:none;", html)
         activate = html[html.index("async function toggleVoiceMode") :]
         self.assertIn("closeVoiceSocket();", activate)
+        transcript = html[html.index("if (event.type === 'transcript')") : html.index("if (event.type === 'state'", html.index("if (event.type === 'transcript')"))]
+        self.assertNotIn("appendMessage('user'", transcript)
 
     def test_voice_chat_streams_groq_text_through_fish_audio(self):
         source = pathlib.Path(__file__).with_name("app.py").read_text(encoding="utf-8")
