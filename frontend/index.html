@@ -4966,9 +4966,15 @@
             return voicePlayCtx;
         }
 
-        function voiceSocketUrl() {
+        function voiceSocketUrl(sessionId = voiceModeSession) {
             const url = new URL('/ws/voice', API_BASE || window.location.href);
             url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+            // WebSockets are normally non-cacheable, but a few mobile browser
+            // and reverse-proxy combinations can keep the previous upgrade
+            // route alive during a rapid close/reopen. A unique query value
+            // makes every activation an unmistakably new network connection.
+            url.searchParams.set('voice_session', String(sessionId));
+            url.searchParams.set('voice_open', String(Date.now()));
             return url.toString();
         }
 
@@ -5116,7 +5122,7 @@
             }
             if (voiceSocketReadyPromise) return voiceSocketReadyPromise;
             voiceSocketError = null;
-            const socket = new WebSocket(voiceSocketUrl());
+            const socket = new WebSocket(voiceSocketUrl(sessionId));
             const generation = ++voiceSocketGeneration;
             socket.binaryType = 'arraybuffer';
             voiceSocket = socket;
@@ -5206,7 +5212,11 @@
         function openFreshVoiceSocket(sessionId) {
             closeVoiceSocket();
             voiceSocketReadyPromise = null;
-            return connectVoiceSocket(sessionId);
+            // Android Chrome can briefly keep the previous native socket in
+            // CLOSING after close() returns. Wait a short, bounded interval so
+            // the next activation cannot race the old transport.
+            return new Promise((resolve) => window.setTimeout(resolve, 120))
+                .then(() => connectVoiceSocket(sessionId));
         }
 
         function closeVoiceSocket() {
