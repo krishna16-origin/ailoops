@@ -1,0 +1,689 @@
+diff --git a/code_artifacts.py b/code_artifacts.py
+new file mode 100644
+index 0000000..aed3348
+--- /dev/null
++++ b/code_artifacts.py
+@@ -0,0 +1,181 @@
++"""Code-mode artifact helpers.
++
++Pure functions only (no I/O, no network), so they are cheap to test and safe
++to call from both the agent loop and the repo-fetch path.
++
++Concepts:
++- Assets: binary/media resources a user drops into a project (images, 3D
++  models, fonts, video, audio, data). The agent must actually wire an asset
++  into the code once it is placed, so each asset gets a usage prompt.
++- Intent: what the user's message is asking for. A problem report ("error",
++  "bug", "fix") narrows the file list to what was edited/fixed. Only an
++  explicit request for all files (or the whole tree) returns the repo listing.
++"""
++
++from __future__ import annotations
++
++import os
++import re
++from typing import Dict, Iterable, List, Optional, Sequence
++
++# ---------------------------------------------------------------------------
++# Asset classification
++# ---------------------------------------------------------------------------
++
++ASSET_KINDS: Dict[str, Sequence[str]] = {
++    "image": (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".ico"),
++    "model3d": (".glb", ".gltf", ".obj", ".fbx", ".stl", ".usdz", ".ply"),
++    "font": (".woff", ".woff2", ".ttf", ".otf"),
++    "video": (".mp4", ".webm", ".mov"),
++    "audio": (".mp3", ".wav", ".ogg", ".m4a"),
++    "data": (".csv", ".json", ".geojson", ".xlsx"),
++}
++
++_EXT_TO_KIND: Dict[str, str] = {
++    ext: kind for kind, exts in ASSET_KINDS.items() for ext in exts
++}
++
++# Default place an asset is copied into, per kind, when the project has no
++# better convention. The agent is told it may choose a different folder if
++# the project already has one.
++DEFAULT_ASSET_DIR: Dict[str, str] = {
++    "image": "public/assets/images",
++    "model3d": "public/assets/models",
++    "font": "public/assets/fonts",
++    "video": "public/assets/video",
++    "audio": "public/assets/audio",
++    "data": "public/assets/data",
++}
++
++
++def classify_asset(filename: str) -> Optional[str]:
++    """Return the asset kind for a filename, or None if it is not an asset."""
++    if not filename:
++        return None
++    _, ext = os.path.splitext(filename.lower())
++    return _EXT_TO_KIND.get(ext)
++
++
++def is_asset(filename: str) -> bool:
++    return classify_asset(filename) is not None
++
++
++def asset_usage_prompt(filename: str, kind: Optional[str] = None) -> str:
++    """Build the instruction sent to the agent when a user clicks 'Use in project'.
++
++    The prompt makes placing and wiring a single step, so an asset is never
++    left sitting in the project unused.
++    """
++    kind = kind or classify_asset(filename) or "file"
++    target_dir = DEFAULT_ASSET_DIR.get(kind, "public/assets")
++    base = os.path.basename(filename)
++    return (
++        f"Add the {kind} asset `{base}` to the project at `{target_dir}/{base}` "
++        f"(use the project's existing asset folder instead if it already has one), "
++        f"then wire it into the code so it is actually used: reference it from the "
++        f"component or page that should display it, and confirm the path resolves. "
++        f"Do not only copy the file."
++    )
++
++
++# ---------------------------------------------------------------------------
++# Request intent
++# ---------------------------------------------------------------------------
++
++_PROBLEM_RE = re.compile(
++    r"\b(error|errors|bug|bugs|broken|not working|doesn'?t work|does not work|"
++    r"fix|fixes|fixed|issue|issues|problem|problems|crash|crashes|crashing|"
++    r"traceback|exception|fails|failing|failed|wrong|undefined|blank)\b",
++    re.IGNORECASE,
++)
++
++_ALL_FILES_RE = re.compile(
++    r"\b(all (the )?files|every file|list (all |the )?files|show (all |the )?files|"
++    r"full (file )?tree|entire (repo|repository|project)|whole (repo|repository|project)|"
++    r"file tree|project structure)\b",
++    re.IGNORECASE,
++)
++
++
++def request_intent(text: str) -> str:
++    """Classify a user message as 'list_all', 'fix', or 'normal'.
++
++    'list_all' wins over 'fix' because an explicit request for the full file
++    list should always be honoured, even if the message also mentions a bug.
++    """
++    if not text:
++        return "normal"
++    if _ALL_FILES_RE.search(text):
++        return "list_all"
++    if _PROBLEM_RE.search(text):
++        return "fix"
++    return "normal"
++
++
++def mentioned_files(text: str, candidates: Iterable[str]) -> List[str]:
++    """Return candidate paths whose basename or path appears in the text.
++
++    Used on problem reports so a stack trace or message that names a file
++    (e.g. 'src/App.jsx:12') pulls that file into the list even if it was
++    not edited this turn.
++    """
++    if not text:
++        return []
++    hits: List[str] = []
++    for path in candidates:
++        base = os.path.basename(path)
++        if path in text or (base and base in text):
++            hits.append(path)
++    return hits
++
++
++def select_files_for_response(
++    intent: str,
++    touched: Dict[str, str],
++    repo_files: Sequence[str],
++    user_text: str = "",
++) -> List[str]:
++    """Decide which files the UI should list for this turn.
++
++    - normal:   only files created or edited this turn.
++    - fix:      only files edited/fixed this turn, plus any file the user's
++                message explicitly names. Never the repo tree.
++    - list_all: everything: the files touched this turn and the full repo
++                listing, de-duplicated and in stable order.
++    """
++    touched_list = list(touched.keys())
++    if intent == "list_all":
++        seen: List[str] = []
++        for path in list(touched_list) + list(repo_files):
++            if path not in seen:
++                seen.append(path)
++        return seen
++    if intent == "fix":
++        extras = [p for p in mentioned_files(user_text, repo_files) if p not in touched_list]
++        return touched_list + extras
++    return touched_list
++
++
++# ---------------------------------------------------------------------------
++# Repo summaries (model context + UI), never the full tree by default
++# ---------------------------------------------------------------------------
++
++def summarize_repo(files: Sequence[str], readme: str = "", readme_chars: int = 1500) -> str:
++    """Return a short, bounded summary of a repo for model context.
++
++    Gives the file count, top-level folders, and a README excerpt. The full
++    file list is deliberately excluded so it is not dumped into the chat or
++    the planning prompt unless the user asks for it.
++    """
++    total = len(files)
++    tops = sorted({p.split("/", 1)[0] for p in files if "/" in p})
++    root_files = sorted(p for p in files if "/" not in p)
++    lines = [f"Repository: {total} files."]
++    if tops:
++        lines.append("Top-level folders: " + ", ".join(tops[:20]) + ("…" if len(tops) > 20 else ""))
++    if root_files:
++        lines.append("Root files: " + ", ".join(root_files[:20]) + ("…" if len(root_files) > 20 else ""))
++    if readme:
++        lines.append("README excerpt:\n" + readme.strip()[:readme_chars])
++    lines.append("(Full file list is available on request.)")
++    return "\n".join(lines)
+diff --git a/frontend/artifacts-panel.js b/frontend/artifacts-panel.js
+new file mode 100644
+index 0000000..8569033
+--- /dev/null
++++ b/frontend/artifacts-panel.js
+@@ -0,0 +1,330 @@
++/*
++ * Code-mode Artifacts panel.
++ *
++ * Adds an "Artifacts" button to the header (Code mode only) that opens a
++ * drawer with two modes:
++ *   - Assets:    images, 3D models, fonts, video, audio, data that the user
++ *                uploaded or the agent produced. "Use in project" sends a
++ *                prompt so the agent places the asset AND wires it into code.
++ *   - All files: every file the session has been given, created, or fixed.
++ *                Chat file cards still show only what changed this turn; the
++ *                complete list lives here and is shown only when opened.
++ *
++ * Hooks called from index.html (all guarded with window.ArtifactsPanel):
++ *   ArtifactsPanel.syncMode(mode)     - show/hide button, close on leaving Code
++ *   ArtifactsPanel.recordTurn(result) - files touched by a Code-mode turn
++ *   ArtifactsPanel.recordUploads(list)- files the user attached this session
++ */
++(function () {
++    'use strict';
++
++    const ASSET_KINDS = {
++        image: ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.avif', '.ico'],
++        model3d: ['.glb', '.gltf', '.obj', '.fbx', '.stl', '.usdz', '.ply'],
++        font: ['.woff', '.woff2', '.ttf', '.otf'],
++        video: ['.mp4', '.webm', '.mov'],
++        audio: ['.mp3', '.wav', '.ogg', '.m4a'],
++        data: ['.csv', '.json', '.geojson', '.xlsx'],
++    };
++    const KIND_LABELS = {
++        image: 'Image', model3d: '3D model', font: 'Font', video: 'Video', audio: 'Audio', data: 'Data',
++    };
++    const DEFAULT_DIR = {
++        image: 'public/assets/images', model3d: 'public/assets/models', font: 'public/assets/fonts',
++        video: 'public/assets/video', audio: 'public/assets/audio', data: 'public/assets/data',
++    };
++    const STATUS_LABELS = { given: 'Given', created: 'Created', fixed: 'Fixed' };
++
++    // path -> { path, status: 'given'|'created'|'fixed', kind: string|null, previewUrl: string|null }
++    const records = new Map();
++    let open = false;
++    let activeTab = 'assets';
++    let btn = null;
++    let drawer = null;
++    let scrim = null;
++
++    function classify(filename) {
++        const dot = (filename || '').lastIndexOf('.');
++        if (dot < 0) return null;
++        const ext = filename.slice(dot).toLowerCase();
++        for (const kind of Object.keys(ASSET_KINDS)) {
++            if (ASSET_KINDS[kind].includes(ext)) return kind;
++        }
++        return null;
++    }
++
++    function basename(path) {
++        const i = path.lastIndexOf('/');
++        return i < 0 ? path : path.slice(i + 1);
++    }
++
++    function upsert(path, patch) {
++        const prev = records.get(path) || { path, status: null, kind: null, previewUrl: null };
++        const next = Object.assign({}, prev, patch);
++        records.set(path, next);
++        return next;
++    }
++
++    function recordTurn(result) {
++        const files = result && result.files ? Object.keys(result.files) : [];
++        for (const path of files) {
++            const prev = records.get(path);
++            // First time the agent touches a file it is "created"; any later
++            // change, including a change to a file the user gave, is "fixed".
++            const status = !prev ? 'created' : 'fixed';
++            upsert(path, { status, kind: classify(path) });
++        }
++        refresh();
++    }
++
++    function recordUploads(list) {
++        for (const rec of list || []) {
++            const path = rec.filename || (rec.file && rec.file.name);
++            if (!path) continue;
++            const prev = records.get(path);
++            upsert(path, {
++                status: prev ? prev.status : 'given',
++                kind: classify(path),
++                previewUrl: rec.localPreview || (prev && prev.previewUrl) || null,
++            });
++        }
++        refresh();
++    }
++
++    function assetRecords() {
++        return [...records.values()].filter(r => r.kind);
++    }
++
++    function buildUsePrompt(rec) {
++        const dir = DEFAULT_DIR[rec.kind] || 'public/assets';
++        const name = basename(rec.path);
++        return (
++            `Add the ${rec.kind} asset \`${name}\` to the project at \`${dir}/${name}\` ` +
++            `(use the project's existing asset folder instead if it already has one), ` +
++            `then wire it into the code so it is actually used: reference it from the ` +
++            `component or page that should display it, and confirm the path resolves. ` +
++            `Do not only copy the file.`
++        );
++    }
++
++    function usePrompt(rec) {
++        const input = document.getElementById('userInput');
++        if (!input || typeof sendMessage !== 'function') return;
++        if (typeof currentMode !== 'undefined' && currentMode !== 'code' && typeof switchMode === 'function') {
++            switchMode('code');
++        }
++        input.value = buildUsePrompt(rec);
++        if (typeof autoResize === 'function') autoResize(input);
++        setOpen(false);
++        sendMessage();
++    }
++
++    function injectStyles() {
++        if (document.getElementById('artifactsPanelStyles')) return;
++        const css = `
++        .artifacts-btn { display:none; align-items:center; gap:7px; background-color:var(--bg-input); color:var(--text-primary);
++            border:1px solid transparent; padding:7px 13px; border-radius:999px; font-size:13px; font-weight:500;
++            cursor:pointer; transition:background .2s ease, border-color .2s ease; }
++        .artifacts-btn.show { display:flex; }
++        .artifacts-btn:hover { border-color:var(--border-color); }
++        .artifacts-btn .artifacts-count { min-width:18px; height:18px; padding:0 5px; border-radius:999px;
++            background:var(--accent); color:#fff; font-size:11px; line-height:18px; text-align:center; }
++        .artifacts-btn .artifacts-count[hidden] { display:none; }
++        .artifacts-scrim { position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:60; }
++        .artifacts-scrim[hidden] { display:none; }
++        .artifacts-drawer { position:fixed; top:0; right:0; bottom:0; width:min(400px,100vw); background:var(--bg-sidebar);
++            border-left:1px solid var(--border-color); z-index:61; display:flex; flex-direction:column;
++            transform:translateX(100%); transition:transform .25s var(--transition-bezier); }
++        .artifacts-drawer.open { transform:translateX(0); }
++        .artifacts-head { display:flex; align-items:center; justify-content:space-between; padding:16px 18px 10px; }
++        .artifacts-title { font:600 15px 'Inter',sans-serif; color:var(--text-primary); }
++        .artifacts-close { background:transparent; border:none; color:var(--text-secondary); cursor:pointer; font-size:20px; line-height:1; padding:4px; }
++        .artifacts-close:hover { color:var(--text-primary); }
++        .artifacts-tabs { display:flex; gap:4px; padding:0 18px 12px; }
++        .artifacts-tab { background:transparent; border:1px solid var(--border-color); color:var(--text-secondary);
++            font:500 12.5px 'Inter',sans-serif; padding:6px 12px; border-radius:999px; cursor:pointer; }
++        .artifacts-tab.active { background:var(--bg-input); color:var(--text-primary); }
++        .artifacts-body { flex:1; overflow-y:auto; padding:4px 18px 24px; display:flex; flex-direction:column; gap:8px; }
++        .artifacts-empty { color:var(--text-secondary); font:13px/1.5 'Inter',sans-serif; padding:24px 4px; }
++        .artifacts-card { display:flex; gap:12px; align-items:center; padding:10px; border:1px solid var(--border-color);
++            border-radius:10px; background:var(--bg-hover); }
++        .artifacts-thumb { width:46px; height:46px; flex:0 0 46px; border-radius:8px; background:var(--bg-main);
++            display:flex; align-items:center; justify-content:center; color:var(--text-secondary); font-size:11px; overflow:hidden; }
++        .artifacts-thumb img { width:100%; height:100%; object-fit:cover; }
++        .artifacts-meta { flex:1; min-width:0; }
++        .artifacts-name { color:var(--text-primary); font:600 13px 'Inter',sans-serif; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
++        .artifacts-sub { color:var(--text-secondary); font:11.5px 'Inter',sans-serif; margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
++        .artifacts-action { flex:0 0 auto; border:1px solid var(--border-color); border-radius:7px; padding:6px 11px;
++            background:var(--bg-main); color:var(--text-primary); font:12px 'Inter',sans-serif; font-weight:500; cursor:pointer; }
++        .artifacts-action:hover { background:var(--bg-input); }
++        .artifacts-badge { font:500 10.5px 'Inter',sans-serif; padding:2px 7px; border-radius:999px; border:1px solid var(--border-color); color:var(--text-secondary); }
++        .artifacts-badge.fixed { color:#aff5b4; border-color:rgba(46,160,67,.5); }
++        .artifacts-badge.created { color:#9ecbff; border-color:rgba(77,163,255,.5); }
++        `;
++        const style = document.createElement('style');
++        style.id = 'artifactsPanelStyles';
++        style.textContent = css;
++        document.head.appendChild(style);
++    }
++
++    function el(tag, cls, text) {
++        const node = document.createElement(tag);
++        if (cls) node.className = cls;
++        if (text !== undefined) node.textContent = text;
++        return node;
++    }
++
++    function renderAssets(body) {
++        const assets = assetRecords();
++        if (!assets.length) {
++            body.appendChild(el('div', 'artifacts-empty',
++                'No assets yet. Upload an image, 3D model, font, or other media in Code mode and it will appear here.'));
++            return;
++        }
++        for (const rec of assets) {
++            const card = el('div', 'artifacts-card');
++            const thumb = el('div', 'artifacts-thumb');
++            if (rec.kind === 'image' && rec.previewUrl) {
++                const img = document.createElement('img');
++                img.src = rec.previewUrl;
++                img.alt = '';
++                thumb.appendChild(img);
++            } else {
++                thumb.textContent = (KIND_LABELS[rec.kind] || 'File').slice(0, 6);
++            }
++            const meta = el('div', 'artifacts-meta');
++            meta.appendChild(el('div', 'artifacts-name', basename(rec.path)));
++            meta.appendChild(el('div', 'artifacts-sub', `${KIND_LABELS[rec.kind]} · ${rec.path}`));
++            const action = el('button', 'artifacts-action', 'Use in project');
++            action.type = 'button';
++            action.addEventListener('click', () => usePrompt(rec));
++            card.append(thumb, meta, action);
++            body.appendChild(card);
++        }
++    }
++
++    function renderAllFiles(body) {
++        const all = [...records.values()];
++        if (!all.length) {
++            body.appendChild(el('div', 'artifacts-empty',
++                'No files yet. Files you give, create, or fix in Code mode will be listed here.'));
++            return;
++        }
++        for (const rec of all) {
++            const card = el('div', 'artifacts-card');
++            const meta = el('div', 'artifacts-meta');
++            meta.appendChild(el('div', 'artifacts-name', basename(rec.path)));
++            meta.appendChild(el('div', 'artifacts-sub', rec.path));
++            const badge = el('span', `artifacts-badge ${rec.status}`, STATUS_LABELS[rec.status] || '');
++            card.append(meta, badge);
++            body.appendChild(card);
++        }
++    }
++
++    function render() {
++        if (!drawer) return;
++        const body = drawer.querySelector('.artifacts-body');
++        body.replaceChildren();
++        drawer.querySelectorAll('.artifacts-tab').forEach(t => {
++            t.classList.toggle('active', t.dataset.tab === activeTab);
++            t.setAttribute('aria-selected', String(t.dataset.tab === activeTab));
++        });
++        if (activeTab === 'assets') renderAssets(body);
++        else renderAllFiles(body);
++    }
++
++    function refresh() {
++        if (btn) {
++            const count = records.size;
++            const badge = btn.querySelector('.artifacts-count');
++            badge.textContent = String(count);
++            badge.hidden = count === 0;
++        }
++        if (open) render();
++    }
++
++    function setOpen(next) {
++        open = !!next;
++        if (drawer) drawer.classList.toggle('open', open);
++        if (scrim) scrim.hidden = !open;
++        if (btn) btn.setAttribute('aria-expanded', String(open));
++        if (open) render();
++    }
++
++    function build() {
++        injectStyles();
++
++        btn = el('button', 'artifacts-btn');
++        btn.type = 'button';
++        btn.setAttribute('aria-label', 'Open artifacts');
++        btn.setAttribute('aria-expanded', 'false');
++        btn.title = 'Artifacts: assets and files';
++        btn.append(el('span', null, 'Artifacts'), el('span', 'artifacts-count'));
++        btn.querySelector('.artifacts-count').hidden = true;
++        btn.addEventListener('click', () => setOpen(!open));
++
++        const headerRight = document.querySelector('.header-right');
++        if (headerRight) headerRight.prepend(btn);
++
++        scrim = el('div', 'artifacts-scrim');
++        scrim.hidden = true;
++        scrim.addEventListener('click', () => setOpen(false));
++
++        drawer = el('aside', 'artifacts-drawer');
++        drawer.setAttribute('role', 'dialog');
++        drawer.setAttribute('aria-label', 'Artifacts');
++
++        const head = el('div', 'artifacts-head');
++        head.append(el('div', 'artifacts-title', 'Artifacts'));
++        const close = el('button', 'artifacts-close', '×');
++        close.type = 'button';
++        close.setAttribute('aria-label', 'Close artifacts');
++        close.addEventListener('click', () => setOpen(false));
++        head.appendChild(close);
++
++        const tabs = el('div', 'artifacts-tabs');
++        tabs.setAttribute('role', 'tablist');
++        for (const [key, label] of [['assets', 'Assets'], ['files', 'All files']]) {
++            const t = el('button', 'artifacts-tab', label);
++            t.type = 'button';
++            t.dataset.tab = key;
++            t.setAttribute('role', 'tab');
++            t.addEventListener('click', () => { activeTab = key; render(); });
++            tabs.appendChild(t);
++        }
++
++        drawer.append(head, tabs, el('div', 'artifacts-body'));
++        document.body.append(scrim, drawer);
++
++        document.addEventListener('keydown', (e) => {
++            if (e.key === 'Escape' && open) setOpen(false);
++        });
++    }
++
++    function syncMode(mode) {
++        if (!btn) return;
++        btn.classList.toggle('show', mode === 'code');
++        if (mode !== 'code' && open) setOpen(false);
++    }
++
++    function init() {
++        build();
++        // Pick up the current mode on load.
++        const mode = typeof currentMode !== 'undefined' ? currentMode : 'chat';
++        syncMode(mode);
++    }
++
++    window.ArtifactsPanel = {
++        init,
++        toggle: () => setOpen(!open),
++        syncMode,
++        recordTurn,
++        recordUploads,
++    };
++
++    if (document.readyState === 'loading') {
++        document.addEventListener('DOMContentLoaded', init);
++    } else {
++        init();
++    }
++})();
+diff --git a/frontend/index.html b/frontend/index.html
+index 9579ea3..3f6704b 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -3022,6 +3022,7 @@
+         function updateWatchLiveVisibility() {
+             if (watchLiveBtn) watchLiveBtn.hidden = currentMode !== 'code';
+             if (currentMode !== 'code' && liveMonitorOpen) toggleLiveMonitor(false);
++            if (window.ArtifactsPanel) ArtifactsPanel.syncMode(currentMode);
+         }
+ 
+         function setLiveMonitorActive(isActive) {
+@@ -5919,6 +5920,8 @@
+             if (!text && !stagedAttachments.length) return;
+ 
+             const mode = currentMode;
++            // Uploads sent from Code mode are "given" files for the Artifacts panel.
++            if (window.ArtifactsPanel && mode === 'code') ArtifactsPanel.recordUploads(stagedAttachments);
+ 
+             // Images-1.2 is prompt-only and runs entirely client-side via
+             // Puter.js — no session/attachments/SSE plumbing needed, so it
+@@ -7006,6 +7009,9 @@
+             }
+ 
+             function renderFileCards(result = {}) {
++                // Feed the Artifacts panel's "All files" tab. Chat file cards
++                // below still show only files changed this turn.
++                if (window.ArtifactsPanel) ArtifactsPanel.recordTurn(result);
+                 if (!fileCardsEl) return;
+                 const hasFiles = result.files && Object.keys(result.files).length > 0;
+                 const statsByFile = new Map(
+@@ -7677,5 +7683,6 @@
+             renderLocalHistory();
+         };
+     </script>
++    <script src="artifacts-panel.js"></script>
+ </body>
+ </html>
+diff --git a/sandbox_manager.py b/sandbox_manager.py
+index c82f283..83a5047 100644
+--- a/sandbox_manager.py
++++ b/sandbox_manager.py
+@@ -384,17 +384,40 @@ async def fetch_github_repo_preview(
+     dest = PLAN_REPO_PREVIEW_DIR
+     q_url = shlex.quote(url)
+     q_dest = shlex.quote(dest)
++    q_listing = shlex.quote(REPO_FILE_LISTING_PATH)
++    # The full file list is written to a side file and NOT printed. The caller
++    # gets only a bounded summary (count, top-level folders, README excerpt);
++    # the complete list is read on demand via list_repo_files().
+     cmd = (
+         f"rm -rf {q_dest} && "
+         f"git clone --depth 1 --quiet {q_url} {q_dest} && "
+-        "echo '--- FILES ---' && "
+-        f"find {q_dest} -maxdepth 3 -not -path '*/.git*' | sed \"s#{dest}/##\" | sort | head -200 && "
++        f"find {q_dest} -not -path '*/.git*' -type f | sed \"s#{dest}/##\" | sort > {q_listing} && "
++        "echo \"--- SUMMARY ---\" && "
++        f"echo \"Repository: $(wc -l < {q_listing}) files.\" && "
++        f"echo \"Top-level folders: $(awk -F/ 'NF>1{{print $1}}' {q_listing} | sort -u | head -20 | paste -sd, -)\" && "
+         "echo '--- README ---' && "
+-        f"(head -c 2000 {q_dest}/README.md 2>/dev/null || head -c 2000 {q_dest}/readme.md 2>/dev/null || echo '(no README found)')"
++        f"(head -c 1500 {q_dest}/README.md 2>/dev/null || head -c 1500 {q_dest}/readme.md 2>/dev/null || echo '(no README found)')"
+     )
+     return await run_command(session_id, cmd, on_output=on_output, cwd="/tmp", timeout=timeout)
+ 
+ 
++REPO_FILE_LISTING_PATH = "/tmp/plan_repo_preview.files.txt"
++_REPO_LIST_MAX_FILES = 2000
++
++
++async def list_repo_files(session_id: str, timeout: float = 30.0) -> Tuple[int, List[str]]:
++    """Return the full file list of the last fetched repo. Only call this when
++    the user has explicitly asked to see all files."""
++    q = shlex.quote(REPO_FILE_LISTING_PATH)
++    exit_code, output = await run_command(
++        session_id, f"head -n {_REPO_LIST_MAX_FILES} {q} 2>/dev/null", cwd="/tmp", timeout=timeout
++    )
++    if exit_code != 0:
++        return exit_code, []
++    files = [line.strip() for line in (output or "").splitlines() if line.strip()]
++    return 0, files
++
++
+ def _strip_archive_suffix(name: str) -> str:
+     low = name.lower()
+     for suf in _ARCHIVE_SUFFIXES:
+diff --git a/test_code_artifacts.py b/test_code_artifacts.py
+new file mode 100644
+index 0000000..2806acc
+--- /dev/null
++++ b/test_code_artifacts.py
+@@ -0,0 +1,74 @@
++"""Tests for code_artifacts. Run: python3 -m pytest test_code_artifacts.py -q
++(or: python3 test_code_artifacts.py)"""
++
++import code_artifacts as ca
++
++
++def test_classify_asset_kinds():
++    assert ca.classify_asset("hero.PNG") == "image"
++    assert ca.classify_asset("models/chair.glb") == "model3d"
++    assert ca.classify_asset("Inter.woff2") == "font"
++    assert ca.classify_asset("intro.mp4") == "video"
++    assert ca.classify_asset("app.jsx") is None
++    assert ca.classify_asset("") is None
++
++
++def test_asset_usage_prompt_requires_wiring():
++    prompt = ca.asset_usage_prompt("chair.glb")
++    assert "model3d" in prompt
++    assert "public/assets/models/chair.glb" in prompt
++    assert "Do not only copy the file" in prompt
++
++
++def test_intent_problem_report_is_fix():
++    assert ca.request_intent("the page is broken, fix it") == "fix"
++    assert ca.request_intent("I get a TypeError traceback") == "fix"
++
++
++def test_intent_all_files_wins_over_fix():
++    assert ca.request_intent("show all files, also there is a bug") == "list_all"
++    assert ca.request_intent("list the files of the repo") == "list_all"
++
++
++def test_intent_normal():
++    assert ca.request_intent("add a dark mode toggle") == "normal"
++    assert ca.request_intent("") == "normal"
++
++
++def test_fix_shows_only_touched_plus_named_files():
++    repo = ["src/App.jsx", "src/Nav.jsx", "README.md"]
++    touched = {"src/App.jsx": "..."}
++    out = ca.select_files_for_response("fix", touched, repo, "error in src/Nav.jsx:12")
++    assert out == ["src/App.jsx", "src/Nav.jsx"]
++    # README must NOT appear: nothing about it was touched or named.
++    assert "README.md" not in out
++
++
++def test_normal_shows_only_touched():
++    repo = ["src/App.jsx", "src/Nav.jsx"]
++    out = ca.select_files_for_response("normal", {"src/Nav.jsx": "x"}, repo, "add a button")
++    assert out == ["src/Nav.jsx"]
++
++
++def test_list_all_returns_everything_once():
++    repo = ["src/App.jsx", "src/Nav.jsx"]
++    out = ca.select_files_for_response("list_all", {"src/App.jsx": "x"}, repo, "show all files")
++    assert out == ["src/App.jsx", "src/Nav.jsx"]
++
++
++def test_repo_summary_excludes_full_tree():
++    files = [f"src/comp{i}.jsx" for i in range(500)] + ["README.md"]
++    summary = ca.summarize_repo(files, readme="# Hello\n" + "x" * 5000)
++    assert "501 files" in summary
++    assert "src/comp499.jsx" not in summary  # no full listing
++    assert "Full file list is available on request." in summary
++    assert len(summary) < 2500
++
++
++if __name__ == "__main__":
++    import sys
++    fns = [v for k, v in dict(globals()).items() if k.startswith("test_")]
++    for fn in fns:
++        fn()
++    print(f"{len(fns)} tests passed")
++    sys.exit(0)
