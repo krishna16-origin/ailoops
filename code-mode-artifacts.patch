@@ -1,9 +1,49 @@
+diff --git a/app.py b/app.py
+index 1d32708..0ae773b 100644
+--- a/app.py
++++ b/app.py
+@@ -39,6 +39,7 @@ from tavily import TavilyClient
+ 
+ from constitution import build_constitution_block
+ import sandbox_manager
++import code_artifacts
+ import mcp_gateway
+ import rag_engine
+ import session_store
+@@ -3167,6 +3168,27 @@ async def upload_file(session_id: str = Form(...), file: UploadFile = File(...))
+     return {key: value for key, value in record.items() if not key.startswith("_")}
+ 
+ 
++@app.post("/project-asset")
++async def project_asset(session_id: str = Form(...), file: UploadFile = File(...)):
++    """Place one asset from the Artifacts panel's Assets tab into the session's
++    sandbox project, under the folder for its kind, so the agent can wire it
++    in. Only this endpoint writes assets into the project: composer '+'
++    uploads go to /upload (RAG context) and never reach the project."""
++    filename = os.path.basename(file.filename or "")
++    kind = code_artifacts.classify_asset(filename)
++    if not filename or kind is None:
++        return JSONResponse({"error": "Not a supported asset type."}, status_code=400)
++    data = await file.read()
++    rel = f"{code_artifacts.DEFAULT_ASSET_DIR[kind]}/{filename}"
++    try:
++        path = await sandbox_manager.write_project_asset(session_id, rel, data)
++    except sandbox_manager.SandboxNotConfigured:
++        return JSONResponse({"error": "Sandbox is not configured."}, status_code=503)
++    except ValueError as exc:
++        return JSONResponse({"error": str(exc)}, status_code=400)
++    return {"path": path, "kind": kind}
++
++
+ @app.get("/session-files/{session_id}")
+ async def list_session_files(session_id: str):
+     session = get_session(session_id)
 diff --git a/code_artifacts.py b/code_artifacts.py
 new file mode 100644
-index 0000000..aed3348
+index 0000000..e0e8904
 --- /dev/null
 +++ b/code_artifacts.py
-@@ -0,0 +1,181 @@
+@@ -0,0 +1,163 @@
 +"""Code-mode artifact helpers.
 +
 +Pure functions only (no I/O, no network), so they are cheap to test and safe
@@ -64,24 +104,6 @@ index 0000000..aed3348
 +
 +def is_asset(filename: str) -> bool:
 +    return classify_asset(filename) is not None
-+
-+
-+def asset_usage_prompt(filename: str, kind: Optional[str] = None) -> str:
-+    """Build the instruction sent to the agent when a user clicks 'Use in project'.
-+
-+    The prompt makes placing and wiring a single step, so an asset is never
-+    left sitting in the project unused.
-+    """
-+    kind = kind or classify_asset(filename) or "file"
-+    target_dir = DEFAULT_ASSET_DIR.get(kind, "public/assets")
-+    base = os.path.basename(filename)
-+    return (
-+        f"Add the {kind} asset `{base}` to the project at `{target_dir}/{base}` "
-+        f"(use the project's existing asset folder instead if it already has one), "
-+        f"then wire it into the code so it is actually used: reference it from the "
-+        f"component or page that should display it, and confirm the path resolves. "
-+        f"Do not only copy the file."
-+    )
 +
 +
 +# ---------------------------------------------------------------------------
@@ -186,386 +208,484 @@ index 0000000..aed3348
 +    lines.append("(Full file list is available on request.)")
 +    return "\n".join(lines)
 diff --git a/frontend/artifacts-panel.js b/frontend/artifacts-panel.js
-new file mode 100644
-index 0000000..d16e869
---- /dev/null
+index d16e869..d0785d9 100644
+--- a/frontend/artifacts-panel.js
 +++ b/frontend/artifacts-panel.js
-@@ -0,0 +1,321 @@
-+/*
-+ * Code-mode Artifacts panel.
+@@ -1,19 +1,22 @@
+ /*
+- * Code-mode Artifacts panel.
++ * Code-mode Artifacts panel (drawer opened by the #artifactsBtn header button).
+  *
+- * Adds an "Artifacts" button to the header (Code mode only) that opens a
+- * drawer with two modes:
+- *   - Assets:    images, 3D models, fonts, video, audio, data that the user
+- *                uploaded or the agent produced. "Use in project" sends a
+- *                prompt so the agent places the asset AND wires it into code.
+- *   - All files: every file the session has been given, created, or fixed.
+- *                Chat file cards still show only what changed this turn; the
+- *                complete list lives here and is shown only when opened.
++ * Two modes:
++ *   - Assets:    media the user DROPS or CHOOSES in this tab's own drop zone
++ *                (images, 3D models, fonts, video, audio, data). "Use in
++ *                project" uploads the file into the sandbox project under its
++ *                kind folder and asks the agent to wire it in.
++ *   - All files: files the session was given, created, or fixed. Images are
++ *                never listed here. Chat file cards still show only files
++ *                changed this turn.
+  *
+- * Hooks called from index.html (all guarded with window.ArtifactsPanel):
+- *   ArtifactsPanel.syncMode(mode)     - show/hide button, close on leaving Code
+- *   ArtifactsPanel.recordTurn(result) - files touched by a Code-mode turn
+- *   ArtifactsPanel.recordUploads(list)- files the user attached this session
++ * Composer '+' uploads are "given" files for All files only. They never
++ * become assets and can never be used in the project.
 + *
-+ * Adds an "Artifacts" button to the header (Code mode only) that opens a
-+ * drawer with two modes:
-+ *   - Assets:    images, 3D models, fonts, video, audio, data that the user
-+ *                uploaded or the agent produced. "Use in project" sends a
-+ *                prompt so the agent places the asset AND wires it into code.
-+ *   - All files: every file the session has been given, created, or fixed.
-+ *                Chat file cards still show only what changed this turn; the
-+ *                complete list lives here and is shown only when opened.
-+ *
-+ * Hooks called from index.html (all guarded with window.ArtifactsPanel):
-+ *   ArtifactsPanel.syncMode(mode)     - show/hide button, close on leaving Code
-+ *   ArtifactsPanel.recordTurn(result) - files touched by a Code-mode turn
-+ *   ArtifactsPanel.recordUploads(list)- files the user attached this session
-+ */
-+(function () {
-+    'use strict';
++ * Hooks from index.html (all guarded by window.ArtifactsPanel):
++ *   syncMode(mode)      show the button only in Code mode
++ *   recordTurn(result)  files touched by a Code-mode turn
++ *   recordUploads(list) composer '+' uploads (non-images only are kept)
+  */
+ (function () {
+     'use strict';
+@@ -26,22 +29,23 @@
+         audio: ['.mp3', '.wav', '.ogg', '.m4a'],
+         data: ['.csv', '.json', '.geojson', '.xlsx'],
+     };
+-    const KIND_LABELS = {
+-        image: 'Image', model3d: '3D model', font: 'Font', video: 'Video', audio: 'Audio', data: 'Data',
+-    };
++    const KIND_LABELS = { image: 'Image', model3d: '3D model', font: 'Font', video: 'Video', audio: 'Audio', data: 'Data' };
+     const DEFAULT_DIR = {
+         image: 'public/assets/images', model3d: 'public/assets/models', font: 'public/assets/fonts',
+         video: 'public/assets/video', audio: 'public/assets/audio', data: 'public/assets/data',
+     };
+     const STATUS_LABELS = { given: 'Given', created: 'Created', fixed: 'Fixed' };
++    const ACCEPT = Object.values(ASSET_KINDS).flat().join(',');
 +
-+    const ASSET_KINDS = {
-+        image: ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.avif', '.ico'],
-+        model3d: ['.glb', '.gltf', '.obj', '.fbx', '.stl', '.usdz', '.ply'],
-+        font: ['.woff', '.woff2', '.ttf', '.otf'],
-+        video: ['.mp4', '.webm', '.mov'],
-+        audio: ['.mp3', '.wav', '.ogg', '.m4a'],
-+        data: ['.csv', '.json', '.geojson', '.xlsx'],
-+    };
-+    const KIND_LABELS = {
-+        image: 'Image', model3d: '3D model', font: 'Font', video: 'Video', audio: 'Audio', data: 'Data',
-+    };
-+    const DEFAULT_DIR = {
-+        image: 'public/assets/images', model3d: 'public/assets/models', font: 'public/assets/fonts',
-+        video: 'public/assets/video', audio: 'public/assets/audio', data: 'public/assets/data',
-+    };
-+    const STATUS_LABELS = { given: 'Given', created: 'Created', fixed: 'Fixed' };
-+
-+    // path -> { path, status: 'given'|'created'|'fixed', kind: string|null, previewUrl: string|null }
-+    const records = new Map();
-+    let open = false;
-+    let activeTab = 'assets';
-+    let btn = null;
-+    let drawer = null;
-+    let scrim = null;
-+
-+    function classify(filename) {
-+        const dot = (filename || '').lastIndexOf('.');
-+        if (dot < 0) return null;
-+        const ext = filename.slice(dot).toLowerCase();
-+        for (const kind of Object.keys(ASSET_KINDS)) {
-+            if (ASSET_KINDS[kind].includes(ext)) return kind;
-+        }
-+        return null;
-+    }
-+
-+    function basename(path) {
-+        const i = path.lastIndexOf('/');
-+        return i < 0 ? path : path.slice(i + 1);
-+    }
-+
-+    function upsert(path, patch) {
-+        const prev = records.get(path) || { path, status: null, kind: null, previewUrl: null };
-+        const next = Object.assign({}, prev, patch);
-+        records.set(path, next);
-+        return next;
-+    }
-+
-+    function recordTurn(result) {
-+        const files = result && result.files ? Object.keys(result.files) : [];
-+        for (const path of files) {
-+            const prev = records.get(path);
-+            // First time the agent touches a file it is "created"; any later
-+            // change, including a change to a file the user gave, is "fixed".
-+            const status = !prev ? 'created' : 'fixed';
-+            upsert(path, { status, kind: classify(path) });
-+        }
-+        refresh();
-+    }
-+
-+    function recordUploads(list) {
-+        for (const rec of list || []) {
-+            const path = rec.filename || (rec.file && rec.file.name);
-+            if (!path) continue;
-+            const prev = records.get(path);
-+            upsert(path, {
-+                status: prev ? prev.status : 'given',
-+                kind: classify(path),
-+                previewUrl: rec.localPreview || (prev && prev.previewUrl) || null,
++    // All-files entries: path -> { path, status, kind }. Images are never stored here.
++    const files = new Map();
++    // Assets: only items added through this tab's drop zone.
++    const assets = [];
++    let nextAssetId = 1;
+ 
+-    // path -> { path, status: 'given'|'created'|'fixed', kind: string|null, previewUrl: string|null }
+-    const records = new Map();
+     let open = false;
+     let activeTab = 'assets';
+-    let btn = null;
+-    let drawer = null;
+-    let scrim = null;
++    let btn = null, countEl = null, drawer = null, scrim = null, notice = '';
+ 
+     function classify(filename) {
+         const dot = (filename || '').lastIndexOf('.');
+@@ -52,27 +56,16 @@
+         }
+         return null;
+     }
++    const basename = (p) => { const i = p.lastIndexOf('/'); return i < 0 ? p : p.slice(i + 1); };
+ 
+-    function basename(path) {
+-        const i = path.lastIndexOf('/');
+-        return i < 0 ? path : path.slice(i + 1);
+-    }
+-
+-    function upsert(path, patch) {
+-        const prev = records.get(path) || { path, status: null, kind: null, previewUrl: null };
+-        const next = Object.assign({}, prev, patch);
+-        records.set(path, next);
+-        return next;
+-    }
++    function isImagePath(p) { return classify(p) === 'image'; }
+ 
+     function recordTurn(result) {
+-        const files = result && result.files ? Object.keys(result.files) : [];
+-        for (const path of files) {
+-            const prev = records.get(path);
+-            // First time the agent touches a file it is "created"; any later
+-            // change, including a change to a file the user gave, is "fixed".
+-            const status = !prev ? 'created' : 'fixed';
+-            upsert(path, { status, kind: classify(path) });
++        const paths = result && result.files ? Object.keys(result.files) : [];
++        for (const path of paths) {
++            if (isImagePath(path)) continue;
++            const prev = files.get(path);
++            files.set(path, { path, status: prev ? 'fixed' : 'created', kind: classify(path) });
+         }
+         refresh();
+     }
+@@ -80,41 +73,62 @@
+     function recordUploads(list) {
+         for (const rec of list || []) {
+             const path = rec.filename || (rec.file && rec.file.name);
+-            if (!path) continue;
+-            const prev = records.get(path);
+-            upsert(path, {
+-                status: prev ? prev.status : 'given',
+-                kind: classify(path),
+-                previewUrl: rec.localPreview || (prev && prev.previewUrl) || null,
+-            });
++            if (!path || isImagePath(path)) continue; // '+' images are not shown anywhere in this panel
++            const prev = files.get(path);
++            files.set(path, { path, status: prev ? prev.status : 'given', kind: classify(path) });
+         }
+         refresh();
+     }
+ 
+-    function assetRecords() {
+-        return [...records.values()].filter(r => r.kind);
++    function addAssetFiles(fileList) {
++        let rejected = 0;
++        for (const file of Array.from(fileList || [])) {
++            const kind = classify(file.name);
++            if (!kind) { rejected++; continue; }
++            assets.push({
++                id: nextAssetId++, name: file.name, kind, file,
++                previewUrl: kind === 'image' ? URL.createObjectURL(file) : null,
 +            });
 +        }
++        notice = rejected ? `${rejected} file(s) skipped: not a supported asset type.` : '';
 +        refresh();
-+    }
-+
-+    function assetRecords() {
-+        return [...records.values()].filter(r => r.kind);
-+    }
-+
-+    function buildUsePrompt(rec) {
-+        const dir = DEFAULT_DIR[rec.kind] || 'public/assets';
-+        const name = basename(rec.path);
-+        return (
-+            `Add the ${rec.kind} asset \`${name}\` to the project at \`${dir}/${name}\` ` +
-+            `(use the project's existing asset folder instead if it already has one), ` +
-+            `then wire it into the code so it is actually used: reference it from the ` +
-+            `component or page that should display it, and confirm the path resolves. ` +
-+            `Do not only copy the file.`
-+        );
-+    }
-+
-+    function usePrompt(rec) {
-+        const input = document.getElementById('userInput');
-+        if (!input || typeof sendMessage !== 'function') return;
-+        if (typeof currentMode !== 'undefined' && currentMode !== 'code' && typeof switchMode === 'function') {
-+            switchMode('code');
-+        }
-+        input.value = buildUsePrompt(rec);
-+        if (typeof autoResize === 'function') autoResize(input);
-+        setOpen(false);
-+        sendMessage();
-+    }
-+
-+    function injectStyles() {
-+        if (document.getElementById('artifactsPanelStyles')) return;
-+        const css = `
-+        .artifacts-btn { align-items:center; gap:7px; background-color:var(--bg-input); color:var(--text-primary);
-+            border:1px solid transparent; padding:7px 13px; border-radius:999px; font-size:13px; font-weight:500;
-+            cursor:pointer; transition:background .2s ease, border-color .2s ease; }
-+        .artifacts-btn[hidden] { display:none; }
-+        .artifacts-btn:not([hidden]) { display:flex; }
-+        .artifacts-btn:hover { border-color:var(--border-color); }
-+        .artifacts-count { min-width:18px; height:18px; padding:0 5px; border-radius:999px;
-+            background:var(--accent); color:#fff; font-size:11px; line-height:18px; text-align:center; }
-+        .artifacts-count[hidden] { display:none; }
-+        .artifacts-scrim { position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:60; }
-+        .artifacts-scrim[hidden] { display:none; }
-+        .artifacts-drawer { position:fixed; top:0; right:0; bottom:0; width:min(400px,100vw); background:var(--bg-sidebar);
-+            border-left:1px solid var(--border-color); z-index:61; display:flex; flex-direction:column;
-+            transform:translateX(100%); transition:transform .25s var(--transition-bezier); }
-+        .artifacts-drawer.open { transform:translateX(0); }
-+        .artifacts-head { display:flex; align-items:center; justify-content:space-between; padding:16px 18px 10px; }
-+        .artifacts-title { font:600 15px 'Inter',sans-serif; color:var(--text-primary); }
-+        .artifacts-close { background:transparent; border:none; color:var(--text-secondary); cursor:pointer; font-size:20px; line-height:1; padding:4px; }
-+        .artifacts-close:hover { color:var(--text-primary); }
-+        .artifacts-tabs { display:flex; gap:4px; padding:0 18px 12px; }
-+        .artifacts-tab { background:transparent; border:1px solid var(--border-color); color:var(--text-secondary);
-+            font:500 12.5px 'Inter',sans-serif; padding:6px 12px; border-radius:999px; cursor:pointer; }
-+        .artifacts-tab.active { background:var(--bg-input); color:var(--text-primary); }
-+        .artifacts-body { flex:1; overflow-y:auto; padding:4px 18px 24px; display:flex; flex-direction:column; gap:8px; }
-+        .artifacts-empty { color:var(--text-secondary); font:13px/1.5 'Inter',sans-serif; padding:24px 4px; }
-+        .artifacts-card { display:flex; gap:12px; align-items:center; padding:10px; border:1px solid var(--border-color);
-+            border-radius:10px; background:var(--bg-hover); }
-+        .artifacts-thumb { width:46px; height:46px; flex:0 0 46px; border-radius:8px; background:var(--bg-main);
-+            display:flex; align-items:center; justify-content:center; color:var(--text-secondary); font-size:11px; overflow:hidden; }
-+        .artifacts-thumb img { width:100%; height:100%; object-fit:cover; }
-+        .artifacts-meta { flex:1; min-width:0; }
-+        .artifacts-name { color:var(--text-primary); font:600 13px 'Inter',sans-serif; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-+        .artifacts-sub { color:var(--text-secondary); font:11.5px 'Inter',sans-serif; margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-+        .artifacts-action { flex:0 0 auto; border:1px solid var(--border-color); border-radius:7px; padding:6px 11px;
-+            background:var(--bg-main); color:var(--text-primary); font:12px 'Inter',sans-serif; font-weight:500; cursor:pointer; }
-+        .artifacts-action:hover { background:var(--bg-input); }
-+        .artifacts-badge { font:500 10.5px 'Inter',sans-serif; padding:2px 7px; border-radius:999px; border:1px solid var(--border-color); color:var(--text-secondary); }
-+        .artifacts-badge.fixed { color:#aff5b4; border-color:rgba(46,160,67,.5); }
-+        .artifacts-badge.created { color:#9ecbff; border-color:rgba(77,163,255,.5); }
-+        `;
-+        const style = document.createElement('style');
-+        style.id = 'artifactsPanelStyles';
-+        style.textContent = css;
-+        document.head.appendChild(style);
-+    }
-+
-+    function el(tag, cls, text) {
-+        const node = document.createElement(tag);
-+        if (cls) node.className = cls;
-+        if (text !== undefined) node.textContent = text;
-+        return node;
-+    }
-+
-+    function renderAssets(body) {
-+        const assets = assetRecords();
-+        if (!assets.length) {
-+            body.appendChild(el('div', 'artifacts-empty',
-+                'No assets yet. Upload an image, 3D model, font, or other media in Code mode and it will appear here.'));
+     }
+ 
+-    function buildUsePrompt(rec) {
+-        const dir = DEFAULT_DIR[rec.kind] || 'public/assets';
+-        const name = basename(rec.path);
+-        return (
+-            `Add the ${rec.kind} asset \`${name}\` to the project at \`${dir}/${name}\` ` +
+-            `(use the project's existing asset folder instead if it already has one), ` +
+-            `then wire it into the code so it is actually used: reference it from the ` +
+-            `component or page that should display it, and confirm the path resolves. ` +
+-            `Do not only copy the file.`
+-        );
++    function sessionIdForCode() {
++        return (typeof modes !== 'undefined' && modes.code && modes.code.sessionId) || null;
+     }
+ 
+-    function usePrompt(rec) {
++    async function useInProject(asset) {
++        const sessionId = sessionIdForCode();
++        if (!sessionId) {
++            notice = 'Send one message in Code mode first so the project exists, then try again.';
++            render();
 +            return;
 +        }
-+        for (const rec of assets) {
-+            const card = el('div', 'artifacts-card');
-+            const thumb = el('div', 'artifacts-thumb');
-+            if (rec.kind === 'image' && rec.previewUrl) {
-+                const img = document.createElement('img');
-+                img.src = rec.previewUrl;
-+                img.alt = '';
-+                thumb.appendChild(img);
-+            } else {
-+                thumb.textContent = (KIND_LABELS[rec.kind] || 'File').slice(0, 6);
-+            }
-+            const meta = el('div', 'artifacts-meta');
-+            meta.appendChild(el('div', 'artifacts-name', basename(rec.path)));
-+            meta.appendChild(el('div', 'artifacts-sub', `${KIND_LABELS[rec.kind]} · ${rec.path}`));
-+            const action = el('button', 'artifacts-action', 'Use in project');
-+            action.type = 'button';
-+            action.addEventListener('click', () => usePrompt(rec));
-+            card.append(thumb, meta, action);
-+            body.appendChild(card);
-+        }
-+    }
-+
-+    function renderAllFiles(body) {
-+        const all = [...records.values()];
-+        if (!all.length) {
-+            body.appendChild(el('div', 'artifacts-empty',
-+                'No files yet. Files you give, create, or fix in Code mode will be listed here.'));
++        notice = `Uploading ${asset.name} to the project…`;
++        render();
++        const form = new FormData();
++        form.append('session_id', sessionId);
++        form.append('file', asset.file, asset.name);
++        let data;
++        try {
++            const res = await fetch(`${typeof API_BASE !== 'undefined' ? API_BASE : ''}/project-asset`, { method: 'POST', body: form });
++            data = await res.json();
++            if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
++        } catch (err) {
++            notice = `Could not add ${asset.name} to the project: ${err.message}`;
++            render();
 +            return;
 +        }
-+        for (const rec of all) {
-+            const card = el('div', 'artifacts-card');
-+            const meta = el('div', 'artifacts-meta');
-+            meta.appendChild(el('div', 'artifacts-name', basename(rec.path)));
-+            meta.appendChild(el('div', 'artifacts-sub', rec.path));
-+            const badge = el('span', `artifacts-badge ${rec.status}`, STATUS_LABELS[rec.status] || '');
-+            card.append(meta, badge);
-+            body.appendChild(card);
-+        }
-+    }
+         const input = document.getElementById('userInput');
+         if (!input || typeof sendMessage !== 'function') return;
+-        if (typeof currentMode !== 'undefined' && currentMode !== 'code' && typeof switchMode === 'function') {
+-            switchMode('code');
+-        }
+-        input.value = buildUsePrompt(rec);
++        if (typeof currentMode !== 'undefined' && currentMode !== 'code' && typeof switchMode === 'function') switchMode('code');
++        input.value =
++            `The ${asset.kind} asset is now in the project at \`${data.path}\`. ` +
++            `Wire it into the code so it is actually used: reference it from the component or page that should display it, ` +
++            `and confirm the path resolves. Do not only mention the file.`;
+         if (typeof autoResize === 'function') autoResize(input);
++        notice = '';
+         setOpen(false);
+         sendMessage();
+     }
+@@ -122,46 +136,42 @@
+     function injectStyles() {
+         if (document.getElementById('artifactsPanelStyles')) return;
+         const css = `
+-        .artifacts-btn { align-items:center; gap:7px; background-color:var(--bg-input); color:var(--text-primary);
+-            border:1px solid transparent; padding:7px 13px; border-radius:999px; font-size:13px; font-weight:500;
+-            cursor:pointer; transition:background .2s ease, border-color .2s ease; }
+         .artifacts-btn[hidden] { display:none; }
+-        .artifacts-btn:not([hidden]) { display:flex; }
++        .artifacts-btn:not([hidden]) { display:flex; align-items:center; gap:7px; background-color:var(--bg-input); color:var(--text-primary);
++            border:1px solid transparent; padding:7px 13px; border-radius:999px; font-size:13px; font-weight:500; cursor:pointer; }
+         .artifacts-btn:hover { border-color:var(--border-color); }
+-        .artifacts-count { min-width:18px; height:18px; padding:0 5px; border-radius:999px;
+-            background:var(--accent); color:#fff; font-size:11px; line-height:18px; text-align:center; }
++        .artifacts-count { min-width:18px; height:18px; padding:0 5px; border-radius:999px; background:var(--accent); color:#fff; font-size:11px; line-height:18px; text-align:center; }
+         .artifacts-count[hidden] { display:none; }
+         .artifacts-scrim { position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:60; }
+         .artifacts-scrim[hidden] { display:none; }
+         .artifacts-drawer { position:fixed; top:0; right:0; bottom:0; width:min(400px,100vw); background:var(--bg-sidebar);
+-            border-left:1px solid var(--border-color); z-index:61; display:flex; flex-direction:column;
+-            transform:translateX(100%); transition:transform .25s var(--transition-bezier); }
++            border-left:1px solid var(--border-color); z-index:61; display:flex; flex-direction:column; transform:translateX(100%); transition:transform .25s var(--transition-bezier); }
+         .artifacts-drawer.open { transform:translateX(0); }
+         .artifacts-head { display:flex; align-items:center; justify-content:space-between; padding:16px 18px 10px; }
+         .artifacts-title { font:600 15px 'Inter',sans-serif; color:var(--text-primary); }
+         .artifacts-close { background:transparent; border:none; color:var(--text-secondary); cursor:pointer; font-size:20px; line-height:1; padding:4px; }
+         .artifacts-close:hover { color:var(--text-primary); }
+         .artifacts-tabs { display:flex; gap:4px; padding:0 18px 12px; }
+-        .artifacts-tab { background:transparent; border:1px solid var(--border-color); color:var(--text-secondary);
+-            font:500 12.5px 'Inter',sans-serif; padding:6px 12px; border-radius:999px; cursor:pointer; }
++        .artifacts-tab { background:transparent; border:1px solid var(--border-color); color:var(--text-secondary); font:500 12.5px 'Inter',sans-serif; padding:6px 12px; border-radius:999px; cursor:pointer; }
+         .artifacts-tab.active { background:var(--bg-input); color:var(--text-primary); }
+         .artifacts-body { flex:1; overflow-y:auto; padding:4px 18px 24px; display:flex; flex-direction:column; gap:8px; }
+-        .artifacts-empty { color:var(--text-secondary); font:13px/1.5 'Inter',sans-serif; padding:24px 4px; }
+-        .artifacts-card { display:flex; gap:12px; align-items:center; padding:10px; border:1px solid var(--border-color);
+-            border-radius:10px; background:var(--bg-hover); }
+-        .artifacts-thumb { width:46px; height:46px; flex:0 0 46px; border-radius:8px; background:var(--bg-main);
+-            display:flex; align-items:center; justify-content:center; color:var(--text-secondary); font-size:11px; overflow:hidden; }
++        .artifacts-drop { border:1px dashed var(--border-color); border-radius:12px; padding:22px 14px; text-align:center; color:var(--text-secondary);
++            font:13px/1.5 'Inter',sans-serif; cursor:pointer; background:var(--bg-hover); }
++        .artifacts-drop.dragover { border-color:var(--accent); color:var(--text-primary); }
++        .artifacts-drop strong { color:var(--text-primary); font-weight:600; }
++        .artifacts-notice { color:var(--text-secondary); font:12px/1.4 'Inter',sans-serif; }
++        .artifacts-empty { color:var(--text-secondary); font:13px/1.5 'Inter',sans-serif; padding:12px 4px; }
++        .artifacts-card { display:flex; gap:12px; align-items:center; padding:10px; border:1px solid var(--border-color); border-radius:10px; background:var(--bg-hover); }
++        .artifacts-thumb { width:46px; height:46px; flex:0 0 46px; border-radius:8px; background:var(--bg-main); display:flex; align-items:center; justify-content:center; color:var(--text-secondary); font-size:11px; overflow:hidden; }
+         .artifacts-thumb img { width:100%; height:100%; object-fit:cover; }
+         .artifacts-meta { flex:1; min-width:0; }
+         .artifacts-name { color:var(--text-primary); font:600 13px 'Inter',sans-serif; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+         .artifacts-sub { color:var(--text-secondary); font:11.5px 'Inter',sans-serif; margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+-        .artifacts-action { flex:0 0 auto; border:1px solid var(--border-color); border-radius:7px; padding:6px 11px;
+-            background:var(--bg-main); color:var(--text-primary); font:12px 'Inter',sans-serif; font-weight:500; cursor:pointer; }
++        .artifacts-action { flex:0 0 auto; border:1px solid var(--border-color); border-radius:7px; padding:6px 11px; background:var(--bg-main); color:var(--text-primary); font:12px 'Inter',sans-serif; font-weight:500; cursor:pointer; }
+         .artifacts-action:hover { background:var(--bg-input); }
+         .artifacts-badge { font:500 10.5px 'Inter',sans-serif; padding:2px 7px; border-radius:999px; border:1px solid var(--border-color); color:var(--text-secondary); }
+         .artifacts-badge.fixed { color:#aff5b4; border-color:rgba(46,160,67,.5); }
+-        .artifacts-badge.created { color:#9ecbff; border-color:rgba(77,163,255,.5); }
+-        `;
++        .artifacts-badge.created { color:#9ecbff; border-color:rgba(77,163,255,.5); }`;
+         const style = document.createElement('style');
+         style.id = 'artifactsPanelStyles';
+         style.textContent = css;
+@@ -169,55 +179,69 @@
+     }
+ 
+     function el(tag, cls, text) {
+-        const node = document.createElement(tag);
+-        if (cls) node.className = cls;
+-        if (text !== undefined) node.textContent = text;
+-        return node;
++        const n = document.createElement(tag);
++        if (cls) n.className = cls;
++        if (text !== undefined) n.textContent = text;
++        return n;
+     }
+ 
+-    function renderAssets(body) {
+-        const assets = assetRecords();
++    function renderAssetsTab(body) {
++        const input = el('input');
++        input.type = 'file';
++        input.multiple = true;
++        input.accept = ACCEPT;
++        input.hidden = true;
++        input.addEventListener('change', () => { addAssetFiles(input.files); input.value = ''; });
 +
-+    function render() {
-+        if (!drawer) return;
-+        const body = drawer.querySelector('.artifacts-body');
-+        body.replaceChildren();
-+        drawer.querySelectorAll('.artifacts-tab').forEach(t => {
-+            t.classList.toggle('active', t.dataset.tab === activeTab);
-+            t.setAttribute('aria-selected', String(t.dataset.tab === activeTab));
-+        });
-+        if (activeTab === 'assets') renderAssets(body);
-+        else renderAllFiles(body);
-+    }
++        const drop = el('div', 'artifacts-drop');
++        drop.setAttribute('role', 'button');
++        drop.tabIndex = 0;
++        drop.append(el('strong', null, 'Drop media here'), document.createTextNode(' or click to choose. Images, 3D models, fonts, video, audio, data.'));
++        drop.addEventListener('click', () => input.click());
++        drop.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); } });
++        drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('dragover'); });
++        drop.addEventListener('dragleave', () => drop.classList.remove('dragover'));
++        drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('dragover'); addAssetFiles(e.dataTransfer.files); });
++        body.append(drop, input);
 +
-+    function refresh() {
-+        if (btn) {
-+            const count = records.size;
-+            const badge = document.getElementById('artifactsCount');
-+            if (badge) { badge.textContent = String(count); badge.hidden = count === 0; }
-+        }
-+        if (open) render();
-+    }
++        if (notice) body.appendChild(el('div', 'artifacts-notice', notice));
 +
-+    function setOpen(next) {
-+        open = !!next;
-+        if (drawer) drawer.classList.toggle('open', open);
-+        if (scrim) scrim.hidden = !open;
-+        if (btn) btn.setAttribute('aria-expanded', String(open));
-+        if (open) render();
-+    }
-+
-+    function build() {
-+        injectStyles();
-+
-+        btn = document.getElementById('artifactsBtn');
-+        if (btn) btn.addEventListener('click', () => setOpen(!open));
-+
-+        scrim = el('div', 'artifacts-scrim');
-+        scrim.hidden = true;
-+        scrim.addEventListener('click', () => setOpen(false));
-+
-+        drawer = el('aside', 'artifacts-drawer');
-+        drawer.setAttribute('role', 'dialog');
-+        drawer.setAttribute('aria-label', 'Artifacts');
-+
-+        const head = el('div', 'artifacts-head');
-+        head.append(el('div', 'artifacts-title', 'Artifacts'));
-+        const close = el('button', 'artifacts-close', '×');
-+        close.type = 'button';
-+        close.setAttribute('aria-label', 'Close artifacts');
-+        close.addEventListener('click', () => setOpen(false));
-+        head.appendChild(close);
-+
-+        const tabs = el('div', 'artifacts-tabs');
-+        tabs.setAttribute('role', 'tablist');
-+        for (const [key, label] of [['assets', 'Assets'], ['files', 'All files']]) {
-+            const t = el('button', 'artifacts-tab', label);
-+            t.type = 'button';
-+            t.dataset.tab = key;
-+            t.setAttribute('role', 'tab');
-+            t.addEventListener('click', () => { activeTab = key; render(); });
-+            tabs.appendChild(t);
-+        }
-+
-+        drawer.append(head, tabs, el('div', 'artifacts-body'));
-+        document.body.append(scrim, drawer);
-+
-+        document.addEventListener('keydown', (e) => {
-+            if (e.key === 'Escape' && open) setOpen(false);
-+        });
-+    }
-+
-+    function syncMode(mode) {
-+        if (!btn) return;
-+        btn.hidden = mode !== 'code';
-+        if (mode !== 'code' && open) setOpen(false);
-+    }
-+
-+    function init() {
-+        build();
-+        // Pick up the current mode on load.
-+        const mode = typeof currentMode !== 'undefined' ? currentMode : 'chat';
-+        syncMode(mode);
-+    }
-+
-+    window.ArtifactsPanel = {
-+        init,
-+        toggle: () => setOpen(!open),
-+        syncMode,
-+        recordTurn,
-+        recordUploads,
-+    };
-+
-+    if (document.readyState === 'loading') {
-+        document.addEventListener('DOMContentLoaded', init);
-+    } else {
-+        init();
-+    }
-+})();
-diff --git a/frontend/index.html b/frontend/index.html
-index 9579ea3..0ae5fa9 100644
---- a/frontend/index.html
-+++ b/frontend/index.html
-@@ -1668,6 +1668,10 @@
-                 </button>
-             </div>
-             <div class="header-right">
-+                <button type="button" class="artifacts-btn" id="artifactsBtn" hidden aria-label="Open artifacts" aria-expanded="false" title="Artifacts: assets and files">
-+                    <span>Artifacts</span>
-+                    <span class="artifacts-count" id="artifactsCount" hidden>0</span>
-+                </button>
-                 <button type="button" class="watch-live-btn" id="watchLiveBtn" hidden onclick="toggleLiveMonitor()" title="Watch the agent's live backend actions">
-                     <span class="live-dot-indicator" id="watchLiveBtnDot"></span>
-                     <span class="watch-live-label">Watch live</span>
-@@ -3022,6 +3026,7 @@
-         function updateWatchLiveVisibility() {
-             if (watchLiveBtn) watchLiveBtn.hidden = currentMode !== 'code';
-             if (currentMode !== 'code' && liveMonitorOpen) toggleLiveMonitor(false);
-+            if (window.ArtifactsPanel) ArtifactsPanel.syncMode(currentMode);
+         if (!assets.length) {
+-            body.appendChild(el('div', 'artifacts-empty',
+-                'No assets yet. Upload an image, 3D model, font, or other media in Code mode and it will appear here.'));
++            body.appendChild(el('div', 'artifacts-empty', 'No assets yet. Assets appear here only when you drop or choose them above.'));
+             return;
+         }
+-        for (const rec of assets) {
++        for (const a of assets) {
+             const card = el('div', 'artifacts-card');
+             const thumb = el('div', 'artifacts-thumb');
+-            if (rec.kind === 'image' && rec.previewUrl) {
++            if (a.previewUrl) {
+                 const img = document.createElement('img');
+-                img.src = rec.previewUrl;
++                img.src = a.previewUrl;
+                 img.alt = '';
+                 thumb.appendChild(img);
+             } else {
+-                thumb.textContent = (KIND_LABELS[rec.kind] || 'File').slice(0, 6);
++                thumb.textContent = (KIND_LABELS[a.kind] || 'File').slice(0, 6);
+             }
+             const meta = el('div', 'artifacts-meta');
+-            meta.appendChild(el('div', 'artifacts-name', basename(rec.path)));
+-            meta.appendChild(el('div', 'artifacts-sub', `${KIND_LABELS[rec.kind]} · ${rec.path}`));
++            meta.append(el('div', 'artifacts-name', a.name), el('div', 'artifacts-sub', `${KIND_LABELS[a.kind]} · ${DEFAULT_DIR[a.kind]}/${a.name}`));
+             const action = el('button', 'artifacts-action', 'Use in project');
+             action.type = 'button';
+-            action.addEventListener('click', () => usePrompt(rec));
++            action.addEventListener('click', () => useInProject(a));
+             card.append(thumb, meta, action);
+             body.appendChild(card);
+         }
+     }
+ 
+-    function renderAllFiles(body) {
+-        const all = [...records.values()];
++    function renderFilesTab(body) {
++        const all = [...files.values()];
+         if (!all.length) {
+-            body.appendChild(el('div', 'artifacts-empty',
+-                'No files yet. Files you give, create, or fix in Code mode will be listed here.'));
++            body.appendChild(el('div', 'artifacts-empty', 'No files yet. Files you give, create, or fix in Code mode appear here. Images are not listed.'));
+             return;
+         }
+         for (const rec of all) {
+             const card = el('div', 'artifacts-card');
+             const meta = el('div', 'artifacts-meta');
+-            meta.appendChild(el('div', 'artifacts-name', basename(rec.path)));
+-            meta.appendChild(el('div', 'artifacts-sub', rec.path));
+-            const badge = el('span', `artifacts-badge ${rec.status}`, STATUS_LABELS[rec.status] || '');
+-            card.append(meta, badge);
++            meta.append(el('div', 'artifacts-name', basename(rec.path)), el('div', 'artifacts-sub', rec.path));
++            card.append(meta, el('span', `artifacts-badge ${rec.status}`, STATUS_LABELS[rec.status] || ''));
+             body.appendChild(card);
+         }
+     }
+@@ -227,18 +251,19 @@
+         const body = drawer.querySelector('.artifacts-body');
+         body.replaceChildren();
+         drawer.querySelectorAll('.artifacts-tab').forEach(t => {
+-            t.classList.toggle('active', t.dataset.tab === activeTab);
+-            t.setAttribute('aria-selected', String(t.dataset.tab === activeTab));
++            const on = t.dataset.tab === activeTab;
++            t.classList.toggle('active', on);
++            t.setAttribute('aria-selected', String(on));
+         });
+-        if (activeTab === 'assets') renderAssets(body);
+-        else renderAllFiles(body);
++        if (activeTab === 'assets') renderAssetsTab(body);
++        else renderFilesTab(body);
+     }
+ 
+     function refresh() {
+-        if (btn) {
+-            const count = records.size;
+-            const badge = document.getElementById('artifactsCount');
+-            if (badge) { badge.textContent = String(count); badge.hidden = count === 0; }
++        if (countEl) {
++            const count = files.size + assets.length;
++            countEl.textContent = String(count);
++            countEl.hidden = count === 0;
+         }
+         if (open) render();
+     }
+@@ -253,8 +278,8 @@
+ 
+     function build() {
+         injectStyles();
+-
+         btn = document.getElementById('artifactsBtn');
++        countEl = document.getElementById('artifactsCount');
+         if (btn) btn.addEventListener('click', () => setOpen(!open));
+ 
+         scrim = el('div', 'artifacts-scrim');
+@@ -280,16 +305,14 @@
+             t.type = 'button';
+             t.dataset.tab = key;
+             t.setAttribute('role', 'tab');
+-            t.addEventListener('click', () => { activeTab = key; render(); });
++            t.addEventListener('click', () => { activeTab = key; notice = ''; render(); });
+             tabs.appendChild(t);
          }
  
-         function setLiveMonitorActive(isActive) {
-@@ -5919,6 +5924,8 @@
-             if (!text && !stagedAttachments.length) return;
+         drawer.append(head, tabs, el('div', 'artifacts-body'));
+         document.body.append(scrim, drawer);
  
-             const mode = currentMode;
-+            // Uploads sent from Code mode are "given" files for the Artifacts panel.
-+            if (window.ArtifactsPanel && mode === 'code') ArtifactsPanel.recordUploads(stagedAttachments);
+-        document.addEventListener('keydown', (e) => {
+-            if (e.key === 'Escape' && open) setOpen(false);
+-        });
++        document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && open) setOpen(false); });
+     }
  
-             // Images-1.2 is prompt-only and runs entirely client-side via
-             // Puter.js — no session/attachments/SSE plumbing needed, so it
-@@ -7006,6 +7013,9 @@
-             }
+     function syncMode(mode) {
+@@ -300,22 +323,12 @@
  
-             function renderFileCards(result = {}) {
-+                // Feed the Artifacts panel's "All files" tab. Chat file cards
-+                // below still show only files changed this turn.
-+                if (window.ArtifactsPanel) ArtifactsPanel.recordTurn(result);
-                 if (!fileCardsEl) return;
-                 const hasFiles = result.files && Object.keys(result.files).length > 0;
-                 const statsByFile = new Map(
-@@ -7677,5 +7687,6 @@
-             renderLocalHistory();
-         };
-     </script>
-+    <script src="artifacts-panel.js"></script>
- </body>
- </html>
+     function init() {
+         build();
+-        // Pick up the current mode on load.
+-        const mode = typeof currentMode !== 'undefined' ? currentMode : 'chat';
+-        syncMode(mode);
++        syncMode(typeof currentMode !== 'undefined' ? currentMode : 'chat');
++        refresh();
+     }
+ 
+-    window.ArtifactsPanel = {
+-        init,
+-        toggle: () => setOpen(!open),
+-        syncMode,
+-        recordTurn,
+-        recordUploads,
+-    };
++    window.ArtifactsPanel = { init, toggle: () => setOpen(!open), syncMode, recordTurn, recordUploads };
+ 
+-    if (document.readyState === 'loading') {
+-        document.addEventListener('DOMContentLoaded', init);
+-    } else {
+-        init();
+-    }
++    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
++    else init();
+ })();
 diff --git a/sandbox_manager.py b/sandbox_manager.py
-index c82f283..83a5047 100644
+index c82f283..a0943e7 100644
 --- a/sandbox_manager.py
 +++ b/sandbox_manager.py
-@@ -384,17 +384,40 @@ async def fetch_github_repo_preview(
+@@ -196,6 +196,39 @@ async def snapshot_project_files(session_id: str) -> Dict[str, str]:
+     return files
+ 
+ 
++ASSET_MAX_BYTES = 25 * 1024 * 1024
++
++
++def _safe_project_rel(rel_path: str) -> str:
++    """Normalize a project-relative path and reject anything that escapes the
++    project dir (absolute paths, '..' segments, empty names)."""
++    rel = (rel_path or "").strip().replace("\\", "/")
++    if not rel or rel.startswith("/") or any(seg in ("", "..", ".") for seg in rel.split("/")):
++        raise ValueError(f"invalid project path: {rel_path!r}")
++    return rel
++
++
++async def write_project_asset(session_id: str, rel_path: str, data: bytes) -> str:
++    """Write one binary asset (image, model, font, ...) into the sandbox
++    project dir. Returns the path inside the project.
++
++    Assets are deliberately NOT recorded in state.file_hashes: sync_files
++    treats any tracked path missing from the text file store as deleted, so
++    tracking a binary here would make the next sync remove it.
++    """
++    if len(data) > ASSET_MAX_BYTES:
++        raise ValueError("asset is larger than 25 MB")
++    safe = _safe_project_rel(rel_path)
++    state = await ensure_session(session_id)
++    async with state.lock:
++        dest = f"{PROJECT_DIR}/{safe}"
++        await state.sandbox.commands.run(
++            f'mkdir -p "$(dirname {shlex.quote(dest)})"', timeout=20
++        )
++        await state.sandbox.files.write(dest, data)
++    return safe
++
++
+ async def sync_files(session_id: str, file_store: Dict[str, str]) -> List[str]:
+     """Write only new/changed files into the sandbox project dir and remove
+     ones no longer in file_store. Returns the list of paths actually written."""
+@@ -384,17 +417,40 @@ async def fetch_github_repo_preview(
      dest = PLAN_REPO_PREVIEW_DIR
      q_url = shlex.quote(url)
      q_dest = shlex.quote(dest)
@@ -611,10 +731,10 @@ index c82f283..83a5047 100644
      for suf in _ARCHIVE_SUFFIXES:
 diff --git a/test_code_artifacts.py b/test_code_artifacts.py
 new file mode 100644
-index 0000000..2806acc
+index 0000000..879d320
 --- /dev/null
 +++ b/test_code_artifacts.py
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,67 @@
 +"""Tests for code_artifacts. Run: python3 -m pytest test_code_artifacts.py -q
 +(or: python3 test_code_artifacts.py)"""
 +
@@ -628,13 +748,6 @@ index 0000000..2806acc
 +    assert ca.classify_asset("intro.mp4") == "video"
 +    assert ca.classify_asset("app.jsx") is None
 +    assert ca.classify_asset("") is None
-+
-+
-+def test_asset_usage_prompt_requires_wiring():
-+    prompt = ca.asset_usage_prompt("chair.glb")
-+    assert "model3d" in prompt
-+    assert "public/assets/models/chair.glb" in prompt
-+    assert "Do not only copy the file" in prompt
 +
 +
 +def test_intent_problem_report_is_fix():
