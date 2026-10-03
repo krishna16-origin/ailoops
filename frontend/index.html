@@ -1668,6 +1668,10 @@
                 </button>
             </div>
             <div class="header-right">
+                <button type="button" class="artifacts-btn" id="artifactsBtn" hidden aria-label="Open artifacts" aria-expanded="false" title="Artifacts: assets and files">
+                    <span>Artifacts</span>
+                    <span class="artifacts-count" id="artifactsCount" hidden>0</span>
+                </button>
                 <button type="button" class="watch-live-btn" id="watchLiveBtn" hidden onclick="toggleLiveMonitor()" title="Watch the agent's live backend actions">
                     <span class="live-dot-indicator" id="watchLiveBtnDot"></span>
                     <span class="watch-live-label">Watch live</span>
@@ -3022,6 +3026,7 @@
         function updateWatchLiveVisibility() {
             if (watchLiveBtn) watchLiveBtn.hidden = currentMode !== 'code';
             if (currentMode !== 'code' && liveMonitorOpen) toggleLiveMonitor(false);
+            if (window.ArtifactsPanel) ArtifactsPanel.syncMode(currentMode);
         }
 
         function setLiveMonitorActive(isActive) {
@@ -5919,6 +5924,8 @@
             if (!text && !stagedAttachments.length) return;
 
             const mode = currentMode;
+            // Uploads sent from Code mode are "given" files for the Artifacts panel.
+            if (window.ArtifactsPanel && mode === 'code') ArtifactsPanel.recordUploads(stagedAttachments);
 
             // Images-1.2 is prompt-only and runs entirely client-side via
             // Puter.js — no session/attachments/SSE plumbing needed, so it
@@ -7006,6 +7013,9 @@
             }
 
             function renderFileCards(result = {}) {
+                // Feed the Artifacts panel's "All files" tab. Chat file cards
+                // below still show only files changed this turn.
+                if (window.ArtifactsPanel) ArtifactsPanel.recordTurn(result);
                 if (!fileCardsEl) return;
                 const hasFiles = result.files && Object.keys(result.files).length > 0;
                 const statsByFile = new Map(
@@ -7677,5 +7687,6 @@
             renderLocalHistory();
         };
     </script>
+    <script src="artifacts-panel.js"></script>
 </body>
 </html>
