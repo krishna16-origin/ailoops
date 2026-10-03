@@ -187,10 +187,10 @@ index 0000000..aed3348
 +    return "\n".join(lines)
 diff --git a/frontend/artifacts-panel.js b/frontend/artifacts-panel.js
 new file mode 100644
-index 0000000..8569033
+index 0000000..d16e869
 --- /dev/null
 +++ b/frontend/artifacts-panel.js
-@@ -0,0 +1,330 @@
+@@ -0,0 +1,321 @@
 +/*
 + * Code-mode Artifacts panel.
 + *
@@ -315,14 +315,15 @@ index 0000000..8569033
 +    function injectStyles() {
 +        if (document.getElementById('artifactsPanelStyles')) return;
 +        const css = `
-+        .artifacts-btn { display:none; align-items:center; gap:7px; background-color:var(--bg-input); color:var(--text-primary);
++        .artifacts-btn { align-items:center; gap:7px; background-color:var(--bg-input); color:var(--text-primary);
 +            border:1px solid transparent; padding:7px 13px; border-radius:999px; font-size:13px; font-weight:500;
 +            cursor:pointer; transition:background .2s ease, border-color .2s ease; }
-+        .artifacts-btn.show { display:flex; }
++        .artifacts-btn[hidden] { display:none; }
++        .artifacts-btn:not([hidden]) { display:flex; }
 +        .artifacts-btn:hover { border-color:var(--border-color); }
-+        .artifacts-btn .artifacts-count { min-width:18px; height:18px; padding:0 5px; border-radius:999px;
++        .artifacts-count { min-width:18px; height:18px; padding:0 5px; border-radius:999px;
 +            background:var(--accent); color:#fff; font-size:11px; line-height:18px; text-align:center; }
-+        .artifacts-btn .artifacts-count[hidden] { display:none; }
++        .artifacts-count[hidden] { display:none; }
 +        .artifacts-scrim { position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:60; }
 +        .artifacts-scrim[hidden] { display:none; }
 +        .artifacts-drawer { position:fixed; top:0; right:0; bottom:0; width:min(400px,100vw); background:var(--bg-sidebar);
@@ -429,9 +430,8 @@ index 0000000..8569033
 +    function refresh() {
 +        if (btn) {
 +            const count = records.size;
-+            const badge = btn.querySelector('.artifacts-count');
-+            badge.textContent = String(count);
-+            badge.hidden = count === 0;
++            const badge = document.getElementById('artifactsCount');
++            if (badge) { badge.textContent = String(count); badge.hidden = count === 0; }
 +        }
 +        if (open) render();
 +    }
@@ -447,17 +447,8 @@ index 0000000..8569033
 +    function build() {
 +        injectStyles();
 +
-+        btn = el('button', 'artifacts-btn');
-+        btn.type = 'button';
-+        btn.setAttribute('aria-label', 'Open artifacts');
-+        btn.setAttribute('aria-expanded', 'false');
-+        btn.title = 'Artifacts: assets and files';
-+        btn.append(el('span', null, 'Artifacts'), el('span', 'artifacts-count'));
-+        btn.querySelector('.artifacts-count').hidden = true;
-+        btn.addEventListener('click', () => setOpen(!open));
-+
-+        const headerRight = document.querySelector('.header-right');
-+        if (headerRight) headerRight.prepend(btn);
++        btn = document.getElementById('artifactsBtn');
++        if (btn) btn.addEventListener('click', () => setOpen(!open));
 +
 +        scrim = el('div', 'artifacts-scrim');
 +        scrim.hidden = true;
@@ -496,7 +487,7 @@ index 0000000..8569033
 +
 +    function syncMode(mode) {
 +        if (!btn) return;
-+        btn.classList.toggle('show', mode === 'code');
++        btn.hidden = mode !== 'code';
 +        if (mode !== 'code' && open) setOpen(false);
 +    }
 +
@@ -522,10 +513,21 @@ index 0000000..8569033
 +    }
 +})();
 diff --git a/frontend/index.html b/frontend/index.html
-index 9579ea3..3f6704b 100644
+index 9579ea3..0ae5fa9 100644
 --- a/frontend/index.html
 +++ b/frontend/index.html
-@@ -3022,6 +3022,7 @@
+@@ -1668,6 +1668,10 @@
+                 </button>
+             </div>
+             <div class="header-right">
++                <button type="button" class="artifacts-btn" id="artifactsBtn" hidden aria-label="Open artifacts" aria-expanded="false" title="Artifacts: assets and files">
++                    <span>Artifacts</span>
++                    <span class="artifacts-count" id="artifactsCount" hidden>0</span>
++                </button>
+                 <button type="button" class="watch-live-btn" id="watchLiveBtn" hidden onclick="toggleLiveMonitor()" title="Watch the agent's live backend actions">
+                     <span class="live-dot-indicator" id="watchLiveBtnDot"></span>
+                     <span class="watch-live-label">Watch live</span>
+@@ -3022,6 +3026,7 @@
          function updateWatchLiveVisibility() {
              if (watchLiveBtn) watchLiveBtn.hidden = currentMode !== 'code';
              if (currentMode !== 'code' && liveMonitorOpen) toggleLiveMonitor(false);
@@ -533,7 +535,7 @@ index 9579ea3..3f6704b 100644
          }
  
          function setLiveMonitorActive(isActive) {
-@@ -5919,6 +5920,8 @@
+@@ -5919,6 +5924,8 @@
              if (!text && !stagedAttachments.length) return;
  
              const mode = currentMode;
@@ -542,7 +544,7 @@ index 9579ea3..3f6704b 100644
  
              // Images-1.2 is prompt-only and runs entirely client-side via
              // Puter.js — no session/attachments/SSE plumbing needed, so it
-@@ -7006,6 +7009,9 @@
+@@ -7006,6 +7013,9 @@
              }
  
              function renderFileCards(result = {}) {
@@ -552,7 +554,7 @@ index 9579ea3..3f6704b 100644
                  if (!fileCardsEl) return;
                  const hasFiles = result.files && Object.keys(result.files).length > 0;
                  const statsByFile = new Map(
-@@ -7677,5 +7683,6 @@
+@@ -7677,5 +7687,6 @@
              renderLocalHistory();
          };
      </script>
