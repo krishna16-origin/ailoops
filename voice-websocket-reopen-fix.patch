@@ -1,0 +1,196 @@
+diff --git a/frontend/index.html b/frontend/index.html
+index 0ae5fa9..3be3676 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -4953,6 +4953,10 @@
+         // check below prevents late callbacks from an old mode session mutating a
+         // newly opened connection.
+         let voiceSocketGeneration = 0;
++        // Bounded auto-reconnect for a socket that drops while voice mode is
++        // still open. Reset on every click and on every successful handshake.
++        let voiceSocketReconnectAttempts = 0;
++        const VOICE_SOCKET_MAX_RECONNECTS = 3;
+         // Identifies one click-to-close voice-mode lifetime. This is separate
+         // from socket generation because microphone startup is asynchronous.
+         let voiceModeSession = 0;
+@@ -5172,6 +5176,12 @@
+             }
+             if (voiceSocketReadyPromise) return voiceSocketReadyPromise;
+             voiceSocketError = null;
++            // The server numbers turns from 1 on every connection. Turn ids
++            // tracked from a previous socket would make the first reply on
++            // this one look like an "ignored" old turn and silently drop its
++            // audio, so every new socket starts with clean turn bookkeeping.
++            voiceActiveServerTurn = 0;
++            voiceIgnoredServerTurn = 0;
+             const socket = new WebSocket(voiceSocketUrl(sessionId));
+             const generation = ++voiceSocketGeneration;
+             socket.binaryType = 'arraybuffer';
+@@ -5203,6 +5213,7 @@
+                         if (event.type === 'ready' && !settled) {
+                             voiceSocketReady = true;
+                             settled = true;
++                            voiceSocketReconnectAttempts = 0;
+                             startVoicePing();
+                             resolve(socket);
+                         }
+@@ -5239,12 +5250,19 @@
+                         stopVoiceAudioPlayback();
+                     }
+                     // Recover a dropped socket without requiring the user to
+-                    // close and reopen voice mode themselves.
+-                    window.setTimeout(() => {
+-                        if (sessionId === voiceModeSession && mobileVoiceOverlay && !mobileVoiceOverlay.hidden && !voiceSocket) {
+-                            connectVoiceSocket(sessionId).catch(() => {});
+-                        }
+-                    }, 400);
++                    // close and reopen voice mode themselves. Bounded with a
++                    // backoff so an unreachable server cannot cause an endless
++                    // reconnect loop; after that the next turn (or the next
++                    // click on the voice button) opens a fresh socket.
++                    if (voiceSocketReconnectAttempts < VOICE_SOCKET_MAX_RECONNECTS) {
++                        const delay = 400 * (2 ** voiceSocketReconnectAttempts);
++                        voiceSocketReconnectAttempts += 1;
++                        window.setTimeout(() => {
++                            if (sessionId === voiceModeSession && voiceStream && mobileVoiceOverlay && !mobileVoiceOverlay.hidden && !voiceSocket) {
++                                connectVoiceSocket(sessionId).catch(() => {});
++                            }
++                        }, delay);
++                    }
+                     resumeVoiceListening();
+                 };
+             });
+@@ -5262,6 +5280,7 @@
+         function openFreshVoiceSocket(sessionId) {
+             closeVoiceSocket();
+             voiceSocketReadyPromise = null;
++            voiceSocketReconnectAttempts = 0;
+             // Android Chrome can briefly keep the previous native socket in
+             // CLOSING after close() returns. Wait a short, bounded interval so
+             // the next activation cannot race the old transport.
+@@ -5427,7 +5446,10 @@
+             clearVoiceResumeRecovery();
+             voiceRecognitionPaused = false;
+             if (voiceAudioSource) {
+-                if (!voiceSocket || !voiceSocketReady || voiceSocket.readyState !== WebSocket.OPEN) {
++                // Only while voice mode is actually open: a late timer or
++                // playback callback after Stop must never open a socket.
++                if (voiceStream && mobileVoiceOverlay && !mobileVoiceOverlay.hidden
++                    && (!voiceSocket || !voiceSocketReady || voiceSocket.readyState !== WebSocket.OPEN)) {
+                     connectVoiceSocket(voiceModeSession).catch(() => {});
+                 }
+                 return;
+diff --git a/requirements.txt b/requirements.txt
+index 2523867..d74b903 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,5 +1,6 @@
+ fastapi
+ uvicorn
++websockets>=12
+ pydantic
+ langchain
+ langchain-core>=1.0
+diff --git a/test_voice_ws.py b/test_voice_ws.py
+index b15842c..ba90a86 100644
+--- a/test_voice_ws.py
++++ b/test_voice_ws.py
+@@ -112,5 +112,63 @@ class VoiceHelpersTests(unittest.TestCase):
+         self.assertTrue(any(event["type"] == "error" for event in events))
+ 
+ 
++async def hello_stream(_session):
++    yield "Hello there, friend."
++
++
++async def tiny_tts(_text, _voice):
++    yield b"\x01\x00" * 120
++
++
++class VoiceReopenTests(unittest.TestCase):
++    """Every click on voice mode is a brand-new socket that must reply."""
++
++    def _client(self, sessions):
++        from fastapi import FastAPI
++        from fastapi.testclient import TestClient
++
++        deps = voice_ws.VoiceDeps(
++            get_session=lambda sid: sessions.setdefault(sid, {"messages": []}),
++            trim_memory=lambda messages, **kwargs: messages,
++            llm_stream=hello_stream,
++            human_message=lambda text: ("human", text),
++            ai_message=lambda text: ("ai", text),
++            tts_pcm=tiny_tts,
++        )
++        app = FastAPI()
++        app.include_router(voice_ws.create_router(deps))
++        return TestClient(app)
++
++    def _one_exchange(self, client, session_id):
++        with client.websocket_connect("/ws/voice") as ws:
++            ws.send_json({"type": "config", "session_id": session_id})
++            self.assertEqual(ws.receive_json()["type"], "ready")
++            ws.send_json({"type": "text", "text": "hi"})
++            audio_turns, done = [], None
++            while done is None:
++                msg = ws.receive()
++                if msg.get("bytes") is not None:
++                    audio_turns.append(int.from_bytes(msg["bytes"][1:5], "big"))
++                elif msg.get("text") is not None:
++                    event = json.loads(msg["text"])
++                    if event["type"] == "turn_done":
++                        done = event
++            return audio_turns, done
++
++    def test_each_new_socket_replies_with_its_own_turn_numbering(self):
++        sessions = {}
++        client = self._client(sessions)
++        for _ in range(4):  # open -> reply -> close, repeated in the same chat session
++            audio_turns, done = self._one_exchange(client, "same-session")
++            self.assertEqual(done["response"], "Hello there, friend.")
++            self.assertTrue(audio_turns, "reply must include audio")
++            # The server restarts turn numbering at 1 on every new socket, which
++            # is why the browser has to reset its turn bookkeeping per socket.
++            self.assertEqual(set(audio_turns), {1})
++            self.assertEqual(done["turn"], 1)
++        # History keeps accumulating in the shared chat session across sockets.
++        self.assertEqual(len(sessions["same-session"]["messages"]), 8)
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/voice_ws.py b/voice_ws.py
+index 49f0e9c..0108c3a 100644
+--- a/voice_ws.py
++++ b/voice_ws.py
+@@ -327,7 +327,12 @@ class VoiceConnection:
+         asyncio.create_task(warmup())
+         try:
+             while True:
+-                msg = await self.ws.receive()
++                try:
++                    msg = await self.ws.receive()
++                except Exception:
++                    # Peer vanished (abrupt close, proxy reset): end this
++                    # connection quietly; the finally block cleans up.
++                    break
+                 if msg["type"] == "websocket.disconnect":
+                     break
+                 if msg.get("bytes") is not None:
+@@ -651,6 +656,15 @@ def create_router(deps: VoiceDeps) -> APIRouter:
+             await ws.close(code=1008)
+             return
+         await ws.accept()
+-        await VoiceConnection(ws, deps).run()
++        # One VoiceConnection per socket: nothing here is shared between
++        # connections, so every new client socket gets a fresh turn counter,
++        # fresh audio buffers and its own cancellation scope.
++        try:
++            await VoiceConnection(ws, deps).run()
++        finally:
++            try:
++                await ws.close()
++            except Exception:
++                pass  # already closed by the client
+ 
+     return router
